@@ -17,6 +17,8 @@ pub(crate) struct UsageAnchor {
     completion_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cached_prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_write_tokens: Option<u32>,
     /// `None` when no price is known for the model, never a guessed zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
@@ -37,6 +39,7 @@ impl UsageAnchor {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             cost_usd: pricing.map(|pricing| pricing.cost(usage)),
         }
     }

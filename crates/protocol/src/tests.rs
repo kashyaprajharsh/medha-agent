@@ -118,6 +118,7 @@ fn an_unreported_cache_bucket_does_not_become_zero() {
             total_tokens: 20,
             completion_tokens: Some(10),
             cached_prompt_tokens: cached,
+            cache_write_tokens: None,
         };
         let decoded: TurnEvent =
             serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();

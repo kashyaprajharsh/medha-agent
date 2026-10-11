@@ -67,6 +67,8 @@ pub struct UsageSnapshot {
     pub completion_tokens: Option<u32>,
     pub total_tokens: u32,
     pub cached_prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

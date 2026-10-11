@@ -14,8 +14,40 @@ fn call(
         prompt,
         completion,
         cached: Some(prompt / 2),
+        written: None,
         cost,
     }
+}
+
+/// The hit rate counts only calls whose server reported re-reads. A local
+/// server that says nothing must not make a caching route look like it misses.
+#[test]
+fn the_hit_rate_ignores_calls_that_reported_no_cache_count() {
+    let session = Ulid::new();
+    let sessions = HashMap::from([(session, ("chat".to_owned(), None))]);
+    let mut caching = call(session, "p:https://a/v1:claude", 10_000, Some(100), None);
+    caching.cached = Some(9_000);
+    caching.written = Some(800);
+    let mut silent = call(session, "p:http://h/v1:local", 30_000, Some(100), None);
+    silent.cached = None;
+
+    let summary = summarize(&[caching, silent], &sessions, 7);
+    let total = &summary["total"];
+    assert_eq!(total["prompt_tokens"], 40_000);
+    assert_eq!(total["cache_measured_tokens"], 10_000);
+    assert_eq!(total["cache_write_tokens"], 800);
+    let text = render(&summary, &summary);
+    assert!(
+        text.contains("40.0k in (9.0k cached · 90% hit · 800 stored)"),
+        "{text}"
+    );
+
+    // No call reported anything: no rate at all, never 0%.
+    let mut quiet = call(session, "p:http://h/v1:local", 2_000, Some(10), None);
+    quiet.cached = None;
+    let summary = summarize(&[quiet], &sessions, 7);
+    let text = render(&summary, &summary);
+    assert!(text.contains("2.0k in (0 cached) · 10 out"), "{text}");
 }
 
 #[test]
@@ -85,7 +117,7 @@ fn the_tui_text_says_when_cost_is_unknown() {
     );
     let text = render(&summary, &summary);
     assert!(
-        text.contains("1 calls · 2.5k in (1.2k cached) · 40 out · cost unknown"),
+        text.contains("1 calls · 2.5k in (1.2k cached · 50% hit) · 40 out · cost unknown"),
         "{text}"
     );
 }

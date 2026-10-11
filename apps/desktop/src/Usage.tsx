@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { hitRate } from "./cache";
 import { PageTop } from "./ExtensionParts";
 import { Select } from "./Select";
 import { SLOTS, UsageChart, type Day, type Series } from "./UsageChart";
@@ -9,6 +10,9 @@ type Tally = {
   prompt_tokens: number;
   completion_tokens: number;
   cached_tokens: number;
+  /** Prompt tokens of the calls whose server reported what it re-read. */
+  cache_measured_tokens?: number;
+  cache_write_tokens?: number;
   cost_usd: number | null;
   unpriced_calls: number;
 };
@@ -46,6 +50,8 @@ function sum(rows: Tally[]): Tally {
     prompt_tokens: rows.reduce((total, row) => total + row.prompt_tokens, 0),
     completion_tokens: rows.reduce((total, row) => total + row.completion_tokens, 0),
     cached_tokens: rows.reduce((total, row) => total + row.cached_tokens, 0),
+    cache_measured_tokens: rows.reduce((total, row) => total + (row.cache_measured_tokens ?? 0), 0),
+    cache_write_tokens: rows.reduce((total, row) => total + (row.cache_write_tokens ?? 0), 0),
     cost_usd: priced.length ? priced.reduce((total, row) => total + (row.cost_usd ?? 0), 0) : null,
     unpriced_calls: rows.reduce((total, row) => total + row.unpriced_calls, 0),
   };
@@ -123,6 +129,8 @@ export function Usage() {
   }, [summary, model, days]);
 
   const total = view?.total;
+  // Only over calls that reported re-reads: a server that says nothing is not a miss.
+  const cacheHit = total && hitRate(total.cached_tokens, total.cache_measured_tokens ?? 0);
   return (
     <div className="usage-page">
       <PageTop title="Usage">Tokens and cost from each model call in this workspace, sub-agents included.</PageTop>
@@ -154,6 +162,10 @@ export function Usage() {
           <dl className="usage-totals">
             <div><dt>Input</dt><dd>{tokens(total.prompt_tokens)}</dd></div>
             <div><dt>Cached</dt><dd>{tokens(total.cached_tokens)}</dd></div>
+            {cacheHit && <div><dt>Cache hit</dt><dd>{cacheHit}</dd></div>}
+            {!!total.cache_write_tokens && (
+              <div><dt>Stored in cache</dt><dd>{tokens(total.cache_write_tokens)}</dd></div>
+            )}
             <div><dt>Output</dt><dd>{tokens(total.completion_tokens)}</dd></div>
             <div><dt>Cost</dt><dd>{cost(total)}</dd></div>
             <div><dt>Model calls</dt><dd>{total.calls}</dd></div>

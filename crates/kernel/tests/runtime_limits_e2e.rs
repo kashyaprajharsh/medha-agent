@@ -1606,6 +1606,7 @@ async fn each_model_call_records_its_tokens_and_cost_in_the_log() {
         input_per_mtok: 2.0,
         output_per_mtok: 8.0,
         cached_input_per_mtok: Some(0.5),
+        cache_write_per_mtok: None,
         indicative: false,
     };
     let kernel =

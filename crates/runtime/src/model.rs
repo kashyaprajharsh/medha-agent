@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub struct Model {
     pub provider: Arc<OpenAiCompat>,
     pub name: String,
-    pub catalogue_pricing: Option<(f64, f64, Option<f64>)>,
+    pub catalogue_pricing: Option<(f64, f64, Option<f64>, Option<f64>)>,
     pub profiles: Arc<std::sync::Mutex<config::Config>>,
     pub active_profile: String,
     pub max_ctx: Option<u32>,

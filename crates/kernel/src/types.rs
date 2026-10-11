@@ -876,11 +876,36 @@ mod usage_tests {
             input_per_mtok: 10.0,
             output_per_mtok: 40.0,
             cached_input_per_mtok: Some(1.0),
+            cache_write_per_mtok: None,
             indicative: false,
         };
         // 100 uncached × $10 + 900 cached × $1 + 100 out × $40 per million.
         let cost = priced.cost(&usage(1_000, Some(900)));
         assert!((cost - (1_000.0 + 900.0 + 4_000.0) / 1_000_000.0).abs() < 1e-12);
+    }
+
+    /// The turn that stores a prefix pays more for it than plain input, and the
+    /// cost shown must say so: 1,000 prompt tokens, 600 re-read, 300 stored.
+    #[test]
+    fn a_cache_write_bills_at_the_write_rate_when_the_route_publishes_one() {
+        let mut stored = usage(1_000, Some(600));
+        stored.cache_write_tokens = Some(300);
+        let priced = Pricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 40.0,
+            cached_input_per_mtok: Some(1.0),
+            cache_write_per_mtok: Some(12.5),
+            indicative: false,
+        };
+        // 100 fresh × $10 + 300 stored × $12.5 + 600 re-read × $1 + 100 out × $40.
+        let expected = (1_000.0 + 3_750.0 + 600.0 + 4_000.0) / 1_000_000.0;
+        assert!((priced.cost(&stored) - expected).abs() < 1e-12);
+        // No published write rate: a write is plain input, never free.
+        let unpriced = Pricing {
+            cache_write_per_mtok: None,
+            ..priced
+        };
+        assert!((unpriced.cost(&stored) - priced.cost(&usage(1_000, Some(600)))).abs() < 1e-12);
     }
 
     #[test]
@@ -889,6 +914,7 @@ mod usage_tests {
             input_per_mtok: 10.0,
             output_per_mtok: 40.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             indicative: false,
         };
         assert_eq!(
@@ -1099,6 +1125,9 @@ pub struct Pricing {
     /// publishes one. Without it a cache hit bills at the full input rate, which
     /// overstates the cost of every turn after the first.
     pub cached_input_per_mtok: Option<f64>,
+    /// Rate for prompt tokens the provider stores in its cache, where the route
+    /// publishes one; usually above the input rate.
+    pub cache_write_per_mtok: Option<f64>,
     pub indicative: bool,
 }
 
@@ -1108,7 +1137,12 @@ impl Pricing {
         // the full input rate otherwise — never silently as free.
         let cached = f64::from(usage.cached_prompt_tokens.unwrap_or(0));
         let cached_rate = self.cached_input_per_mtok.unwrap_or(self.input_per_mtok);
-        (f64::from(usage.uncached_prompt_tokens()) * self.input_per_mtok
+        // A write is part of the prompt that was not re-read, at its own rate.
+        let fresh = usage.uncached_prompt_tokens();
+        let written = usage.cache_write_tokens.unwrap_or(0).min(fresh);
+        let write_rate = self.cache_write_per_mtok.unwrap_or(self.input_per_mtok);
+        (f64::from(fresh - written) * self.input_per_mtok
+            + f64::from(written) * write_rate
             + cached * cached_rate
             + f64::from(usage.completion_tokens) * self.output_per_mtok)
             / 1_000_000.0

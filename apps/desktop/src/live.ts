@@ -103,7 +103,7 @@ export type LiveState = {
   agents: LiveAgent[];
   questions: QuestionForm[];
   settings?: SessionSettings;
-  usage?: { prompt: number; total: number; cached?: number };
+  usage?: { prompt: number; total: number; cached?: number; written?: number };
   verification?: { ok: boolean; summary: string };
   compaction?: {
     before: number;
@@ -633,6 +633,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
           prompt: num(params.prompt_tokens) ?? 0,
           total: num(params.total_tokens) ?? 0,
           cached: num(params.cached_prompt_tokens),
+          written: num(params.cache_write_tokens),
         },
       };
     case "verify":

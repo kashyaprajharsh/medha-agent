@@ -229,10 +229,13 @@ test("unknown cache usage stays unknown while a reported zero stays zero", () =>
       prompt_tokens: 30,
       total_tokens: 50,
       cached_prompt_tokens: 0,
+      cache_write_tokens: 12,
     }),
   );
   assert.equal(unknown.usage.cached, undefined);
+  assert.equal(unknown.usage.written, undefined);
   assert.equal(zero.usage.cached, 0);
+  assert.equal(zero.usage.written, 12);
 });
 
 test("answer acknowledgement releases only the corresponding form", () => {

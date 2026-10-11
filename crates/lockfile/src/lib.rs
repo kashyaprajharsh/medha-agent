@@ -385,6 +385,9 @@ pub struct PricingConfig {
     /// cached tokens bill at `input_per_mtok`, which overstates every turn after
     /// the first rather than understating it.
     pub cached_input_per_mtok: Option<f64>,
+    /// Rate for prompt tokens the provider stores in its cache. Left unset,
+    /// they bill at `input_per_mtok`.
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 /// Execution sandbox for shell, build, and VCS commands.

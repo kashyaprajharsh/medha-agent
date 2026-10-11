@@ -39,6 +39,7 @@ impl runtime::agents::AgentWatcher for Watch {
                 total_tokens: usage.total_tokens,
                 completion_tokens: Some(usage.completion_tokens),
                 cached_prompt_tokens: usage.cached_prompt_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
             },
         );
     }

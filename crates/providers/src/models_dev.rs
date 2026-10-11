@@ -209,6 +209,9 @@ pub struct ModelMeta {
     /// USD per million prompt tokens served from the provider's cache.
     #[serde(default)]
     pub cached_input_per_mtok: Option<f64>,
+    /// USD per million prompt tokens the provider stores in its cache.
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
     /// Exact effort values, separate from toggle/budget reasoning controls.
@@ -305,6 +308,9 @@ struct Cost {
     /// price cache reads separately, not that they are free.
     #[serde(default)]
     cache_read: Option<f64>,
+    /// Rate for prompt tokens the provider stores in its cache for later.
+    #[serde(default)]
+    cache_write: Option<f64>,
 }
 
 pub(crate) fn parse_catalogue(bytes: &[u8]) -> Result<crate::catalogue::Snapshot, String> {
@@ -403,6 +409,7 @@ fn flatten(providers: BTreeMap<String, Provider>) -> BTreeMap<String, ModelMeta>
                 input_per_mtok: model.cost.as_ref().and_then(|c| c.input),
                 output_per_mtok: model.cost.as_ref().and_then(|c| c.output),
                 cached_input_per_mtok: model.cost.as_ref().and_then(|c| c.cache_read),
+                cache_write_per_mtok: model.cost.as_ref().and_then(|c| c.cache_write),
                 capabilities: capability_values
                     .has_known_value()
                     .then_some(capability_values),
@@ -572,13 +579,18 @@ pub async fn profile_context_window(profile: &crate::ProviderProfile) -> Option<
     profile_meta(profile, &data.entries, true).and_then(|meta| meta.context)
 }
 
-pub async fn profile_pricing(profile: &crate::ProviderProfile) -> Option<(f64, f64, Option<f64>)> {
+/// List price for a profile: input, output, then cache re-read and cache write
+/// where the catalogue publishes them.
+pub async fn profile_pricing(
+    profile: &crate::ProviderProfile,
+) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
     let data = crate::catalogue::snapshot();
     let meta = profile_meta(profile, &data.entries, true)?;
     Some((
         meta.input_per_mtok?,
         meta.output_per_mtok?,
         meta.cached_input_per_mtok,
+        meta.cache_write_per_mtok,
     ))
 }
 
@@ -632,6 +644,26 @@ fn lookup<'a>(model_id: &str, entries: &'a BTreeMap<String, ModelMeta>) -> Optio
 mod tests {
     use super::*;
     use crate::catalogue::{Cache, SCHEMA as CACHE_SCHEMA_VERSION};
+
+    /// Both cache prices come from the catalogue. A model that lists neither
+    /// has neither: an absent price is never taken to be zero.
+    #[test]
+    fn cache_prices_are_read_from_the_catalogue_when_it_lists_them() {
+        let raw = serde_json::from_value(serde_json::json!({
+            "one":{"models":{
+                "caching":{"cost":{"input":3.0,"output":15.0,"cache_read":0.3,"cache_write":3.75}},
+                "plain":{"cost":{"input":1.0,"output":2.0}}
+            }}
+        }))
+        .unwrap();
+        let entries = flatten(raw);
+        let prices = |model: &str| {
+            let meta = lookup(model, &entries).unwrap();
+            (meta.cached_input_per_mtok, meta.cache_write_per_mtok)
+        };
+        assert_eq!(prices("caching"), (Some(0.3), Some(3.75)));
+        assert_eq!(prices("plain"), (None, None));
+    }
 
     #[test]
     fn an_explicit_provider_never_inherits_another_deployments_metadata() {
@@ -839,6 +871,7 @@ mod tests {
                 input_per_mtok: None,
                 output_per_mtok: None,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
                 capabilities: None,
                 reasoning_efforts: None,
             },
@@ -850,6 +883,7 @@ mod tests {
                 input_per_mtok: Some(15.0),
                 output_per_mtok: Some(75.0),
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
                 capabilities: None,
                 reasoning_efforts: None,
             },
@@ -877,6 +911,7 @@ mod tests {
             input_per_mtok: Some(1.0),
             output_per_mtok: Some(2.0),
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             capabilities: None,
             reasoning_efforts: None,
         };
@@ -885,6 +920,7 @@ mod tests {
             input_per_mtok: Some(3.0),
             output_per_mtok: Some(4.0),
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             capabilities: None,
             reasoning_efforts: None,
         };

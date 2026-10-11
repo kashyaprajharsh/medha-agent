@@ -5,6 +5,7 @@ import { BackgroundTasks } from "./Tasks";
 import { useWorkspaceApi } from "./Workspace";
 import { useEffect, useMemo, useState } from "react";
 import { type Patch, type SessionSettings } from "./api";
+import { hitRate } from "./cache";
 import { Icon } from "./Icon";
 import type { LiveState } from "./live";
 import { Preview } from "./OutputPreview";
@@ -609,6 +610,17 @@ export function WorkSurface(props: Props) {
                       ? "Not reported"
                       : props.state.usage.cached.toLocaleString()}
                   </dd>
+                  <dt>Cache hit</dt>
+                  <dd>
+                    {hitRate(props.state.usage.cached, props.state.usage.prompt) ??
+                      "Not reported"}
+                  </dd>
+                  {props.state.usage.written !== undefined && (
+                    <>
+                      <dt>Stored in cache</dt>
+                      <dd>{props.state.usage.written.toLocaleString()}</dd>
+                    </>
+                  )}
                 </>
               )}
             </dl>

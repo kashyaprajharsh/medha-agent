@@ -693,6 +693,8 @@ pub enum TurnEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion_tokens: Option<u32>,
         cached_prompt_tokens: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u32>,
     },
     #[serde(rename = "cost")]
     Cost { total_usd: f64, indicative: bool },

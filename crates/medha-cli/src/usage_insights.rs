@@ -16,6 +16,7 @@ pub(crate) struct Call {
     pub prompt: u64,
     pub completion: Option<u64>,
     pub cached: Option<u64>,
+    pub written: Option<u64>,
     pub cost: Option<f64>,
 }
 
@@ -37,6 +38,7 @@ pub(crate) fn calls(events: &[Event]) -> (Vec<Call>, Vec<Ulid>) {
                     prompt: number("prompt_tokens").unwrap_or(0),
                     completion: number("completion_tokens"),
                     cached: number("cached_prompt_tokens"),
+                    written: number("cache_write_tokens"),
                     cost: event.payload.get("cost_usd").and_then(Value::as_f64),
                 });
             }
@@ -100,6 +102,10 @@ struct Total {
     prompt: u64,
     completion: u64,
     cached: u64,
+    /// Prompt tokens of the calls whose server said how much it re-read: the
+    /// only fair base for a hit rate, since silence is not a miss.
+    measured: u64,
+    written: u64,
     cost: f64,
     priced: u64,
 }
@@ -109,7 +115,11 @@ impl Total {
         self.calls += 1;
         self.prompt += call.prompt;
         self.completion += call.completion.unwrap_or(0);
-        self.cached += call.cached.unwrap_or(0);
+        if let Some(cached) = call.cached {
+            self.cached += cached;
+            self.measured += call.prompt;
+        }
+        self.written += call.written.unwrap_or(0);
         if let Some(cost) = call.cost {
             self.cost += cost;
             self.priced += 1;
@@ -121,6 +131,8 @@ impl Total {
             "prompt_tokens": self.prompt,
             "completion_tokens": self.completion,
             "cached_tokens": self.cached,
+            "cache_measured_tokens": self.measured,
+            "cache_write_tokens": self.written,
             "cost_usd": (self.priced > 0).then_some(self.cost),
             "unpriced_calls": self.calls - self.priced,
         })
@@ -213,12 +225,23 @@ pub(crate) fn render(session: &Value, window: &Value) -> String {
             .as_f64()
             .map_or_else(|| "cost unknown".to_owned(), |cost| format!("${cost:.4}"));
         let unpriced = usage["unpriced_calls"].as_u64().unwrap_or(0);
+        let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+        let mut cache = format!("{} cached", tokens(count("cached_tokens")));
+        // A rate only over calls whose server reported re-reads; silence is not a miss.
+        if let Some(rate) = hit_rate(count("cached_tokens"), count("cache_measured_tokens")) {
+            cache.push_str(&format!(" · {rate} hit"));
+        }
+        if count("cache_write_tokens") > 0 {
+            cache.push_str(&format!(
+                " · {} stored",
+                tokens(count("cache_write_tokens"))
+            ));
+        }
         format!(
-            "{} calls · {} in ({} cached) · {} out · {cost}{}",
+            "{} calls · {} in ({cache}) · {} out · {cost}{}",
             usage["calls"],
-            tokens(usage["prompt_tokens"].as_u64().unwrap_or(0)),
-            tokens(usage["cached_tokens"].as_u64().unwrap_or(0)),
-            tokens(usage["completion_tokens"].as_u64().unwrap_or(0)),
+            tokens(count("prompt_tokens")),
+            tokens(count("completion_tokens")),
             if unpriced > 0 && usage["cost_usd"].is_number() {
                 format!(" (+{unpriced} unpriced)")
             } else {
@@ -241,6 +264,18 @@ pub(crate) fn render(session: &Value, window: &Value) -> String {
     }
     text.push_str("\nCalls from before usage was recorded count prompt tokens only.");
     text
+}
+
+/// Share of the measured prompt that was re-read, or nothing when no call
+/// reported it. A rate that rounds to 100 without being 100 says so.
+fn hit_rate(cached: u64, measured: u64) -> Option<String> {
+    let cached = cached.min(measured);
+    let percent = 100.0 * cached as f64 / measured as f64;
+    match measured {
+        0 => None,
+        _ if cached < measured && percent >= 99.5 => Some(">99%".into()),
+        _ => Some(format!("{percent:.0}%")),
+    }
 }
 
 fn tokens(count: u64) -> String {

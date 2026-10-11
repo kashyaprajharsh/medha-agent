@@ -1398,6 +1398,7 @@ mod tests {
             input_per_mtok: 2.0,
             output_per_mtok: 12.0,
             cached_input_per_mtok: Some(0.2),
+            cache_write_per_mtok: None,
             indicative: false,
         };
         let expected = (5220.0 * 2.0 + 16356.0 * 0.2 + 57.0 * 12.0) / 1_000_000.0;

@@ -279,6 +279,7 @@ mod tests {
                     total_tokens: 120,
                     completion_tokens: Some(20),
                     cached_prompt_tokens: cached,
+                    cache_write_tokens: None,
                 },
             );
         }
@@ -818,6 +819,7 @@ impl Presentation {
                 total_tokens,
                 completion_tokens,
                 cached_prompt_tokens,
+                cache_write_tokens,
             } => {
                 self.metrics.prompt_tokens = self
                     .metrics
@@ -837,6 +839,7 @@ impl Presentation {
                     total_tokens,
                     completion_tokens,
                     cached_prompt_tokens,
+                    cache_write_tokens,
                 });
             }
             TurnEvent::Cost {

@@ -761,12 +761,14 @@ pub async fn start(
             // Configured rates are the operator's own; nothing is inferred for
             // cached reads, so they bill at the input rate unless stated.
             cached_input_per_mtok: lock.pricing.cached_input_per_mtok,
+            cache_write_per_mtok: lock.pricing.cache_write_per_mtok,
             indicative: false,
         }),
-        _ => catalogue_pricing.map(|(input, output, cached)| kernel::Pricing {
+        _ => catalogue_pricing.map(|(input, output, cached, written)| kernel::Pricing {
             input_per_mtok: input,
             output_per_mtok: output,
             cached_input_per_mtok: cached,
+            cache_write_per_mtok: written,
             indicative: true,
         }),
     };

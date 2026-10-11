@@ -424,6 +424,7 @@ mod tests {
                         input_per_mtok: 1.0,
                         output_per_mtok: 1.0,
                         cached_input_per_mtok: None,
+                        cache_write_per_mtok: None,
                         indicative: false,
                     })
                 ),
@@ -466,6 +467,7 @@ mod tests {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             indicative: false,
         };
         let per_turn = p.cost(&Usage {
@@ -566,6 +568,7 @@ mod tests {
             input_per_mtok: 2.0,
             output_per_mtok: 10.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             indicative: false,
         };
         let mut governor = Governor::new(Budget {

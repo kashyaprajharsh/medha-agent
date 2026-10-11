@@ -49,9 +49,16 @@ pub struct SessionSearchHit {
     pub source: String,
 }
 
+/// What a person typed, without the sentences Medha stored with it for the model.
+fn typed(payload: &serde_json::Value) -> Option<&str> {
+    payload.get("text")?.as_str()?;
+    Some(kernel::turn_instruction::shown_payload(payload, true).0)
+}
+
 fn search_text(kind: &EventKind, payload: &serde_json::Value) -> Option<String> {
     let text = match kind {
-        EventKind::UserMessage | EventKind::ModelText => payload.get("text")?.as_str()?.to_string(),
+        EventKind::UserMessage => typed(payload)?.to_string(),
+        EventKind::ModelText => payload.get("text")?.as_str()?.to_string(),
         EventKind::ModelMessage => {
             let message: kernel::ModelMessage = serde_json::from_value(payload.clone()).ok()?;
             message
@@ -756,7 +763,7 @@ impl SqliteLog {
             let title = first_user
                 .as_deref()
                 .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
-                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+                .and_then(|v| typed(&v).map(str::to_owned))
                 .map(|t| {
                     let t = t.trim().replace('\n', " ");
                     if t.chars().count() > 72 {
@@ -1942,6 +1949,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(log.list_sessions().unwrap()[0].title, "fix the login bug");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sentence Medha stores with a message for the model is not the chat's
+    /// title and is not what a search of past chats finds.
+    #[tokio::test]
+    async fn a_chat_is_titled_and_found_by_what_was_typed() {
+        let dir = std::env::temp_dir().join(format!("medha-sess-typed-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let session = kernel::Session::new();
+        let mut message = kernel::Message::user("Only for the model. fix the login bug");
+        message.instruction_prefix = Some("Only for the model. ".into());
+        log.append(Event::user_input_message(&session, &message))
+            .await
+            .unwrap();
+        assert_eq!(log.list_sessions().unwrap()[0].title, "fix the login bug");
+        assert_eq!(log.search("login", 5).unwrap().len(), 1);
+        assert!(log.search("model", 5).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -16,7 +16,7 @@ pub(crate) async fn points<P: Provider, L: EventLog>(
         .await
         .map_err(|e| e.to_string())?;
     Ok(
-        json!({"points": events.iter().filter(|event| event.is_from_person()).map(|event| json!({ "id": event.id.to_string(), "text": event.payload["text"].as_str().unwrap_or_default(), "files": kernel::rollback_plan_in(&events, event.id, root).len() })).collect::<Vec<_>>() }),
+        json!({"points": events.iter().filter(|event| event.is_from_person()).map(|event| json!({ "id": event.id.to_string(), "text": event.shown_text().0, "files": kernel::rollback_plan_in(&events, event.id, root).len() })).collect::<Vec<_>>() }),
     )
 }
 #[allow(clippy::too_many_arguments)]

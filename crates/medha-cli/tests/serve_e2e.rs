@@ -2024,6 +2024,51 @@ async fn an_image_too_large_for_its_server_is_sent_smaller() {
     );
 }
 
+/// A message typed in Plan mode reaches the model with the plan instruction,
+/// and a person reads only what they typed: in the chat, its title and rewind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_instruction_reaches_the_model_and_nowhere_a_person_reads() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("planned");
+    let chat = client.open(&folder).await;
+    let plan = json!({"mode": "plan"});
+    client.ask("session.configure", Some(&chat), plan).await;
+    client.send(&chat, "fix the login bug").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+
+    let asked = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let told = user_texts(&asked);
+    assert!(
+        told.contains("Plan mode is active") && told.contains("fix the login bug"),
+        "{told}"
+    );
+
+    let rewind = client
+        .ask("session.rewind.points", Some(&chat), json!({}))
+        .await;
+    assert_eq!(
+        rewind["result"]["points"][0]["text"], "fix the login bug",
+        "{rewind}"
+    );
+    let listed = json!({"method": "sessions.list"});
+    let listed = client.about(&folder, listed).await.unwrap().to_string();
+    assert!(listed.contains("fix the login bug"), "{listed}");
+    assert!(!listed.contains("Plan mode is active"), "{listed}");
+    // The test server echoes what it was sent, so only the person's line is checked.
+    let events = json!({"method": "sessions.events", "session_id": chat});
+    let events = client.about(&folder, events).await.unwrap();
+    let typed: Vec<_> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "user")
+        .map(|event| event["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(typed, ["fix the login bug"]);
+}
+
 /// The provider's key never travels back to the provider inside a tool result:
 /// a command that prints it shows the model a marker, while the record of the
 /// command keeps what it printed.

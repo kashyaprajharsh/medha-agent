@@ -15,7 +15,8 @@ pub(crate) fn history_notes(events: &[Event], budget: u32, counter: &dyn TokenCo
             if event.kind != EventKind::UserMessage || event.trust != TrustLabel::User {
                 return None;
             }
-            let text = event.payload.get("text")?.as_str()?;
+            // Their own words: a mode's instruction for one turn is not theirs.
+            let text = event.shown_text().0;
             (!text.trim().is_empty()).then_some((event.id, text))
         })
         .collect();
@@ -72,3 +73,7 @@ pub(crate) fn summary_body(summary: &str) -> &str {
         .rsplit_once(NOTES_MARKER)
         .map_or(summary, |(body, _)| body)
 }
+
+#[cfg(test)]
+#[path = "handoff_tests.rs"]
+mod tests;

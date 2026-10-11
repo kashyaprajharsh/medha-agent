@@ -649,7 +649,8 @@ impl SessionsSearch {
             _ => event.kind.as_str(),
         };
         let text = match &event.kind {
-            EventKind::UserMessage | EventKind::ModelText => event
+            EventKind::UserMessage => event.shown_text().0.to_string(),
+            EventKind::ModelText => event
                 .payload
                 .get("text")
                 .and_then(Value::as_str)
@@ -1352,6 +1353,29 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The model reads a past message as the person typed it, without the
+    /// sentence a mode stored with it: that sentence was never theirs.
+    #[tokio::test]
+    async fn sessions_search_returns_what_the_person_typed() {
+        let (tool, _artifacts, _dir) = session_search_tool("typed");
+        let session = Session::new();
+        let mut planned = kernel::Message::user("Do not implement changes.\n\nfix the login bug");
+        planned.instruction_prefix = Some("Do not implement changes.\n\n".into());
+        let event = Event::user_input_message(&session, &planned);
+        tool.log.append(event).await.unwrap();
+
+        let found = tool.execute(&json!({ "query": "login" })).await.unwrap();
+        assert_eq!(
+            found["sessions"][0]["window"][0]["text"],
+            "fix the login bug"
+        );
+        let none = tool
+            .execute(&json!({ "query": "implement" }))
+            .await
+            .unwrap();
+        assert_eq!(none["sessions"], json!([]), "{none}");
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 use crate::{Message, Role, TrustLabel};
 
-const PLAN: &str = "For this turn, Plan mode is active. Investigate using read-only tools and present an actionable plan with affected files, risks, and validation steps. Do not implement changes, execute commands, or delegate work.\n\n";
+const PLAN: &str = "For this turn, Plan mode is active. Investigate using read-only tools and present an actionable plan with affected files, risks, and validation steps. Do not implement changes, execute commands, or delegate work. The user must switch to careful/normal/yolo mode before implementation.\n\n";
 
 pub(crate) fn apply(message: &mut Message, planning: bool) {
     if planning

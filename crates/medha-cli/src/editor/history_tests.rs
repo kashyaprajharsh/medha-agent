@@ -61,6 +61,11 @@ async fn canonical_text_reasoning_and_tool_calls_are_replayed_once_across_compac
             json!({"summary":"do not replace visible history"}),
         ),
         record("second", "user.message", json!({"text":"second"})),
+        record(
+            "plan",
+            "user.message",
+            json!({"text":"For this turn. About output. inspect", "instruction_prefix":"For this turn. ", "about":{"lead":14, "label":"Diagram"}}),
+        ),
     ] {
         replay.record(&writer, "session", event).await;
     }
@@ -74,7 +79,7 @@ async fn canonical_text_reasoning_and_tool_calls_are_replayed_once_across_compac
             .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
             .collect()
     };
-    assert_eq!(content("user_message_chunk"), "firstsecond");
+    assert_eq!(content("user_message_chunk"), "firstsecondinspect");
     assert_eq!(content("agent_message_chunk"), "answer");
     assert_eq!(content("agent_thought_chunk"), "thought");
     assert_eq!(

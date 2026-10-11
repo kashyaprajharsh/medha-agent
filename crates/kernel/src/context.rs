@@ -156,6 +156,11 @@ pub trait ContextEngine: Send + Sync {
     /// Rebuild bounded continuity notes from checked original events, not generated summaries.
     fn restore_history(&self, _events: &[crate::Event], _input_limit: Option<u32>) {}
 
+    /// Message-token regrowth threshold saved with the next committed checkpoint.
+    fn prune_rearm_tokens(&self) -> u32 {
+        0
+    }
+
     /// Restore provider usage only after the kernel has matched the priced request prefix.
     fn restore_usage(&self, _ctx: &CompiledContext, _prompt_tokens: u32) {}
 

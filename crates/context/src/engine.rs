@@ -43,6 +43,7 @@ pub struct PipelineEngine {
     ineffective_full: AtomicBool,
     /// Context size when anti-thrash latched; sufficient growth releases it.
     latched_at: AtomicU32,
+    prune_batch: crate::prune_batch::PruneBatch,
     /// The previous full compaction's summary failed; the next failure falls back.
     summary_failed: AtomicBool,
     summary_failure: std::sync::Mutex<Option<String>>,
@@ -90,6 +91,7 @@ impl PipelineEngine {
             ineffective: AtomicU32::new(0),
             ineffective_full: AtomicBool::new(false),
             latched_at: AtomicU32::new(0),
+            prune_batch: crate::prune_batch::PruneBatch::default(),
             summary_failed: AtomicBool::new(false),
             summary_failure: std::sync::Mutex::new(None),
             pending_estimate: AtomicU32::new(0),
@@ -214,6 +216,7 @@ impl ContextEngine for PipelineEngine {
             self.ineffective.store(0, Ordering::Relaxed);
             self.ineffective_full.store(false, Ordering::Relaxed);
             self.latched_at.store(0, Ordering::Relaxed);
+            self.prune_batch.restore(0);
             self.summary_failed.store(false, Ordering::Relaxed);
             *self.last_summary.lock().unwrap() = None;
             self.history_notes.lock().unwrap().clear();
@@ -228,6 +231,18 @@ impl ContextEngine for PipelineEngine {
     }
 
     fn restore_history(&self, events: &[kernel::Event], input_limit: Option<u32>) {
+        let threshold = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == kernel::EventKind::Compaction
+                    && kernel::events::has_valid_compaction_snapshot(&event.payload)
+            })
+            .and_then(|event| event.payload.get("prune_rearm_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0);
+        self.prune_batch.restore(threshold);
         let budget = input_limit.map_or(2_048, |limit| {
             (ContextBudget::from_max_ctx(limit).usable() / 20).min(4_096)
         });
@@ -251,6 +266,10 @@ impl ContextEngine for PipelineEngine {
 
     fn compaction_policy_version(&self) -> Option<u64> {
         Some(3)
+    }
+
+    fn prune_rearm_tokens(&self) -> u32 {
+        self.prune_batch.threshold()
     }
 
     fn checkpoint_needs_refresh(&self, messages: &[Message], input_limit: Option<u32>) -> bool {
@@ -305,7 +324,10 @@ impl ContextEngine for PipelineEngine {
         };
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
         let full = forced || basis >= usable * self.policy.trigger_ratio || near_hard_ceiling;
-        let prune = basis >= usable * self.policy.microcompact_ratio;
+        let prune = basis >= usable * self.policy.microcompact_ratio
+            && self
+                .prune_batch
+                .ready(count_all(messages, self.counter.as_ref()));
         if !full && !prune {
             return false;
         }
@@ -513,6 +535,9 @@ impl PipelineEngine {
             return Ok(passthrough(messages, before, false));
         }
         let full = action == CompactionAction::Full;
+        if !full && !self.prune_batch.ready(before.saturating_sub(overhead)) {
+            return Ok(passthrough(messages, before, false));
+        }
         if self.ineffective_full.swap(full, Ordering::Relaxed) != full {
             self.ineffective.store(0, Ordering::Relaxed);
         }
@@ -574,23 +599,12 @@ impl PipelineEngine {
             self.policy.prune_floor(budget.usable()),
             counter,
         );
-        let raw_middle_tokens: u32 = raw_middle
-            .iter()
-            .map(|tracked| count_msg(&tracked.message, counter))
-            .sum();
-        let deduped_tokens: u32 = deduped
-            .iter()
-            .map(|tracked| count_msg(&tracked.message, counter))
-            .sum();
-        let pre_pass_saved = raw_middle_tokens.saturating_sub(deduped_tokens);
         let middle: &[TrackedMessage] = &deduped;
 
         match action {
             CompactionAction::Prune => {
                 // Preserve tool-call structure and ids while pruning bodies.
                 let floor = self.policy.prune_floor(budget.usable()).max(1);
-                let target = usable * self.policy.microcompact_ratio;
-                let mut est = basis - pre_pass_saved as f32;
                 for tracked in middle {
                     let m = &tracked.message;
                     let toks = if m.role == Role::Tool {
@@ -598,7 +612,7 @@ impl PipelineEngine {
                     } else {
                         0
                     };
-                    if m.role == Role::Tool && toks >= floor && est >= target {
+                    if m.role == Role::Tool && toks >= floor {
                         let mut pm = m.clone();
                         pm.content = match self
                             .artifacts
@@ -612,7 +626,6 @@ impl PipelineEngine {
                                 "[earlier tool output pruned to save context — {toks} tokens]"
                             ),
                         };
-                        est -= (toks.saturating_sub(counter.count(&pm.content))) as f32;
                         out.push(TrackedMessage {
                             message: pm,
                             // The provider state belongs to the original full
@@ -829,6 +842,15 @@ impl PipelineEngine {
             .sum::<u32>()
             + overhead;
 
+        let accepted = full
+            || self.prune_batch.accept(
+                before.saturating_sub(overhead),
+                after.saturating_sub(overhead),
+                budget.usable(),
+                (usable * self.policy.microcompact_ratio) as u32,
+            );
+        let after = if accepted { after } else { before };
+
         // Track effectiveness: a compaction that frees <10% counts as
         // ineffective; two in a row trips the anti-thrash backoff above.
         // Remember the size we latched at so growth can release the backoff.
@@ -842,6 +864,10 @@ impl PipelineEngine {
             );
         } else {
             self.ineffective.store(0, Ordering::Relaxed);
+        }
+
+        if !accepted {
+            return Ok(passthrough(messages, before, false));
         }
 
         // Even after compaction, check the result against the true hard
@@ -885,6 +911,9 @@ impl PipelineEngine {
         if let Some(summary) = &summary_text {
             *self.last_summary.lock().unwrap() =
                 Some(crate::handoff::summary_body(summary).to_owned());
+        }
+        if full {
+            self.prune_batch.restore(0);
         }
         Ok(CompileResult {
             source_indices: out.iter().map(|tracked| tracked.source_index).collect(),
@@ -2143,7 +2172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_is_oldest_first_respects_floor_and_stops_at_target() {
+    async fn prune_batches_all_eligible_outputs_and_respects_floor() {
         let eng = engine(CompactionPolicy {
             protect_first_n: 1,
             protect_last_n: 2,
@@ -2179,8 +2208,8 @@ mod tests {
             .collect();
         assert_eq!(
             pruned.len(),
-            1,
-            "stop at target: only the oldest is pruned: {:?}",
+            3,
+            "all eligible outputs belong to one batch: {:?}",
             r.messages
                 .iter()
                 .map(|m| m.content.chars().take(30).collect::<String>())
@@ -2194,8 +2223,9 @@ mod tests {
         assert!(
             r.messages
                 .iter()
-                .any(|m| m.tool_call_id.as_deref() == Some("c1") && m.content.starts_with("bbb")),
-            "newer big output survives once under target"
+                .any(|m| m.tool_call_id.as_deref() == Some("c1")
+                    && m.content.contains("pruned to save context")),
+            "crossing below the trigger does not stop the batch"
         );
         assert!(
             r.messages

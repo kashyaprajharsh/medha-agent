@@ -107,6 +107,20 @@ struct Rebound {
 
 #[async_trait]
 impl kernel::Executor for Rebound {
+    async fn tool_inventory(
+        &self,
+        previous_sources: &std::collections::BTreeMap<String, String>,
+    ) -> kernel::tool_snapshot::ToolInventory {
+        let mut inventory = self.inner.tool_inventory(previous_sources).await;
+        for spec in &mut inventory.specs {
+            if let Some(tool) = self.tools.get(&spec.name) {
+                spec.description = tool.description().to_string();
+                spec.schema = tool.schema();
+            }
+        }
+        inventory
+    }
+
     fn specs(&self) -> Vec<kernel::ToolSpec> {
         self.inner
             .specs()
@@ -128,10 +142,6 @@ impl kernel::Executor for Rebound {
 
     fn call_radius(&self, intent: &kernel::ToolIntent) -> Option<BlastRadius> {
         self.inner.call_radius(intent)
-    }
-
-    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
-        self.inner.least_radius(tool)
     }
 
     fn category(&self, tool: &str) -> Option<ToolCategory> {

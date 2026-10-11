@@ -57,7 +57,11 @@ impl Replay {
                         writer,
                         session,
                         "user_message_chunk",
-                        payload["text"].as_str().unwrap_or_default(),
+                        kernel::turn_instruction::shown_payload(
+                            &payload,
+                            record.trust == "User" && payload.get("hook").is_none(),
+                        )
+                        .0,
                     )
                     .await;
                     if let Some(attachments) = payload["attachments"].as_array() {

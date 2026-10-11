@@ -15,6 +15,7 @@ mod model_view;
 pub mod outputs;
 mod shell_hints;
 mod shown;
+mod tool_inventory;
 pub use agents::{ParentHandle, SessionHandle};
 
 pub mod hub;
@@ -77,11 +78,6 @@ pub trait Tool: Send + Sync {
 
     /// Risk of this one call; a tool whose verb is an argument answers per call.
     fn call_radius(&self, _args: &Value) -> BlastRadius {
-        self.blast_radius()
-    }
-
-    /// The lowest risk any call of this tool has.
-    fn least_radius(&self) -> BlastRadius {
         self.blast_radius()
     }
 
@@ -1082,6 +1078,13 @@ impl Default for ToolRegistry {
 
 #[async_trait]
 impl Executor for ToolRegistry {
+    async fn tool_inventory(
+        &self,
+        previous_sources: &std::collections::BTreeMap<String, String>,
+    ) -> kernel::tool_snapshot::ToolInventory {
+        tool_inventory::collect(self, previous_sources).await
+    }
+
     fn specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<ToolSpec> = self
             .tools
@@ -1122,13 +1125,6 @@ impl Executor for ToolRegistry {
         match self.tools.get(&intent.tool) {
             Some(tool) => Some(tool.call_radius(&intent.args)),
             None => self.blast_radius(&intent.tool),
-        }
-    }
-
-    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
-        match self.tools.get(tool) {
-            Some(found) => Some(found.least_radius()),
-            None => self.blast_radius(tool),
         }
     }
 
@@ -6102,9 +6098,6 @@ impl Tool for Git {
             true => BlastRadius::Read,
             false => self.blast_radius(),
         }
-    }
-    fn least_radius(&self) -> BlastRadius {
-        BlastRadius::Read
     }
     fn mutation_key(&self, args: &Value) -> Option<String> {
         (!self.reads(args)).then(|| lanes::tree(self.sbx.root()))

@@ -719,7 +719,7 @@ impl Provider for OneChange {
         {
             return Ok(stream::iter(vec![Ok(Block::Text("done".into()))]).boxed());
         }
-        let said = ctx.messages.last().unwrap().content.clone();
+        let said = ctx.messages.last().unwrap().shown().0;
         let mut words = said.split(' ');
         let (name, lane) = (words.next().unwrap(), words.next().unwrap());
         let args = json!({ "lane": lane, "mode": words.next() });
@@ -781,10 +781,6 @@ impl Executor for Changes {
             Some(_) => self.blast_radius(&intent.tool),
             None => Some(BlastRadius::Read),
         }
-    }
-
-    fn least_radius(&self, _: &str) -> Option<BlastRadius> {
-        Some(BlastRadius::Read)
     }
 
     fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {

@@ -45,6 +45,7 @@ struct Request {
 pub(crate) struct Snapshot {
     pub(crate) servers: Vec<ServerStatus>,
     pub(crate) catalogs: HashMap<String, Catalog>,
+    pub(crate) registrations: HashMap<String, crate::session_tools::Registration>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -336,6 +337,10 @@ impl Link {
 
     pub fn statuses(&self) -> Vec<ServerStatus> {
         self.mirror.read().expect("hub mirror lock").servers.clone()
+    }
+
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        self.mirror.read().expect("hub mirror lock").clone()
     }
 
     pub fn tool_specs(&self) -> Vec<McpToolSpec> {

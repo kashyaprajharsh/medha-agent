@@ -114,6 +114,9 @@ pub struct Message {
     pub attachments: Vec<MediaPart>,
     pub role: Role,
     pub content: String,
+    /// Exact leading instruction retained for the model and hidden from the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_prefix: Option<String>,
     /// Assistant messages: the tool calls the model requested this turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolIntent>,
@@ -151,13 +154,19 @@ impl Message {
     /// The person's own words and the output they are about, with the sentence
     /// written for the model left out.
     pub fn shown(&self) -> (&str, Option<&str>) {
-        match &self.about {
-            Some(about) if self.content.is_char_boundary(about.lead) => (
-                &self.content[about.lead..],
-                Some(about.label.as_str()).filter(|label| !label.is_empty()),
-            ),
-            _ => (&self.content, None),
+        if self.role != Role::User || self.trust.is_some_and(|trust| trust != TrustLabel::User) {
+            return (&self.content, None);
         }
+        let text = crate::turn_instruction::without_prefix(
+            &self.content,
+            self.instruction_prefix.as_deref(),
+        );
+        crate::turn_instruction::shown(
+            text,
+            self.about
+                .as_ref()
+                .map(|about| (about.lead, about.label.as_str())),
+        )
     }
 }
 
@@ -166,6 +175,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            instruction_prefix: None,
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -188,6 +198,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            instruction_prefix: None,
             attachments: Vec::new(),
             tool_calls,
             tool_call_id: None,
@@ -199,6 +210,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            instruction_prefix: None,
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
@@ -488,6 +500,7 @@ impl TryFrom<&ModelMessage> for Message {
             }
         }
         Ok(Message {
+            instruction_prefix: None,
             role: message.role.clone(),
             content,
             attachments: Vec::new(),

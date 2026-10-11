@@ -74,6 +74,23 @@ impl NarrowedExecutor {
 
 #[async_trait]
 impl Executor for NarrowedExecutor {
+    async fn tool_inventory(
+        &self,
+        previous_sources: &std::collections::BTreeMap<String, String>,
+    ) -> kernel::tool_snapshot::ToolInventory {
+        let mut inventory = self.inner.tool_inventory(previous_sources).await;
+        inventory
+            .specs
+            .retain(|spec| self.allowed.contains(&spec.name));
+        inventory
+            .sources
+            .retain(|name, _| self.allowed.contains(name));
+        inventory
+            .unavailable
+            .retain(|name| self.allowed.contains(name));
+        inventory
+    }
+
     fn specs(&self) -> Vec<ToolSpec> {
         self.inner
             .specs()
@@ -94,13 +111,6 @@ impl Executor for NarrowedExecutor {
             return None;
         }
         self.inner.call_radius(intent)
-    }
-
-    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
-        if !self.allows(tool) {
-            return None;
-        }
-        self.inner.least_radius(tool)
     }
 
     fn category(&self, tool: &str) -> Option<ToolCategory> {

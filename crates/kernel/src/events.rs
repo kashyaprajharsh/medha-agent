@@ -100,6 +100,7 @@ pub enum EventKind {
     Compaction,
     /// Provider usage for an exact request prefix, used only for context calibration.
     ContextUsage,
+    ToolSnapshot,
     /// A compaction summary failed and the turn continued; never a checkpoint.
     SummaryFailed,
     Session,
@@ -139,6 +140,7 @@ impl EventKind {
             EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
             EventKind::ContextUsage => "context.usage",
+            EventKind::ToolSnapshot => "context.tools",
             EventKind::SummaryFailed => "context.summary_failed",
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
@@ -168,6 +170,7 @@ impl EventKind {
             "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
             "context.usage" => EventKind::ContextUsage,
+            "context.tools" => EventKind::ToolSnapshot,
             "context.summary_failed" => EventKind::SummaryFailed,
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
@@ -279,25 +282,7 @@ impl Event {
     /// of the output they were about. The sentence written for the model stays
     /// in the log and out of sight.
     pub fn shown_text(&self) -> (&str, Option<&str>) {
-        let text = self
-            .payload
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let about = self
-            .payload
-            .get("about")
-            .filter(|_| self.is_from_person())
-            .and_then(|about| {
-                let lead = usize::try_from(about.get("lead")?.as_u64()?).ok()?;
-                Some((lead, about.get("label")?.as_str()?))
-            });
-        match about {
-            Some((lead, label)) if text.is_char_boundary(lead) => {
-                (&text[lead..], Some(label).filter(|label| !label.is_empty()))
-            }
-            _ => (text, None),
-        }
+        crate::turn_instruction::shown_payload(&self.payload, self.is_from_person())
     }
 
     pub fn user_input_message(s: &Session, message: &Message) -> Self {
@@ -308,6 +293,11 @@ impl Event {
         );
         if !message.attachments.is_empty() {
             event.payload["attachments"] = serde_json::json!(message.attachments);
+        }
+        if event.trust == TrustLabel::User
+            && let Some(prefix) = &message.instruction_prefix
+        {
+            event.payload["instruction_prefix"] = json!(prefix);
         }
         // Only what the user themselves sent can be about an output. A report
         // or web content entering on the user channel never carries one.
@@ -611,6 +601,18 @@ impl Event {
             s,
             EventKind::ContextUsage,
             json!(anchor),
+            TrustLabel::System,
+        )
+    }
+
+    pub(crate) fn tool_snapshot(
+        s: &Session,
+        snapshot: &crate::tool_snapshot::ToolSnapshot,
+    ) -> Self {
+        Self::new(
+            s,
+            EventKind::ToolSnapshot,
+            snapshot.value(),
             TrustLabel::System,
         )
     }
@@ -1249,7 +1251,7 @@ fn compaction_snapshot(payload: &Value) -> Option<CompactionSnapshotV1> {
     Some(snapshot)
 }
 
-pub(crate) fn has_valid_compaction_snapshot(payload: &Value) -> bool {
+pub fn has_valid_compaction_snapshot(payload: &Value) -> bool {
     compaction_snapshot(payload).is_some()
 }
 
@@ -1357,6 +1359,10 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     // Carry the recorded label back onto the message so a
                     // resumed session taints exactly as the live one did.
                     let mut message = Message::user(t);
+                    if e.is_from_person() {
+                        message.instruction_prefix =
+                            e.payload["instruction_prefix"].as_str().map(str::to_owned);
+                    }
                     message.attachments = serde_json::from_value(
                         e.payload
                             .get("attachments")

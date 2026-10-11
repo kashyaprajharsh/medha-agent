@@ -17,6 +17,17 @@ pub trait Executor: Send + Sync {
     /// Tool specs exposed for this session.
     fn specs(&self) -> Vec<ToolSpec>;
 
+    /// Fresh definitions plus registered tools that are temporarily unavailable.
+    async fn tool_inventory(
+        &self,
+        _previous_sources: &std::collections::BTreeMap<String, String>,
+    ) -> crate::tool_snapshot::ToolInventory {
+        crate::tool_snapshot::ToolInventory {
+            specs: self.specs(),
+            ..Default::default()
+        }
+    }
+
     /// The registered tool's blast radius, or `None` if unknown.
     fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {
         None
@@ -26,12 +37,6 @@ pub trait Executor: Send + Sync {
     /// the tool's own, which is never lower.
     fn call_radius(&self, intent: &ToolIntent) -> Option<BlastRadius> {
         self.blast_radius(&intent.tool)
-    }
-
-    /// The lowest risk any call of this tool has: `Read` for one that can also
-    /// write, so read-only modes still offer it.
-    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
-        self.blast_radius(tool)
     }
 
     /// The registered tool's presentation category, or `None` if unknown.

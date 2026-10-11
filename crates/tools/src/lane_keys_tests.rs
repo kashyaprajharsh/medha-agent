@@ -52,14 +52,6 @@ fn each_call_says_what_it_must_not_run_beside() {
         (Some(ReversibleLocal), tree.clone()),
         "a call that names no reader is not one"
     );
-    // A read-only mode offers a tool that can read, and no tool that cannot.
-    assert_eq!(Executor::least_radius(&reg, "git"), Some(Read));
-    assert_eq!(Executor::least_radius(&reg, "edit"), Some(ReversibleLocal));
-    assert_eq!(
-        Executor::least_radius(&reg, "shell.exec"),
-        Some(IrreversibleLocal)
-    );
-
     let shell = |args: Value| ask("shell.exec", args);
     assert_eq!(
         shell(json!({ "command": "rg TODO src | head" })),

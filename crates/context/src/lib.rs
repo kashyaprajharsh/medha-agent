@@ -8,6 +8,7 @@ mod handoff;
 pub mod identity;
 pub mod policy;
 pub mod prompts;
+mod prune_batch;
 pub mod tokens;
 
 pub use budget::ContextBudget;

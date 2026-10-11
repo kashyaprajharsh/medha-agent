@@ -8,6 +8,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "compaction_runtime/prune_batches.rs"]
+mod prune_batches;
+
 struct Endpoint {
     caps: ProviderCaps,
     limit: AtomicU32,

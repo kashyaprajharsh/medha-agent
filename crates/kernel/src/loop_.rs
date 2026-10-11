@@ -1378,16 +1378,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         self.executor.images_reach_model(
             self.vision.is_some() || self.route_reads_images().unwrap_or(false),
         );
-        let specs: Vec<_> = self
-            .executor
-            .specs()
-            .into_iter()
-            .filter(|spec| {
-                !planning || self.executor.least_radius(&spec.name) == Some(BlastRadius::Read)
-            })
-            .collect();
-        // Tool definitions are sent every turn and count toward the request.
-        self.context.note_tools(&specs);
         let mut gov = crate::budgets::Governor::new(budget);
         // Every trailing user message is new, not just the last: a surface can
         // append a typed prompt and then an agent report in one turn.
@@ -1399,6 +1389,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // twice, and the projection only collapses adjacent identical turns.
         let history_started = std::time::Instant::now();
         let prior_events = self.log.checked_events(session.id).await?;
+        let prior_tools = crate::tool_snapshot::ToolSnapshot::restore(&prior_events);
+        let mut tool_snapshot = crate::tool_snapshot::ToolSnapshot::refresh(
+            prior_tools.as_ref(),
+            self.executor.as_ref(),
+            false,
+        )
+        .await;
+        let mut specs = tool_snapshot.specs.clone();
+        self.context.note_tools(&specs);
         // A surface restored from the log may end with user-channel failure
         // feedback. That whole prefix is already admitted, even across usage,
         // hook and compaction events; only its new suffix is a new prompt.
@@ -1428,21 +1427,29 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .iter()
             .any(|message| !message.attachments.is_empty());
         let mut image_route_reported = false;
-        for message in &messages[fresh..] {
+        for message in &mut messages[fresh..] {
             // Match the durable suffix in order and with its trust label.
             // Membership matching reordered duplicate lines, while comparing
             // text alone could treat a Tool/Web report as a trusted retry.
             let trust = message.trust.unwrap_or(TrustLabel::User);
             if admitted.is_none()
                 && already.get(logged_cursor).is_some_and(|input| {
-                    input.content == message.content
-                        && input.trust == trust
+                    crate::turn_instruction::without_prefix(
+                        &input.content,
+                        input.instruction_prefix.as_deref(),
+                    ) == crate::turn_instruction::without_prefix(
+                        &message.content,
+                        message.instruction_prefix.as_deref(),
+                    ) && input.trust == trust
                         && input.attachments == serde_json::json!(message.attachments)
                 })
             {
+                message.content = already[logged_cursor].content.clone();
+                message.instruction_prefix = already[logged_cursor].instruction_prefix.clone();
                 logged_cursor += 1;
                 continue;
             }
+            crate::turn_instruction::apply(message, planning);
             let e = self
                 .log
                 .append(Event::user_input_message(session, message))
@@ -1460,7 +1467,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 message.role == crate::types::Role::User
                     && message.trust.is_none_or(|trust| trust == TrustLabel::User)
             })
-            .map(|message| message.content.as_str())
+            .map(|message| {
+                crate::turn_instruction::without_prefix(
+                    &message.content,
+                    message.instruction_prefix.as_deref(),
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
         let mut hook_events = self
@@ -1484,6 +1496,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             window_taint = window_taint.min(TrustLabel::Tool);
         }
         let mut hook_continuations = 0u8;
+        if prior_tools.as_ref().map(|snapshot| snapshot.value()) != Some(tool_snapshot.value()) {
+            self.log
+                .append(Event::tool_snapshot(session, &tool_snapshot))
+                .await?;
+        }
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
         let mut logged_events = self.log.checked_events(session.id).await?;
@@ -1623,19 +1640,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         ordered: Some(ordered_messages.clone()),
                         tools: specs.clone(),
                     };
-                    // Transient session instructions stay out of durable history:
-                    // resuming or leaving Plan must not retain a stale restriction.
-                    if planning {
-                        let directive = Message::system(
-                            "Plan mode is active. Investigate using read-only tools and present an actionable plan with affected files, risks, and validation steps. Do not implement changes, execute commands, or delegate work. The user must switch to careful/normal/yolo mode before implementation.",
-                        );
-                        candidate
-                            .ordered
-                            .as_mut()
-                            .expect("ordered candidate")
-                            .insert(0, directive.ordered());
-                        candidate.messages.insert(0, directive);
-                    }
                     // Images either go to the model as pixels or reach it as a
                     // described, clearly-labelled substitute. They are never
                     // dropped on the way to a model that cannot see.
@@ -1893,8 +1897,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         &ordered_messages,
                         &compiled.source_indices,
                     );
-                    if compiled.summarized {
+                    if compiled.summarized || !has_checkpoint {
                         checkpoint_policy = self.context.compaction_policy_version();
+                    }
+                    if compiled.summarized {
+                        tool_snapshot = crate::tool_snapshot::ToolSnapshot::refresh(
+                            Some(&tool_snapshot),
+                            self.executor.as_ref(),
+                            true,
+                        )
+                        .await;
+                        specs = tool_snapshot.specs.clone();
+                        self.context.note_tools(&specs);
                     }
                     let mut checkpoint = Event::compaction_snapshot(
                         session,
@@ -1907,6 +1921,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     if let Some(version) = checkpoint_policy {
                         checkpoint.payload["policy_version"] = serde_json::json!(version);
                     }
+                    checkpoint.payload["prune_rearm_tokens"] =
+                        serde_json::json!(self.context.prune_rearm_tokens());
+                    checkpoint.payload["tools"] = tool_snapshot.value();
                     self.log.append(checkpoint).await?;
                     self.post_compaction_hooks(
                         session,
@@ -3659,6 +3676,7 @@ fn escalate_for_trust_flow(
 struct LoggedInput {
     id: ulid::Ulid,
     content: String,
+    instruction_prefix: Option<String>,
     trust: TrustLabel,
     attachments: serde_json::Value,
 }
@@ -3669,6 +3687,9 @@ fn logged_tail(events: &[Event]) -> Vec<LoggedInput> {
         match event.kind {
             EventKind::UserMessage => tail.push(LoggedInput {
                 id: event.id,
+                instruction_prefix: event.payload["instruction_prefix"]
+                    .as_str()
+                    .map(str::to_owned),
                 content: event.payload["text"]
                     .as_str()
                     .unwrap_or_default()
@@ -3680,10 +3701,8 @@ fn logged_tail(events: &[Event]) -> Vec<LoggedInput> {
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!([])),
             }),
-            // Anything else ends the run: only the trailing block is this
-            // turn's, and an identical prompt from an earlier turn is a real
-            // repeat the user typed.
-            EventKind::Interrupt => continue,
+            // These events do not finish the pending user turn.
+            EventKind::Interrupt | EventKind::ToolSnapshot => continue,
             _ => break,
         }
     }
@@ -3738,6 +3757,13 @@ mod unlogged_tail_tests {
         let events = vec![
             Event::user_message(&session, "again"),
             Event::user_message(&session, "again"),
+            Event::tool_snapshot(
+                &session,
+                &serde_json::from_value(serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"), "specs": [], "sources": {}
+                }))
+                .unwrap(),
+            ),
         ];
         let tail = logged_tail(&events);
         assert_eq!(

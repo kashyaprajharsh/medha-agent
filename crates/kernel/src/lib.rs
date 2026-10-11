@@ -17,6 +17,8 @@ pub mod provider;
 pub mod redact;
 pub mod request_images;
 pub mod sink;
+pub mod tool_snapshot;
+pub mod turn_instruction;
 pub mod types;
 pub mod verify;
 pub mod vision;

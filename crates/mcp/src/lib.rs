@@ -47,6 +47,7 @@ pub mod hub;
 mod lapse;
 mod oauth;
 mod renewal;
+pub mod session_tools;
 
 use lapse::{ChallengeWatch, Lapse, Needs};
 
@@ -158,7 +159,7 @@ impl Error {
 
 /// Per-server tool exposure filter. `allow` (when non-empty) whitelists, then
 /// `deny` subtracts. Entries are exact names or a single trailing `*` glob.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolFilter {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
@@ -775,9 +776,29 @@ impl McpManager {
 
     /// Every server's state with its tools, for the host to publish.
     pub(crate) async fn snapshot(&self) -> hub::Snapshot {
-        let servers = self.status().await;
+        let slots = self.inner.servers.lock().await;
         let catalogs = self.catalogs().clone();
-        hub::Snapshot { servers, catalogs }
+        let servers = slots
+            .iter()
+            .map(|(id, slot)| status_of(id, slot, catalogs.get(id)))
+            .collect();
+        let registrations = slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), session_tools::Registration::new(&slot.config)))
+            .collect();
+        drop(slots);
+        let mut snapshot = hub::Snapshot {
+            servers,
+            catalogs,
+            registrations,
+        };
+        if let Some(link) = self.hub() {
+            let shared = link.snapshot();
+            snapshot.servers.extend(shared.servers);
+            snapshot.catalogs.extend(shared.catalogs);
+            snapshot.registrations.extend(shared.registrations);
+        }
+        snapshot
     }
 
     /// Run `server` without reconnecting it for everyone; changed settings, a

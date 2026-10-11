@@ -1267,7 +1267,7 @@ async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_a
             .filter(|e| e.kind == EventKind::ToolObs
                 && e.payload["payload"]["error_code"] == "tool_unavailable")
             .count(),
-        4
+        1
     );
     for request in provider.requests.lock().unwrap().iter() {
         assert_eq!(
@@ -1276,7 +1276,7 @@ async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_a
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>(),
-            ["fs.read"]
+            ["fs.read", "edit", "shell.exec", "agent.spawn"]
         );
         assert!(
             request
@@ -1291,10 +1291,14 @@ async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_a
         }));
     }
     assert!(
-        !history
+        history
             .iter()
             .any(|m| m.content.contains("Plan mode is active"))
     );
+    assert_eq!(history[0].shown().0, "please implement everything");
+    let old_request = provider.requests.lock().unwrap().last().unwrap().clone();
+    let mut history = history;
+    history.push(Message::user("implement now"));
     session.autonomy = kernel::AutonomyLevel::Normal;
     kernel
         .run_session(
@@ -1309,12 +1313,15 @@ async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_a
     let requests = provider.requests.lock().unwrap();
     let last = requests.last().unwrap();
     assert_eq!(last.tools.len(), 4);
-    assert!(
-        !last
-            .messages
-            .iter()
-            .any(|m| m.content.contains("Plan mode is active"))
+    assert_eq!(
+        serde_json::to_value(&last.tools).unwrap(),
+        serde_json::to_value(&old_request.tools).unwrap()
     );
+    assert_eq!(
+        serde_json::to_value(&last.messages[..old_request.messages.len()]).unwrap(),
+        serde_json::to_value(&old_request.messages).unwrap()
+    );
+    assert_eq!(last.messages.last().unwrap().content, "implement now");
 }
 
 struct RequiredVerifier {

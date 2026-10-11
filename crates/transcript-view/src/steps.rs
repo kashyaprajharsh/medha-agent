@@ -26,9 +26,17 @@ impl Steps {
         call
     }
 
-    /// `tool` is used only when the call was never seen.
-    pub fn result(&mut self, id: &str, tool: &str, ok: bool, output: &Value) -> Outcome {
-        self.stored.result(id, output);
+    /// `tool` is used only when the call was never seen. `stored` is where the
+    /// kernel kept the result when it was too large to send whole.
+    pub fn result(
+        &mut self,
+        id: &str,
+        tool: &str,
+        ok: bool,
+        output: &Value,
+        stored: Option<&str>,
+    ) -> Outcome {
+        self.stored.result(id, output, stored);
         let name = self
             .names
             .get(id)

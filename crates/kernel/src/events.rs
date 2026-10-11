@@ -71,6 +71,16 @@ fn visible_observation_payload(event_payload: &Value) -> Value {
     payload
 }
 
+/// What the model reads for a saved tool result: the tool's own view of it
+/// when it wrote one, else the result itself. A live turn and a replay of it
+/// both read this, so a reopened chat sends exactly what was sent before.
+pub(crate) fn observation_for_model(event_payload: &Value) -> String {
+    match event_payload.get("model_text").and_then(Value::as_str) {
+        Some(text) => text.to_owned(),
+        None => visible_observation_payload(event_payload).to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
     UserMessage,
@@ -1429,8 +1439,7 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     .get("intent_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let content = visible_observation_payload(&e.payload).to_string();
-                out.push(Message::tool_result(id, content));
+                out.push(Message::tool_result(id, observation_for_model(&e.payload)));
                 if let Some(carrier) = replayed_tool_media(&e.payload, e.trust) {
                     out.push(carrier);
                 }
@@ -1606,7 +1615,7 @@ fn project_ordered_messages_impl(
                     .get("intent_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let content = visible_observation_payload(&event.payload).to_string();
+                let content = observation_for_model(&event.payload);
                 out.push(ModelMessage {
                     role: crate::types::Role::Tool,
                     parts: vec![ContentPart::ToolResult(ToolResultPart {
@@ -1841,6 +1850,41 @@ mod tests {
             last.parts.last(),
             Some(ContentPart::Media(part)) if part.source == MediaSource::Artifact("hash-7".into())
         ));
+    }
+
+    /// A reopened chat sends the model what the live turn sent: a tool's own
+    /// view of its result when it wrote one, and the result itself otherwise,
+    /// so chats saved before views existed replay byte for byte as they did.
+    #[test]
+    fn replay_gives_the_model_the_view_the_live_turn_gave() {
+        let session = Session::new();
+        let payload = json!({ "path": "a.rs", "old": "x\n".repeat(500), "new": "y\n" });
+        let mut viewed = Observation::ok("1", payload.clone());
+        viewed.model_text = Some("Changed a.rs: +1 -500 lines.".into());
+        let plain = Observation::ok("2", json!({ "entries": [] }));
+        let events = vec![
+            Event::tool_obs(&session, &viewed, TrustLabel::Tool),
+            Event::tool_obs(&session, &plain, TrustLabel::Tool),
+        ];
+        assert_eq!(
+            events[0].payload["payload"], payload,
+            "the record keeps everything"
+        );
+        let legacy: Vec<_> = project_messages(&events)
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        let ordered: Vec<_> = project_ordered_messages(&events)
+            .into_iter()
+            .map(|m| match &m.parts[0] {
+                ContentPart::ToolResult(result) => result.content.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        for contents in [legacy, ordered] {
+            assert_eq!(contents[0], "Changed a.rs: +1 -500 lines.");
+            assert_eq!(contents[1], r#"{"entries":[]}"#);
+        }
     }
 
     #[test]

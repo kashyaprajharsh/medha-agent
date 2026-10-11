@@ -690,7 +690,11 @@ fn sanitize(mut frame: Value, steps: &mut Steps) -> Value {
         Some("tool.observation") => {
             let output = params.remove("payload").unwrap_or(Value::Null);
             let ok = params.get("ok") == Some(&Value::Bool(true));
-            let outcome = steps.result(&id, &tool, ok, &output);
+            let stored = params
+                .get("stored")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let outcome = steps.result(&id, &tool, ok, &output, stored.as_deref());
             put(
                 params,
                 "error_code",
@@ -754,7 +758,7 @@ fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) ->
                 Row::Assistant { text, source_event } => Event::Text { delta: text, source_event },
                 Row::Reasoning { text } => Event::Reasoning { delta: text },
                 Row::ToolCall { id, tool, args } => Event::ToolCall { id, tool, args },
-                Row::ToolResult { id, tool, ok, payload, source_event } => Event::ToolResult { id, tool, ok, payload, source_event },
+                Row::ToolResult { id, tool, ok, payload, source_event } => Event::ToolResult { id, tool, ok, payload, source_event, stored: None },
                 Row::Compaction { before, after, summarized, summary } => Event::Compaction { before, after, summarized, summary },
                 Row::Verify { ok, summary } => Event::Verify { ok, summary },
                 Row::Notice { text } => Event::Notice { text },

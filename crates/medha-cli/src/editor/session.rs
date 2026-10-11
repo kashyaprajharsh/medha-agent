@@ -380,6 +380,7 @@ pub(super) async fn presentation(
                     ok,
                     payload,
                     source_event,
+                    stored: None,
                 },
             )
             .await

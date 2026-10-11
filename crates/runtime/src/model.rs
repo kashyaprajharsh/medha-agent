@@ -16,6 +16,8 @@ pub struct Model {
     pub active_profile: String,
     pub max_ctx: Option<u32>,
     pub open_setup: bool,
+    /// The credential the provider was built with, kept out of tool results.
+    pub credential: Option<String>,
 }
 
 pub async fn resolve(
@@ -190,6 +192,7 @@ pub async fn resolve(
     }
     let mut runtime_profile = resolved.provider;
     runtime_profile.max_ctx = max_ctx;
+    let credential = Some(resolved.credential.to_string()).filter(|key| !key.is_empty());
     let provider = if open_setup && runtime_profile.base_url.is_empty() {
         // Keep empty endpoints out of normal profile validation.
         OpenAiCompat::unconfigured()
@@ -231,5 +234,6 @@ pub async fn resolve(
         active_profile,
         max_ctx,
         open_setup,
+        credential,
     })
 }

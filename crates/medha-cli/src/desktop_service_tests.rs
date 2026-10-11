@@ -176,6 +176,7 @@ fn result(session: &Session, id: &str, status: ObsStatus, payload: Value) -> Eve
             media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
+            model_text: None,
         },
         TrustLabel::System,
     )

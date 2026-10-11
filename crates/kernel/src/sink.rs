@@ -39,6 +39,8 @@ pub trait StreamSink: Send + Sync {
     fn tool_result_with_id(&self, _id: &str, tool: &str, ok: bool, payload: &Value) {
         self.tool_result(tool, ok, payload);
     }
+    /// A saved tool result. `stored` names where the whole of what the model
+    /// would have read is kept, when it was too large to send it.
     fn tool_result_saved(
         &self,
         _event: ulid::Ulid,
@@ -46,6 +48,7 @@ pub trait StreamSink: Send + Sync {
         tool: &str,
         ok: bool,
         payload: &Value,
+        _stored: Option<&str>,
     ) {
         self.tool_result_with_id(id, tool, ok, payload);
     }

@@ -14,6 +14,7 @@ pub mod interrupts;
 pub mod policy;
 pub mod progress;
 pub mod provider;
+pub mod redact;
 pub mod sink;
 pub mod types;
 pub mod verify;

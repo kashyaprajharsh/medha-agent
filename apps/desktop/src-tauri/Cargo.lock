@@ -1927,6 +1927,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "medha-extension-api",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

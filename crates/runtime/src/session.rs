@@ -93,6 +93,7 @@ pub async fn start(
         active_profile,
         max_ctx,
         open_setup,
+        credential,
     } = model;
     let prompt = options.prompt.clone();
     let cwd = workspace_home.root.clone();
@@ -810,7 +811,13 @@ pub async fn start(
         verifier,
     )
     .with_pricing(pricing)
+    .with_secrets(kernel::redact::Secrets::new(
+        credential
+            .into_iter()
+            .chain(kernel::redact::Secrets::in_environment()),
+    ))
     .with_max_parallel_tools(max_parallel_tools)
+    .with_result_limits(lock.budget.tool_result_bytes, lock.budget.tool_round_bytes)
     .with_hooks(Arc::new(hook_runner))
     .with_session_owner(Arc::new(Ownership::new(state.clone(), lease)));
     if let Some(auxiliary) = auxiliary_vision {

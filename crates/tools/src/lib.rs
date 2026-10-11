@@ -10,6 +10,7 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 mod agents;
 mod browser;
 mod edit_match;
+mod model_view;
 pub mod outputs;
 mod shell_hints;
 pub use agents::{ParentHandle, SessionHandle};
@@ -120,6 +121,13 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// What the model reads for a successful result, when the tool can say it
+    /// more compactly than its full payload. The payload itself is kept whole
+    /// for people and for the record. Default: the model reads the payload.
+    fn model_view(&self, _payload: &Value) -> Option<String> {
+        None
+    }
+
     /// Hard wall-clock ceiling for one call, default 60s. `None` means the tool
     /// bounds itself — `shell.exec` owns a stricter deadline with process-tree
     /// teardown; `diagnostics` and a crawl legitimately run longer.
@@ -170,8 +178,10 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
             let relayed = take_relayed_trust(&mut payload);
             let net_denied = take_net_denied(&mut payload);
             let media = take_media(&mut payload);
+            let model_text = tool.model_view(&payload);
             let mut obs = Observation::ok(&intent.id, payload);
             obs.media = media;
+            obs.model_text = model_text;
             if let Some(trust) = relayed {
                 obs = obs.relaying(trust);
             }
@@ -189,6 +199,7 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
                 media: Vec::new(),
                 relayed_trust: None,
                 net_denied: false,
+                model_text: None,
             };
             if net_denied { obs.net_denied() } else { obs }
         }
@@ -1214,6 +1225,7 @@ impl Executor for ToolRegistry {
                             media: Vec::new(),
                             relayed_trust: None,
                             net_denied: false,
+                            model_text: None,
                         }
                     } else {
                         Observation::ok(&intent.id, payload)
@@ -1252,6 +1264,11 @@ struct Read {
 impl Tool for Read {
     fn name(&self) -> &str {
         "read"
+    }
+    /// A text page reads as numbered lines. Stored results, counts and images
+    /// keep their own shape: none of them is a page of a file.
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        self.text.model_view(payload)
     }
     fn description(&self) -> &str {
         "Read a file by `path`, or a stored artifact by `hash`. For text, use \
@@ -1410,7 +1427,10 @@ impl Tool for ImageView {
     }
 }
 
-const FS_READ_MAX_WHOLE_BYTES: u64 = 2_000_000;
+/// One page of a read: at most this many lines, ending at a whole line before
+/// this many characters. Larger files are read a page at a time.
+const READ_PAGE_LINES: u64 = 2_000;
+const READ_PAGE_CHARS: usize = 50_000;
 /// Directory entries retained by one `fs.list` call; the count of what was
 /// left out is still reported, so truncation is visible rather than silent.
 const FS_LIST_MAX_ENTRIES: usize = 2_000;
@@ -1423,13 +1443,12 @@ impl Tool for FsRead {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 text file (workspace, or outside with permission). Reads the \
-         whole file by default; for large files pass `offset` (1-based start line) \
-         and/or `limit` (line count) to read just a slice and save context. Typical \
-         flow: `glob`/`grep` to locate the file and line, then read the range around \
-         it rather than the whole file. Content is returned verbatim without line \
-         numbers; `start_line` anchors a ranged read, and `grep` reports the line \
-         number when you need to cite one."
+        "Read a UTF-8 text file (workspace, or outside with permission), one page at \
+         a time: up to 2000 lines from `offset` (1-based, default 1), or fewer with \
+         `limit`. Lines come back as `N|text`; the number and bar are not part of the \
+         file, so leave them out when you edit. When more remains, the result says \
+         which offset continues it. Typical flow: `glob`/`grep` to find the line, \
+         then read the range around it."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -1439,7 +1458,7 @@ impl Tool for FsRead {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative or absolute path" },
-                "offset": { "type": "integer", "minimum": 1, "description": "1-based line to start at (optional; default whole file)" },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based line to start at (optional; default 1)" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Max lines to return from offset (optional)" }
             },
             "required": ["path"]
@@ -1476,57 +1495,55 @@ impl Tool for FsRead {
                  nested view, or `glob`/`grep` to find files inside it"
             )));
         }
-        // Reject oversized whole-file reads before allocation.
-        if offset.is_none()
-            && limit.is_none()
-            && let Ok(md) = std::fs::metadata(&resolved)
-            && md.len() > FS_READ_MAX_WHOLE_BYTES
-        {
-            return Err(ToolError::Failed(format!(
-                "{path} is {} bytes — too large for a whole-file read (cap {FS_READ_MAX_WHOLE_BYTES}). \
-                 Read a range with offset/limit, or grep it.",
-                md.len()
-            )));
-        }
-        if offset.is_some() || limit.is_some() {
-            let range = self
-                .sbx
-                .read_line_range_resolved(
-                    &resolved,
-                    offset.unwrap_or(1),
-                    limit,
-                    FS_READ_MAX_RANGE_SCAN_BYTES,
-                    FS_READ_MAX_RANGE_OUTPUT_BYTES,
-                )
-                .await
-                .map_err(|error| ToolError::Failed(format!("read failed: {error}")))?;
-            let note = if range.beyond_eof {
-                Some(format!(
-                    "offset {} is past end of file ({} lines)",
-                    offset.unwrap_or(1),
-                    range.total_lines.unwrap_or(0)
-                ))
-            } else {
-                None
-            };
-            return Ok(json!({
-                "path": path,
-                "content": range.content,
-                "start_line": range.start_line,
-                "end_line": range.end_line,
-                "total_lines": range.total_lines,
-                "has_more": range.has_more,
-                "bytes_scanned": range.bytes_scanned,
-                "note": note,
-            }));
-        }
-
-        let content = self
+        // Every read is a page: without a range it is the first one, so a large
+        // file is read in steps rather than refused or sent whole.
+        let start = offset.unwrap_or(1);
+        let mut range = self
             .sbx
-            .read_resolved(&resolved)
+            .read_line_range_resolved(
+                &resolved,
+                start,
+                Some(limit.unwrap_or(READ_PAGE_LINES)),
+                FS_READ_MAX_RANGE_SCAN_BYTES,
+                FS_READ_MAX_RANGE_OUTPUT_BYTES,
+            )
             .await
             .map_err(|error| ToolError::Failed(format!("read failed: {error}")))?;
-        Ok(json!({ "path": path, "content": content }))
+        // A page also ends at whole lines before READ_PAGE_CHARS; the next one
+        // starts where it stopped.
+        if range.content.len() > READ_PAGE_CHARS {
+            let mut cut = READ_PAGE_CHARS;
+            while !range.content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if let Some(newline) = range.content[..cut].rfind('\n') {
+                cut = newline + 1;
+            }
+            range.content.truncate(cut);
+            let lines = range.content.matches('\n').count().max(1) as u64;
+            range.end_line = start + lines - 1;
+            range.has_more = true;
+        }
+        let note = range.beyond_eof.then(|| {
+            format!(
+                "offset {start} is past end of file ({} lines)",
+                range.total_lines.unwrap_or(0)
+            )
+        });
+        Ok(json!({
+            "path": path,
+            "content": range.content,
+            "start_line": range.start_line,
+            "end_line": range.end_line,
+            "total_lines": range.total_lines,
+            "has_more": range.has_more,
+            "bytes_scanned": range.bytes_scanned,
+            "note": note,
+        }))
+    }
+
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::file_page(payload)
     }
 }
 
@@ -1541,6 +1558,9 @@ struct Edit {
 impl Tool for Edit {
     fn name(&self) -> &str {
         "edit"
+    }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::file_change(payload)
     }
     fn description(&self) -> &str {
         "Change part of an existing file. Give `old_string` (text copied from the file) and \
@@ -1640,6 +1660,9 @@ struct FsWrite {
 impl Tool for FsWrite {
     fn name(&self) -> &str {
         "write"
+    }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::file_change(payload)
     }
     fn description(&self) -> &str {
         "Create a file, or replace a whole file, with `content` (UTF-8 text). Creates \
@@ -1918,6 +1941,9 @@ struct FsEdit {
 impl Tool for FsEdit {
     fn name(&self) -> &str {
         "edit"
+    }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::file_change(payload)
     }
     fn description(&self) -> &str {
         "Edit a file by replacing an exact substring. `old_string` must match uniquely unless `replace_all` is true. Returns a unified diff. Supports paths outside workspace with permission."
@@ -5292,6 +5318,9 @@ impl Tool for ShellExec {
     fn name(&self) -> &str {
         "shell.exec"
     }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::shell_run(payload)
+    }
     fn category(&self) -> ToolCategory {
         ToolCategory::Shell
     }
@@ -5758,6 +5787,9 @@ fn apply_edits_inner(content: &str, edits: &[Value]) -> Result<(String, bool), T
 impl Tool for MultiEdit {
     fn name(&self) -> &str {
         "edit"
+    }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::file_change(payload)
     }
     fn icon(&self) -> &'static str {
         "❏"
@@ -7983,6 +8015,70 @@ mod tests {
             args,
         })
         .await
+    }
+
+    /// Each built-in tool, called by the name the model uses, hands the model
+    /// its compact view; a tool reached through a router must not lose it.
+    #[tokio::test]
+    async fn every_registered_file_and_shell_tool_gives_the_model_its_view() {
+        let dir = std::env::temp_dir().join(format!("medha-views-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let body: String = (1..=2_500).map(|n| format!("line {n}\n")).collect();
+        let wrote = run(&reg, "write", json!({ "path": "big.txt", "content": body })).await;
+        assert_eq!(
+            wrote.model_text.as_deref(),
+            Some(format!("Wrote big.txt (2500 lines, {} bytes).", body.len()).as_str())
+        );
+        let first = run(&reg, "read", json!({ "path": "big.txt" })).await;
+        let first = first.model_text.unwrap();
+        assert!(
+            first.starts_with("1|line 1\n2|line 2\n"),
+            "{}",
+            &first[..40]
+        );
+        assert!(
+            // The page stops reading at its last line, so the total is unknown.
+            first.ends_with("2000|line 2000\n[lines 1-2000; continue with offset=2001]"),
+            "{}",
+            &first[first.len() - 120..]
+        );
+        let rest = run(&reg, "read", json!({ "path": "big.txt", "offset": 2001 })).await;
+        assert!(rest.model_text.unwrap().ends_with("2500|line 2500\n"));
+        let edited = run(
+            &reg,
+            "edit",
+            json!({ "path": "big.txt", "old_string": "line 1200\n", "new_string": "line twelve hundred\n" }),
+        )
+        .await;
+        let edited = edited.model_text.unwrap();
+        assert!(
+            edited.starts_with("Changed big.txt: +1 -1 lines"),
+            "{edited}"
+        );
+        assert!(edited.len() < 600, "{} bytes", edited.len());
+        assert_eq!(
+            edited.lines().count(),
+            12,
+            "summary, two headers, a hunk header, 3+1+1+3 lines: {edited}"
+        );
+        let shell = run(&reg, "shell.exec", json!({ "command": "echo hi" })).await;
+        assert!(
+            shell
+                .model_text
+                .as_deref()
+                .is_some_and(|view| view.starts_with("$ echo hi\nexit code: 0")),
+            "{:?} {}",
+            shell.model_text,
+            shell.payload
+        );
+        let stored = reg.artifacts.as_ref().unwrap().put(b"stored text").unwrap();
+        let page = run(&reg, "read", json!({ "hash": stored })).await;
+        assert_eq!(page.status, kernel::ObsStatus::Ok, "{}", page.payload);
+        assert!(
+            page.model_text.is_none(),
+            "a stored page keeps its own shape"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

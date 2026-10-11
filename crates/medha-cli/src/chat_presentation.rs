@@ -81,6 +81,7 @@ mod tests {
                     ok: true,
                     payload: json!({}),
                     source_event: Some(format!("tool-{source}")),
+                    stored: None,
                 },
             );
         }
@@ -179,6 +180,7 @@ mod tests {
                 ok: true,
                 payload: json!("kept"),
                 source_event: None,
+                stored: None,
             },
         );
         observe(
@@ -362,6 +364,7 @@ mod tests {
                 ok: true,
                 payload: json!("x".repeat(ROW_BYTES)),
                 source_event: None,
+                stored: None,
             },
         );
         assert!(state.snapshot().items.iter().any(
@@ -741,6 +744,7 @@ impl Presentation {
                 ok,
                 payload,
                 source_event,
+                ..
             } => {
                 self.metrics.current_tool = None;
                 self.rows.push(Item::ToolResult {

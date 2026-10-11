@@ -21,6 +21,7 @@ fn write(session: &Session, id: &str, tool: &str, status: ObsStatus, payload: Va
                 media: Vec::new(),
                 relayed_trust: None,
                 net_denied: false,
+                model_text: None,
             },
             TrustLabel::System,
         ),

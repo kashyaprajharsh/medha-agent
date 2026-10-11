@@ -1068,6 +1068,7 @@ impl kernel::StreamSink for Sink {
             ok,
             payload: payload.clone(),
             source_event: None,
+            stored: None,
         });
     }
     fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &Value) {
@@ -1077,6 +1078,7 @@ impl kernel::StreamSink for Sink {
             ok,
             payload: payload.clone(),
             source_event: None,
+            stored: None,
         });
     }
     fn tool_result_saved(
@@ -1086,6 +1088,7 @@ impl kernel::StreamSink for Sink {
         tool: &str,
         ok: bool,
         payload: &Value,
+        stored: Option<&str>,
     ) {
         self.writer.turn_event(protocol::TurnEvent::ToolResult {
             id: Some(id.to_owned()),
@@ -1093,6 +1096,7 @@ impl kernel::StreamSink for Sink {
             ok,
             payload: payload.clone(),
             source_event: Some(event.to_string()),
+            stored: stored.map(str::to_owned),
         });
         self.saved.notify_one();
     }

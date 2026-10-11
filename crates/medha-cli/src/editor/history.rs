@@ -192,6 +192,7 @@ impl Replay {
                         ok: payload["status"] == "ok",
                         payload: payload["payload"].clone(),
                         source_event: None,
+                        stored: None,
                     },
                 )
                 .await;

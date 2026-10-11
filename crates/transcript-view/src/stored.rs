@@ -3,9 +3,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// The kernel's `SPILL_THRESHOLD`: a result whose JSON is longer than this is
-/// stored under the SHA-256 of that JSON and the model pages it by hash.
-const SPILL_THRESHOLD: usize = 16_000;
+/// Results saved before the kernel named where it stored them: one whose JSON
+/// was longer than this was stored under the SHA-256 of that JSON.
+const LEGACY_SPILL_THRESHOLD: usize = 16_000;
 
 /// Names stored outputs after what produced them. A large result is kept as
 /// an artifact and paged later by hash, so later pages can say which file or
@@ -32,8 +32,9 @@ impl StoredNames {
     }
 
     /// Link the hashes a result is stored under to what its call named: the
-    /// one a paging read returns, and the one the kernel spilled it to.
-    pub fn result(&mut self, id: &str, output: &Value) {
+    /// one a paging read returns, and the one the kernel spilled it to, which
+    /// it names (`stored`) or, for older results, implied by their size.
+    pub fn result(&mut self, id: &str, output: &Value, stored: Option<&str>) {
         let Some(path) = self.call_paths.get(id) else {
             return;
         };
@@ -42,10 +43,13 @@ impl StoredNames {
             .get("hash")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let spilled = serde_json::to_string(output)
-            .ok()
-            .filter(|json| json.len() > SPILL_THRESHOLD)
-            .map(|json| format!("{:x}", Sha256::digest(json.as_bytes())));
+        let spilled = match stored {
+            Some(hash) => Some(hash.to_owned()),
+            None => serde_json::to_string(output)
+                .ok()
+                .filter(|json| json.len() > LEGACY_SPILL_THRESHOLD)
+                .map(|json| format!("{:x}", Sha256::digest(json.as_bytes()))),
+        };
         for hash in returned.into_iter().chain(spilled) {
             self.hash_paths.entry(hash).or_insert_with(|| file.clone());
         }

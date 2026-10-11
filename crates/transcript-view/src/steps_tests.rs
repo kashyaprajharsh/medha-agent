@@ -8,7 +8,7 @@ fn call(tool: &str, args: Value) -> crate::Call {
 fn run(tool: &str, args: Value, output: Value) -> crate::Outcome {
     let mut steps = Steps::default();
     steps.call("c1", tool, &args);
-    steps.result("c1", "", true, &output)
+    steps.result("c1", "", true, &output, None)
 }
 
 #[test]
@@ -39,6 +39,7 @@ fn a_later_page_of_a_stored_read_is_named_after_its_file() {
         "read",
         true,
         &json!({"content": "…", "hash": "64d557f8bb"}),
+        None,
     );
     let page = steps.call(
         "r2",
@@ -258,6 +259,7 @@ fn an_unknown_tool_reads_as_fields_and_a_failure_is_not_repeated_as_output() {
         "read",
         false,
         &json!({"error": "read failed: No such file"}),
+        None,
     );
     assert_eq!(failed.detail.as_deref(), Some("read failed: No such file"));
     assert_eq!(failed.output, None);

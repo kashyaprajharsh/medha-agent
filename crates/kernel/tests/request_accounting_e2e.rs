@@ -390,7 +390,57 @@ async fn tool_result_is_prepared_and_recounted_before_the_following_model_call()
         })
         .expect("the live ordered request includes the tool result");
     assert!(live_result.len() < 8_000);
-    assert!(live_result.contains("call read with hash="));
+    assert!(live_result.contains("read hash=\""), "{live_result}");
+}
+
+/// One round of results cannot fill the request: once it has used its room,
+/// further large results are stored and previewed instead of sent whole.
+#[tokio::test]
+async fn a_round_of_results_is_kept_within_its_room() {
+    let call = |n: u8| {
+        Block::ToolIntent(ToolIntent {
+            id: format!("call-{n}"),
+            tool: "test.tool".into(),
+            args: json!({}),
+        })
+    };
+    let provider = Arc::new(RecordingProvider::new(vec![
+        Ok((1..=4).map(call).collect()),
+        Ok(vec![Block::Text("finished".into())]),
+    ]));
+    let kernel = kernel_with_context(provider.clone(), Arc::new(Passthrough))
+        .with_result_limits(Some(25_000), Some(45_000));
+    kernel
+        .run_session(
+            &Session::new(),
+            vec![Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    let sent = provider.sent.lock().unwrap();
+    let results: Vec<&String> = sent[1]
+        .context
+        .ordered
+        .as_ref()
+        .unwrap()
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            ContentPart::ToolResult(result) => Some(&result.content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 4);
+    let whole = results.iter().filter(|text| text.len() > 19_000).count();
+    let stored = results
+        .iter()
+        .filter(|text| text.len() < 3_000 && text.contains("read hash=\""))
+        .count();
+    assert_eq!((whole, stored), (2, 2));
+    assert!(results.iter().map(|text| text.len()).sum::<usize>() < 45_000 + 2 * 3_000);
 }
 
 #[tokio::test]
@@ -772,7 +822,11 @@ async fn resumed_ordered_tool_results_are_spilled_without_losing_identity_or_opa
     assert_eq!(result.tool_call_id, call.id);
     assert_eq!(result.provider_state, vec![provider_state]);
     assert!(result.content.len() < 8_000);
-    assert!(result.content.contains("call read with hash="));
+    assert!(
+        result.content.contains("read hash=\""),
+        "{}",
+        result.content
+    );
 }
 
 #[tokio::test]

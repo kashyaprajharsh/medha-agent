@@ -468,6 +468,11 @@ pub struct Kernel<P: Provider, L: EventLog> {
     vision: Option<Arc<dyn crate::vision::VisionDescriber>>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
+    /// (per result, per round) limits set in config; each one unset is worked
+    /// out from the model's context window.
+    result_limits: (Option<usize>, Option<usize>),
+    /// Removed from every tool result before the model reads it.
+    secrets: Arc<crate::redact::Secrets>,
     pricing: Option<crate::types::Pricing>,
     /// Serializes human-gate prompts: parallel tool dispatch must not pop
     /// several approval cards at once.
@@ -496,7 +501,51 @@ pub struct Kernel<P: Provider, L: EventLog> {
 /// replaced in-context by a head and a `read_artifact` reference. Public
 /// because the paging tool must size its pages to survive this threshold: a
 /// page that spills costs a round trip instead of saving one.
-pub const SPILL_THRESHOLD: usize = 16_000;
+pub const SPILL_THRESHOLD: usize = 40_000;
+/// The most one round of tool results may put in front of the model together.
+const ROUND_LIMIT: usize = 120_000;
+/// How much of a stored result the model sees in place of it: its start, where
+/// errors usually begin, and a larger end, where a run says how it finished.
+const SPILL_PREVIEW: usize = 2_000;
+
+/// A stored result in brief: its first and last lines, how much was left out,
+/// and how to read the rest. The whole text stays in the store, readable later.
+fn spilled_preview(content: &str, hash: &str) -> String {
+    let head_budget = SPILL_PREVIEW * 2 / 5;
+    let mut head = head_budget.min(content.len());
+    while !content.is_char_boundary(head) {
+        head -= 1;
+    }
+    if let Some(newline) = content[..head]
+        .rfind('\n')
+        .filter(|at| *at > head_budget / 2)
+    {
+        head = newline + 1;
+    }
+    let mut tail = content
+        .len()
+        .saturating_sub(SPILL_PREVIEW - head_budget)
+        .max(head);
+    while !content.is_char_boundary(tail) {
+        tail += 1;
+    }
+    if let Some(newline) = content[tail..]
+        .find('\n')
+        .filter(|at| *at < SPILL_PREVIEW / 4)
+    {
+        tail += newline + 1;
+    }
+    format!(
+        "{}\n[… {} of {} bytes not shown, bytes {}–{}. The whole result is stored: read \
+         hash=\"{hash}\" with offset (a byte) and length to see any part of it.]\n{}",
+        content[..head].trim_end_matches('\n'),
+        tail - head,
+        content.len(),
+        head,
+        tail,
+        &content[tail..]
+    )
+}
 
 /// Absolute per-turn ingestion limits. These are deliberately independent of
 /// provider/model limits: a broken or adversarial stream must not be able to
@@ -585,6 +634,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             vision: None,
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            result_limits: (None, None),
+            secrets: Arc::default(),
             pricing: None,
             gate_serial: Arc::new(futures::lock::Mutex::new(())),
             mutation_serial: Arc::new(tokio::sync::Mutex::new(())),
@@ -617,6 +668,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             vision: self.vision.clone(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
+            result_limits: self.result_limits,
+            secrets: Arc::clone(&self.secrets),
             pricing: self.pricing,
             // Shared, not rebuilt: see the field's own note. A fresh lane here
             // is what let three children pop three cards at one surface.
@@ -764,30 +817,113 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
-    /// Spill an oversized tool-result payload to the artifact store, returning a
-    /// truncated head + a `read_artifact` pointer. The full payload is still in
-    /// the event log, so nothing is lost; only the *live context* shrinks.
+    /// Store a result too large to send and return its brief in its place. The
+    /// full payload is still in the event log, so nothing is lost; only the
+    /// live context shrinks. Callers decide what is too large.
     async fn maybe_spill(&self, content: String) -> String {
-        if content.len() <= SPILL_THRESHOLD {
-            return content;
-        }
         match Arc::clone(&self.artifacts)
             .put_async(content.as_bytes().to_vec())
             .await
         {
-            Ok(hash) => {
-                let head: String = content.chars().take(2_000).collect();
-                format!(
-                    "{head}\n\n[SHOWING FIRST 2000 CHARS of {} total bytes — the rest is NOT \
-                     lost. Continue reading it: call read with hash=\"{hash}\" \
-                     (offset, length) to page through the remainder, or re-read a specific \
-                     line range with read offset+limit. Do NOT report to the user that the \
-                     output was truncated or that you can't see it — page through it and \
-                     finish the task.]",
-                    content.len()
-                )
-            }
+            Ok(hash) => spilled_preview(&content, &hash),
             Err(_) => content, // spill failed → keep full rather than lose data
+        }
+    }
+
+    /// Secrets to remove from every tool result before the model reads it.
+    pub fn with_secrets(mut self, secrets: crate::redact::Secrets) -> Self {
+        self.secrets = Arc::new(secrets);
+        self
+    }
+
+    /// Set limits for what one tool result, and one round of them, may put in
+    /// front of the model; each `None` is worked out from its context window.
+    pub fn with_result_limits(
+        mut self,
+        per_result: Option<usize>,
+        per_round: Option<usize>,
+    ) -> Self {
+        self.result_limits = (per_result.map(|n| n.max(1)), per_round.map(|n| n.max(1)));
+        self
+    }
+
+    /// What one tool result, and one round of them, may put in front of the
+    /// model, in bytes: a share of its context window, within bounds. A model
+    /// with an unknown window gets the upper bounds. Bytes stand in for
+    /// tokens at four to one; this is a budget, not the exact fit, which the
+    /// context engine counts before every request.
+    fn result_limits(&self) -> (usize, usize) {
+        let window = self
+            .provider
+            .context_window()
+            .map(|tokens| tokens as usize * 4);
+        let share = |percent: usize, (low, high): (usize, usize)| {
+            window.map_or(high, |bytes| (bytes * percent / 100).clamp(low, high))
+        };
+        let (per_result, per_round) = self.result_limits;
+        (
+            per_result.unwrap_or_else(|| share(15, (8_000, SPILL_THRESHOLD))),
+            per_round.unwrap_or_else(|| share(30, (16_000, ROUND_LIMIT))),
+        )
+    }
+
+    /// Settle what the model reads for a result before it is saved: the tool's
+    /// own view, or the result itself, with anything the kernel added to it.
+    /// When that is more than one result may take, or more than this round has
+    /// left, the whole is stored and the model reads its start and end and
+    /// where it is kept. Returns that place. What is decided here is saved
+    /// with the result, so a reopened chat reads exactly the same.
+    async fn fit_for_model(&self, obs: &mut Observation, room: &mut usize) -> Option<String> {
+        let mut viewed = obs.model_text.is_some();
+        let mut text = match obs.model_text.take() {
+            Some(mut view) => {
+                for key in ["adjusted", "project_context"] {
+                    match obs.payload.get(key) {
+                        Some(serde_json::Value::String(note)) => {
+                            view.push_str(&format!("\n{key}: {note}"))
+                        }
+                        Some(value) => view.push_str(&format!("\n{key}: {value}")),
+                        None => {}
+                    }
+                }
+                view
+            }
+            None => {
+                let mut visible = obs.payload.clone();
+                crate::events::strip_private_observation_fields(&mut visible);
+                visible.to_string()
+            }
+        };
+        // The record keeps what the tool returned; the model reads it without
+        // secrets, and so does anything stored for it to page.
+        if let std::borrow::Cow::Owned(clean) = self.secrets.redact(&text) {
+            text = clean;
+            viewed = true;
+        }
+        let per_result = self.result_limits().0;
+        // A result no bigger than a preview would only grow by being stored.
+        let small = text.len() <= SPILL_PREVIEW * 3 / 2;
+        if small || (text.len() <= per_result && text.len() <= *room) {
+            *room = room.saturating_sub(text.len());
+            obs.model_text = viewed.then_some(text);
+            return None;
+        }
+        match Arc::clone(&self.artifacts)
+            .put_async(text.as_bytes().to_vec())
+            .await
+        {
+            Ok(hash) => {
+                let preview = spilled_preview(&text, &hash);
+                *room = room.saturating_sub(preview.len());
+                obs.model_text = Some(preview);
+                Some(hash)
+            }
+            // Nowhere to keep it: the model reads it whole rather than lose it.
+            Err(_) => {
+                *room = room.saturating_sub(text.len());
+                obs.model_text = viewed.then_some(text);
+                None
+            }
         }
     }
 
@@ -799,8 +935,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         messages: &mut [Message],
         ordered_messages: &mut [ModelMessage],
     ) {
+        // Results saved with their fit already decided are within this; older
+        // ones, and any too large for a smaller model since, are fitted here.
+        let limit = self.result_limits().0;
         for message in messages {
-            if message.role == Role::Tool && message.content.len() > SPILL_THRESHOLD {
+            if message.role != Role::Tool {
+                continue;
+            }
+            // Results saved before secrets were removed have them removed here.
+            if let std::borrow::Cow::Owned(clean) = self.secrets.redact(&message.content) {
+                message.content = clean;
+            }
+            if message.content.len() > limit {
                 message.content = self.maybe_spill(std::mem::take(&mut message.content)).await;
             }
         }
@@ -809,12 +955,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 continue;
             }
             for part in &mut message.parts {
+                if let ContentPart::ToolResult(result) = part
+                    && let std::borrow::Cow::Owned(clean) = self.secrets.redact(&result.content)
+                {
+                    result.content = clean;
+                }
                 match part {
-                    ContentPart::ToolResult(result) if result.content.len() > SPILL_THRESHOLD => {
+                    ContentPart::ToolResult(result) if result.content.len() > limit => {
                         result.content =
                             self.maybe_spill(std::mem::take(&mut result.content)).await;
                     }
-                    ContentPart::Text(text) if text.text.len() > SPILL_THRESHOLD => {
+                    ContentPart::Text(text) if text.text.len() > limit => {
                         text.text = self.maybe_spill(std::mem::take(&mut text.text)).await;
                     }
                     _ => {}
@@ -984,6 +1135,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         mut obs: Observation,
         discovered: Option<crate::context::DiscoveredContext>,
         adjusted: &std::collections::HashMap<String, String>,
+        room: &mut usize,
         window_events: &mut Vec<ulid::Ulid>,
         window_taint: &mut TrustLabel,
         web_tainted: &mut bool,
@@ -1040,10 +1192,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         if let Some(op) = applied.filter(|op| op.is_object()) {
             self.log.append(Event::memory_write(session, op)).await?;
         }
-        let event = self
-            .log
-            .append(Event::observed_tool(session, &obs, trust, &tool))
-            .await?;
+        let stored = self.fit_for_model(&mut obs, room).await;
+        let mut event = Event::observed_tool(session, &obs, trust, &tool);
+        if let Some(hash) = &stored {
+            event.payload["stored"] = serde_json::json!(hash);
+        }
+        let event = self.log.append(event).await?;
         let screen = event.payload.get(crate::events::TOOL_SCREEN_FIELD).cloned();
         crate::events::strip_private_observation_fields(&mut obs.payload);
         window_events.push(event.id);
@@ -1054,14 +1208,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             *web_tainted = true;
         }
         let ok = matches!(obs.status, crate::types::ObsStatus::Ok);
-        sink.tool_result_saved(event.id, &id, &tool, ok, &obs.payload);
+        sink.tool_result_saved(event.id, &id, &tool, ok, &obs.payload, stored.as_deref());
         if let Some(screen) = &screen {
             sink.tool_screen(&id, screen);
         }
-        let content = self
-            .maybe_spill(serde_json::to_string(&obs.payload).unwrap_or_default())
-            .await;
-        let message = Message::tool_result(&id, content);
+        let message =
+            Message::tool_result(&id, crate::events::observation_for_model(&event.payload));
         ordered_messages.push(message.ordered());
         messages.push(message);
         if !obs.media.is_empty() {
@@ -1883,6 +2035,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // own schema before policy, approval and dispatch see them. The
             // saved reply above keeps what the model actually wrote.
             let mut adjusted = std::collections::HashMap::new();
+            // What this round's results may still put in front of the model.
+            let mut room = self.result_limits().1;
             for it in &mut intents {
                 let Some(spec) = specs.iter().find(|spec| spec.name == it.tool) else {
                     continue;
@@ -1992,6 +2146,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 obs,
                                 discovered,
                                 &adjusted,
+                                &mut room,
                                 &mut window_events,
                                 &mut window_taint,
                                 &mut web_tainted,
@@ -2029,6 +2184,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             Observation::error(&id, reason),
                             None,
                             &adjusted,
+                            &mut room,
                             &mut window_events,
                             &mut window_taint,
                             &mut web_tainted,
@@ -2099,6 +2255,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         obs,
                         discovered,
                         &adjusted,
+                        &mut room,
                         &mut window_events,
                         &mut window_taint,
                         &mut web_tainted,
@@ -2134,6 +2291,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         obs,
                         discovered,
                         &adjusted,
+                        &mut room,
                         &mut window_events,
                         &mut window_taint,
                         &mut web_tainted,
@@ -3617,6 +3775,7 @@ mod progressive_context_tests {
                 media: Vec::new(),
                 relayed_trust: None,
                 net_denied: false,
+                model_text: None,
             };
             assert!(
                 successful_observed_path(&observation).is_none(),
@@ -3798,6 +3957,26 @@ mod retry_tests {
             throttled.retry_after().unwrap_or_else(|| retry_backoff(1)),
             asked
         );
+    }
+
+    /// A stored result is previewed by whole lines from its start and its end,
+    /// so a test run's first error and its final summary both stay in view.
+    #[test]
+    fn a_stored_result_is_previewed_by_its_first_and_last_lines() {
+        let content: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
+        let preview = spilled_preview(&content, "abc");
+        let (head, rest) = preview.split_once("\n[… ").unwrap();
+        let (note, tail) = rest.split_once("]\n").unwrap();
+        assert!(head.starts_with("line 1\nline 2\n") && head.ends_with(char::is_numeric));
+        assert!(tail.ends_with("line 4999\nline 5000\n") && tail.starts_with("line "));
+        assert!(
+            note.contains(&format!("of {} bytes not shown", content.len())),
+            "{note}"
+        );
+        assert!(note.contains("read hash=\"abc\""));
+        let shown = head.len() + tail.len();
+        assert!((1_500..=SPILL_PREVIEW + 20).contains(&shown), "{shown}");
+        assert!(tail.len() > head.len(), "the end gets the larger share");
     }
 
     #[test]

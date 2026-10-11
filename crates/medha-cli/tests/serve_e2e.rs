@@ -1836,6 +1836,20 @@ async fn a_written_page_is_read_back_from_its_write_and_never_copied() {
         .await;
     assert_eq!(allowed["result"]["accepted"], true, "{allowed}");
     client.until(|frame| kind(frame, "turn.done")).await;
+    // The model reads that the page was written, not the page again.
+    let _call = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let after = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let result = after["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        result,
+        format!("Wrote index.html (1 lines, {} bytes).", page.len())
+    );
 
     let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
     let listed = client.about(&folder, list).await.unwrap();
@@ -1865,6 +1879,50 @@ async fn a_written_page_is_read_back_from_its_write_and_never_copied() {
         })
         .collect();
     assert!(stored.is_empty(), "nothing was copied: {stored:?}");
+}
+
+/// The provider's key never travels back to the provider inside a tool result:
+/// a command that prints it shows the model a marker, while the record of the
+/// command keeps what it printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_that_prints_the_provider_key_never_shows_it_to_the_model() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("secret");
+    let chat = client.open(&folder).await;
+    client
+        .send(&chat, &format!("RUN `printf 'key=%s' {SECRET}`"))
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id": approval["params"]["gate_id"], "approve": true}),
+        )
+        .await;
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let _call = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let after = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let result = after["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+        .unwrap_or_default();
+    // The key is in this test's own message and command; what is checked is
+    // that the command's output does not carry it back a second way.
+    assert!(result.contains("key=[secret removed]"), "{result}");
+    assert!(!result.contains(SECRET), "{result}");
+    assert!(
+        observed["params"]["payload"]["stdout"]
+            .as_str()
+            .is_some_and(|out| out.contains(SECRET)),
+        "the person's own record shows what the command printed: {observed}"
+    );
 }
 
 /// A window stays current from what each turn adds: every turn sends only its
@@ -2661,6 +2719,10 @@ impl DrawingServer {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
+                // On macOS an accepted socket inherits the listener's
+                // non-blocking mode; a request still in flight would then read
+                // as nothing and be dropped, failing the call under load.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

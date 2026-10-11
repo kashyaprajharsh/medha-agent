@@ -90,6 +90,7 @@ impl Executor for SleepyExecutor {
             media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
+            model_text: None,
         }
     }
 }

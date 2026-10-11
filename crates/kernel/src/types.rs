@@ -1150,6 +1150,11 @@ pub struct Observation {
     /// offer a network grant and retry.
     #[serde(default)]
     pub net_denied: bool,
+    /// What the model reads for this result, written by a built-in tool that
+    /// knows its shape. The payload stays whole for people and for replay of
+    /// what was done; without this, the model reads the payload itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_text: Option<String>,
 }
 
 impl Observation {
@@ -1161,6 +1166,7 @@ impl Observation {
             media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
+            model_text: None,
         }
     }
     pub fn denial(intent_id: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -1171,6 +1177,7 @@ impl Observation {
             media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
+            model_text: None,
         }
     }
     pub fn error(intent_id: impl Into<String>, message: impl Into<String>) -> Self {
@@ -1181,6 +1188,7 @@ impl Observation {
             media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
+            model_text: None,
         }
     }
     pub fn relaying(mut self, trust: TrustLabel) -> Self {

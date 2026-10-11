@@ -669,6 +669,10 @@ pub enum TurnEvent {
         payload: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_event: Option<String>,
+        /// Where the whole of what the model would have read is kept, when it
+        /// was too large to send; the model pages it by this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stored: Option<String>,
     },
     #[serde(rename = "tool.input")]
     ToolInput {

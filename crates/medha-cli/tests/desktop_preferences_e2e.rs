@@ -209,6 +209,8 @@ fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
                 Err(error) => panic!("discovery server: {error}"),
             }
         };
+        // An accepted socket can inherit the listener's non-blocking mode.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();

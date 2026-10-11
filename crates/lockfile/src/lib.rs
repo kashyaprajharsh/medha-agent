@@ -560,6 +560,12 @@ pub struct BudgetConfig {
     pub max_wall_s: Option<u64>,
     /// Per-turn tool concurrency; `None` uses the kernel default.
     pub max_parallel_tools: Option<usize>,
+    /// Most bytes one tool result may put in front of the model before it is
+    /// stored and previewed; `None` scales with the model's context window.
+    pub tool_result_bytes: Option<usize>,
+    /// Most bytes one round of tool results may put in front of the model
+    /// together; `None` scales with the model's context window.
+    pub tool_round_bytes: Option<usize>,
 }
 
 impl Default for BudgetConfig {
@@ -571,6 +577,8 @@ impl Default for BudgetConfig {
             max_cost_usd: d.max_cost_usd,
             max_wall_s: d.max_wall_s,
             max_parallel_tools: None,
+            tool_result_bytes: None,
+            tool_round_bytes: None,
         }
     }
 }

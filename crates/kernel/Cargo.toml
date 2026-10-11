@@ -21,6 +21,7 @@ tokio-util = "0.7"
 sha2 = "0.10"
 base64 = "0.22"
 tracing = "0.1"
+regex = "1"
 medha-extension-api = { path = "../extension-api" }
 
 [dev-dependencies]

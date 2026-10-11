@@ -49,6 +49,8 @@ fn a_headless_provider_failure_exits_nonzero() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // An accepted socket can inherit the listener's non-blocking mode.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -206,6 +208,8 @@ fn required_completion_failure_exits_nonzero_but_plan_does_not_run_checks() {
                 }
                 Err(error) => panic!("{error}"),
             };
+            // An accepted socket can inherit the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

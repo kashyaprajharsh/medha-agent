@@ -740,7 +740,13 @@ fn tool_view(steps: &mut transcript_view::Steps, event: &Event) -> Option<EventV
         }
         EventKind::ToolObs => {
             let (id, status) = (field("intent_id")?, field("status")?);
-            let outcome = steps.result(id, "", status == "ok", value("payload"));
+            let outcome = steps.result(
+                id,
+                "",
+                status == "ok",
+                value("payload"),
+                event.payload["stored"].as_str(),
+            );
             Some(EventView {
                 tool_id: Some(id.to_owned()),
                 summary: outcome.summary,

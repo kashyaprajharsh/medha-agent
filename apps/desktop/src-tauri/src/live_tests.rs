@@ -203,7 +203,7 @@ fn a_shared_current_turn_keeps_its_user_image_references() {
     let images = json!([{"hash":"a".repeat(64), "name":"shot.png", "mime":"image/png"}]);
     let snapshot = json!({"revision":1,"conversation":"conversation","running":true,"turn":1,
         "pending_steers":[],"force_aborting":false,"settings":null,
-        "items":[{"type":"user","text":"Look", "images":images}], "current_turn_from":0,"omitted_items":0,
+        "items":[{"type":"user","text":"Look", "images":images, "about":"Diagram: Read path"}], "current_turn_from":0,"omitted_items":0,
         "approvals":[],"questions":[],"metrics":protocol::PresentationMetrics::default(),"agents":[],"omitted_agent_views":0,"cursor":null});
     let rendered = render_snapshot(
         json!({"method":"session.presentation", "params":snapshot}),
@@ -215,6 +215,33 @@ fn a_shared_current_turn_keeps_its_user_image_references() {
         "message.accepted"
     );
     assert_eq!(rendered["params"]["frames"][0]["params"]["images"], images);
+    // What the message was about survives reattaching to a running chat.
+    assert_eq!(
+        rendered["params"]["frames"][0]["params"]["about"],
+        "Diagram: Read path"
+    );
+}
+
+#[test]
+fn saved_source_metadata_survives_stream_coalescing_without_replacing_markdown() {
+    let now = Instant::now();
+    let mut stream = StreamFrames::default();
+    let mut segment = String::new();
+    assert!(stream.push(text("**diagram**"), now).is_empty());
+    let metadata = json!({"method":"event", "params":{"kind":"model.text", "delta":"", "source_event":"saved"}});
+    let ready = stream.push(metadata.clone(), now);
+    assert_eq!(ready.len(), 1);
+    assert_eq!(
+        render(ready[0].clone(), &mut segment)["params"]["html"],
+        "<p><strong>diagram</strong></p>"
+    );
+    assert_eq!(render(stream.flush().unwrap(), &mut segment), metadata);
+    assert_eq!(segment, "**diagram**");
+    let rendered = sanitize(
+        json!({"method":"event", "params":{"kind":"tool.observation", "id":"reused", "tool":"draw", "ok":true, "payload":{}, "source_event":"tool-saved"}}),
+        &mut Steps::default(),
+    );
+    assert_eq!(rendered["params"]["source_event"], "tool-saved");
 }
 
 #[test]

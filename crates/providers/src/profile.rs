@@ -105,7 +105,17 @@ pub struct ProviderProfile {
     pub image_input: ImageInputMode,
     #[serde(default, skip_serializing_if = "is_default")]
     pub chat_token_limit: ChatTokenLimit,
+    /// How long this deployment's response stream may deliver nothing before
+    /// it is treated as lost and reopened. Missing means the default. A
+    /// deployment that builds a large tool call before sending any of it, or
+    /// a slow local server, may need longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_seconds: Option<u64>,
 }
+
+/// Bounds on a configured stream wait: long enough for a model to think,
+/// short enough that a dead stream is still noticed.
+pub const STREAM_IDLE_SECONDS: std::ops::RangeInclusive<u64> = 30..=1800;
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     value == &T::default()
@@ -133,6 +143,7 @@ impl ProviderProfile {
             capabilities: None,
             image_input: ImageInputMode::Auto,
             chat_token_limit: ChatTokenLimit::Auto,
+            stream_idle_seconds: None,
         }
     }
 
@@ -179,6 +190,16 @@ impl ProviderProfile {
                 "provider base URL must not contain credentials; select an auth kind instead"
                     .into(),
             );
+        }
+        if self
+            .stream_idle_seconds
+            .is_some_and(|seconds| !STREAM_IDLE_SECONDS.contains(&seconds))
+        {
+            return Err(format!(
+                "stream_idle_seconds must be between {} and {}",
+                STREAM_IDLE_SECONDS.start(),
+                STREAM_IDLE_SECONDS.end()
+            ));
         }
         if parsed.fragment().is_some() {
             return Err("provider base URL must not contain a URL fragment".into());
@@ -283,6 +304,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             image_input: ImageInputMode,
             #[serde(default)]
             chat_token_limit: ChatTokenLimit,
+            #[serde(default)]
+            stream_idle_seconds: Option<u64>,
         }
 
         let raw = RawProfile::deserialize(deserializer)?;
@@ -306,6 +329,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             capabilities: raw.capabilities,
             image_input: raw.image_input,
             chat_token_limit: raw.chat_token_limit,
+            stream_idle_seconds: raw.stream_idle_seconds,
         })
     }
 }

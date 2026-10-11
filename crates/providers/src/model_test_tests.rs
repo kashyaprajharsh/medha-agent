@@ -24,6 +24,101 @@ fn tool_stream(name: &str) -> Response {
 }
 
 #[tokio::test]
+async fn a_slow_setup_response_is_not_rejected_after_fifteen_seconds() {
+    let server = Server::scripted(vec![
+        Response {
+            delay: Duration::from_secs(20),
+            ..text_json()
+        },
+        text_stream("MEDHA_OK", true),
+        tool_stream(TOOL),
+        text_stream("MEDHA_OK", true),
+    ])
+    .await;
+    let profile = ProviderProfile::openai_chat(&server.url, "fixture", AuthKind::None);
+    let task = tokio::spawn(async move { test(&profile, "").await });
+    // Establish real loopback I/O before moving the test clock. A paused clock
+    // at connection time can otherwise jump past pending OS I/O.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(20)).await;
+    tokio::time::resume();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result.text.status,
+        Status::Passed,
+        "{}",
+        result.text.message
+    );
+    assert_eq!(result.streaming.status, Status::Passed);
+    assert_eq!(result.tools.status, Status::Passed);
+    assert_eq!(server.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn slow_checks_share_the_total_budget_and_do_not_start_a_late_request() {
+    let server = Server::scripted(
+        [
+            text_json(),
+            text_stream("MEDHA_OK", true),
+            tool_stream(TOOL),
+        ]
+        .into_iter()
+        .map(|response| Response {
+            delay: Duration::from_secs(200),
+            ..response
+        })
+        .collect(),
+    )
+    .await;
+    let profile = ProviderProfile::openai_chat(&server.url, "fixture", AuthKind::None);
+    let task = tokio::spawn(async move { test(&profile, "").await });
+    for count in 1..=3 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.requests.lock().unwrap().len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(200)).await;
+        tokio::time::resume();
+    }
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result.text.status,
+        Status::Passed,
+        "{}",
+        result.text.message
+    );
+    assert_eq!(
+        result.streaming.status,
+        Status::Passed,
+        "{}",
+        result.streaming.message
+    );
+    assert_eq!(result.tools.failure.as_deref(), Some("timeout"));
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        3,
+        "an expired test sends neither a retry nor the result follow-up"
+    );
+}
+
+#[tokio::test]
 async fn setup_checks_real_chat_adapter_and_synthetic_result_without_executing_a_tool() {
     let server = Server::scripted(vec![
         text_json(),
@@ -267,6 +362,19 @@ async fn setup_output_and_absolute_deadline_are_bounded() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(error, ProviderError::ProgressTimeout { .. }));
+    assert!(matches!(error, CheckError::Deadline));
+    let check = failed(error, "");
+    assert_eq!(check.failure.as_deref(), Some("timeout"));
+    assert!(check.message.contains("Model support is not confirmed"));
+    assert!(!check.message.contains("no progress"));
     assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+    let before = server.requests.lock().unwrap().len();
+    let error = call(&client, &context, false, tokio::time::Instant::now())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, CheckError::Deadline));
+    assert_eq!(server.requests.lock().unwrap().len(), before);
 }

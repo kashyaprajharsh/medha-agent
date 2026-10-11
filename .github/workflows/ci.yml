@@ -233,6 +233,10 @@ jobs:
       - name: Test the window
         run: npm test
 
+      - name: Test artifact rendering in WebKit
+        if: runner.os == 'macOS'
+        run: npm run test:artifacts:webkit
+
       - name: Build the bundled program
         run: npm run prepare:backend
 

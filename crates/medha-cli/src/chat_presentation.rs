@@ -54,6 +54,64 @@ mod tests {
     }
 
     #[test]
+    fn publication_ids_survive_the_shared_presentation_barrier() {
+        let mut state = Presentation::default();
+        state.seed("chat".into(), &[], settings());
+        for (turn, source) in [(1, "first-event"), (2, "second-event")] {
+            observe(&mut state, TurnEvent::Started { turn });
+            observe(
+                &mut state,
+                TurnEvent::Text {
+                    delta: "identical diagram".into(),
+                    source_event: None,
+                },
+            );
+            observe(
+                &mut state,
+                TurnEvent::Text {
+                    delta: String::new(),
+                    source_event: Some(source.into()),
+                },
+            );
+            observe(
+                &mut state,
+                TurnEvent::ToolResult {
+                    id: Some("reused".into()),
+                    tool: "draw".into(),
+                    ok: true,
+                    payload: json!({}),
+                    source_event: Some(format!("tool-{source}")),
+                },
+            );
+        }
+        let rows = state.snapshot().items;
+        let sources: Vec<_> = rows
+            .iter()
+            .filter_map(|item| match item {
+                Item::Assistant { text, source_event } => {
+                    assert_eq!(text, "identical diagram");
+                    source_event.as_deref()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, ["first-event", "second-event"]);
+        let sources: Vec<_> = rows
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult { source_event, .. } => source_event.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, ["tool-first-event", "tool-second-event"]);
+        assert_eq!(
+            state.rows.bytes,
+            size(&state.rows.snapshot())
+                .saturating_sub(2 + state.rows.items.len().saturating_sub(1))
+        );
+    }
+
+    #[test]
     fn late_viewers_get_the_agent_roster_at_the_same_barrier_as_active_text() {
         let mut state = Presentation::default();
         state.seed("one".into(), &[], settings());
@@ -72,6 +130,7 @@ mod tests {
             &mut state,
             TurnEvent::Text {
                 delta: "active".into(),
+                source_event: None,
             },
         );
         let snapshot = state.snapshot();
@@ -101,6 +160,7 @@ mod tests {
             &mut state,
             TurnEvent::Text {
                 delta: "failed attempt".into(),
+                source_event: None,
             },
         );
         observe(
@@ -118,6 +178,7 @@ mod tests {
                 tool: "read".into(),
                 ok: true,
                 payload: json!("kept"),
+                source_event: None,
             },
         );
         observe(
@@ -131,25 +192,31 @@ mod tests {
             &mut state,
             TurnEvent::Text {
                 delta: "successful attempt".into(),
+                source_event: None,
             },
         );
         let rows = state.snapshot().items;
         assert!(rows.contains(&Item::Assistant {
-            text: "old answer".into()
+            text: "old answer".into(),
+            source_event: None,
         }));
         assert!(rows.contains(&Item::Assistant {
-            text: "successful attempt".into()
+            text: "successful attempt".into(),
+            source_event: None,
         }));
         assert!(rows.iter().any(
             |row| matches!(row, Item::ToolResult { payload, .. } if *payload == json!("kept"))
         ));
-        assert!(!rows.iter().any(|row| matches!(row, Item::Assistant { text } | Item::Reasoning { text } if text.contains("discarded") || text.contains("failed"))));
+        assert!(!rows.iter().any(|row| matches!(row, Item::Assistant { text, .. } | Item::Reasoning { text } if text.contains("discarded") || text.contains("failed"))));
     }
 
     #[test]
     fn eviction_keeps_the_retry_boundary_at_the_correct_row() {
         let mut rows = Rows::default();
-        rows.push(Item::Assistant { text: "old".into() });
+        rows.push(Item::Assistant {
+            text: "old".into(),
+            source_event: None,
+        });
         rows.push(Item::ToolCall {
             id: None,
             tool: "before".into(),
@@ -158,6 +225,7 @@ mod tests {
         rows.attempt = rows.items.len();
         rows.push(Item::Assistant {
             text: "retry".into(),
+            source_event: None,
         });
         rows.evict();
         rows.restart();
@@ -220,7 +288,8 @@ mod tests {
             state.snapshot().items,
             vec![Item::User {
                 text: "same".into(),
-                images: Vec::new()
+                images: Vec::new(),
+                about: None
             }]
         );
     }
@@ -292,6 +361,7 @@ mod tests {
                 tool: "read".into(),
                 ok: true,
                 payload: json!("x".repeat(ROW_BYTES)),
+                source_event: None,
             },
         );
         assert!(state.snapshot().items.iter().any(
@@ -378,7 +448,9 @@ impl Rows {
             && let Some((last, bytes)) = self.items.back_mut()
         {
             let text = match (last, thinking) {
-                (Item::Assistant { text }, false) | (Item::Reasoning { text }, true) => Some(text),
+                (Item::Assistant { text, .. }, false) | (Item::Reasoning { text }, true) => {
+                    Some(text)
+                }
                 _ => None,
             };
             if let Some(text) = text
@@ -394,8 +466,38 @@ impl Rows {
         self.push(if thinking {
             Item::Reasoning { text: delta.into() }
         } else {
-            Item::Assistant { text: delta.into() }
+            Item::Assistant {
+                text: delta.into(),
+                source_event: None,
+            }
         });
+    }
+
+    fn text_saved(&mut self, event: String) {
+        // One measurement at publication, rather than reserializing per token.
+        if let Some((item, bytes)) = self
+            .items
+            .iter_mut()
+            .skip(self.attempt)
+            .rev()
+            .find(|(item, _)| matches!(item, Item::Assistant { .. }))
+        {
+            if let Item::Assistant { source_event, .. } = item {
+                *source_event = Some(event);
+            }
+            self.bytes = self.bytes.saturating_sub(*bytes);
+            *bytes = size(item);
+            if *bytes > ROW_BYTES {
+                *item = Item::PreviewOmitted {
+                    subject: "assistant reply".into(),
+                    id: None,
+                    bytes: *bytes,
+                };
+                *bytes = size(item);
+            }
+            self.bytes += *bytes;
+            self.bound(5000, HISTORY_BYTES);
+        }
     }
 
     fn restart(&mut self) {
@@ -513,15 +615,18 @@ impl Presentation {
                         .trust
                         .is_none_or(|trust| trust == kernel::TrustLabel::User) =>
                 {
+                    let (text, about) = message.shown();
                     self.rows.push(Item::User {
-                        text: message.content.clone(),
+                        text: text.into(),
                         images: crate::chat_history::images(&message.attachments),
+                        about: about.map(str::to_owned),
                     })
                 }
                 kernel::Role::Assistant => {
                     if !message.content.trim().is_empty() {
                         self.rows.push(Item::Assistant {
                             text: message.content.clone(),
+                            source_event: None,
                         });
                     }
                     for call in &message.tool_calls {
@@ -554,6 +659,7 @@ impl Presentation {
                         tool,
                         ok,
                         payload,
+                        source_event: None,
                     });
                 }
                 _ => {}
@@ -583,13 +689,18 @@ impl Presentation {
                 self.rows.push(Item::User {
                     text: content,
                     images: Vec::new(),
+                    about: None,
                 });
             }
             TurnEvent::User {
-                content, images, ..
+                content,
+                images,
+                about,
+                ..
             } => self.rows.push(Item::User {
                 text: content,
                 images,
+                about,
             }),
             TurnEvent::Queued {
                 content: Some(content),
@@ -603,7 +714,17 @@ impl Presentation {
                     }
                 }
             }
-            TurnEvent::Text { delta } => self.rows.text(&delta, false),
+            TurnEvent::Text {
+                delta,
+                source_event,
+            } => {
+                if !delta.is_empty() {
+                    self.rows.text(&delta, false);
+                }
+                if let Some(event) = source_event {
+                    self.rows.text_saved(event);
+                }
+            }
             TurnEvent::Reasoning { delta } => {
                 self.metrics.reasoning_received_this_turn |= !delta.is_empty();
                 self.rows.text(&delta, true);
@@ -619,6 +740,7 @@ impl Presentation {
                 tool,
                 ok,
                 payload,
+                source_event,
             } => {
                 self.metrics.current_tool = None;
                 self.rows.push(Item::ToolResult {
@@ -626,6 +748,7 @@ impl Presentation {
                     tool,
                     ok,
                     payload,
+                    source_event,
                 });
             }
             TurnEvent::Notice { text } => self.rows.push(Item::Notice { text }),
@@ -791,6 +914,7 @@ impl Presentation {
                             pane.rows.push(Item::User {
                                 text: objective,
                                 images: Vec::new(),
+                                about: None,
                             });
                             pane.rows.attempt = pane.rows.items.len();
                         }
@@ -809,6 +933,7 @@ impl Presentation {
                             tool,
                             ok,
                             payload,
+                            source_event: None,
                         }),
                         AgentStep::Restarted => {
                             pane.rows.attempt = pane
@@ -834,6 +959,7 @@ impl Presentation {
                             pane.rows.push(Item::User {
                                 text,
                                 images: Vec::new(),
+                                about: None,
                             });
                         }
                         AgentStep::SteersReturned(texts) => {

@@ -1,4 +1,4 @@
-import type { LiveFrame, MessageImage, SessionSettings, ToolScreen } from "./api";
+import type { ArtifactRevision, LiveFrame, MessageImage, SessionSettings, ToolScreen } from "./api";
 
 /** What may be answered to an approval, as the backend names each answer. */
 export type ApprovalChoice =
@@ -39,6 +39,7 @@ export type QuestionForm = {
 
 export type Step = {
   id: string;
+  sourceEvent?: string;
   tool: string;
   verb?: string;
   target?: string;
@@ -80,8 +81,8 @@ export type LiveAgent = {
 };
 
 export type LiveItem =
-  | { kind: "user"; id: string; text: string; ts: number; images?: MessageImage[] }
-  | { kind: "text"; id: string; text: string; html?: string }
+  | { kind: "user"; id: string; text: string; ts: number; images?: MessageImage[]; /** The output it was about, as the label shown beside it. */ about?: string }
+  | { kind: "text"; id: string; text: string; html?: string; sourceEvent?: string }
   | { kind: "plan"; id: string; plan: Plan }
   | {
       kind: "reasoning";
@@ -113,7 +114,8 @@ export type LiveState = {
   stopReason?: string;
   contextPercent?: number;
   contextPressure?: { input: number; usable?: number; quality?: string };
-  activity?: { kind: "compacting" | "model"; started: number };
+  /** `tool`: the model has named a tool and is still writing its call, which can take minutes for a large file. */
+  activity?: { kind: "compacting" | "model" | "tool"; started: number; tool?: string; target?: string };
   notice?: string;
   error?: string;
   settled: number;
@@ -121,7 +123,14 @@ export type LiveState = {
   returned?: string[];
   /** Calls to a server's tool that the model is still writing, for a screen to draw from. */
   writing?: WritingCall[];
+  /** Outputs the chat's saved events added since its outputs were last listed. */
+  outputs?: ArtifactRevision[];
+  /** Rises when that list may have missed some, so the outputs are listed afresh. */
+  outputsEpoch?: number;
 };
+
+// Past this the oldest are let go and the chat's outputs are listed again instead.
+const MAX_PUSHED = 2000;
 
 export type WritingCall = { id: string; tool: string; text: string };
 // A turn writes few such calls at once and a drawing is small; past this a
@@ -238,10 +247,13 @@ export function queuedMessages(state: LiveState) {
 /** Folds one bridge frame into the live view, in the order things happened.
  * `settled` bumps when a turn ends: the cue to reload the durable transcript. */
 export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
-  const params = frame.params ?? {};
+  // Recovery replies must be folded at the stream barrier, before later
+  // events, rather than when the request promise resumes.
+  const params = frame.params ?? (frame.method === "session.presentation" ? frame.result : undefined) ?? {};
   switch (frame.method) {
     case "session.presentation": {
-      let recovered = { ...state, items: [], approvals: [], questions: [], activity: undefined } as LiveState;
+      // Outputs pushed while the stream was away are not replayed; list them afresh.
+      let recovered = { ...state, items: [], approvals: [], questions: [], activity: undefined, outputs: [], outputsEpoch: (state.outputsEpoch ?? 0) + 1 } as LiveState;
       for (const row of Array.isArray(params.frames) ? params.frames : []) {
         recovered = reduceLive(recovered, row as LiveFrame);
       }
@@ -377,24 +389,42 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         (sent) => sent.text === text && state.items.some((item) => item.kind === "user" && item.id === sent.id),
       );
       const images = Array.isArray(params.images) ? params.images as MessageImage[] : [];
+      // The backend decides whether the message was about an output: a
+      // reference it could not confirm is dropped, and so is its label here.
+      const about = str(params.about);
       return { ...state, status: "running", items: alreadyShown ? state.items.map((item) =>
-        item.kind === "user" && item.id === alreadyShown.id && images.length
-          ? { ...item, images } : item) : [
-        ...closeReasoning(state.items), { kind: "user", id: nextId("user"), text, ts: now(), images },
+        item.kind === "user" && item.id === alreadyShown.id
+          ? { ...item, about, ...(images.length ? { images } : {}) } : item) : [
+        ...closeReasoning(state.items), { kind: "user", id: nextId("user"), text, ts: now(), images, about },
       ] };
     }
     case "model.waiting":
       return { ...state, activity: { kind: "model", started: now() } };
+    case "tool.started": {
+      // Sent when the call is named and again once its target is known. The
+      // call itself arrives only when it is whole, so this is all there is to show.
+      const tool = str(params.tool);
+      if (!tool) return state;
+      const began = state.activity?.kind === "tool" && state.activity.tool === tool ? state.activity.started : now();
+      return { ...state, status: "running", activity: { kind: "tool", started: began, tool, target: str(params.target) ?? state.activity?.target } };
+    }
     case "notice":
       return { ...state, notice: str(params.text) };
     case "model.text": {
       const delta = str(params.delta) ?? "";
       const html = str(params.html);
+      const sourceEvent = str(params.source_event);
+      if (!delta && sourceEvent) {
+        let at = state.items.length - 1;
+        while (at >= 0 && state.items[at].kind !== "text") at--;
+        if (at < 0) return state;
+        return { ...state, items: state.items.map((item, index) => index === at && item.kind === "text" ? { ...item, sourceEvent } : item) };
+      }
       const items = withLast(
         closeReasoning(state.items),
         "text",
-        (item) => ({ ...item, text: item.text + delta, html }),
-        () => ({ kind: "text", id: nextId("text"), text: delta, html }),
+        (item) => ({ ...item, text: item.text + delta, html: html ?? item.html, sourceEvent: sourceEvent ?? item.sourceEvent }),
+        () => ({ kind: "text", id: nextId("text"), text: delta, html, sourceEvent }),
       );
       return {
         ...state,
@@ -432,7 +462,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       if (
         state.items.some(
           (item) =>
-            item.kind === "tools" && item.steps.some((step) => step.id === id),
+            item.kind === "tools" && item.steps.some((step) => step.id === id && step.status === "running"),
         )
       )
         return state;
@@ -483,6 +513,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
           return {
             ...step,
             status: params.ok === true ? ("ok" as const) : ("failed" as const),
+            sourceEvent: str(params.source_event),
             errorCode: str(params.error_code),
             detail: str(params.detail),
             summary: str(params.summary),
@@ -506,12 +537,28 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       const rest = calls.filter((other) => other.id !== id).slice(1 - MAX_WRITING);
       return { ...state, writing: [...rest, { ...call, text: call.text + delta }] };
     }
+    // A rewind, a cleared or resumed chat: its outputs are listed afresh.
+    case "presentation.reset":
+      return { ...state, outputs: [], outputsEpoch: (state.outputsEpoch ?? 0) + 1 };
+    case "outputs": {
+      const added = (Array.isArray(params.revisions) ? params.revisions : []).filter(
+        (record): record is ArtifactRevision => typeof record?.revision_id === "string" && typeof record?.artifact_id === "string",
+      );
+      if (!added.length) return state;
+      const outputs = [...(state.outputs ?? []), ...added];
+      return outputs.length > MAX_PUSHED
+        ? { ...state, outputs: [], outputsEpoch: (state.outputsEpoch ?? 0) + 1 }
+        : { ...state, outputs };
+    }
     case "tool.screen": {
       const screen = params.screen as ToolScreen | undefined;
       if (!screen || typeof screen.resource !== "string") return state;
-      const items = state.items.map((item) =>
+      const source = screen.source_event;
+      let group = state.items.length - 1;
+      while (group >= 0 && !(state.items[group].kind === "tools" && (state.items[group] as Extract<LiveItem, { kind: "tools" }>).steps.some(step => step.id === params.id && (!source || step.sourceEvent === source)))) group--;
+      const items = state.items.map((item, index) =>
         item.kind === "tools"
-          ? { ...item, steps: item.steps.map((step) => (step.id === params.id ? { ...step, screen } : step)) }
+          && index === group ? { ...item, steps: item.steps.map((step) => (step.id === params.id && (!source || step.sourceEvent === source) ? { ...step, screen } : step)) }
           : item,
       );
       return { ...state, items, writing: state.writing?.filter((call) => call.id !== params.id) };
@@ -577,7 +624,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         items.at(-1)?.kind === "reasoning"
       )
         items.pop();
-      return { ...state, items, writing: undefined, notice: "Reconnecting to the model…" };
+      return { ...state, items, writing: undefined, activity: undefined, notice: "Reconnecting to the model…" };
     }
     case "usage":
       return {

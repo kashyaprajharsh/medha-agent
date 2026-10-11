@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 mod presentation;
 pub use presentation::*;
+mod artifacts;
+pub use artifacts::*;
 mod resources;
 pub use resources::*;
 mod model_providers;
@@ -413,6 +415,9 @@ pub struct SendMessage {
     /// Explicit intent prevents a delayed steer from starting another turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<SendIntent>,
+    /// The output this message asks to change. Honoured only when it starts a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<OutputReference>,
 }
 command!(SendMessage, "message.send", Chat, MessageAccepted);
 
@@ -627,13 +632,20 @@ pub enum TurnEvent {
         turn: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<SavedImage>,
+        /// The output this message was about, as a label to show beside it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        about: Option<String>,
     },
     #[serde(rename = "model.waiting")]
     Waiting,
     #[serde(rename = "notice")]
     Notice { text: String },
     #[serde(rename = "model.text")]
-    Text { delta: String },
+    Text {
+        delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_event: Option<String>,
+    },
     #[serde(rename = "model.reasoning")]
     Reasoning { delta: String },
     #[serde(rename = "tool.started")]
@@ -655,6 +667,8 @@ pub enum TurnEvent {
         tool: String,
         ok: bool,
         payload: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_event: Option<String>,
     },
     #[serde(rename = "tool.input")]
     ToolInput {
@@ -664,6 +678,10 @@ pub enum TurnEvent {
     },
     #[serde(rename = "tool.screen")]
     ToolScreen { id: String, screen: Value },
+    /// Outputs the chat's newly saved events added, in order. A window that
+    /// listed the chat's outputs once stays current from these alone.
+    #[serde(rename = "outputs")]
+    Outputs { revisions: Vec<ArtifactRevision> },
     #[serde(rename = "usage")]
     Usage {
         prompt_tokens: u32,

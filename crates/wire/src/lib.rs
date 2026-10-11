@@ -27,6 +27,7 @@ pub const CAPABILITIES: &[&str] = &[
     "editor-sessions",
     "workspace-images",
     "model-providers",
+    "artifact-revisions",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",

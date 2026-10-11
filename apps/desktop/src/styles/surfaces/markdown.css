@@ -10,7 +10,7 @@
 }
 .prose.plain.streaming::after,
 .prose.md.streaming > :is(p, li, h1, h2, h3, h4):last-child::after,
-.prose.md.streaming > :is(ul, ol) > li:last-child::after {
+.prose.md.streaming > :is(ul, ol):last-child > li:last-child::after {
   content: "";
   display: inline-block;
   width: 7px;

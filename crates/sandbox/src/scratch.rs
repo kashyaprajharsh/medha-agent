@@ -20,19 +20,52 @@ pub(crate) fn try_lock_file(path: &Path) -> Option<std::fs::File> {
     Some(file)
 }
 
-/// Removes every folder whose sibling `.lock` no live process holds.
+/// Whether the process exists. An id that cannot be one is treated as alive,
+/// so nothing is removed on its account.
+#[cfg(unix)]
+pub(crate) fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Removes every folder whose sibling `.lock` no live process holds, and every
+/// `<pid>-…` folder left with no lock at all once that process has exited.
 pub(crate) fn sweep_unlocked(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    for lock in entries.flatten().map(|entry| entry.path()) {
+    let found: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    for lock in &found {
         if lock.extension().is_none_or(|ext| ext != "lock") {
             continue;
         }
-        if let Some(released) = try_lock_file(&lock) {
+        if let Some(released) = try_lock_file(lock) {
             let _ = std::fs::remove_dir_all(lock.with_extension(""));
             drop(released);
-            let _ = std::fs::remove_file(&lock);
+            let _ = std::fs::remove_file(lock);
+        }
+    }
+    // The system's temp cleaner can take an idle lock file and leave its
+    // folder, which the pass above then never sees. A live owner may have lost
+    // its lock file the same way, so only its exit makes the folder removable.
+    #[cfg(unix)]
+    for folder in &found {
+        let owner = folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|_| folder.extension().is_none())
+            .and_then(|name| name.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<i32>().ok());
+        if let Some(pid) = owner
+            && !folder.with_extension("lock").exists()
+            && !process_alive(pid)
+            && std::fs::symlink_metadata(folder).is_ok_and(|kind| kind.is_dir())
+        {
+            let _ = std::fs::remove_dir_all(folder);
         }
     }
 }

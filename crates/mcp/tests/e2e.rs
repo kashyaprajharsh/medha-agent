@@ -696,6 +696,19 @@ async fn a_screen_reaches_only_what_its_server_opened_to_it() {
     );
     assert_eq!(page.border, Some(true));
     assert!(page.clipboard, "the one permission that is passed on");
+    let identity = page.identity.as_deref().unwrap();
+    manager
+        .call_from_screen_checked("fake", "save", &json!({}), identity)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .call_from_screen_checked("fake", "save", &json!({}), "a different endpoint")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("server changed")
+    );
     for other in ["file:///etc/passwd", "https://evil.example/", "fake/draw"] {
         assert!(manager.read_screen("fake", other).await.is_err(), "{other}");
     }

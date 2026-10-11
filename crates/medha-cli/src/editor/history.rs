@@ -165,7 +165,7 @@ impl Replay {
                     }
                 }
             }
-            "model.intent" => {
+            "model.tool_intent" => {
                 let id = payload["id"].as_str().unwrap_or_default();
                 if !self.canonical_calls.contains(id) {
                     self.flush(writer, session).await;
@@ -191,6 +191,7 @@ impl Replay {
                         tool: payload["tool"].as_str().unwrap_or("tool").into(),
                         ok: payload["status"] == "ok",
                         payload: payload["payload"].clone(),
+                        source_event: None,
                     },
                 )
                 .await;

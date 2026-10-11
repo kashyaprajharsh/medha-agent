@@ -1721,14 +1721,7 @@ const ISOLATED_HOMES: &str = "medha-native-homes";
 use crate::scratch::try_lock_file;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return true;
-    }
-    // SAFETY: signal 0 only checks that the process exists.
-    let exists = unsafe { libc::kill(pid, 0) } == 0;
-    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
+use crate::scratch::process_alive;
 
 /// Removes homes whose lock is free, and legacy `medha-native-home-<pid>-*` of exited processes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

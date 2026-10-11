@@ -5,6 +5,9 @@ export type Drawn = { svg: string; paper?: boolean } | { problem: string };
 type Mermaid = typeof import("mermaid").default;
 let loading: Promise<Mermaid> | undefined;
 let serial = 0;
+// Mermaid owns process-wide configuration and a rendering queue. Keep our
+// initialize/parse/render sequence atomic too, including concurrent thumbnails.
+let rendering: Promise<unknown> = Promise.resolve();
 
 const TOKENS = ["overlay", "text", "dim", "line", "gold", "gold-wash", "hover"] as const;
 
@@ -220,7 +223,13 @@ function problemOf(cause: unknown, source: string): string {
     : `Line ${line} could not be read.`;
 }
 
-export async function drawDiagram(source: string, dark: boolean): Promise<Drawn> {
+export function drawDiagram(source: string, dark: boolean): Promise<Drawn> {
+  const draw = rendering.then(() => renderDiagram(source, dark));
+  rendering = draw.catch(() => {});
+  return draw;
+}
+
+async function renderDiagram(source: string, dark: boolean): Promise<Drawn> {
   loading ??= import("mermaid").then((module) => module.default);
   const mermaid = await loading.catch(() => undefined);
   if (!mermaid) {
@@ -235,6 +244,9 @@ export async function drawDiagram(source: string, dark: boolean): Promise<Drawn>
     theme: "base",
     darkMode: dark,
     htmlLabels: false,
+    // Preserve Mermaid's security defaults and forbid source directives from
+    // switching to foreignObject labels, which SVG sanitization must strip.
+    secure: [...(mermaid.mermaidAPI.defaultConfig.secure ?? []), "htmlLabels"],
     flowchart: { htmlLabels: false, padding: 18, nodeSpacing: 44, rankSpacing: 56 },
     themeVariables: colours,
   });

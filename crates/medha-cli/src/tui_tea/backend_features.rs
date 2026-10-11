@@ -223,6 +223,21 @@ pub(super) fn send_held(model: &mut Model, held: backend_ui::DeferredSend) {
             return;
         }
     };
+    // Startup reads and other requests can briefly hold every slot; the message
+    // waits for one rather than being refused.
+    if !backend_ui::send_slot_free(model) {
+        if model.input.trim() == line {
+            model.input.clear();
+            model.cursor = 0;
+        }
+        model.backend_deferred = Some(backend_ui::DeferredSend {
+            raw: line,
+            intent,
+            target,
+            followup,
+        });
+        return;
+    }
     let paths = input::unstaged_images(model, &expanded);
     if !paths.is_empty() {
         if stage_images(model, input::ImageSource::Paths(paths)) {
@@ -263,6 +278,7 @@ pub(super) fn send_held(model: &mut Model, held: backend_ui::DeferredSend) {
         content,
         images: model.images.wire(),
         intent: Some(intent),
+        about: None,
     };
     // Account for the RPC envelope before scheduling; a rejected large message
     // must preserve both its draft and immutable staged attachments.

@@ -13,13 +13,16 @@ const PASTE_LINES = 25;
 // A skill chosen in the composer rides after the request in the TUI's words.
 const SKILL = /\n\n\[Loaded skill: ([^\]\n]+)\] Follow this procedure[^\n]*\n\n/;
 
-export function UserText({ text: raw, images = [] }: { text: string; images?: MessageImage[] }) {
+export function UserText({ text: raw, images = [], about }: { text: string; images?: MessageImage[]; about?: string }) {
   const { text, files } = attachedFiles(raw);
   const skill = SKILL.exec(text);
   const said = skill ? text.slice(0, skill.index) : text;
   const lines = said.split("\n").length;
-  // The same token the composer showed, leading the text it was sent with.
-  const lead = skill ? <SentToken kind="skill" label={skill[1]} /> : null;
+  // The same tokens the composer showed, leading the text it was sent with.
+  const lead = about || skill ? <>
+    {about && <SentToken kind="output" label={about} />}
+    {skill && <SentToken kind="skill" label={skill[1]} />}
+  </> : null;
   return <div className="you-text">
     {said.length > PASTE_CHARS || lines > PASTE_LINES
       ? <PastedText text={said} lines={lines} lead={lead} />

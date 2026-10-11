@@ -45,6 +45,10 @@ type Props = {
   onConnect?: () => void;
   /** Enabled skills the `/` menu offers alongside its commands. */
   skills?: { name: string; description: string }[];
+  /** The output open beside the chat that the next message is about, by its label. */
+  about?: string;
+  /** The person removed that token: this message is not about the open output. */
+  onAbout?: () => void;
   /** The skill riding along with the next message, if one was chosen. */
   skill?: string;
   onSkill?: (name: string | null) => void | Promise<void>;
@@ -137,6 +141,7 @@ export function Composer(props: Props) {
   const [leaving, setLeaving] = useState<string | null>(null);
   const [layout, setLayout] = useState<TokenLayout>({ indent: 0, lift: 0 });
   const tokens: MessageToken[] = [
+    ...(props.about ? [{ id: "about", kind: "output" as const, label: props.about, title: `Your message is about ${props.about}, open beside the chat. Remove this to ask for something new.` }] : []),
     ...(props.skill ? [{ id: "skill", kind: "skill" as const, label: props.skill }] : []),
     ...props.attachments.map((attachment) => ({
       id: attachment.id,
@@ -153,7 +158,8 @@ export function Composer(props: Props) {
     const drop = () => {
       if (!mounted.current) return;
       setLeaving(null);
-      if (id === "skill") latest.current.onSkill?.(null);
+      if (id === "about") latest.current.onAbout?.();
+      else if (id === "skill") latest.current.onSkill?.(null);
       else latest.current.onAttachments(latest.current.attachments.filter((item) => item.id !== id));
     };
     // Exits are faster than entries; without motion the token just goes.

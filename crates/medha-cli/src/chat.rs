@@ -1001,6 +1001,9 @@ fn deny_pending(pending: &Pending) -> usize {
 struct Sink {
     writer: Arc<Writer>,
     unread: Unread,
+    /// Rung whenever a reply or a tool result is saved, so the outputs it
+    /// added are worked out and sent on.
+    saved: Arc<tokio::sync::Notify>,
 }
 
 impl kernel::StreamSink for Sink {
@@ -1017,7 +1020,15 @@ impl kernel::StreamSink for Sink {
     fn text(&self, delta: &str) {
         self.writer.turn_event(protocol::TurnEvent::Text {
             delta: delta.to_owned(),
+            source_event: None,
         });
+    }
+    fn text_saved(&self, event: ulid::Ulid) {
+        self.writer.turn_event(protocol::TurnEvent::Text {
+            delta: String::new(),
+            source_event: Some(event.to_string()),
+        });
+        self.saved.notify_one();
     }
     fn reasoning(&self, delta: &str) {
         self.writer.turn_event(protocol::TurnEvent::Reasoning {
@@ -1056,6 +1067,7 @@ impl kernel::StreamSink for Sink {
             tool: tool.to_owned(),
             ok,
             payload: payload.clone(),
+            source_event: None,
         });
     }
     fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &Value) {
@@ -1064,7 +1076,25 @@ impl kernel::StreamSink for Sink {
             tool: tool.to_owned(),
             ok,
             payload: payload.clone(),
+            source_event: None,
         });
+    }
+    fn tool_result_saved(
+        &self,
+        event: ulid::Ulid,
+        id: &str,
+        tool: &str,
+        ok: bool,
+        payload: &Value,
+    ) {
+        self.writer.turn_event(protocol::TurnEvent::ToolResult {
+            id: Some(id.to_owned()),
+            tool: tool.to_owned(),
+            ok,
+            payload: payload.clone(),
+            source_event: Some(event.to_string()),
+        });
+        self.saved.notify_one();
     }
     fn tool_input(&self, id: &str, tool: &str, delta: &str) {
         // Only a server's tool can have a screen to draw this on, and only
@@ -1202,6 +1232,8 @@ enum RpcAction {
         /// Admitted into the artifact store as the turn starts, so pixels never
         /// sit in the transcript or the log.
         images: Vec<IncomingImage>,
+        /// The saved output this message asks to change; checked as the turn starts.
+        about: Option<protocol::OutputReference>,
         admission_reply_to: Option<Value>,
     },
     /// Admission is acknowledged only after the owned queue accepts it.
@@ -1388,6 +1420,16 @@ fn dispatch_rpc(
                 rpc_error(writer, &id, -32602, "content must be a non-empty string");
                 return RpcAction::None;
             };
+            let about = match params.get("about").filter(|about| !about.is_null()) {
+                None => None,
+                Some(about) => match serde_json::from_value(about.clone()) {
+                    Ok(about) => Some(about),
+                    Err(_) => {
+                        rpc_error(writer, &id, -32602, "about must name one saved output");
+                        return RpcAction::None;
+                    }
+                },
+            };
             if running {
                 if interrupt.is_none() {
                     rpc_error(writer, &id, -32000, "a turn is already running");
@@ -1401,6 +1443,7 @@ fn dispatch_rpc(
                 RpcAction::StartTurn {
                     content,
                     images,
+                    about,
                     admission_reply_to: id,
                 }
             }
@@ -1629,6 +1672,8 @@ where
     let mut history_head = 0u64;
     let mut history_marked = false;
     let mut history_reader = crate::chat_history::Reader::default();
+    let saved = Arc::new(tokio::sync::Notify::new());
+    let mut outputs = crate::application_artifacts::Following::default();
     loop {
         if !running && (turn_requested || reports_ready) {
             reports_ready = false;
@@ -1651,6 +1696,7 @@ where
                     .checked_history_record(session.id, 0, None, true)
                     .await?
                     .0;
+                outputs.begin(session.id, history_head);
                 if !history_marked {
                     writer.mark_history();
                 }
@@ -1672,6 +1718,7 @@ where
                 let sink = Sink {
                     writer: writer.clone(),
                     unread: unread.clone(),
+                    saved: saved.clone(),
                 };
                 let agents = agents.clone();
                 let owner = turns.spawn(async move {
@@ -1839,8 +1886,24 @@ where
                         writer.turn_event(protocol::TurnEvent::Queued { content: Some(content) });
                         rpc_result(&writer, &reply_to, json!({"accepted": true, "steered": true, "turn": turn_number}));
                     }
-                    RpcAction::StartTurn { content, images, admission_reply_to } => {
+                    RpcAction::StartTurn { content, images, about, admission_reply_to } => {
                         let mut prompt = Message::user(content);
+                        // The reference is recorded only once this chat's own
+                        // history confirms it; the model reads which output is
+                        // meant in words and is never shown an ID to copy.
+                        if let Some(about) = about
+                            && let Ok(events) = kernel.log.output_events(session.id).await
+                            && let Some((lead, label)) = crate::application_artifacts::described(&events, &about)
+                        {
+                            let lead = format!("{lead}\n\n");
+                            prompt.about = Some(kernel::OutputReference {
+                                artifact_id: about.artifact_id,
+                                revision_id: about.revision_id,
+                                label,
+                                lead: lead.len(),
+                            });
+                            prompt.content = lead + &prompt.content;
+                        }
                         match admit_images(images, &kernel.artifacts).await {
                             Ok(attachments) => prompt.attachments = attachments,
                             Err(error) => {
@@ -1860,8 +1923,9 @@ where
                         history_marked = true;
                         if writer.presents() {
                             let prompt = transcript.last().expect("accepted prompt");
+                            let (content, about) = prompt.shown();
                             writer.turn_event(protocol::TurnEvent::User {
-                                content:prompt.content.clone(), turn:turn_number.saturating_add(1), images:crate::chat_history::images(&prompt.attachments)
+                                content:content.into(), turn:turn_number.saturating_add(1), images:crate::chat_history::images(&prompt.attachments), about:about.map(str::to_owned)
                             });
                         }
                         turn_requested = true;
@@ -1936,6 +2000,15 @@ where
             }
             Some(owner) = report_rx.recv(), if agents.is_some() => {
                 if owner.is_none() || owner == Some(session.id) { reports_ready = true; }
+            }
+            _ = saved.notified() => {
+                match outputs.added(kernel.log.as_ref()).await {
+                    Ok(revisions) if !revisions.is_empty() => {
+                        writer.turn_event(protocol::TurnEvent::Outputs { revisions });
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "new outputs could not be read"),
+                }
             }
             _ = roster_tick.tick(), if roster.is_some() || running || history_reader.has_cached() => {
                 history_reader.expire(Instant::now());
@@ -2104,6 +2177,7 @@ mod tests {
         let sink = Sink {
             writer,
             unread: unread.clone(),
+            saved: Default::default(),
         };
         sink.steered("same");
         sink.steers_returned(&["late".into(), "agent report".into()]);
@@ -2120,6 +2194,7 @@ mod tests {
         let sink = Sink {
             writer,
             unread: Unread::default(),
+            saved: Default::default(),
         };
         sink.phase(kernel::progress::Phase::Generating);
         sink.notice("Model request failed. Retrying (1/3)…");
@@ -2141,6 +2216,7 @@ mod tests {
         let sink = Sink {
             writer,
             unread: Unread::default(),
+            saved: Default::default(),
         };
         sink.phase(kernel::Phase::Generating);
         sink.notice("image described by the vision model");

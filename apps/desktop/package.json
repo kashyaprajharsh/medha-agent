@@ -9,7 +9,8 @@
     "prepare:backend": "node scripts/prepare-backend.mjs",
     "link:command": "node scripts/link-command.mjs",
     "tauri": "tauri",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "test:artifacts:webkit": "node tests/artifact-browser/run.mjs"
   },
   "dependencies": {
     "@fontsource/anek-latin": "^5.3.0",

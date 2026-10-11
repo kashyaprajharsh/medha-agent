@@ -7,7 +7,7 @@ import {
 } from "pdfjs-dist";
 import worker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 GlobalWorkerOptions.workerSrc = worker;
-export default function PdfPreview({ bytes }: { bytes: number[] }) {
+export default function PdfPreview({ bytes }: { bytes: number[] | Uint8Array }) {
   const [pdf, setPdf] = useState<PDFDocumentProxy>();
   const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(1);

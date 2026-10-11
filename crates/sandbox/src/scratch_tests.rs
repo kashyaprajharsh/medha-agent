@@ -28,6 +28,44 @@ fn a_scratch_folder_is_removed_at_exit_and_swept_after_a_crash() {
     std::fs::remove_dir_all(&temp).ok();
 }
 
+/// The system's temp cleaner can delete an idle lock file and leave the folder.
+/// Such a folder is removed only once the process named in it has exited: a
+/// running backend whose lock file was taken must keep its files.
+#[cfg(unix)]
+#[test]
+fn a_folder_with_no_lock_is_swept_only_after_its_process_has_exited() {
+    let temp = base("orphan");
+    let live = Scratch::create_in(&temp).unwrap();
+    let root = live.path().parent().unwrap().to_path_buf();
+    let mut exited = std::process::Command::new("true").spawn().unwrap();
+    let gone = exited.id();
+    exited.wait().unwrap();
+    let orphan = root.join(format!("{gone}-01ORPHAN"));
+    std::fs::create_dir_all(orphan.join("left")).unwrap();
+    // This process is alive, and its lock file has been taken from under it.
+    let mine = root.join(format!("{}-01MINE", std::process::id()));
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(mine.join("kept.txt"), "in use").unwrap();
+    // Not Medha's naming, so not Medha's to remove.
+    let foreign = root.join("notes");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::remove_file(&live.lock).unwrap();
+
+    sweep_unlocked(&root);
+    assert!(!orphan.exists(), "an exited process's folder is removed");
+    assert!(
+        mine.join("kept.txt").exists(),
+        "a running process keeps its files"
+    );
+    assert!(
+        live.path().exists(),
+        "so does one whose lock file was deleted"
+    );
+    assert!(foreign.exists());
+    drop(live);
+    std::fs::remove_dir_all(&temp).ok();
+}
+
 /// The folder is Medha's own, so neither a file tool nor a jailed command waits for a card.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]

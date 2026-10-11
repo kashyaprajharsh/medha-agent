@@ -20,6 +20,9 @@ local models and hosted providers.
   chat its own managed folder for generated files.
 - **Files and changes:** preview Markdown, code, images, PDFs, DOCX and
   spreadsheets; inspect session edits, Git diffs and pending agent patches.
+- **Generated outputs:** view diagrams, pages, drawings and generated files in
+  Preview, with saved versions. References to existing files remain clickable
+  without opening Preview automatically.
 - **Approvals and questions:** review requests and choose the access or answer
   you want to give.
 - **Agents:** inspect transcripts, send steering or follow-up instructions, and
@@ -55,13 +58,31 @@ Medha uses its tools to read them and asks for access when required. These paths
 remain in the conversation, so keep the files available when resuming work.
 Support for reading a particular format depends on the tools available.
 
+### Generated outputs and Preview
+
+Outputs belong to the chat that produced them. Saved versions retain their
+content; **Open current file** opens the file on disk separately. A chosen older
+version stays selected when a newer version arrives. Failed drawing calls show
+a compact error and preserve the last successful output.
+
+HTML previews start offline. Preview controls can enable scripts or HTTPS access
+for that revision; these permissions do not grant agent tools network access.
+File-backed HTML includes bounded, already-approved local dependencies where
+available, and identifies missing assets. PowerPoint uses a simplified preview
+and reports unsupported or omitted content; use the original file for full
+presentation fidelity.
+
+Supported Excalidraw screens retain captured checkpoints. Open the latest drawing,
+choose **Edit working copy**, then **Keep version** to save an immutable revision.
+Other MCP screens may have different editing capabilities.
+
 ### Models and providers
 
-Choose **Add model** in Settings, search for a provider, and select a model from
-its server. Saved servers are offered first. A saved key is reused only for its
-exact API endpoint; endpoint parameters such as an account ID are entered
-separately from credentials. **Custom endpoint** keeps manual protocol, address
-and model-ID entry available.
+Choose **Add model** in Settings, search for a public provider, and select a model
+from its server. Use **Custom endpoint** to enter a protocol, address and model
+ID, or choose one of your own endpoints from **Saved custom server**. A saved key
+is reused only for its exact API endpoint; endpoint parameters such as an account
+ID are entered separately from credentials.
 
 The provider catalogue includes bundled metadata for offline use and supports
 background and manual refresh. If discovery is unavailable, catalogue models or
@@ -70,7 +91,9 @@ can use a model. Providers needing an unimplemented protocol or sign-in method
 are shown with an explanation.
 
 **Test model** is optional. It checks text, streaming and a synthetic function
-round trip, using up to four billed requests with a 45-second total deadline.
+round trip, using up to four billed requests. Slow servers can take several
+minutes; requests have a five-minute limit and the test has an eight-minute total
+deadline. A timeout leaves support unconfirmed; you can still save the model.
 It sends no project content and executes no tools. Test results describe that
 model, endpoint and key; they do not verify every capability or account.
 
@@ -163,6 +186,7 @@ From `apps/desktop`:
 ```sh
 npm run build
 npm test
+npm run test:artifacts:webkit # macOS: real WebKit rendering checks
 npm run prepare:backend
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings

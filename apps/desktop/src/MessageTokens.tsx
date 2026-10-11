@@ -3,7 +3,8 @@ import { Icon } from "./Icon";
 
 export type MessageToken = {
   id: string;
-  kind: "skill" | "image" | "file" | "folder";
+  /** `output` is the thing open beside the chat, which this message is about. */
+  kind: "skill" | "image" | "file" | "folder" | "output";
   label: string;
   preview?: string;
   title?: string;
@@ -76,6 +77,7 @@ export function MessageTokens({
         >
           {token.kind === "image" && token.preview && <img src={token.preview} alt="" />}
           {(token.kind === "file" || token.kind === "folder") && <Icon name={token.kind} />}
+          {token.kind === "output" && <Icon name="panel" />}
           <span className="msg-token-label">{token.label}</span>
           <button type="button" tabIndex={-1} aria-label={`Remove ${token.label}`} onMouseDown={(event) => event.preventDefault()} onClick={() => onRemove(token.id)}>
             <Icon name="x" />
@@ -89,7 +91,8 @@ export function MessageTokens({
 /** The same token, fixed, at the start of a sent message. */
 export function SentToken({ kind, label }: { kind: MessageToken["kind"]; label: string }) {
   return (
-    <span className={`msg-token token-${kind} sent`} title={kind === "skill" ? `${label} guided this message` : label}>
+    <span className={`msg-token token-${kind} sent`} title={kind === "skill" ? `${label} guided this message` : kind === "output" ? `This message was about ${label}` : label}>
+      {kind === "output" && <Icon name="panel" />}
       <span className="msg-token-label">{label}</span>
     </span>
   );

@@ -88,6 +88,7 @@ export const LiveTail = memo(function LiveTail({
     state.approvals.length === 0 &&
     state.questions.length === 0 &&
     (state.activity?.kind === "compacting" ||
+      state.activity?.kind === "tool" ||
       !last ||
       last.kind === "user" ||
       queued.length > 0 ||
@@ -99,6 +100,8 @@ export const LiveTail = memo(function LiveTail({
       ? "Starting Medha…"
       : state.activity?.kind === "compacting"
         ? "Condensing earlier messages to fit the model’s context…"
+        : state.activity?.kind === "tool" && (state.activity.tool === "write" || state.activity.tool === "edit")
+          ? `Writing ${state.activity.target?.split(/[\\/]/).at(-1) || "a file"}`
         : last && last.kind !== "reasoning"
           ? "Working"
           : "Thinking";
@@ -226,9 +229,11 @@ export const LiveTail = memo(function LiveTail({
       );
     if (item.kind === "tools") return <StepGroup steps={item.steps} live />;
     if (item.kind === "plan") return <PlanCard plan={item.plan} />;
-    const streaming = working && index === state.items.length - 1;
+    // Once the model has moved on to a tool call, this text is finished: the
+    // status line below shows the work, not a caret after the last word.
+    const streaming = working && index === state.items.length - 1 && state.activity?.kind !== "tool";
     return item.html ? (
-      <Markdown html={item.html} streaming={streaming} scope={`live-${index}`} at={LIVE + index} fresh />
+      <Markdown html={item.html} streaming={streaming} scope={item.sourceEvent ?? `live-${index}`} at={LIVE + index} fresh />
     ) : (
       <div className={`prose plain ${streaming ? "streaming" : ""}`}>
         {item.text}
@@ -249,7 +254,7 @@ const UserMessage = memo(function UserMessage({
       <span className="you-mark" aria-hidden="true">
         ›
       </span>
-      <UserText text={message.text} images={message.images} />
+      <UserText text={message.text} images={message.images} about={message.about} />
       <time>{clock(message.ts)}</time>
     </div>
   );

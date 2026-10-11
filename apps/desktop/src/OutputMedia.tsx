@@ -9,7 +9,7 @@ const MAX_DECODE = 32 * 1024 * 1024;
 const SPEEDS = [1, 1.5, 2, 0.5];
 
 export function Picture({ output, zoom, onProblem, onDetail }: RenderProps) {
-  const file = useFile(output.path, onProblem);
+  const file = useFile(output, onProblem);
   const extension = extensionOf(output.path ?? "");
   const url = useBlobUrl(file?.bytes, `image/${extension === "jpg" ? "jpeg" : extension}`);
   if (!url) return <div className="out-wait" />;
@@ -100,7 +100,7 @@ function Transport({ playback, label }: { playback: Playback; label: string }) {
 }
 
 export function Video({ output, size, onProblem, onDetail }: RenderProps) {
-  const media = useMedia(output.path, onProblem);
+  const media = useMedia(output, onProblem);
   const ref = useRef<HTMLVideoElement>(null);
   const playback = usePlayback(ref);
   const full = size === "full";
@@ -170,7 +170,7 @@ function usePeaks(media: { url: string; size: number } | undefined): number[] | 
 }
 
 export function Sound({ output, size, onProblem, onDetail }: RenderProps) {
-  const media = useMedia(output.path, onProblem);
+  const media = useMedia(output, onProblem);
   const ref = useRef<HTMLAudioElement>(null);
   const playback = usePlayback(ref);
   const peaks = usePeaks(media);

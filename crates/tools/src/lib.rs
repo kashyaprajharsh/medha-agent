@@ -10,6 +10,7 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 mod agents;
 mod browser;
 mod edit_match;
+pub mod outputs;
 mod shell_hints;
 pub use agents::{ParentHandle, SessionHandle};
 
@@ -1114,6 +1115,13 @@ impl Executor for ToolRegistry {
         self.tasks.as_ref().map(|t| t.info()).unwrap_or_default()
     }
 
+    async fn named_outputs(&self, text: &str, since: f64) -> Vec<serde_json::Value> {
+        match &self.sandbox {
+            Some(sbx) => outputs::named(sbx, text, since).await,
+            None => Vec::new(),
+        }
+    }
+
     async fn grant_network(
         &self,
         detail: Option<&str>,
@@ -1190,6 +1198,7 @@ impl Executor for ToolRegistry {
                             "server": out.server,
                             "tool": out.tool,
                             "resource": resource,
+                            "identity": out.identity,
                             "input": intent.args,
                             "result": out.result,
                         });
@@ -1688,6 +1697,7 @@ impl Tool for FsWrite {
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let mut out = json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content });
+        outputs::attach(&mut out, &self.sbx, guard.resolved(), &content).await;
         if unreadable {
             out["note"] = json!(
                 "prior file existed but was unreadable (non-UTF-8 or permission denied); diff shows it as empty"
@@ -1978,6 +1988,7 @@ impl Tool for FsEdit {
             "replacements": done.count,
             "snapshot": snapshot
         });
+        outputs::attach(&mut out, &self.sbx, guard.resolved(), &updated).await;
         if done.loose {
             out["note"] = json!(edit_match::LOOSE_NOTE);
         }
@@ -5829,6 +5840,7 @@ impl Tool for MultiEdit {
             "new": updated,
             "snapshot": snapshot
         });
+        outputs::attach(&mut out, &self.sbx, guard.resolved(), &updated).await;
         if loose {
             out["note"] = json!(edit_match::LOOSE_NOTE);
         }

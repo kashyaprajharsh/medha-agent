@@ -5,6 +5,11 @@ export type Outputs = {
   open: Output | null;
   /** Every output on screen in this chat, oldest first. */
   all: Output[];
+  /** Resolve a transient plate to the backend's persisted revision. */
+  resolve?: (output: Output) => Output;
+  notice?: string;
+  retry?: () => void;
+  running?: boolean;
   /** The viewer is showing, so a revision need not repeat itself in the chat. */
   viewing: boolean;
   /** Pages the person has stopped, by anchor. A page runs unless it is here. */
@@ -17,6 +22,8 @@ export type Outputs = {
   enter?: (output: Output, order: number) => () => void;
   made?: (output: Output) => void;
   ask?: (text: string) => void;
+  /** Sends a request to correct this output at once, as its next version when it is a saved one. */
+  fix?: (output: Output, text: string) => void;
   stop?: (output: Output, stopped: boolean) => void;
   allow?: (output: Output, online: boolean) => void;
   browse?: () => void;

@@ -653,6 +653,21 @@ async fn a_screen_works_the_same_through_the_shared_host() {
         .unwrap();
     assert_eq!(page.html, "<html>hosted</html>");
     assert_eq!(page.connect, ["https://api.hosted.example"]);
+    chat.call_from_screen_checked(
+        "hosted",
+        "save",
+        &json!({}),
+        page.identity.as_deref().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        chat.call_from_screen_checked("hosted", "save", &json!({}), "stale endpoint")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("server changed")
+    );
     assert!(
         chat.read_screen("hosted", "https://evil.example/")
             .await

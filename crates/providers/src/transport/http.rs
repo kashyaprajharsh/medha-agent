@@ -64,9 +64,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// and cutting that short turns a busy provider into a failure.
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Maximum time without text, reasoning, tool arguments or completion.
-/// Network heartbeats do not reset this deadline.
-pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long an open stream may deliver no event before it is treated as lost
+/// and reopened, unless the profile sets its own. Keep-alive comments are not
+/// events, so a connection that is merely held open still runs out. Long
+/// enough for a model that writes a large tool call before sending any of it.
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// This deployment's stream wait: its own setting, or the default.
+pub(crate) fn stream_idle(profile: &ProviderProfile) -> Duration {
+    profile
+        .stream_idle_seconds
+        .map_or(STREAM_IDLE_TIMEOUT, Duration::from_secs)
+}
 
 /// Ceiling on an honoured `Retry-After`. A provider asking for an hour is
 /// telling us to stop, not to sleep — past this the caller's own backoff and
@@ -153,9 +162,19 @@ pub(crate) async fn send_model_request(
     }
 }
 
-pub(crate) fn stalled_stream() -> ProviderError {
-    ProviderError::ProgressTimeout {
-        waited_secs: STREAM_IDLE_TIMEOUT.as_secs(),
+pub(crate) fn stalled_stream(waited: Duration) -> ProviderError {
+    ProviderError::StreamStalled {
+        waited_secs: waited.as_secs(),
+    }
+}
+
+/// A read from an open stream failed. The client's own read timeout means no
+/// byte arrived at all, which is the same stall seen from the socket.
+pub(crate) fn stream_read_failed(error: reqwest::Error) -> ProviderError {
+    if error.is_timeout() {
+        stalled_stream(READ_TIMEOUT)
+    } else {
+        ProviderError::Transport(error.without_url().to_string())
     }
 }
 
@@ -407,17 +426,28 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_stream_is_not_resubmitted_automatically() {
-        let error = stalled_stream();
-        assert!(
-            !error.is_retryable(),
-            "a live connection without model progress must not repeat expensive work"
-        );
+    fn a_stalled_stream_is_reopened_and_waits_as_long_as_its_profile_says() {
+        let mut profile =
+            ProviderProfile::openai_chat("https://example.test/v1", "model", AuthKind::None);
+        assert_eq!(stream_idle(&profile), STREAM_IDLE_TIMEOUT);
+        let error = stalled_stream(stream_idle(&profile));
+        assert!(error.is_retryable() && error.is_stream_stall());
         assert!(
             !error.is_context_overflow(),
             "compaction cannot fix a stall"
         );
-        assert!(error.to_string().contains("90s"), "{error}");
+        assert!(error.to_string().contains("180s"), "{error}");
+
+        profile.stream_idle_seconds = Some(600);
+        assert!(profile.validate().is_ok());
+        assert_eq!(stream_idle(&profile), Duration::from_secs(600));
+        for outside in [0, 29, 1801] {
+            profile.stream_idle_seconds = Some(outside);
+            assert!(profile.validate().is_err(), "{outside}");
+        }
+        // The other waits stay final: resending cannot help a listing or a
+        // reply that was never a stream.
+        assert!(!ProviderError::ProgressTimeout { waited_secs: 15 }.is_retryable());
     }
 
     #[tokio::test]

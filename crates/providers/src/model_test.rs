@@ -10,7 +10,11 @@ use kernel::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(15);
+// A queued/reasoning model can legitimately take minutes even for a small
+// prompt. Keep setup bounded without imposing a shorter first-response limit
+// than the production transport. Streaming still uses its progress watchdog.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const TEST_TIMEOUT: Duration = Duration::from_secs(480);
 const MAX_BYTES: usize = 64 * 1024;
 const TOOL: &str = "medha_setup_echo";
 
@@ -48,17 +52,36 @@ fn passed(message: &str) -> Check {
         failure: None,
     }
 }
-fn failed(error: ProviderError, credential: &str) -> Check {
+#[derive(Debug, thiserror::Error)]
+enum CheckError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    // A completion deadline says nothing about whether progress was made.
+    #[error(
+        "The setup test's time limit was reached before this check completed. Model support is not confirmed. You can save without testing. No automatic retry was sent."
+    )]
+    Deadline,
+}
+
+fn failed(error: impl Into<CheckError>, credential: &str) -> Check {
+    let error = error.into();
     let kind = match &error {
-        ProviderError::Status(401, _) => "credentials_rejected",
-        ProviderError::Status(403, _) => "access_restricted",
-        ProviderError::Status(429, _) | ProviderError::Throttled { status: 429, .. } => "throttled",
-        ProviderError::Status(500..=599, _) | ProviderError::Throttled { .. } => "unavailable",
-        ProviderError::Status(_, _) => "invalid_request",
-        ProviderError::ResponseTimeout { .. } | ProviderError::ProgressTimeout { .. } => "timeout",
-        ProviderError::Truncated => "incomplete",
-        ProviderError::Transport(_) | ProviderError::Stream(_) => "transport",
-        _ => "invalid_response",
+        CheckError::Deadline => "timeout",
+        CheckError::Provider(error) => match error {
+            ProviderError::Status(401, _) => "credentials_rejected",
+            ProviderError::Status(403, _) => "access_restricted",
+            ProviderError::Status(429, _) | ProviderError::Throttled { status: 429, .. } => {
+                "throttled"
+            }
+            ProviderError::Status(500..=599, _) | ProviderError::Throttled { .. } => "unavailable",
+            ProviderError::Status(_, _) => "invalid_request",
+            ProviderError::ResponseTimeout { .. }
+            | ProviderError::ProgressTimeout { .. }
+            | ProviderError::StreamStalled { .. } => "timeout",
+            ProviderError::Truncated => "incomplete",
+            ProviderError::Transport(_) | ProviderError::Stream(_) => "transport",
+            _ => "invalid_response",
+        },
     };
     // Provider diagnostics are already redacted. Remove the exact supplied key
     // too, including an upstream which echoes it in an otherwise innocuous field.
@@ -84,9 +107,13 @@ async fn call(
     context: &CompiledContext,
     streaming: bool,
     deadline: tokio::time::Instant,
-) -> std::result::Result<Answer, ProviderError> {
+) -> std::result::Result<Answer, CheckError> {
+    let now = tokio::time::Instant::now();
+    if deadline <= now {
+        return Err(CheckError::Deadline);
+    }
     client.set_streaming(streaming);
-    tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + TIMEOUT), async {
+    tokio::time::timeout_at(deadline.min(now + REQUEST_TIMEOUT), async {
         let mut stream = client.stream(context).await?;
         let mut answer = Answer {
             text: false,
@@ -168,13 +195,12 @@ async fn call(
         Ok(answer)
     })
     .await
-    .map_err(|_| ProviderError::ProgressTimeout {
-        waited_secs: TIMEOUT.as_secs(),
-    })?
+    .map_err(|_| CheckError::Deadline)?
+    .map_err(CheckError::from)
 }
 
 pub async fn test(profile: &ProviderProfile, credential: &str) -> Result {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     let mut result = Result {
         text: skipped(),
         streaming: skipped(),

@@ -10,6 +10,8 @@ const RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationship
 const MAX_SLIDES = 200;
 const MAX_PART = 4 * 1024 * 1024;
 const MAX_PICTURE = 3 * 1024 * 1024;
+const MAX_UNPACKED = 32 * 1024 * 1024;
+const MAX_MARKUP = 16 * 1024 * 1024;
 const FRAME = { width: 960, height: 540 };
 const PICTURES: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif" };
 const SIZES: Record<string, number> = { title: 40, ctrTitle: 44, subTitle: 24, body: 24, obj: 24 };
@@ -17,7 +19,7 @@ const DEFAULT_INKS: Record<string, string> = { dk1: "000000", lt1: "ffffff", dk2
 const ALIASES: Record<string, string> = { tx1: "dk1", bg1: "lt1", tx2: "dk2", bg2: "lt2" };
 
 type Box = { x: number; y: number; w: number; h: number };
-type Parts = { zip: JSZip; cache: Map<string, Promise<Document | undefined>> };
+type Parts = { zip: JSZip; cache: Map<string, Promise<Document | undefined>>; used: number; notices: Set<string> };
 
 const child =(node: Element | undefined, name: string) =>
   node ? [...node.children].find((other) => other.localName === name) : undefined;
@@ -27,19 +29,46 @@ const within = (node: Element | undefined, ...names: string[]) =>
   names.reduce<Element | undefined>((at, name) => child(at, name), node);
 
 /** One file from the archive, refused before it is unpacked when it claims to be too large. */
-async function unpacked(zip: JSZip, path: string, limit: number, as: "string" | "base64") {
-  const file = zip.file(path) as (JSZip.JSZipObject & { _data?: { uncompressedSize?: number } }) | null;
-  if (!file || (file._data?.uncompressedSize ?? 0) > limit) return undefined;
-  const data = await file.async(as);
-  return data.length > limit * (as === "base64" ? 1.4 : 1) ? undefined : data;
+async function unpacked(parts: Parts, path: string, limit: number, as: "string" | "base64") {
+  // JSZip's documented file stream is missing from its bundled declaration.
+  const file = parts.zip.file(path) as (JSZip.JSZipObject & { _data?: { uncompressedSize?: number }; internalStream(type: "uint8array"): JSZip.JSZipStreamHelper<Uint8Array> }) | null;
+  const maximum = Math.min(limit, MAX_UNPACKED - parts.used);
+  if (!file || maximum <= 0 || (file._data?.uncompressedSize ?? 0) > maximum) {
+    if (file) parts.notices.add("Some parts exceed the per-part or 32 MiB total decompression limit.");
+    return undefined;
+  }
+  // Bound actual streamed bytes too: archive headers cannot authorize a larger
+  // decompression. A paused failed stream is not resumed or retained.
+  const data = await new Promise<Uint8Array | undefined>((resolve) => {
+    const stream = file.internalStream("uint8array");
+    const chunks: Uint8Array[] = []; let size = 0; let ended = false;
+    stream.on("data", (chunk: Uint8Array) => {
+      if (ended) return;
+      if (size + chunk.length > maximum) { ended = true; stream.pause(); chunks.length = 0; parts.notices.add("A decompressed part exceeded the preview limit."); resolve(undefined); return; }
+      chunks.push(chunk); size += chunk.length;
+    }).on("error", () => { if (!ended) { ended = true; resolve(undefined); } }).on("end", () => {
+      if (ended) return;
+      ended = true; const joined = new Uint8Array(size); let at = 0;
+      for (const chunk of chunks) { joined.set(chunk, at); at += chunk.length; }
+      resolve(joined);
+    }).resume();
+  });
+  if (!data) return undefined;
+  parts.used += data.byteLength;
+  if (as === "string") return new TextDecoder().decode(data);
+  // Avoid one call argument per byte or an intermediate number-array copy.
+  let binary = "";
+  for (let at = 0; at < data.length; at += 8192) binary += String.fromCharCode(...data.subarray(at, at + 8192));
+  return btoa(binary);
 }
 
-function part({ zip, cache }: Parts, path: string): Promise<Document | undefined> {
+function part(parts: Parts, path: string): Promise<Document | undefined> {
+  const { cache } = parts;
   if (!cache.has(path))
     cache.set(
       path,
       (async () => {
-        const text = await unpacked(zip, path, MAX_PART, "string");
+        const text = await unpacked(parts, path, MAX_PART, "string");
         if (!text) return undefined;
         const parsed = new DOMParser().parseFromString(text, "application/xml");
         return parsed.querySelector("parsererror") ? undefined : parsed;
@@ -184,14 +213,15 @@ async function picture(parts: Parts, shape: Element, rels: Map<string, string>):
   const id = shape.getElementsByTagNameNS("*", "blip")[0]?.getAttributeNS(RELS, "embed");
   const path = rels.get(id ?? "") ?? "";
   const type = PICTURES[path.split(".").at(-1)?.toLowerCase() ?? ""];
-  const data = type ? await unpacked(parts.zip, path, MAX_PICTURE, "base64") : undefined;
-  if (!data) return '<div class="missing">Picture</div>';
+  const data = type ? await unpacked(parts, path, MAX_PICTURE, "base64") : undefined;
+  if (!data) { parts.notices.add("Some pictures could not be previewed."); return '<div class="missing">Picture unavailable in preview</div>'; }
   return `<img alt="" src="data:${type};base64,${data}">`;
 }
 
 /** The slides of a PowerPoint file as a deck: one section each, drawn to the file's own proportions. */
 export async function readDeck(bytes: Uint8Array): Promise<Deck> {
-  const parts: Parts = { zip: await JSZip.loadAsync(bytes), cache: new Map() };
+  const parts: Parts = { zip: await JSZip.loadAsync(bytes), cache: new Map(), used: 0, notices: new Set(["Simplified PowerPoint preview. Layout, master graphics, SmartArt and animations may differ; use Open current file for the original."]) };
+  if (Object.keys(parts.zip.files).length > 20_000) throw new Error("This presentation has too many archive entries to preview.");
   const show = await part(parts, "ppt/presentation.xml");
   if (!show) throw new Error("This is not a PowerPoint file Medha can read.");
   const size = child(show.documentElement, "sldSz");
@@ -200,15 +230,17 @@ export async function readDeck(bytes: Uint8Array): Promise<Deck> {
   // A point is 12,700 of the file's units; type keeps its size relative to the sheet.
   const pt = fit * 12700;
   const showLinks = await links(parts, "ppt/presentation.xml");
-  const order = children(child(show.documentElement, "sldIdLst"), "sldId")
-    .map((slide) => showLinks.get(slide.getAttributeNS(RELS, "id") ?? "") ?? "")
-    .filter(Boolean)
-    .slice(0, MAX_SLIDES);
+  const declared = children(child(show.documentElement, "sldIdLst"), "sldId");
+  const order = declared.slice(0, MAX_SLIDES).map((slide) => showLinks.get(slide.getAttributeNS(RELS, "id") ?? "") ?? "");
+  if (declared.length > MAX_SLIDES) parts.notices.add(`Only the first ${MAX_SLIDES} of ${declared.length} slides are previewed.`);
 
   const slides: string[] = [];
+  let markup = 0;
+  const placeholder = (number: number) => `<section><div class="missing">Slide ${number} could not be previewed. Open the original presentation.</div></section>`;
   for (const path of order) {
+    if (markup >= MAX_MARKUP) { slides.push(placeholder(slides.length + 1)); continue; }
     const slide = await part(parts, path);
-    if (!slide) continue;
+    if (!slide) { parts.notices.add("Unreadable slides keep their original positions as placeholders."); slides.push(placeholder(slides.length + 1)); continue; }
     const rels = await links(parts, path);
     const layoutPath = [...rels.values()].find((target) => target.includes("slideLayout")) ?? "";
     const layout = await part(parts, layoutPath);
@@ -228,7 +260,10 @@ export async function readDeck(bytes: Uint8Array): Promise<Deck> {
 
     const boxes: string[] = [];
     for (const shape of within(slide.documentElement, "cSld", "spTree")?.children ?? []) {
-      if (!["sp", "pic", "graphicFrame"].includes(shape.localName)) continue;
+      if (!["sp", "pic", "graphicFrame"].includes(shape.localName)) {
+        if (["grpSp", "contentPart", "oleObj"].includes(shape.localName)) parts.notices.add("Grouped shapes or embedded objects are not shown in this simplified preview.");
+        continue;
+      }
       const holder = holderOf(shape);
       const kind = holder ? (holder.getAttribute("type") ?? "body") : undefined;
       if (kind && ["dt", "ftr", "sldNum"].includes(kind)) continue;
@@ -263,12 +298,13 @@ export async function readDeck(bytes: Uint8Array): Promise<Deck> {
     }
     const width = sheet.w * fit;
     const height = sheet.h * fit;
-    slides.push(
-      `<section style="background:${ground ?? `#${inks.lt1}`};color:#${inks.dk1}"><div class="sheet" style="width:${width.toFixed(1)}px;height:${height.toFixed(1)}px">${boxes.join("")}</div></section>`,
-    );
+    const page = `<section style="background:${ground ?? `#${inks.lt1}`};color:#${inks.dk1}"><div class="sheet" style="width:${width.toFixed(1)}px;height:${height.toFixed(1)}px">${boxes.join("")}</div></section>`;
+    markup += new TextEncoder().encode(page).byteLength;
+    if (markup > MAX_MARKUP) { parts.notices.add("Some slides exceeded the 16 MiB rendered-preview limit."); slides.push(placeholder(slides.length + 1)); }
+    else slides.push(page);
   }
   if (!slides.length) throw new Error("This file has no slides Medha can read.");
-  return { head: STYLE, body: "", slides };
+  return { head: STYLE, body: "", slides, total: declared.length, notices: [...parts.notices] };
 }
 
 const STYLE = `<style>

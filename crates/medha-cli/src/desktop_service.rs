@@ -72,6 +72,9 @@ struct EventView {
     text: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     images: Vec<protocol::SavedImage>,
+    /// The output a person's message was about, as a label to show beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    about: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +233,49 @@ async fn handle(
     workspace: &std::path::Path,
     req: Request,
 ) -> Response {
+    if matches!(
+        req.method.as_str(),
+        "application.artifacts" | "application.artifacts.read" | "application.artifacts.file"
+    ) {
+        let id = req.params["session_id"]
+            .as_str()
+            .and_then(|id| Ulid::from_string(id).ok());
+        let Some(id) = id else {
+            return Response::error(req.id, "valid session_id required");
+        };
+        let result = if req.method == "application.artifacts" {
+            let events = match log.output_events(id).await {
+                Ok(events) => events,
+                Err(error) => return Response::error(req.id, error.to_string()),
+            };
+            let records = crate::application_artifacts::catalogue(&events);
+            match serde_json::from_value::<protocol::ListArtifacts>(req.params) {
+                Ok(request) => crate::application_artifacts::page(records, request.cursor)
+                    .and_then(|page| serde_json::to_value(page).map_err(|e| e.to_string())),
+                Err(_) => Err("Invalid artifact request.".into()),
+            }
+        } else if req.method == "application.artifacts.file" {
+            match serde_json::from_value::<protocol::ArtifactFile>(req.params) {
+                Ok(request) => crate::application_artifacts::file(
+                    log,
+                    &request.session_id,
+                    &request.revision_id,
+                )
+                .await
+                .and_then(|file| serde_json::to_value(file).map_err(|e| e.to_string())),
+                Err(_) => Err("Invalid file revision request.".into()),
+            }
+        } else {
+            match serde_json::from_value::<protocol::ReadArtifact>(req.params) {
+                Ok(request) => crate::application_artifacts::read(log, artifacts, request).await,
+                Err(_) => Err("Invalid artifact read.".into()),
+            }
+        };
+        return match result {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::error(req.id, error),
+        };
+    }
     if let Some(result) = crate::application_resources::folder(
         log,
         artifacts,
@@ -555,9 +601,12 @@ fn page_events(
                 .cloned()
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default();
+            event.payload.get("text")?.as_str()?;
+            let (text, about) = event.shown_text();
             Some(EventView {
                 images: crate::chat_history::images(&attachments),
-                ..event_view(event, kind, event.payload.get("text")?.as_str()?.to_owned())
+                about: about.map(str::to_owned),
+                ..event_view(event, kind, text.to_owned())
             })
         }
         EventKind::ModelText => {

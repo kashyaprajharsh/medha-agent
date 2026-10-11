@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <title>Artifact rendering regression checks</title>
+    <style>
+      body { overflow: auto !important; }
+      .fixture-head { display: flex; justify-content: space-between; padding: 12px; }
+      .fixture-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .fixture-cases { padding: 12px; overflow: auto; height: 88vh; }
+      article { margin-bottom: 24px; }
+      article h2 { font-size: 18px; }
+      .fixture-viewer { height: 88vh; position: sticky; top: 0; }
+      .fixture-thumb { display: block !important; width: 180px !important; height: 130px !important; }
+      :root[data-hide-labels] .out-diagram { opacity: 0 !important; }
+    </style>
+  </head>
+  <body><div id="checks"></div><script type="module" src="/components.tsx"></script></body>
+</html>

@@ -6,7 +6,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 pub const SCHEME: &str = "medha-view";
@@ -122,12 +122,48 @@ struct Screen {
     policy: String,
     /// How many frames show this page; it is kept once and goes with the last of them.
     shown: usize,
+    assets: Arc<Vec<Asset>>,
+    fingerprint: [u8; 32],
+}
+
+pub struct Asset {
+    pub path: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+fn asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.contains(['\\', '%', ':', '?', '#'])
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+}
+
+fn asset_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/css"
+            | "text/javascript"
+            | "application/json"
+            | "image/svg+xml"
+            | "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "font/woff"
+            | "font/woff2"
+            | "font/ttf"
+            | "font/otf"
+    )
 }
 
 #[derive(Default)]
 pub struct Views {
     screens: Mutex<VecDeque<Screen>>,
     links: Mutex<VecDeque<(String, PathBuf)>>,
+    bundles: Mutex<VecDeque<(String, Arc<Vec<Asset>>)>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -159,40 +195,164 @@ pub fn media_type(path: &Path) -> Option<&'static str> {
 }
 
 impl Views {
+    pub fn bundle(&self, assets: Vec<Asset>) -> Result<String, String> {
+        let size: usize = assets.iter().map(|asset| asset.data.len()).sum();
+        let mut names = std::collections::HashSet::new();
+        if assets.len() > 64
+            || size > 32 * 1024 * 1024
+            || assets.iter().any(|asset| {
+                !asset_path(&asset.path)
+                    || !asset_mime(&asset.mime)
+                    || asset.data.len() > 4 * 1024 * 1024
+                    || !names.insert(&asset.path)
+            })
+        {
+            return Err("Invalid or oversized artifact asset manifest.".into());
+        }
+        let mut bundles = self.bundles.lock().unwrap();
+        let held: usize = bundles
+            .iter()
+            .flat_map(|(_, assets)| assets.iter())
+            .map(|asset| asset.data.len())
+            .sum();
+        if bundles.len() >= 32 || held + size > MAX_SCREENS {
+            return Err("Too many artifact assets are open. Close a preview and try again.".into());
+        }
+        let id = token()?;
+        bundles.push_back((id.clone(), Arc::new(assets)));
+        Ok(id)
+    }
+
+    pub fn drop_bundle(&self, id: &str) {
+        self.bundles
+            .lock()
+            .unwrap()
+            .retain(|(other, _)| other != id);
+    }
+
+    /// Lets go of everything the window held. A page that loads again has lost
+    /// every link it was given, so nothing it held would ever be dropped.
+    pub fn forget_all(&self) {
+        self.screens.lock().unwrap().clear();
+        self.links.lock().unwrap().clear();
+        self.bundles.lock().unwrap().clear();
+    }
+
     pub fn put(&self, html: String, reach: Reach) -> Result<String, String> {
+        self.put_bundle(html, reach, None)
+    }
+
+    pub fn put_bundle(
+        &self,
+        html: String,
+        reach: Reach,
+        bundle: Option<&str>,
+    ) -> Result<String, String> {
         if html.len() > MAX_SCREEN {
             return Err("This page is too large to preview.".into());
         }
-        let policy = policy(&reach);
+        let assets = if let Some(id) = bundle {
+            self.bundles
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(other, _)| other == id)
+                .map(|(_, assets)| assets.clone())
+                .ok_or("The artifact's assets were released. Reopen the preview.")?
+        } else {
+            Arc::new(Vec::new())
+        };
+        let mut policy = policy(&reach);
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(html.as_bytes());
+        digest.update(policy.as_bytes());
+        let fingerprint: [u8; 32] = digest.finalize().into();
         let mut screens = self.screens.lock().unwrap();
         // The same page under the same policy is the same thing to serve.
-        if let Some(same) = screens
-            .iter_mut()
-            .find(|screen| screen.policy == policy && screen.html == html)
-        {
+        if let Some(same) = screens.iter_mut().find(|screen| {
+            bundle.is_none() && screen.assets.is_empty() && screen.fingerprint == fingerprint
+        }) {
             same.shown += 1;
             return Ok(format!("{BASE}/screen/{}", same.id));
         }
         let id = token()?;
+        let html = if !matches!(reach, Reach::App(_)) {
+            if matches!(reach, Reach::Still) {
+                // Only our reporting script runs in a stopped/static preview;
+                // author scripts remain blocked by a nonce CSP.
+                policy = policy.replace(
+                    "sandbox;",
+                    &format!("sandbox allow-scripts; script-src 'nonce-{id}';"),
+                );
+            }
+            let monitor = format!(
+                "<script nonce=\"{id}\">addEventListener('securitypolicyviolation',e=>parent.postMessage({{kind:'medha-preview-blocked',id:'{id}',uri:e.blockedURI,directive:e.violatedDirective}},'*'))</script>"
+            );
+            if let Some(end) = html
+                .to_ascii_lowercase()
+                .find("<head")
+                .and_then(|at| html[at..].find('>').map(|end| at + end + 1))
+            {
+                format!("{}{}{}", &html[..end], monitor, &html[end..])
+            } else {
+                format!("{monitor}{html}")
+            }
+        } else {
+            html
+        };
+        if !assets.is_empty() {
+            let own = format!("{BASE}/screen/{id}/");
+            for directive in ["style-src", "img-src", "font-src", "media-src"] {
+                policy = policy.replace(&format!("{directive} "), &format!("{directive} {own} "));
+            }
+            if !matches!(reach, Reach::Still) {
+                policy = policy.replace("script-src ", &format!("script-src {own} "));
+            }
+            if policy.contains("connect-src ") {
+                policy = policy.replace("connect-src ", &format!("connect-src {own} "));
+            } else {
+                policy.push_str(&format!("; connect-src {own}"));
+            }
+        }
+        let held: usize = screens
+            .iter()
+            .map(|screen| {
+                screen.html.len()
+                    + screen
+                        .assets
+                        .iter()
+                        .map(|asset| asset.data.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let size = html.len() + assets.iter().map(|asset| asset.data.len()).sum::<usize>();
+        if screens.len() >= 64 || held + size > MAX_SCREENS {
+            return Err("Too many previews are open. Close one and try again.".into());
+        }
         screens.push_back(Screen {
             id: id.clone(),
             html,
             policy,
             shown: 1,
+            assets,
+            fingerprint,
         });
-        while screens
-            .iter()
-            .map(|screen| screen.html.len())
-            .sum::<usize>()
-            > MAX_SCREENS
-        {
-            screens.pop_front();
-        }
-        Ok(format!("{BASE}/screen/{id}"))
+        Ok(if bundle.is_some() {
+            format!("{BASE}/screen/{id}/index.html")
+        } else {
+            format!("{BASE}/screen/{id}")
+        })
     }
 
     pub fn drop_screen(&self, url: &str) {
-        let id = url.rsplit('/').next().unwrap_or_default();
+        let id = url
+            .split("/screen/")
+            .nth(1)
+            .unwrap_or_default()
+            .split('/')
+            .next()
+            .unwrap_or_default();
         self.screens.lock().unwrap().retain_mut(|screen| {
             if screen.id == id {
                 screen.shown -= 1;
@@ -227,11 +387,32 @@ impl Views {
         }
     }
 
-    fn screen(&self, id: &str) -> Reply {
+    fn screen(&self, path: &str) -> Reply {
+        let (id, asset) = path.split_once('/').unwrap_or((path, ""));
         let screens = self.screens.lock().unwrap();
         let Some(screen) = screens.iter().find(|screen| screen.id == id) else {
             return plain(404);
         };
+        if !asset.is_empty() && asset != "index.html" {
+            // Percent encoding is decoded by the URL adapter only for ordinary
+            // names; no arbitrary path, traversal or filesystem lookup occurs.
+            let Ok(asset) = percent_name(asset) else {
+                return plain(404);
+            };
+            let Some(asset) = screen.assets.iter().find(|entry| entry.path == asset) else {
+                return plain(404);
+            };
+            return Reply {
+                status: 200,
+                headers: vec![
+                    ("Content-Type", asset.mime.clone()),
+                    ("X-Content-Type-Options", "nosniff".into()),
+                    ("Access-Control-Allow-Origin", "*".into()),
+                    ("Cache-Control", "no-store".into()),
+                ],
+                body: asset.data.clone(),
+            };
+        }
         let policy = screen.policy.as_str();
         Reply {
             status: 200,
@@ -290,6 +471,35 @@ impl Views {
             body,
         }
     }
+}
+
+fn percent_name(path: &str) -> Result<String, ()> {
+    // Asset names with spaces/non-ASCII characters arrive URL-encoded. Reject
+    // encoded separators and traversal, then compare the whole manifest key.
+    let mut bytes = Vec::new();
+    let mut input = path.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let hex = |byte: u8| {
+                (byte as char)
+                    .to_digit(16)
+                    .map(|digit| digit as u8)
+                    .ok_or(())
+            };
+            let decoded = hex(input.next().ok_or(())?)? * 16 + hex(input.next().ok_or(())?)?;
+            if matches!(decoded, b'/' | b'\\' | b'%') {
+                return Err(());
+            }
+            bytes.push(decoded);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let name = String::from_utf8(bytes).map_err(|_| ())?;
+    if !asset_path(&name) {
+        return Err(());
+    }
+    Ok(name)
 }
 
 fn plain(status: u16) -> Reply {

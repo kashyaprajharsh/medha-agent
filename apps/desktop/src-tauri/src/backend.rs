@@ -3,8 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-#[cfg(test)]
-pub(crate) use medha_client::OPEN_ELSEWHERE;
 pub(crate) use medha_client::{Connection, Hear, NOT_TAKING, Said, TOO_LARGE, WRAPPER, size};
 
 pub(crate) struct Backend(Arc<medha_client::Backend>);
@@ -15,7 +13,12 @@ impl Backend {
         Arc::clone(SHARED.get_or_init(|| {
             Arc::new(Self(medha_client::Backend::for_surface(
                 executable,
-                &["shared-live-state", "workspace-images", "model-providers"],
+                &[
+                    "shared-live-state",
+                    "workspace-images",
+                    "model-providers",
+                    "artifact-revisions",
+                ],
             )))
         }))
     }

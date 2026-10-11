@@ -458,6 +458,7 @@ impl ProviderClient {
         }
 
         let byte_stream = resp.bytes_stream();
+        let idle = http::stream_idle(&connection.profile);
         let stream = async_stream::stream! {
             let mut sse = crate::transport::sse::SseDecoder::default();
             let mut decoder = gemini_interactions::ResponseDecoder::new(names.clone());
@@ -466,13 +467,13 @@ impl ProviderClient {
             let mut unread = Some(Vec::new());
 
             futures::pin_mut!(byte_stream);
-            let mut progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
+            let mut progress_deadline = tokio::time::Instant::now() + idle;
             'chunks: loop {
                 let next = tokio::time::timeout_at(progress_deadline, byte_stream.next()).await;
                 let chunk = match next {
                     Err(_) if decoder.completed() => break,
                     Err(_) => {
-                        yield Err(http::stalled_stream());
+                        yield Err(http::stalled_stream(idle));
                         return;
                     }
                     Ok(None) => break,
@@ -480,7 +481,7 @@ impl ProviderClient {
                 };
                 match chunk {
                     Err(error) => {
-                        yield Err(ProviderError::Transport(error.to_string()));
+                        yield Err(http::stream_read_failed(error));
                         return;
                     }
                     Ok(bytes) => {
@@ -496,11 +497,11 @@ impl ProviderClient {
                             Err(error) => { yield Err(error); return; }
                         };
                         for event in events {
+                            if event.is_delivery() {
+                                progress_deadline = tokio::time::Instant::now() + idle;
+                            }
                             match decoder.push(&event) {
                                 Ok(blocks) => {
-                                    if decoder.progressed() {
-                                        progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
-                                    }
                                     for block in blocks {
                                         unread = None;
                                         yield Ok(block);
@@ -1254,6 +1255,7 @@ impl Provider for ProviderClient {
         }
 
         let byte_stream = resp.bytes_stream();
+        let idle = http::stream_idle(&connection.profile);
         let s = async_stream::stream! {
             let mut sse = crate::transport::sse::SseDecoder::default();
             let mut decoder = openai_chat::ResponseDecoder::new(names.clone());
@@ -1265,7 +1267,7 @@ impl Provider for ProviderClient {
             let mut unread = Some(Vec::new());
 
             futures::pin_mut!(byte_stream);
-            let mut progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
+            let mut progress_deadline = tokio::time::Instant::now() + idle;
             'chunks: loop {
                 let next = tokio::time::timeout_at(progress_deadline, byte_stream.next()).await;
                 let chunk = match next {
@@ -1274,7 +1276,7 @@ impl Provider for ProviderClient {
                         if let Some(b) = decoder.flush_pending() {
                             yield Ok(b);
                         }
-                        yield Err(http::stalled_stream());
+                        yield Err(http::stalled_stream(idle));
                         return;
                     }
                     Ok(None) => break,
@@ -1287,7 +1289,7 @@ impl Provider for ProviderClient {
                         if let Some(b) = decoder.flush_pending() {
                             yield Ok(b);
                         }
-                        yield Err(ProviderError::Transport(e.to_string()));
+                        yield Err(http::stream_read_failed(e));
                         return;
                     }
                     Ok(bytes) => {
@@ -1303,11 +1305,11 @@ impl Provider for ProviderClient {
                             Err(error) => { yield Err(error); return; }
                         };
                         for event in events {
+                            if event.is_delivery() {
+                                progress_deadline = tokio::time::Instant::now() + idle;
+                            }
                             match decoder.push(&event) {
                                 Ok(blocks) => {
-                                    if decoder.progressed() {
-                                        progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
-                                    }
                                     for b in blocks { unread = None; yield Ok(b); }
                                 },
                                 Err(e) => { yield Err(e); return; }

@@ -1,23 +1,21 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import { useWorkspaceApi } from "./Workspace";
 import type { ToolScreen } from "./api";
 import type { Step, WritingCall } from "./live";
 import { useOffered } from "./OutputApp";
-import { labelOf, noteOf, screenOutput, titleOf, versionsOf, type Output, type OutputKind } from "./outputBlocks";
+import { labelOf, noteOf, screenOutput, titleOf, versionsOf, type Output } from "./outputBlocks";
 import { useOutputs, type Detail } from "./outputContext";
 import { useKeyed } from "./outputFiles";
 import { Rendered } from "./OutputRendered";
 
-type Props = {
-  anchor: string;
-  kind: OutputKind;
-  source: string;
+type Props = Omit<Output, "name"> & {
   writing: boolean;
   order: number;
   path?: string;
   name?: string;
   screen?: ToolScreen;
+  fresh?: boolean;
 };
 
 type ScreensProps = {
@@ -30,26 +28,43 @@ type ScreensProps = {
 
 /** The screens the tools in one stretch of work came with, each as a plate. */
 export const Screens = memo(function Screens({ steps, at, writing, fresh }: ScreensProps) {
-  const { made } = useOutputs();
+  const { made, all, resolve, show } = useOutputs();
   const offered = useOffered(writing);
-  // One plate per call, from its first written piece to its result, so the
-  // screen that drew the pieces is the one that shows the finished drawing.
+  // A completed screen belongs to its durable event. Providers can reuse call
+  // IDs, so those IDs identify only an unfinished call in this stretch of work.
   const shown = new Map<string, { screen: ToolScreen; written: boolean }>();
   for (const call of writing ?? []) {
     const tool = offered(call.tool);
     if (tool) shown.set(call.id, { screen: { ...tool, partial: call.text }, written: false });
   }
-  for (const step of steps) if (step.screen) shown.set(step.id, { screen: step.screen, written: true });
+  const failed: Step[] = [];
+  for (const step of steps) if (step.screen) {
+    if (step.status === "ok" && !(step.screen.result as { isError?: boolean } | undefined)?.isError) {
+      shown.delete(step.id);
+      shown.set(step.screen.source_event ?? step.id, { screen: step.screen, written: true });
+    }
+    else if (step.status !== "running") { shown.delete(step.id); failed.push(step); }
+  }
+  const files = all.filter((output) => steps.some((step) =>
+    step.sourceEvent && step.sourceEvent === output.sourceEvent && step.status === "ok" &&
+    // A presentation snapshot carries the observation's event ID. Its screen
+    // can be recovered from the catalogue without duplicating screen bodies in
+    // every shared snapshot; the live notification already supplies its plate.
+    (output.kind !== "app" || !step.screen)));
   // A screen that arrives while the person watches opens beside the chat, like anything Medha makes.
   const newest = [...shown].filter(([, entry]) => entry.written).at(-1);
   const anchor = newest && `screen:${newest[0]}`;
   const arrived = newest?.[1].screen;
+  const opened = useRef<string>(undefined);
   useEffect(() => {
-    if (fresh && arrived && anchor) made?.(screenOutput(anchor, arrived));
-  }, [fresh, made, anchor, arrived]);
-  if (!shown.size) return null;
+    if (fresh && arrived && anchor && opened.current !== anchor) { opened.current = anchor; const output = screenOutput(anchor, arrived); made?.(resolve?.(output) ?? output); }
+  }, [fresh, made, anchor, arrived, resolve]);
+  if (!shown.size && !failed.length && !files.length) return null;
   return (
+    <>
+      {failed.map((step) => <details key={step.sourceEvent ?? step.id} className="out-failed"><summary>{labelOf({ kind: "app", screen: step.screen })} couldn't finish</summary><p>{step.summary ?? step.detail ?? "The tool did not produce an output."}</p>{step.output && <pre>{step.output}</pre>}<button type="button" onClick={() => show?.(screenOutput(`error-screen:${step.sourceEvent ?? step.id}`, step.screen!))}>Inspect error screen</button></details>)}
     <div className="out-grid">
+      {files.map((output, index) => <Plate key={output.anchor} {...output} writing={false} fresh={fresh} order={at * 1000 + index} />)}
       {[...shown].map(([id, { screen, written }], index) => (
         <Plate
           key={id}
@@ -60,6 +75,7 @@ export const Screens = memo(function Screens({ steps, at, writing, fresh }: Scre
         />
       ))}
     </div>
+    </>
   );
 });
 
@@ -74,62 +90,40 @@ export function Caption({ output, detail }: { output: Output; detail?: Detail })
 export function Unshown({ output, problem }: { output: Output; problem: string }) {
   const api = useWorkspaceApi();
   const path = output.path!;
+  const [failure, setFailure] = useState<string>();
+  const act = (call: Promise<unknown>) => { setFailure(undefined); void call.catch((error) => setFailure(String(error))); };
   return (
     <div className="out-problem">
       <b>{path.split(/[\\/]/).at(-1)}</b>
       <span>{problem}</span>
       <div className="out-problem-actions">
-        <button type="button" onClick={() => void api.revealFile(path).catch(() => {})}>
+        <button type="button" onClick={() => act(api.revealFile(path))}>
           Show in folder
         </button>
-        <button type="button" onClick={() => void api.openFile(path).catch(() => {})}>
+        <button type="button" onClick={() => act(api.openFile(path))}>
           Open
         </button>
       </div>
+      {failure && <span role="alert">{failure}</span>}
     </div>
   );
 }
 
-/**
- * A file the reply only named. It becomes a plate once it is found in the chat's
- * folder, and stays out of the way when it is not there or nothing can open it.
- */
-export function Mentioned({ fresh, ...plate }: Props & { fresh: boolean }) {
-  const api = useWorkspaceApi();
-  const { enter, made } = useOutputs();
-  const [there, setThere] = useState(false);
-  const { anchor, kind, path = "", name } = plate;
-  useEffect(() => {
-    if (!enter) return;
-    let current = true;
-    const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    void api
-      .files(path.slice(0, Math.max(cut, 0)))
-      .then((entries) => {
-        if (!current || !entries.some((entry) => !entry.directory && entry.name === path.slice(cut + 1))) return;
-        setThere(true);
-        if (fresh) made?.({ anchor, kind, source: "", path, name: name ?? path.slice(cut + 1) });
-      })
-      .catch(() => {});
-    return () => {
-      current = false;
-    };
-  }, [api, enter, made, fresh, anchor, kind, path, name]);
-  return there ? <Plate {...plate} /> : null;
-}
-
 /** One thing Medha made, shown where it was made: the content, then one caption row. */
-export const Plate = memo(function Plate({ anchor, kind, source, writing, order, path, name: given, screen }: Props) {
-  const { open, all, viewing, show, follow, enter, made, ask } = useOutputs();
-  const [problem, setProblem] = useKeyed<string>(`${source}\0${path}\0${screen?.resource}`);
-  const [detail, setDetail] = useKeyed<Detail>(`${source}\0${path}\0${screen?.resource}`);
+export const Plate = memo(function Plate({ anchor: requestedAnchor, kind, source, writing, order, path, name: given, screen, fresh, ...identity }: Props) {
+  const { open, all, viewing, show, follow, enter, made, fix, running, resolve } = useOutputs();
+  const [problem, setProblem] = useKeyed<string>(`${requestedAnchor}\0${source}\0${path}\0${screen?.resource}`);
+  const [detail, setDetail] = useKeyed<Detail>(`${requestedAnchor}\0${source}\0${path}\0${screen?.resource}`);
   const [code, setCode] = useState(false);
+  const [asked, setAsked] = useState(false);
+  const [valid, setValid] = useState(false);
+  const report = useCallback((problem: string | undefined) => { setProblem(problem); setValid(!problem); }, [setProblem]);
   const stage = useRef<HTMLDivElement>(null);
   const output = useMemo<Output>(
-    () => ({ anchor, kind, source, path, screen, name: given ?? titleOf(kind, source) }),
-    [anchor, kind, source, path, screen, given],
+    () => { const output = { ...identity, anchor: requestedAnchor, kind, source, path, screen, name: given ?? titleOf(kind, source) }; return !writing && resolve ? resolve(output) : output; },
+    [requestedAnchor, kind, source, path, screen, given, writing, resolve, identity.artifactId, identity.sourceEvent, identity.sourceIndex, identity.sourceDigest, identity.revisionId, identity.snapshot, identity.sessionId, identity.toolCall, identity.storedSource, identity.predecessor],
   );
-  const { name } = output;
+  const { name, anchor } = output;
   useEffect(() => (writing ? undefined : enter?.(output, order)), [enter, output, order, writing]);
   const here = open?.anchor === anchor;
   useEffect(() => {
@@ -141,16 +135,19 @@ export const Plate = memo(function Plate({ anchor, kind, source, writing, order,
   useEffect(() => {
     if (wrote.current && !writing) {
       setDeveloped(true);
-      made?.(output);
     }
     wrote.current = writing;
   }, [writing, made, output]);
+  const opened = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!writing && valid && (fresh || developed) && opened.current !== anchor) { opened.current = anchor; made?.(output); }
+  }, [writing, valid, fresh, developed, anchor, made, output]);
 
   const versions = versionsOf(all, output);
   const version = versions.findIndex((other) => other.anchor === anchor) + 1;
   // The same thing shown again elsewhere in the chat is current too; a screen is only ever itself.
   const current =
-    here || (!screen && !!open && open.kind === kind && open.source === source && open.path === path);
+    here || (!!open && !!output.revisionId && open.revisionId === output.revisionId);
   const reveal =
     show && !writing && !problem
       ? () => show(output, stage.current?.getBoundingClientRect())
@@ -163,7 +160,7 @@ export const Plate = memo(function Plate({ anchor, kind, source, writing, order,
     return (
       <button type="button" className={`out-revision ${current ? "current" : ""}`} onClick={reveal}>
         <span className="out-thumb">
-          <Rendered output={output} size="thumb" onProblem={setProblem} />
+          <Rendered output={output} size="thumb" onProblem={report} />
         </span>
         <span className="out-revision-text">
           <b>{name}</b>
@@ -188,7 +185,7 @@ export const Plate = memo(function Plate({ anchor, kind, source, writing, order,
             output={output}
             size="plate"
             writing={writing}
-            onProblem={setProblem}
+            onProblem={report}
             onDetail={setDetail}
           />
         ) : path ? (
@@ -204,20 +201,23 @@ export const Plate = memo(function Plate({ anchor, kind, source, writing, order,
             <b>This {label.toLowerCase()} couldn't be drawn</b>
             <span>{problem}</span>
             <div className="out-problem-actions">
-              <button type="button" onClick={() => setCode((seen) => !seen)}>
-                {code ? "Hide code" : "Show code"}
-              </button>
-              {ask && (
+              {fix && (
                 <button
                   type="button"
                   className="gold"
-                  onClick={() =>
-                    ask(`The ${label.toLowerCase()} "${name}" couldn't be drawn. ${problem} Please fix it.`)
-                  }
+                  // One request per broken output; while Medha works, another would only steer it.
+                  disabled={running || asked}
+                  onClick={() => {
+                    setAsked(true);
+                    fix(output, `The ${label.toLowerCase()} "${name}" couldn't be drawn. ${problem} Please fix it.`);
+                  }}
                 >
-                  Ask Medha to fix it
+                  {asked && running ? "Fixing…" : "Fix it"}
                 </button>
               )}
+              <button type="button" onClick={() => setCode((seen) => !seen)}>
+                {code ? "Hide code" : "Show code"}
+              </button>
             </div>
             {code && <pre className="out-source">{source}</pre>}
           </div>

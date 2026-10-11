@@ -150,7 +150,7 @@ function Table({ file, size, onDetail }: RenderProps & { file: FilePreview }) {
 
 /** A document, a PDF or a table Medha wrote to a file, read and shown on paper. */
 export default function Paper(props: RenderProps) {
-  const file = useFile(props.output.path, props.onProblem);
+  const file = useFile(props.output, props.onProblem);
   if (!file) return <div className="out-wait" />;
   if (props.output.kind === "pdf") return <Pdf {...props} file={file} />;
   if (props.output.kind === "table") return <Table {...props} file={file} />;

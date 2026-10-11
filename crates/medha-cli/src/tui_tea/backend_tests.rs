@@ -35,6 +35,58 @@ fn setup_enter(model: &mut Model) {
     input::handle_key(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 }
 
+/// A message typed while startup reads hold every request slot is sent when
+/// one frees, never refused; at launch that is the first thing a person types.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_typed_while_requests_are_busy_waits_and_is_sent() {
+    let mut f = fixture().await;
+    while send_slot_free(&f.model) {
+        assert!(request(
+            &mut f.model,
+            Effect::Read(Read::Sessions, After::Notice)
+        ));
+    }
+    let sends = |model: &Model| {
+        model.remote.as_ref().unwrap().pending.iter()
+            .filter(|pending| matches!(&pending.effect, Effect::Send(draft) if draft.request.content == "hello"))
+            .count()
+    };
+    input::handle_paste(&mut f.model, "hello".into());
+    setup_enter(&mut f.model);
+    assert_eq!(sends(&f.model), 0);
+    assert!(
+        f.model.input.is_empty(),
+        "the message is on its way, not left to retype"
+    );
+    assert!(
+        !f.model
+            .items
+            .iter()
+            .any(|entry| format!("{:?}", entry.item).contains("still finishing")),
+        "nothing was refused"
+    );
+    let read = f
+        .model
+        .remote
+        .as_mut()
+        .unwrap()
+        .pending
+        .pop_front()
+        .unwrap();
+    completed(
+        &mut f.model,
+        &mut f.view,
+        Completion {
+            generation: 1,
+            effect: read.effect,
+            form: read.form,
+            command: read.command,
+            result: Err("done".into()),
+        },
+    );
+    assert_eq!(sends(&f.model), 1, "sent once a slot was free");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_setup_searches_pasted_text_resolves_parameters_and_keeps_secrets_out_of_transcript()
  {
@@ -147,6 +199,50 @@ async fn an_explicit_model_test_is_owned_by_its_form_and_does_not_save_or_activa
             .iter()
             .any(|entry| format!("{:?}", entry.item).contains("old test completed"))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_setup_timeout_is_unconfirmed_and_does_not_save_or_activate() {
+    let mut f = fixture().await;
+    let mut setup = ModelSetup::new();
+    setup.protocol = kernel::Protocol::OpenAiChat;
+    setup.base_url = "http://localhost/v1".into();
+    setup.model = "fixture".into();
+    setup.step = ModelSetupStep::ConfirmTest;
+    f.model.model_setup = Some(setup);
+    input::handle_paste(&mut f.model, "test".into());
+    setup_enter(&mut f.model);
+    let skipped = protocol::ModelTestCheck {
+        status: protocol::ModelTestStatus::Skipped,
+        message: "Not tested because an earlier check failed.".into(),
+        failure: None,
+    };
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::Tested(protocol::ModelTestResult {
+            text: protocol::ModelTestCheck {
+                status: protocol::ModelTestStatus::Failed,
+                message: "Model support is not confirmed.".into(),
+                failure: Some("timeout".into()),
+            },
+            streaming: skipped.clone(),
+            tools: skipped,
+        })),
+    );
+    let shown = f
+        .model
+        .items
+        .iter()
+        .map(|entry| format!("{:?}", entry.item))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(shown.contains("Text: Timed out"));
+    assert!(!shown.contains("Text: Failed"));
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().step,
+        ModelSetupStep::ReviewTest
+    ));
+    assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -508,6 +604,7 @@ fn snapshot(model: &Model, text: &str) -> protocol::PresentationSnapshot {
         items: vec![protocol::PresentationItem::User {
             text: text.into(),
             images: Vec::new(),
+            about: None,
         }],
         revision: 0,
         running: false,
@@ -882,6 +979,7 @@ async fn consecutive_turns_keep_their_assistant_answers_separate() {
         &mut f.model,
         protocol::TurnEvent::Text {
             delta: "first".into(),
+            source_event: None,
         },
     );
     turn_event(&mut f.model, protocol::TurnEvent::Done { stopped: None });
@@ -890,6 +988,7 @@ async fn consecutive_turns_keep_their_assistant_answers_separate() {
         &mut f.model,
         protocol::TurnEvent::Text {
             delta: "second".into(),
+            source_event: None,
         },
     );
     let answers: Vec<_> = f

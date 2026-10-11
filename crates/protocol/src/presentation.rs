@@ -12,9 +12,14 @@ pub enum PresentationItem {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<super::SavedImage>,
+        /// The output this message was about, as a label to show beside it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        about: Option<String>,
     },
     Assistant {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_event: Option<String>,
     },
     Reasoning {
         text: String,
@@ -29,6 +34,8 @@ pub enum PresentationItem {
         tool: String,
         ok: bool,
         payload: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_event: Option<String>,
     },
     Notice {
         text: String,

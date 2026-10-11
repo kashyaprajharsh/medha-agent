@@ -573,7 +573,6 @@ pub(crate) struct ResponseDecoder {
     target_announced: HashSet<u32>,
     think_filter: ThinkTagFilter,
     completed: bool,
-    progressed: bool,
 }
 
 impl ResponseDecoder {
@@ -584,7 +583,6 @@ impl ResponseDecoder {
             target_announced: HashSet::new(),
             think_filter: ThinkTagFilter::default(),
             completed: false,
-            progressed: false,
         }
     }
 
@@ -595,33 +593,16 @@ impl ResponseDecoder {
             &mut self.think_filter,
             &mut self.target_announced,
         )?;
-        self.progressed = false;
         if event.data.trim() == "[DONE]" {
-            self.progressed = !self.completed;
             self.completed = true;
         } else if let Ok(chunk) = serde_json::from_str::<StreamChunk>(&event.data)
             && let Some(choice) = chunk.choices.first()
         {
-            let delta = &choice.delta;
-            self.progressed = [&delta.content, &delta.reasoning_content, &delta.reasoning]
-                .iter()
-                .any(|text| text.as_ref().is_some_and(|text| !text.is_empty()))
-                || delta.tool_calls.iter().any(|call| {
-                    call.function.as_ref().is_some_and(|function| {
-                        [&function.name, &function.arguments]
-                            .iter()
-                            .any(|text| text.as_ref().is_some_and(|text| !text.is_empty()))
-                    })
-                })
-                || (!self.completed && choice.finish_reason.is_some());
             self.completed |= choice.finish_reason.is_some();
         }
         Ok(blocks)
     }
 
-    pub(crate) fn progressed(&self) -> bool {
-        self.progressed
-    }
     pub(crate) fn completed(&self) -> bool {
         self.completed
     }
@@ -1280,39 +1261,6 @@ mod tests {
                     .any(|b| matches!(b, Block::ToolIntent(_)))
             );
         }
-    }
-
-    #[test]
-    fn stream_progress_excludes_keepalives_but_includes_tool_arguments() {
-        let mut decoder = ResponseDecoder::new(HashMap::new());
-        for (data, progress) in [
-            (r#"{"choices":[{"delta":{"content":"working"}}]}"#, true),
-            (r#"{"choices":[],"usage":{"prompt_tokens":10}}"#, false),
-            (r#"{"choices":[{"delta":{}}]}"#, false),
-            ("", false),
-            (
-                r#"{"choices":[{"delta":{"reasoning_content":"checking"}}]}"#,
-                true,
-            ),
-            (
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
-                true,
-            ),
-            (
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]}}]}"#,
-                true,
-            ),
-            ("[DONE]", true),
-        ] {
-            decoder
-                .push(&SseEvent {
-                    event: None,
-                    data: data.into(),
-                })
-                .unwrap();
-            assert_eq!(decoder.progressed(), progress, "{data}");
-        }
-        assert!(decoder.finish().is_ok());
     }
 
     #[test]

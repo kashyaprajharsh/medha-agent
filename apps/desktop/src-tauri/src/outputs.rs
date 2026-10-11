@@ -1,6 +1,6 @@
 //! Commands behind the things a chat makes: showing, saving and revealing them.
 
-use crate::{DesktopState, files, kept, view};
+use crate::{DesktopState, artifacts, files, kept, view};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tauri::{Manager, State, UriSchemeContext, UriSchemeResponder, http};
@@ -25,6 +25,7 @@ pub fn screen_put(
     run: bool,
     online: bool,
     app: Option<view::Origins>,
+    bundle: Option<String>,
 ) -> Result<String, String> {
     // The window passes `online` only for a page the person allowed, one page at a
     // time, and `app` only for a connected server's screen, with what it declared.
@@ -34,7 +35,10 @@ pub fn screen_put(
         (None, false, true) => view::Reach::Running,
         (None, false, false) => view::Reach::Still,
     };
-    state.views.put(html, reach)
+    match bundle {
+        Some(bundle) => state.views.put_bundle(html, reach, Some(&bundle)),
+        None => state.views.put(html, reach),
+    }
 }
 
 fn shelf(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -75,6 +79,11 @@ pub async fn screen_kept(
 #[tauri::command]
 pub fn screen_drop(state: State<'_, DesktopState>, url: String) {
     state.views.drop_screen(&url);
+}
+
+#[tauri::command]
+pub fn artifact_release(state: State<'_, DesktopState>, bundle: String) {
+    state.views.drop_bundle(&bundle);
 }
 
 #[tauri::command]
@@ -130,28 +139,70 @@ pub fn file_reveal(
     shown.map(|_| ()).map_err(|error| error.to_string())
 }
 
-/// Saves an output where the person chooses: its bytes, or a copy of its file. `false` when they cancel.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveOutput {
+    name: String,
+    content: SaveContent,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SaveContent {
+    Bytes { data: Vec<u8> },
+    File { path: String },
+    Revision { revision_id: String },
+}
+
+/// Saves one explicit source where the person chooses. `false` when they cancel.
 #[tauri::command]
 pub async fn output_save(
     state: State<'_, DesktopState>,
     workspace_id: String,
     chat_key: Option<String>,
     session_id: Option<String>,
-    name: String,
-    data: Option<Vec<u8>>,
-    path: Option<String>,
+    request: SaveOutput,
 ) -> Result<bool, String> {
-    let from = match &path {
-        Some(path) => Some(within(
+    enum Source {
+        Bytes(Vec<u8>),
+        File(PathBuf),
+    }
+    let source = match request.content {
+        SaveContent::Revision {
+            revision_id: revision,
+        } => {
+            let session = session_id
+                .as_deref()
+                .ok_or("The artifact has no conversation.")?;
+            let runtime = state
+                .workspaces
+                .resolve(&workspace_id, None, Some(session))?;
+            let session = session.to_owned();
+            let data = tauri::async_runtime::spawn_blocking(move || {
+                let manifest = artifacts::manifest(&runtime, &session, &revision)?;
+                artifacts::bytes(
+                    &runtime,
+                    &session,
+                    &revision,
+                    None,
+                    manifest.size,
+                    &manifest.hash,
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            Source::Bytes(data)
+        }
+        SaveContent::Bytes { data } => Source::Bytes(data),
+        SaveContent::File { path } => Source::File(within(
             &state,
             &workspace_id,
             chat_key.as_deref(),
             session_id.as_deref(),
-            path,
+            &path,
         )?),
-        None => None,
     };
-    let name = name.replace(['/', '\\', ':'], "-");
+    let name = request.name.replace(['/', '\\', ':'], "-");
     let Some(target) = rfd::AsyncFileDialog::new()
         .set_title("Save")
         .set_file_name(name)
@@ -161,10 +212,9 @@ pub async fn output_save(
         return Ok(false);
     };
     let target = target.path().to_path_buf();
-    tauri::async_runtime::spawn_blocking(move || match (from, data) {
-        (Some(from), _) => std::fs::copy(from, target).map(|_| ()),
-        (None, Some(data)) => std::fs::write(target, data),
-        (None, None) => Ok(()),
+    tauri::async_runtime::spawn_blocking(move || match source {
+        Source::File(from) => std::fs::copy(from, target).map(|_| ()),
+        Source::Bytes(data) => std::fs::write(target, data),
     })
     .await
     .map_err(|error| error.to_string())?
@@ -200,4 +250,28 @@ pub fn serve<R: tauri::Runtime>(
             responder.respond(response);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_historical_export_cannot_silently_choose_a_current_file_instead() {
+        let saved = json!({"name":"old.html","content":{"kind":"revision","revision_id":"old"}});
+        assert!(serde_json::from_value::<SaveOutput>(saved.clone()).is_ok());
+        let mut conflicting = saved;
+        conflicting["content"]["path"] = json!("current.html");
+        assert!(serde_json::from_value::<SaveOutput>(conflicting).is_err());
+        for content in [
+            json!({}),
+            json!({"kind":"bytes","data":[1],"revision_id":"old"}),
+        ] {
+            assert!(
+                serde_json::from_value::<SaveOutput>(json!({"name":"old.html","content":content}))
+                    .is_err()
+            );
+        }
+    }
 }

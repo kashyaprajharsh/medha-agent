@@ -896,7 +896,7 @@ pub(super) fn item(item: protocol::PresentationItem) -> Item {
     use protocol::PresentationItem as P;
     match item {
         P::User { text, .. } => Item::User(text),
-        P::Assistant { text } => Item::Assistant(text),
+        P::Assistant { text, .. } => Item::Assistant(text),
         P::Reasoning { text } => Item::Thinking(text),
         P::Notice { text } => Item::Notice(text),
         P::ToolCall { id, tool, args } => Item::ToolCall { id, tool, args },
@@ -905,6 +905,7 @@ pub(super) fn item(item: protocol::PresentationItem) -> Item {
             tool,
             ok,
             payload,
+            ..
         } => Item::ToolResult {
             id,
             tool,
@@ -1365,9 +1366,11 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
         }
         E::PresentationReset { .. } | E::Restarted => recover(model),
         E::User { content, .. } => model.push_main_item(Item::User(content)),
-        E::Text { delta } => {
-            model.current_tool = None;
-            model.push_text_delta(&delta);
+        E::Text { delta, .. } => {
+            if !delta.is_empty() {
+                model.current_tool = None;
+                model.push_text_delta(&delta);
+            }
         }
         E::Reasoning { delta } => model.push_thinking_delta(&delta),
         E::Notice { text } => model.push_main_notice(text),
@@ -1378,6 +1381,7 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
             tool,
             ok,
             payload,
+            ..
         } => {
             model.current_tool = None;
             model.push_main_item(Item::ToolResult {
@@ -1541,7 +1545,26 @@ pub(super) fn restore_draft(model: &mut Model, text: String) {
     model.cursor = model.input.len();
 }
 
+/// Whether a message could be sent now without waiting for a request to finish.
+pub(super) fn send_slot_free(model: &Model) -> bool {
+    model
+        .remote
+        .as_ref()
+        .is_some_and(|peer| peer.normal < NORMAL_REQUESTS)
+}
+
 fn completed(model: &mut Model, stream: &mut View, done: Completion) {
+    settle(model, stream, done);
+    // A message typed while every request slot was taken goes once one frees.
+    if send_slot_free(model)
+        && !model.images.is_loading()
+        && let Some(held) = model.backend_deferred.take()
+    {
+        crate::tui_tea::backend_features::send_held(model, held);
+    }
+}
+
+fn settle(model: &mut Model, stream: &mut View, done: Completion) {
     let Some(peer) = &mut model.remote else {
         return;
     };
@@ -1838,7 +1861,13 @@ fn completed(model: &mut Model, stream: &mut View, done: Completion) {
                     ("Streaming", result.streaming),
                     ("Functions", result.tools),
                 ] {
-                    model.push_notice(format!("{name}: {:?} — {}", check.status, check.message));
+                    let status = match (check.status, check.failure.as_deref()) {
+                        (protocol::ModelTestStatus::Failed, Some("timeout")) => "Timed out",
+                        (protocol::ModelTestStatus::Passed, _) => "Passed",
+                        (protocol::ModelTestStatus::Failed, _) => "Failed",
+                        (protocol::ModelTestStatus::Skipped, _) => "Skipped",
+                    };
+                    model.push_notice(format!("{name}: {status} — {}", check.message));
                 }
                 if let Some(setup) = &mut model.model_setup {
                     setup.step = ModelSetupStep::ReviewTest;
@@ -1911,11 +1940,15 @@ fn completed(model: &mut Model, stream: &mut View, done: Completion) {
                 };
                 model.session_op = None;
                 model.images.reset();
-                model.backend_deferred = None;
+                let held = model.backend_deferred.take();
                 model.tool_viz = tool_viz(&bootstrap);
                 model.restore.execution = bootstrap.execution_backend;
                 model.memory_enabled = bootstrap.memory_enabled;
                 restore_snapshot(model, snapshot);
+                // A message still waiting to go was meant for the chat left behind.
+                if let Some(held) = held {
+                    restore_draft(model, held.raw);
+                }
             }
             Answer::Images(images) => {
                 if let Effect::Images { generation, .. } = done.effect {

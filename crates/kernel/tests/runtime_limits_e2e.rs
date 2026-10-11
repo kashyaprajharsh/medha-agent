@@ -395,6 +395,221 @@ async fn correction_is_bounded_and_respects_budget_cancellation_and_fatal_errors
     }
 }
 
+/// A tool whose schema takes its elements as JSON text, recording what it runs with.
+#[derive(Default)]
+struct TextFieldTool(Mutex<Vec<serde_json::Value>>);
+
+#[async_trait]
+impl Executor for TextFieldTool {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "draw".into(),
+            description: String::new(),
+            schema: json!({"type": "object", "required": ["elements"],
+                "properties": {"elements": {"type": "string"}, "zoom": {"type": "number"}}}),
+            blast_radius: BlastRadius::Read,
+            category: kernel::ToolCategory::Other,
+            icon: String::new(),
+        }]
+    }
+
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        self.0.lock().unwrap().push(intent.args.clone());
+        Observation::ok(intent.id.clone(), json!({"drawn": true}))
+    }
+}
+
+/// Wrong JSON types are repaired against the tool's schema before the tool
+/// runs. The model is told in the result, and its own reply is kept as written.
+#[tokio::test]
+async fn arguments_of_the_wrong_type_are_repaired_the_model_is_told_and_its_reply_is_kept() {
+    let sent = json!({"elements": [{"type": "rectangle"}], "zoom": "1.5"});
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
+        Block::ToolIntent(ToolIntent {
+            id: "c1".into(),
+            tool: "draw".into(),
+            args: sent.clone(),
+        }),
+    ])]));
+    let tool = Arc::new(TextFieldTool::default());
+    let kernel = Kernel::new(
+        provider.clone(),
+        Arc::new(InMemoryLog::new()),
+        tool.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let session = Session::new();
+    kernel
+        .run_session(
+            &session,
+            vec![Message::user("draw")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let ran = tool.0.lock().unwrap().clone();
+    assert_eq!(
+        ran,
+        [json!({"elements": "[{\"type\":\"rectangle\"}]", "zoom": 1.5})]
+    );
+
+    // Copied out, so no lock is held across the await below.
+    let follow_up = provider
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .messages
+        .clone();
+    let call = follow_up
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .find(|c| c.id == "c1")
+        .unwrap();
+    assert_eq!(
+        call.args, sent,
+        "the model's own call is replayed as it wrote it"
+    );
+    let result = follow_up
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+        .unwrap();
+    assert!(
+        result
+            .content
+            .contains("`elements` was sent as an array and passed as a string")
+            && result
+                .content
+                .contains("`zoom` was sent as a string and passed as a number"),
+        "{}",
+        result.content
+    );
+
+    let events = kernel.log.events(session.id).await;
+    let intent = events
+        .iter()
+        .find(|e| e.kind == EventKind::ModelIntent)
+        .unwrap();
+    assert_eq!(intent.payload["args"], ran[0], "the record shows what ran");
+    assert!(
+        intent.payload["adjusted"]
+            .as_str()
+            .unwrap()
+            .contains("`elements`")
+    );
+}
+
+#[derive(Default)]
+struct NoticeSink {
+    notices: Mutex<Vec<String>>,
+    restarts: AtomicUsize,
+}
+
+impl kernel::StreamSink for NoticeSink {
+    fn supports_restart(&self) -> bool {
+        true
+    }
+    fn restarted(&self) {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+    }
+    fn notice(&self, text: &str) {
+        self.notices.lock().unwrap().push(text.into());
+    }
+}
+
+/// A stream that goes silent is reopened, because a fresh connection often
+/// clears it. Each try waits out the whole idle limit and resends the request,
+/// so it gets two reopenings, not the five a dropped connection gets.
+#[tokio::test]
+async fn a_silent_stream_is_reopened_twice_and_then_the_turn_stops() {
+    let silent = || ProviderError::StreamStalled { waited_secs: 180 };
+    let run = |turns: Vec<Turn>| async move {
+        let provider = Arc::new(LimitProvider::new(turns));
+        let kernel = kernel_with(provider.clone(), Arc::new(CountingExecutor::default()));
+        let sink = NoticeSink::default();
+        let result = kernel
+            .run_session(
+                &Session::new(),
+                vec![Message::user("go")],
+                Budget::default(),
+                &sink,
+                None,
+            )
+            .await;
+        let notices = sink.notices.lock().unwrap().clone();
+        (
+            result,
+            provider.calls.load(Ordering::SeqCst),
+            notices,
+            sink.restarts.load(Ordering::SeqCst),
+        )
+    };
+
+    // Silent twice, the second time after half a reply; the third try answers.
+    let (result, calls, notices, restarts) = run(vec![
+        Turn::Failed(Vec::new(), silent()),
+        Turn::Failed(vec![Block::Text("half a rep".into())], silent()),
+    ])
+    .await;
+    assert_eq!(result.unwrap().0.last().unwrap().content, "done");
+    assert_eq!(calls, 3);
+    assert_eq!(
+        restarts, 1,
+        "the half reply is taken back before it is written again"
+    );
+    assert_eq!(
+        notices,
+        [
+            "The model sent nothing for 180s. Reconnecting (1/2)…",
+            "The model sent nothing for 180s. Reconnecting (2/2)…"
+        ]
+    );
+
+    // Silent every time: three requests in all, and the reason says so.
+    let (result, calls, notices, _) =
+        run((0..6).map(|_| Turn::Failed(Vec::new(), silent())).collect()).await;
+    let Err(KernelError::Provider(said)) = result else {
+        panic!("a stream that never answers must end the turn");
+    };
+    assert_eq!(calls, 3, "not the six a transient failure would be given");
+    assert_eq!(notices.len(), 2);
+    assert!(
+        said.contains("sent nothing for 180s, 3 times this turn"),
+        "{said}"
+    );
+
+    // Dropped connections earlier in the turn do not use up the stall allowance.
+    let dropped = || ProviderError::Transport("connection reset".into());
+    let (result, calls, notices, _) = run(vec![
+        Turn::Failed(Vec::new(), dropped()),
+        Turn::Failed(Vec::new(), dropped()),
+        Turn::Failed(Vec::new(), silent()),
+    ])
+    .await;
+    assert_eq!(result.unwrap().0.last().unwrap().content, "done");
+    assert_eq!(calls, 4);
+    assert_eq!(
+        notices.last().unwrap(),
+        "The model sent nothing for 180s. Reconnecting (1/2)…"
+    );
+
+    // A wait that is not a live stream stays final: resending cannot help it.
+    let (result, calls, notices, _) = run(vec![Turn::Failed(
+        Vec::new(),
+        ProviderError::ProgressTimeout { waited_secs: 60 },
+    )])
+    .await;
+    assert!(result.is_err() && calls == 1 && notices.is_empty());
+}
+
 #[derive(Default)]
 struct ReviewedCalls(Mutex<Vec<String>>);
 

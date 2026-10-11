@@ -37,6 +37,6 @@ export function ProviderFields({ provider, disabled, onChange, onResolved }: {
 export function ModelTest({ result }: { result?: ModelTestResult }) {
   if (!result) return null;
   return <div className="quiet" role="status">
-    {(["text", "streaming", "tools"] as const).map((kind) => <p key={kind}><b>{kind === "tools" ? "Functions" : kind === "text" ? "Text" : "Streaming"}: {result[kind].status}</b> — {result[kind].message}</p>)}
+    {(["text", "streaming", "tools"] as const).map((kind) => <p key={kind}><b>{kind === "tools" ? "Functions" : kind === "text" ? "Text" : "Streaming"}: {result[kind].status === "failed" && result[kind].failure === "timeout" ? "timed out" : result[kind].status}</b> — {result[kind].message}</p>)}
   </div>;
 }

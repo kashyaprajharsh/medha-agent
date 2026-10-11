@@ -456,6 +456,9 @@ pub struct CallOutput {
     pub tool: String,
     pub text: String,
     pub is_error: bool,
+    /// Opaque configuration identity checked when the tool was dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     /// The `ui://` screen this tool's result is shown on, if its server offers one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<String>,
@@ -469,6 +472,10 @@ pub struct CallOutput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Screen {
     pub html: String,
+    /// Opaque connection identity, supplied by Medha rather than server HTML.
+    /// Replacing a configured server invalidates its remembered screen grants.
+    #[serde(default)]
+    pub identity: Option<String>,
     pub connect: Vec<String>,
     pub resources: Vec<String>,
     pub frames: Vec<String>,
@@ -488,6 +495,17 @@ struct Catalog {
     /// Tools a server keeps for its own screens. Never offered to the model.
     #[serde(default)]
     app_only: Vec<McpToolSpec>,
+}
+
+/// Which connection a screen was drawn by: the server's name and where it runs.
+/// Credentials are left out, so a rotated token keeps the screens it drew.
+fn screen_identity(server: &str, definition: &ServerConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let place = match &definition.transport {
+        Transport::Stdio { command, .. } => serde_json::json!(["stdio", server, command]),
+        Transport::Remote { url, .. } => serde_json::json!(["http", server, url]),
+    };
+    format!("{:x}", Sha256::digest(place.to_string().as_bytes()))
 }
 
 /// A live connection taken out of its slot, awaiting shutdown and process reap.
@@ -1232,7 +1250,7 @@ impl McpManager {
 
     /// Invoke `mcp__<server>__<tool>` with the given arguments, as the model.
     pub async fn call(&self, qualified: &str, args: &Value) -> Result<CallOutput, Error> {
-        self.call_as(qualified, args, false).await
+        self.call_as(qualified, args, false, None).await
     }
 
     /// A screen calling a tool on its own server. It reaches the tools the
@@ -1243,7 +1261,20 @@ impl McpManager {
         tool: &str,
         args: &Value,
     ) -> Result<CallOutput, Error> {
-        self.call_as(&qualify(server, tool), args, true).await
+        self.call_as(&qualify(server, tool), args, true, None).await
+    }
+
+    /// A viewer grant is valid only for the server definition whose page it
+    /// displayed. The incarnation check and dispatch share an admission lease.
+    pub async fn call_from_screen_checked(
+        &self,
+        server: &str,
+        tool: &str,
+        args: &Value,
+        identity: &str,
+    ) -> Result<CallOutput, Error> {
+        self.call_as(&qualify(server, tool), args, true, Some(identity))
+            .await
     }
 
     async fn call_as(
@@ -1251,14 +1282,22 @@ impl McpManager {
         qualified: &str,
         args: &Value,
         screen: bool,
+        identity: Option<&str>,
     ) -> Result<CallOutput, Error> {
         if !self.inner.config.enabled {
             return Err(Error::Disabled);
         }
         let (server, tool) = parse_qualified(qualified)?;
         if let Some(link) = self.hub_for(&server) {
-            return link.call(qualified, args, screen).await;
+            return link.call(qualified, args, screen, identity).await;
         }
+        let dispatched_identity = {
+            let servers = self.inner.servers.lock().await;
+            let slot = servers
+                .get(&server)
+                .ok_or_else(|| Error::UnknownServer(server.clone()))?;
+            screen_identity(&server, &slot.config)
+        };
         let mut params = CallToolRequestParams::new(tool.clone());
         if let Some(object) = args.as_object() {
             params = params.with_arguments(object.clone());
@@ -1266,6 +1305,7 @@ impl McpManager {
         let (resource, result) = self
             .round_trip(
                 &server,
+                Some(identity.unwrap_or(&dispatched_identity)),
                 |catalog| {
                     let spec = catalog
                         .exposed
@@ -1289,6 +1329,7 @@ impl McpManager {
             .await?;
         Ok(CallOutput {
             is_error: result.is_error.unwrap_or(false),
+            identity: Some(dispatched_identity),
             text: flatten(&result),
             result: (screen || resource.is_some()).then(|| {
                 serde_json::to_value(&result)
@@ -1313,15 +1354,24 @@ impl McpManager {
         if let Some(link) = self.hub_for(server) {
             return link.read_screen(server, uri).await;
         }
+        let definition = self.server_config(server).await?;
         let params = ReadResourceRequestParams::new(uri);
         let ((), read) = self
             .round_trip(
                 server,
+                None,
                 |_| Ok(()),
                 |peer, ()| async move { peer.read_resource(params).await },
             )
             .await?;
-        screen_page(read)
+        if self.server_config(server).await? != definition {
+            return Err(Error::Protocol(
+                "the screen's server changed while it was loading".into(),
+            ));
+        }
+        let mut page = screen_page(read)?;
+        page.identity = Some(screen_identity(server, &definition));
+        Ok(page)
     }
 
     /// One request to a server under the rules every request obeys: it goes to
@@ -1331,6 +1381,7 @@ impl McpManager {
     async fn round_trip<P, T, E, Fut>(
         &self,
         server: &str,
+        identity: Option<&str>,
         pick: impl FnOnce(&Catalog) -> Result<P, Error>,
         send: impl FnOnce(Peer<RoleClient>, &P) -> Fut,
     ) -> Result<(P, T), Error>
@@ -1345,6 +1396,9 @@ impl McpManager {
             let slot = servers
                 .get(&server)
                 .ok_or_else(|| Error::UnknownServer(server.clone()))?;
+            if identity.is_some_and(|identity| identity != screen_identity(&server, &slot.config)) {
+                return Err(Error::Protocol("The screen's server changed. Reopen the screen and approve its permissions again.".into()));
+            }
             let admission = Arc::clone(&slot.admission);
             let (peer, gate) = match (&slot.peer, slot.state.is_live()) {
                 (Some(peer), true) => (peer.clone(), Arc::clone(&slot.gate)),
@@ -2239,6 +2293,7 @@ fn screen_page(read: ReadResourceResult) -> Result<Screen, Error> {
             .collect()
     };
     Ok(Screen {
+        identity: None,
         connect: origins("connectDomains"),
         resources: origins("resourceDomains"),
         frames: origins("frameDomains"),
@@ -2642,6 +2697,57 @@ mod tests {
         assert!(!valid_tool_name("evil__name")); // would break qualified parsing
         assert!(!valid_tool_name("drop\ntable")); // control characters
         assert!(!valid_tool_name(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn a_screen_identity_follows_where_its_server_runs_not_how_it_signs_in() {
+        let remote = |url: &str, auth| ServerConfig {
+            transport: Transport::Remote {
+                url: url.into(),
+                auth,
+            },
+            ..Default::default()
+        };
+        let drawn = screen_identity(
+            "draw",
+            &remote("https://a.example/mcp", RemoteAuth::Bearer("old".into())),
+        );
+        assert_eq!(
+            drawn,
+            screen_identity(
+                "draw",
+                &remote("https://a.example/mcp", RemoteAuth::Bearer("new".into()))
+            ),
+            "a rotated token keeps the screens it drew"
+        );
+        assert_ne!(
+            drawn,
+            screen_identity("draw", &remote("https://b.example/mcp", RemoteAuth::Auto))
+        );
+        assert_ne!(
+            drawn,
+            screen_identity("other", &remote("https://a.example/mcp", RemoteAuth::Auto))
+        );
+        let local = |command: &[&str]| ServerConfig {
+            transport: Transport::Stdio {
+                command: command.iter().map(|part| part.to_string()).collect(),
+                env: vec![],
+            },
+            ..Default::default()
+        };
+        // Arguments are kept apart, so moving a space between them is another server.
+        assert_ne!(
+            screen_identity("draw", &local(&["npx", "a b"])),
+            screen_identity("draw", &local(&["npx a", "b"]))
+        );
+        // Recorded in saved chats, so the value itself must not drift.
+        assert_eq!(
+            screen_identity("draw", &local(&["draw-server"])),
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(br#"["stdio","draw",["draw-server"]]"#)
+            )
+        );
     }
 
     #[test]

@@ -1030,8 +1030,8 @@ fn a_chat_that_sleeps_keeps_no_thread_waiting_to_send_to_it() {
 }
 
 #[test]
-fn opening_a_chat_that_is_live_in_another_window_is_refused_and_leaves_it_running() {
-    let (model, _) = stand_in_model();
+fn a_remounted_window_reuses_its_chat_and_can_send_and_cancel() {
+    let (model, arrived, release) = held_model();
     let Some(chat) = Chat::open("shared", &model) else {
         return;
     };
@@ -1039,34 +1039,43 @@ fn opening_a_chat_that_is_live_in_another_window_is_refused_and_leaves_it_runnin
     let ready = chat.wait("the greeting", |frame| frame["method"] == "ready");
     let session = ready["params"]["session"].as_str().unwrap().to_owned();
 
+    chat.call(
+        "message.send",
+        json!({"content":"HOLD the turn during renderer recovery"}),
+    );
+    arrived.recv_timeout(Duration::from_secs(20)).unwrap();
+
     let second: Arc<Mutex<Vec<Value>>> = Arc::default();
     let sink = Arc::clone(&second);
-    chat.sessions
+    let reopened = chat
+        .sessions
         .open_to(
             Arc::new(move |frame| sink.lock().unwrap().push(frame)),
             "second",
             Some(&session),
         )
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let refused = loop {
-        let exit = second
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|frame| frame["method"] == "exit")
-            .cloned();
-        if let Some(exit) = exit {
-            break exit;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the second window was never told"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(refused["params"]["stderr"], crate::backend::OPEN_ELSEWHERE);
-
+    assert_eq!(reopened.key, chat.key);
+    assert!(reopened.reused);
+    assert_eq!(chat.sessions.inner.open.lock().unwrap().len(), 1);
+    assert!(
+        second.lock().unwrap().is_empty(),
+        "no second viewer was started"
+    );
+    let recovered = chat.call("session.presentation", json!({}));
+    assert_eq!(recovered["method"], "session.presentation");
+    assert_eq!(recovered["result"]["session"], session);
+    assert_eq!(recovered["result"]["running"], true);
+    assert!(recovered["result"]["frames"].is_array());
+    assert!(chat.call("cancel", json!({})).get("error").is_none());
+    chat.wait("the cancelled turn", |frame| {
+        frame["params"]["kind"] == "turn.cancelled"
+    });
+    release.send(()).unwrap();
+    assert_eq!(
+        chat.call("session.presentation", json!({}))["result"]["running"],
+        false
+    );
     chat.turn("second");
     assert_eq!(
         chat.count(|frame| frame["method"] == "exit"),

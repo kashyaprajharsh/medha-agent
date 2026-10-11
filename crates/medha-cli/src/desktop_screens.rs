@@ -28,6 +28,8 @@ pub(crate) fn offered(mcp: &Manager) -> Result<Value, String> {
             let (server, tool) = spec.name.strip_prefix(mcp::TOOL_PREFIX)?.split_once("__")?;
             Some(json!({
                 "name": spec.name, "server": server, "tool": tool, "resource": spec.screen?,
+                // A call shown while it is written is shown as it will run.
+                "text_fields": kernel::arg_repair::text_fields(&spec.schema),
             }))
         })
         .collect();
@@ -47,7 +49,12 @@ pub(crate) async fn page(mcp: &Manager, params: &Value) -> Result<Value, String>
 pub(crate) async fn call(mcp: &Manager, params: &Value) -> Result<Value, String> {
     let args = params.get("args").cloned().unwrap_or_else(|| json!({}));
     let output = manager(mcp)?
-        .call_from_screen(text(params, "server")?, text(params, "tool")?, &args)
+        .call_from_screen_checked(
+            text(params, "server")?,
+            text(params, "tool")?,
+            &args,
+            text(params, "identity")?,
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok(output.result.filter(|result| !result.is_null()).unwrap_or_else(|| {

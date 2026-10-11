@@ -98,9 +98,35 @@ pub fn read(root: &Path, requested: &str) -> Result<Value, String> {
     if bytes.len() as u64 > limit {
         return Err("The file grew beyond the preview limit".into());
     }
-    if binary {
+    preview_bytes(&path, bytes)
+}
+
+/// The same format adapter for current files and immutable backend revisions.
+pub fn preview_bytes(path: &Path, bytes: Vec<u8>) -> Result<Value, String> {
+    use base64::Engine;
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let kind = match extension.as_str() {
+        "md" | "markdown" | "mdx" => "markdown",
+        "pdf" => "pdf",
+        "docx" => "document",
+        "xlsx" => "spreadsheet",
+        "pptx" => "slides",
+        "csv" | "tsv" => "table",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => "image",
+        "mp4" | "m4v" | "mov" | "webm" | "mp3" | "wav" | "m4a" | "ogg" | "oga" | "flac" => "media",
+        _ => "text",
+    };
+    let size = bytes.len();
+    if matches!(
+        kind,
+        "pdf" | "document" | "spreadsheet" | "slides" | "image" | "media"
+    ) {
         return Ok(
-            json!({"kind": kind, "extension": extension, "size": metadata.len(), "bytes": bytes}),
+            json!({"kind": kind, "extension": extension, "size": size, "data": base64::engine::general_purpose::STANDARD.encode(bytes)}),
         );
     }
     let text = String::from_utf8(bytes)
@@ -111,7 +137,7 @@ pub fn read(root: &Path, requested: &str) -> Result<Value, String> {
         );
     }
     Ok(
-        json!({"kind": kind, "extension": extension, "size": metadata.len(), "html": (kind == "markdown").then(|| transcript_view::to_html(&text)), "text": text}),
+        json!({"kind": kind, "extension": extension, "size": size, "html": (kind == "markdown").then(|| transcript_view::to_html(&text)), "text": text}),
     )
 }
 pub fn open_default(root: &Path, requested: &str) -> Result<(), String> {

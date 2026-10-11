@@ -8,6 +8,7 @@ import {
 } from "react";
 import { type Attachment, type SessionChange } from "./api";
 import { messageRequest } from "./messageRequest";
+import type { OutputAbout } from "./outputBlocks";
 import {
   reduceLive,
   recordSent,
@@ -81,8 +82,12 @@ export function useLive() {
     if (opened.current.has(key)) return;
     const promise = (async () => {
       try {
-        await api.liveOpen(key, resume);
+        const reused = await api.liveOpen(key, resume);
         opened.current.add(key);
+        if (reused) {
+          await api.liveCall(key, "session.presentation");
+          return;
+        }
         const settings = await api.liveCall(key, "session.settings");
         patch(key, (state) =>
           reduceLive(state, { method: "settings", params: settings }),
@@ -119,12 +124,18 @@ export function useLive() {
       resume: string | null,
       text: string,
       attachments: Attachment[] = [],
+      /** The saved output this message asks to change, and what to call it beside the message. */
+      about?: OutputAbout,
     ) => {
       // Reject before opening a chat or optimistically recording an unsent
       // message. The composer keeps the text and attachments for correction.
-      let params;
+      let params: ReturnType<typeof messageRequest> & { about?: { artifact_id: string; revision_id: string } };
+      // A message sent into a running turn steers it; only one that starts a
+      // turn can be about an output, so the reference is not claimed otherwise.
+      const starts = latest.current[key]?.status !== "running" && latest.current[key]?.status !== "starting";
       try {
         params = messageRequest(text, attachments);
+        if (about && starts) params = { ...params, about: { artifact_id: about.artifact_id, revision_id: about.revision_id } };
       } catch (cause) {
         patch(key, (state) => ({
           ...state,
@@ -140,6 +151,7 @@ export function useLive() {
         images: attachments.flatMap((attachment) => "data" in attachment
           ? [{ name: attachment.name, mime: attachment.mime, preview: attachment.preview }]
           : []),
+        about: params.about ? about?.label : undefined,
         ts: Date.now() / 1000,
       };
       const before = latest.current[key];
@@ -165,6 +177,12 @@ export function useLive() {
       }));
       try {
         await ensureOpen(key, resume);
+        // Recovery replaces the live tail. Keep this not-yet-dispatched
+        // message in an idle chat's timeline under its optimistic id; the
+        // acceptance then enriches it rather than adding a duplicate.
+        patch(key, (state) => state.status === "idle" && !state.items.some((item) => item.id === message.id)
+          ? { ...state, status: "running", items: [...state.items, message] }
+          : state);
         await api.liveCall(key, "message.send", params);
       } catch (cause) {
         patch(key, (state) => ({
@@ -192,8 +210,8 @@ export function useLive() {
   );
 
   const cancel = useCallback(
-    (key: string) => {
-      void api
+    async (key: string) => {
+      await api
         .liveCall(key, "cancel")
         .catch((cause) =>
           patch(key, (state) => ({ ...state, error: String(cause) })),

@@ -2,8 +2,9 @@ import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "reac
 import { highlightCode } from "./highlight";
 import { Icon } from "./Icon";
 import { useWorkspace } from "./Workspace";
-import { mentionsOf, splitOutputs } from "./outputBlocks";
-import { Mentioned, Plate } from "./OutputPlate";
+import { fileReference, splitOutputs } from "./outputBlocks";
+import { Plate } from "./OutputPlate";
+import { useOutputs } from "./outputContext";
 import { highlightAsync } from "./syntax";
 
 const WORKER_THRESHOLD = 8_000;
@@ -58,15 +59,11 @@ export const Markdown = memo(function Markdown({
   fresh = false,
 }: MarkdownProps) {
   const segments = useMemo(() => splitOutputs(html), [html]);
-  // Files the reply only names are looked for once it is whole, not on every word.
-  const named = useMemo(() => {
-    if (streaming) return [];
-    const shown = new Set(segments.map((segment) => (segment.type === "output" ? segment.path : undefined)));
-    return mentionsOf(html).filter((mention) => !shown.has(mention.path));
-  }, [html, segments, streaming]);
   const prose = streaming ? `${className} streaming` : className;
-  if (segments.length === 1 && segments[0].type === "html" && !named.length)
-    return <Prose html={html} className={prose} onFile={onFile} />;
+  // Files the reply named are known once it is saved, never while it streams.
+  const named = !streaming && !scope.startsWith("live-") && <Named scope={scope} at={at} fresh={fresh} />;
+  if (segments.length === 1 && segments[0].type === "html")
+    return <><Prose html={html} className={prose} onFile={onFile} />{named}</>;
   const last = segments.length - 1;
   const rows: ReactNode[] = [];
   for (let index = 0; index < segments.length; index++) {
@@ -92,8 +89,9 @@ export const Markdown = memo(function Markdown({
           anchor={`${scope}:${index}`}
           kind={next.kind}
           source={next.source}
-          path={next.path}
-          name={next.name}
+          sourceEvent={scope.startsWith("live-") ? undefined : scope}
+          sourceIndex={next.sourceIndex}
+          fresh={fresh}
           writing={streaming && index === last}
           order={at * 1000 + index}
         />,
@@ -105,26 +103,23 @@ export const Markdown = memo(function Markdown({
       </div>,
     );
   }
-  if (named.length)
-    rows.push(
-      <div className="out-grid" key="named">
-        {named.map((mention, index) => (
-          <Mentioned
-            key={mention.path}
-            anchor={`${scope}:named:${mention.path}`}
-            kind={mention.kind}
-            source=""
-            path={mention.path}
-            name={mention.name}
-            writing={false}
-            order={at * 1000 + 900 + index}
-            fresh={fresh}
-          />
-        ))}
-      </div>,
-    );
-  return <>{rows}</>;
+  return <>{rows}{named}</>;
 });
+
+/** The files a saved reply named that its run changed, shown where they lie. */
+function Named({ scope, at, fresh }: { scope: string; at: number; fresh: boolean }) {
+  const { all } = useOutputs();
+  const files = useMemo(() => all.filter((output) => output.sourceEvent === scope && output.path && !output.snapshot && !output.screen), [all, scope]);
+  if (!files.length) return null;
+  return (
+    <div className="out-grid">
+      {files.map((file) => (
+        <Plate key={file.anchor} anchor={file.anchor} kind={file.kind} source="" path={file.path} name={file.name}
+          sourceEvent={scope} sourceIndex={file.sourceIndex} fresh={fresh} writing={false} order={at * 1000 + (file.sourceIndex ?? 0)} />
+      ))}
+    </div>
+  );
+}
 
 const Prose = memo(function Prose({
   html,
@@ -135,6 +130,16 @@ const Prose = memo(function Prose({
   const workspace = useWorkspace();
   useEffect(() => {
     const controller = new AbortController();
+    root.current?.querySelectorAll<HTMLElement>("code, .md-image").forEach((element) => {
+      if (element.closest("pre, a")) return;
+      const path = fileReference(element.dataset.src ?? element.textContent ?? "");
+      if (!path) return;
+      const link = document.createElement("a");
+      link.href = encodeURI(path);
+      link.title = "Preview referenced file";
+      element.replaceWith(link);
+      link.append(element);
+    });
     root.current?.querySelectorAll<HTMLPreElement>("pre").forEach((pre) => {
       const code = pre.querySelector("code");
       if (!code) return;

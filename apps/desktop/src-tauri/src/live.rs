@@ -4,7 +4,7 @@
 //! `transcript-view` exactly as the read-only history reshapes them.
 
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -18,7 +18,7 @@ use crate::sleep::{self, Rest, Settled, Wake};
 #[path = "request_queue.rs"]
 mod request_queue;
 
-const REQUESTS: [&str; 25] = [
+const REQUESTS: &[&str] = &[
     "mcp.signin",
     "connectors.connect",
     "tasks.list",
@@ -30,6 +30,7 @@ const REQUESTS: [&str; 25] = [
     "approval.respond",
     "cancel",
     "session.settings",
+    "session.presentation",
     "session.configure",
     "agent.control",
     "patch.list",
@@ -166,6 +167,15 @@ struct Live {
     next_id: u64,
     emit: Emit,
     rest: Arc<Rest>,
+    /// Native ownership survives a webview reload and a rewind's durable-id change.
+    conversation: Arc<Mutex<Option<String>>>,
+    snapshots: Arc<Mutex<HashSet<u64>>>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct Opened {
+    pub key: String,
+    pub reused: bool,
 }
 
 type Emit = Arc<dyn Fn(Value) + Send + Sync>;
@@ -207,11 +217,11 @@ impl LiveSessions {
         Self { inner }
     }
 
-    pub fn open(&self, app: &AppHandle, key: &str, resume: Option<&str>) -> Result<(), String> {
+    pub fn open(&self, app: &AppHandle, key: &str, resume: Option<&str>) -> Result<Opened, String> {
         self.open_to(forward(app, key), key, resume)
     }
 
-    fn open_to(&self, emit: Emit, key: &str, resume: Option<&str>) -> Result<(), String> {
+    fn open_to(&self, emit: Emit, key: &str, resume: Option<&str>) -> Result<Opened, String> {
         if !is_token(key) {
             return Err("invalid live session key".into());
         }
@@ -220,13 +230,41 @@ impl LiveSessions {
         {
             return Err("invalid session id".into());
         }
-        let mut open = self.inner.awake(key)?;
-        if open.get(key).is_some_and(|live| !live.has_ended()) {
-            return Ok(());
+        let mut owned_key = key.to_owned();
+        loop {
+            let mut open = self.inner.awake(&owned_key)?;
+            if open.get(&owned_key).is_some_and(|live| !live.has_ended()) {
+                return Ok(Opened {
+                    key: owned_key,
+                    reused: true,
+                });
+            }
+            // The renderer may have forgotten a draft key while our native
+            // viewer is still attached. Reuse it without detaching or ending
+            // a running turn, rather than creating a second local viewer.
+            if let Some(resume) = resume
+                && let Some(existing) = open.iter().find_map(|(existing, live)| {
+                    let resumable = !live.has_ended()
+                        || matches!(live.rest.current(), Some(Settled::Asleep(_)));
+                    (resumable
+                        && live
+                            .conversation
+                            .lock()
+                            .is_ok_and(|id| id.as_deref() == Some(resume)))
+                    .then(|| existing.clone())
+                })
+            {
+                owned_key = existing;
+                drop(open);
+                continue;
+            }
+            let live = self.inner.spawn(&emit, resume, None);
+            open.insert(key.to_owned(), live);
+            return Ok(Opened {
+                key: key.to_owned(),
+                reused: false,
+            });
         }
-        let live = self.inner.spawn(&emit, resume, None);
-        open.insert(key.to_owned(), live);
-        Ok(())
     }
 
     pub fn request(&self, key: &str, method: &str, params: Value) -> Result<u64, String> {
@@ -246,11 +284,24 @@ impl LiveSessions {
         if bytes > wire::MAX_FRAME {
             return Err(crate::backend::TOO_LARGE.into());
         }
+        if method == "session.presentation" {
+            let mut snapshots = live.snapshots.lock().map_err(|error| error.to_string())?;
+            if snapshots.len() >= 32 {
+                return Err(WAITING.into());
+            }
+            snapshots.insert(id);
+        }
         let refused = match live.requests.try_send((bytes, frame)) {
             Ok(()) => return Ok(id),
             Err(TrySendError::Disconnected(_)) => STOPPED,
             Err(TrySendError::Full(_)) => WAITING,
         };
+        if method == "session.presentation" {
+            live.snapshots
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&id);
+        }
         Err(refused.into())
     }
 
@@ -362,6 +413,8 @@ impl Inner {
     /// asked meanwhile waits in order. A chat that cannot open says so as its exit.
     fn spawn(&self, emit: &Emit, resume: Option<&str>, wake: Option<&Wake>) -> Live {
         let rest = Rest::new();
+        let conversation = Arc::new(Mutex::new(resume.map(str::to_owned)));
+        let snapshots: Arc<Mutex<HashSet<u64>>> = Arc::default();
         let ended = Arc::new(AtomicBool::new(false));
         let (behind, closed) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
         let why = Arc::new(Mutex::new(String::new()));
@@ -373,6 +426,7 @@ impl Inner {
             let (behind, waiting, nudge) =
                 (Arc::clone(&behind), Arc::clone(&waiting), requests.clone());
             let sender = Mutex::new(Some(sender));
+            let (conversation, snapshots) = (Arc::clone(&conversation), Arc::clone(&snapshots));
             // A resumed chat is one the window knows; a fresh one brings a new session id.
             let greeted = AtomicBool::new(wake.is_none_or(|wake| wake.resume.is_none()));
             // The chat's stream is over for this window; whoever sends its requests is woken to see so.
@@ -390,9 +444,31 @@ impl Inner {
                 nudge.close();
             };
             move |said| match said {
-                Said::Frame(frame) | Said::Event { frame, .. } => {
+                Said::Frame(mut frame) | Said::Event { mut frame, .. } => {
                     if rest.answer(&frame) {
                         return;
+                    }
+                    if matches!(frame["method"].as_str(), Some("ready" | "session.rewound"))
+                        && frame["params"]["code_only"] != true
+                        && let Some(id) = frame["params"]["session"].as_str()
+                        && let Ok(mut conversation) = conversation.lock()
+                    {
+                        *conversation = Some(id.to_owned());
+                    }
+                    if let Some(id) = frame["id"].as_u64()
+                        && snapshots
+                            .lock()
+                            .is_ok_and(|mut snapshots| snapshots.remove(&id))
+                        && frame.get("error").is_none()
+                    {
+                        frame["method"] = json!("session.presentation");
+                        frame["params"] = frame["result"].take();
+                    }
+                    if frame["method"] == "session.presentation"
+                        && let Some(id) = frame["params"]["conversation"].as_str()
+                        && let Ok(mut conversation) = conversation.lock()
+                    {
+                        *conversation = Some(id.to_owned());
                     }
                     if frame["method"] == "ready" && !greeted.swap(true, Ordering::Relaxed) {
                         return;
@@ -421,7 +497,17 @@ impl Inner {
             let mut steps = Steps::default();
             pump_stream(Weighed { frames, waiting }, |frame| {
                 let frame = if frame["method"] == "session.presentation" {
-                    render_snapshot(frame, &mut steps, &mut segment)
+                    // The backend publishes a snapshot after its preceding
+                    // events on this connection. The same FIFO inbox preserves
+                    // that barrier while resetting the Markdown/tool projection.
+                    let recovery_reply = frame.get("id").cloned();
+                    let rendered = render_snapshot(frame, &mut steps, &mut segment);
+                    match recovery_reply {
+                        Some(id) if rendered["method"] != "exit" => {
+                            json!({"id": id, "method": "session.presentation", "result": rendered["params"]})
+                        }
+                        _ => rendered,
+                    }
                 } else {
                     render(sanitize(frame, &mut steps), &mut segment)
                 };
@@ -504,6 +590,8 @@ impl Inner {
             next_id: 1,
             emit: Arc::clone(emit),
             rest,
+            conversation,
+            snapshots,
         }
     }
 }
@@ -632,6 +720,9 @@ fn render(mut frame: Value, segment: &mut String) -> Value {
     }
     match frame["params"]["kind"].as_str() {
         Some("model.text") => {
+            if frame["params"]["delta"] == "" && frame["params"]["source_event"].is_string() {
+                return frame;
+            }
             segment.push_str(frame["params"]["delta"].as_str().unwrap_or_default());
             frame["params"]["html"] = Value::String(transcript_view::to_html(segment));
         }
@@ -659,11 +750,11 @@ fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) ->
         snapshot.items.into_iter().skip(from).map(|row| {
             use protocol::{PresentationItem as Row, TurnEvent as Event};
             let event = match row {
-                Row::User { text, images } => Event::User { content: text, turn: snapshot.turn, images },
-                Row::Assistant { text } => Event::Text { delta: text },
+                Row::User { text, images, about } => Event::User { content: text, turn: snapshot.turn, images, about },
+                Row::Assistant { text, source_event } => Event::Text { delta: text, source_event },
                 Row::Reasoning { text } => Event::Reasoning { delta: text },
                 Row::ToolCall { id, tool, args } => Event::ToolCall { id, tool, args },
-                Row::ToolResult { id, tool, ok, payload } => Event::ToolResult { id, tool, ok, payload },
+                Row::ToolResult { id, tool, ok, payload, source_event } => Event::ToolResult { id, tool, ok, payload, source_event },
                 Row::Compaction { before, after, summarized, summary } => Event::Compaction { before, after, summarized, summary },
                 Row::Verify { ok, summary } => Event::Verify { ok, summary },
                 Row::Notice { text } => Event::Notice { text },

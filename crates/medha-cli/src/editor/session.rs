@@ -173,7 +173,11 @@ fn question(
 pub(super) async fn emit(writer: &Writer, session: &str, event: protocol::TurnEvent) {
     use protocol::TurnEvent as E;
     match event {
-        E::Text { delta } => text(writer, session, "agent_message_chunk", &delta).await,
+        E::Text { delta, .. } => {
+            if !delta.is_empty() {
+                text(writer, session, "agent_message_chunk", &delta).await;
+            }
+        }
         E::Reasoning { delta } => text(writer, session, "agent_thought_chunk", &delta).await,
         E::User { content, .. } | E::Steered { content } => {
             text(writer, session, "user_message_chunk", &content).await
@@ -191,6 +195,7 @@ pub(super) async fn emit(writer: &Writer, session: &str, event: protocol::TurnEv
             tool,
             ok,
             payload,
+            ..
         } => {
             let id = id.unwrap_or_else(|| tool.clone());
             let output = serde_json::to_string(&payload).expect("tool data serializes");
@@ -345,11 +350,12 @@ pub(super) async fn presentation(
         I::User {
             text: content,
             images,
+            ..
         } => {
             text(writer, session, "user_message_chunk", &content).await;
             replay_images(writer, session, &images, view).await;
         }
-        I::Assistant { text: content } => {
+        I::Assistant { text: content, .. } => {
             text(writer, session, "agent_message_chunk", &content).await
         }
         I::Reasoning { text: content } => {
@@ -363,6 +369,7 @@ pub(super) async fn presentation(
             tool,
             ok,
             payload,
+            source_event,
         } => {
             emit(
                 writer,
@@ -372,6 +379,7 @@ pub(super) async fn presentation(
                     tool,
                     ok,
                     payload,
+                    source_event,
                 },
             )
             .await

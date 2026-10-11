@@ -87,6 +87,7 @@ pub(super) async fn prompt(value: Value) -> Result<protocol::SendMessage, String
             content,
             images: Vec::new(),
             intent: Some(protocol::SendIntent::Start),
+            about: None,
         });
     }
     static DECODERS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -154,5 +155,6 @@ pub(super) async fn prompt(value: Value) -> Result<protocol::SendMessage, String
         content,
         images,
         intent: Some(protocol::SendIntent::Start),
+        about: None,
     })
 }

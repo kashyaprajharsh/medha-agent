@@ -115,6 +115,30 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]}}]}),
             json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
         ]
+    } else if let Some(elements) = asked
+        .strip_prefix("DRAW ")
+        .or_else(|| asked.strip_prefix("DRAWLIST "))
+        .filter(|_| !read_completed)
+    {
+        // DRAWLIST sends the elements as a list, where the tool takes JSON text.
+        let elements = if asked.starts_with("DRAWLIST ") {
+            serde_json::from_str::<Value>(elements).unwrap()
+        } else {
+            json!(elements)
+        };
+        let name = body["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .find(|name| name.ends_with("drawing__create_view"))
+            .expect("the drawing tool was not offered to the model");
+        let call = json!({"index":0,"id":"drawing-call","type":"function",
+            "function":{"name":name,"arguments":json!({"elements":elements}).to_string()}});
+        vec![
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]
     } else if let Some(path) = asked.strip_prefix("READ_PATH ").filter(|_| !read_completed) {
         let arguments = json!({"path":path});
         let call = json!({"index":0,"id":"read_path","type":"function",
@@ -122,6 +146,16 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
         vec![
             json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]}}]}),
             json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]
+    } else if let Some(rest) = asked.strip_prefix("WRITE ").filter(|_| !read_completed) {
+        // WRITE <path> then a newline, then the file's contents.
+        let (path, content) = rest.split_once('\n').unwrap_or((rest, ""));
+        let arguments = json!({"path": path, "content": content});
+        let call = json!({"index": 0, "id": "write_1", "type": "function",
+            "function": {"name": "write", "arguments": arguments.to_string()}});
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
         ]
     } else if asked.contains("RUN") && !ran {
         let shell = body["tools"]
@@ -131,7 +165,12 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             .filter_map(|tool| tool["function"]["name"].as_str())
             .find(|name| name.contains("shell") && name.contains("exec"))
             .unwrap_or("shell_exec");
-        let arguments = json!({"command": "touch made-by-the-test.txt", "network": false});
+        // The first `quoted` part of the message is the command, if there is one.
+        let command = asked
+            .split('`')
+            .nth(1)
+            .unwrap_or("touch made-by-the-test.txt");
+        let arguments = json!({"command": command, "network": false});
         let call = json!({"index": 0, "id": "call_1", "type": "function",
             "function": {"name": shell, "arguments": arguments.to_string()}});
         vec![
@@ -630,7 +669,9 @@ impl Client {
     async fn frame(&mut self) -> Value {
         let frame = tokio::time::timeout(WAIT, wire::read_frame(&mut self.reader))
             .await
-            .expect("the backend went quiet")
+            .unwrap_or_else(|error| {
+                panic!("the backend went quiet: {error}; heard: {}", self.heard)
+            })
             .expect("the backend closed the connection");
         self.heard.push_str(&frame.to_string());
         frame
@@ -1721,6 +1762,160 @@ async fn a_message_sent_mid_turn_is_steered_whichever_client_sends_it() {
     }
 }
 
+/// A file a command made is an output of the reply that names it; a file the
+/// reply only mentions, made before the run, is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_shows_the_files_its_run_made_and_only_those() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("named");
+    std::fs::write(folder.join("old.png"), b"made earlier").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(folder.join("old.png"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let chat = client.open(&folder).await;
+
+    client
+        .send(
+            &chat,
+            "RUN `touch chart.png` then show `chart.png` beside `old.png`",
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let allowed = client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id": approval["params"]["gate_id"], "approve": true}),
+        )
+        .await;
+    assert_eq!(allowed["result"]["accepted"], true, "{allowed}");
+    client.until(|frame| kind(frame, "turn.done")).await;
+
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let listed = client.about(&folder, list).await.unwrap();
+    let files: Vec<_> = listed["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["path"].is_string())
+        .collect();
+    assert_eq!(files.len(), 1, "{listed}");
+    let made = folder.canonicalize().unwrap().join("chart.png");
+    assert_eq!(files[0]["path"], json!(made.to_string_lossy()));
+    assert_eq!(files[0]["kind"], "image");
+    assert!(files[0].get("snapshot").is_none(), "no copy is kept");
+}
+
+/// A written page is saved once, in its write's own result: reading it back
+/// gives exactly what was written, its stylesheet is listed by path for the
+/// window to read, and nothing is copied into the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_written_page_is_read_back_from_its_write_and_never_copied() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("written");
+    std::fs::write(folder.join("site.css"), "h1{color:blue}").unwrap();
+    let chat = client.open(&folder).await;
+    let page = "<html><head><link rel=stylesheet href=site.css></head><h1>one</h1></html>";
+    client
+        .send(&chat, &format!("WRITE index.html\n{page}"))
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let allowed = client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id": approval["params"]["gate_id"], "approve": true}),
+        )
+        .await;
+    assert_eq!(allowed["result"]["accepted"], true, "{allowed}");
+    client.until(|frame| kind(frame, "turn.done")).await;
+
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let listed = client.about(&folder, list).await.unwrap();
+    let saved = &listed["revisions"][0];
+    assert_eq!(saved["kind"], "page", "{listed}");
+    let assets = &saved["snapshot"]["assets"];
+    assert_eq!(assets[0]["path"], "site.css", "{saved}");
+    assert!(
+        assets[0].get("hash").is_none(),
+        "the stylesheet is not copied"
+    );
+    let revision = saved["revision_id"].as_str().unwrap();
+    let read = json!({"method":"application.artifacts.read","params":{"session_id":chat,"revision_id":revision,"asset":null}});
+    let bytes = client.about(&folder, read).await.unwrap();
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD
+        .decode(bytes["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(text, page.as_bytes());
+
+    let stored: Vec<_> = walk(&world.home())
+        .into_iter()
+        .filter(|path| {
+            path.components()
+                .any(|part| part.as_os_str() == "artifacts")
+                && path.is_file()
+        })
+        .collect();
+    assert!(stored.is_empty(), "nothing was copied: {stored:?}");
+}
+
+/// A window stays current from what each turn adds: every turn sends only its
+/// own new outputs, and those are exactly what listing the chat again returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_turn_sends_only_the_outputs_it_added() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("following");
+    let chat = client.open(&folder).await;
+    let mut pushed = Vec::new();
+    for name in ["first.html", "second.html"] {
+        client
+            .send(
+                &chat,
+                &format!("WRITE {name}\n<html><h1>{name}</h1></html>"),
+            )
+            .await;
+        let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+        client
+            .ask(
+                "approval.respond",
+                Some(&chat),
+                json!({"gate_id": approval["params"]["gate_id"], "approve": true}),
+            )
+            .await;
+        let (_, sent) = client.until(|frame| kind(frame, "outputs")).await;
+        let revisions = sent["params"]["revisions"].as_array().unwrap().clone();
+        assert_eq!(revisions.len(), 1, "{sent}");
+        assert_eq!(revisions[0]["name"], name);
+        pushed.extend(revisions);
+        client.until(|frame| kind(frame, "turn.done")).await;
+    }
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let listed = client.about(&folder, list).await.unwrap();
+    assert_eq!(listed["revisions"], json!(pushed));
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        }
+        found.push(path);
+    }
+    found
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_approval_is_shown_to_both_clients_and_answered_once() {
     let world = World::new();
@@ -2441,6 +2636,216 @@ fn remote_mcp_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     (url, connected)
 }
 
+/// Harmless implementation of the drawing app's documented checkpoint protocol.
+/// Both the model and server are loopback fixtures; nothing is sent to a provider.
+struct DrawingServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DrawingServer {
+    fn start() -> Self {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut checkpoints: HashMap<String, Value> = HashMap::new();
+            let mut serial = 0;
+            while !stopped.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let Some((_, body)) = read_request(&mut stream) else {
+                    continue;
+                };
+                let asked: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let result = match asked["method"].as_str() {
+                    Some("initialize") => {
+                        json!({"protocolVersion":"2025-06-18", "capabilities":{"tools":{},"resources":{}}, "serverInfo":{"name":"drawing-fixture","version":"1"}})
+                    }
+                    Some("tools/list") => json!({"tools":[
+                        {"name":"create_view","description":"Show a drawing", "inputSchema":{"type":"object","properties":{"elements":{"type":"string"}},"required":["elements"]}, "_meta":{"ui":{"resourceUri":"ui://excalidraw/mcp-app.html"}}},
+                        {"name":"read_checkpoint","description":"Read a drawing checkpoint", "inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}, "_meta":{"ui":{"visibility":["app"]}}},
+                        {"name":"save_checkpoint","description":"Save a working checkpoint", "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"data":{"type":"string"}},"required":["id","data"]}, "_meta":{"ui":{"visibility":["app"]}}}
+                    ]}),
+                    Some("resources/read") => {
+                        json!({"contents":[{"uri":"ui://excalidraw/mcp-app.html","mimeType":"text/html","text":"<!doctype html><p>Drawing fixture</p>"}]})
+                    }
+                    Some("tools/call") => {
+                        let args = &asked["params"]["arguments"];
+                        match asked["params"]["name"].as_str() {
+                            Some("create_view") => {
+                                let elements: Vec<Value> =
+                                    serde_json::from_str(args["elements"].as_str().unwrap())
+                                        .unwrap();
+                                let elements = if let Some(restore) = elements
+                                    .iter()
+                                    .find(|element| element["type"] == "restoreCheckpoint")
+                                {
+                                    checkpoints[restore["id"].as_str().unwrap()]["elements"].clone()
+                                } else {
+                                    json!(elements)
+                                };
+                                serial += 1;
+                                let id = format!("scene-{serial}");
+                                checkpoints.insert(id.clone(), json!({"elements":elements}));
+                                json!({"content":[{"type":"text","text":"Drawing ready"}],"structuredContent":{"checkpointId":id}})
+                            }
+                            Some("read_checkpoint") => {
+                                let state = &checkpoints[args["id"].as_str().unwrap()];
+                                json!({"content":[{"type":"text","text":state.to_string()}]})
+                            }
+                            Some("save_checkpoint") => {
+                                let id = args["id"].as_str().unwrap();
+                                assert!(checkpoints.contains_key(id));
+                                let state: Value =
+                                    serde_json::from_str(args["data"].as_str().unwrap()).unwrap();
+                                checkpoints.insert(id.into(), state);
+                                json!({"content":[{"type":"text","text":"Saved working copy"}]})
+                            }
+                            _ => {
+                                json!({"isError":true,"content":[{"type":"text","text":"Unknown fixture tool"}]})
+                            }
+                        }
+                    }
+                    _ => json!({}),
+                };
+                respond(
+                    &mut stream,
+                    "application/json",
+                    &json!({"jsonrpc":"2.0","id":asked["id"],"result":result}).to_string(),
+                );
+            }
+        });
+        Self {
+            url,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for DrawingServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drawing_is_saved_as_its_call_recorded_it_and_its_screen_calls_back_only_as_its_connection()
+ {
+    use base64::Engine;
+    let world = World::new();
+    let drawing = DrawingServer::start();
+    std::fs::create_dir_all(world.home()).unwrap();
+    std::fs::write(
+        world.home().join("config.toml"),
+        format!(
+            "[mcp.drawing]\nurl = \"{}\"\ntrust = \"trusted\"\n",
+            drawing.url
+        ),
+    )
+    .unwrap();
+    let backend = world.backend();
+    let folder = world.folder("artifacts");
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    client
+        .until(|frame| {
+            frame["method"] == "mcp.status"
+                && frame["params"]["servers"]
+                    .as_array()
+                    .is_some_and(|servers| {
+                        servers.iter().any(|server| {
+                            server["server"] == "drawing" && server["state"] == "ready"
+                        })
+                    })
+        })
+        .await;
+    let accepted = client
+        .send(&chat, "DRAW [{\"id\":\"shape\",\"x\":1}]")
+        .await;
+    assert!(accepted.get("error").is_none(), "{accepted}");
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let allowed = client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id":approval["params"]["gate_id"],"approve":true}),
+        )
+        .await;
+    assert_eq!(allowed["result"]["accepted"], true, "{allowed}");
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let listed = client.about(&folder, list.clone()).await.unwrap();
+    let first = &listed["revisions"][0];
+    assert_eq!(
+        first["screen"]["input"]["elements"], "[{\"id\":\"shape\",\"x\":1}]",
+        "{first}"
+    );
+    assert!(
+        first["screen"].get("checkpoints").is_none(),
+        "nothing is fetched from the server after the call: {first}"
+    );
+    let revision = first["revision_id"].as_str().unwrap().to_owned();
+    let identity = first["screen"]["identity"].as_str().unwrap().to_owned();
+
+    // The screen may call its own server back, and only as the connection it was drawn by.
+    let state = json!({"elements":[{"id":"shape","x":2}]}).to_string();
+    let call = |identity: &str| json!({"server":"drawing","tool":"save_checkpoint","args":{"id":"scene-1","data":state},"identity":identity});
+    let refused = client
+        .ask("mcp.screen.call", Some(&chat), call("different server"))
+        .await;
+    assert!(refused.get("error").is_some(), "{refused}");
+    let accepted = client
+        .ask("mcp.screen.call", Some(&chat), call(&identity))
+        .await;
+    assert!(accepted.get("error").is_none(), "{accepted}");
+
+    // A saved output is read back exactly as the call recorded it.
+    let bytes = client.about(&folder, json!({"method":"application.artifacts.read","params":{"session_id":chat,"revision_id":revision,"asset":null}})).await.unwrap();
+    let recorded: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(bytes["data"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recorded, first["screen"]);
+
+    // A later drawing is its own output: no server declared a shared document.
+    client
+        .send(
+            &chat,
+            "DRAW [{\"type\":\"restoreCheckpoint\",\"id\":\"scene-1\"}]",
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let allowed = client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id":approval["params"]["gate_id"],"approve":true}),
+        )
+        .await;
+    assert_eq!(allowed["result"]["accepted"], true, "{allowed}");
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let listed = client.about(&folder, list).await.unwrap();
+    let records = listed["revisions"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "{listed}");
+    assert_ne!(records[1]["artifact_id"], records[0]["artifact_id"]);
+    assert!(records[1]["predecessor"].is_null());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
     let world = World::new();
@@ -2827,4 +3232,217 @@ async fn the_backend_saves_keys_reaches_out_and_installs_without_showing_a_key()
     for key in [SECRET, "sk-zz-model-key", "sk-zz-second-key"] {
         assert!(!client.heard.contains(key), "{key} reached a client");
     }
+}
+
+/// A new version of an output is linked by what the person's message names,
+/// sent as data. The model reads which output in words and never sees an ID,
+/// and nothing it writes back can name one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_about_an_output_links_its_reply_and_shows_the_model_no_id() {
+    let world = World::new();
+    let backend = world.backend();
+    let folder = world.folder("revisions");
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let drawn = |body: &str| format!("drawn\n```mermaid\nflowchart LR\n{body}\n```");
+    macro_rules! turn {
+        ($params:expr) => {{
+            let accepted = client.ask("message.send", Some(&chat), $params).await;
+            assert!(accepted.get("error").is_none(), "{accepted}");
+            let (_, shown) = client.until(|frame| kind(frame, "message.accepted")).await;
+            let asked = world.provider.asked();
+            client.until(|frame| kind(frame, "turn.done")).await;
+            let listed = client.about(&folder, list.clone()).await.unwrap();
+            // What every surface shows for this message is the person's own
+            // words, live and again from saved history.
+            assert_eq!(shown["params"]["content"], $params["content"], "{shown}");
+            let saved = client
+                .ask("session.presentation", Some(&chat), json!({}))
+                .await;
+            let saved: protocol::PresentationSnapshot =
+                serde_json::from_value(saved["result"].clone()).unwrap();
+            let last = saved.items.iter().rev().find_map(|item| match item {
+                protocol::PresentationItem::User { text, about, .. } => {
+                    Some((text.clone(), about.clone()))
+                }
+                _ => None,
+            });
+            assert_eq!(
+                last,
+                Some((
+                    $params["content"].as_str().unwrap().to_owned(),
+                    shown["params"]["about"].as_str().map(str::to_owned)
+                )),
+            );
+            (
+                asked,
+                listed["revisions"].as_array().unwrap().clone(),
+                shown["params"]["about"].clone(),
+            )
+        }};
+    }
+
+    let (_, records, label) = turn!(json!({"content": drawn("A-->B")}));
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(label.is_null(), "{label}");
+    let first = records[0].clone();
+    let about = json!({"artifact_id": first["artifact_id"], "revision_id": first["revision_id"]});
+
+    let (asked, records, label) = turn!(json!({"content": drawn("A-->C"), "about": about}));
+    assert_eq!(label, "Diagram");
+    assert!(
+        asked.contains("About the diagram you made earlier:"),
+        "{asked}"
+    );
+    assert!(
+        !asked.contains("medha-output") && !asked.contains("artifact"),
+        "{asked}"
+    );
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1]["artifact_id"], first["artifact_id"]);
+    assert_eq!(records[1]["predecessor"], first["revision_id"]);
+
+    // An ordinary follow-up, and a reference to an output that does not exist.
+    let (_, records, _) = turn!(json!({"content": drawn("X-->Y")}));
+    assert_ne!(records[2]["artifact_id"], first["artifact_id"]);
+    assert!(records[2]["predecessor"].is_null(), "{records:?}");
+    let forged =
+        json!({"artifact_id": "inline:someone-elses:diagram", "revision_id": first["revision_id"]});
+    let (asked, records, label) = turn!(json!({"content": drawn("P-->Q"), "about": forged}));
+    assert!(label.is_null(), "{label}");
+    let latest = asked.rsplit(" | ").next().unwrap();
+    assert!(!latest.contains("About the diagram"), "{latest}");
+    assert_ne!(records[3]["artifact_id"], first["artifact_id"]);
+    assert!(records[3]["predecessor"].is_null(), "{records:?}");
+
+    let malformed = client
+        .ask(
+            "message.send",
+            Some(&chat),
+            json!({"content": "x", "about": "the first one"}),
+        )
+        .await;
+    assert!(malformed.get("error").is_some(), "{malformed}");
+
+    // A fresh backend rebuilds the chat from its log alone: the same words,
+    // the same label, and the same link.
+    drop(client);
+    let mut backend = backend;
+    backend.child.kill().unwrap();
+    backend.child.wait().unwrap();
+    drop(backend);
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let resumed = client.create(&folder, Some(&chat)).await;
+    assert_eq!(resumed["result"]["session"], chat.as_str(), "{resumed}");
+    client
+        .ask("session.attach", Some(&chat), json!({"after": 0}))
+        .await;
+    let saved = client
+        .ask("session.presentation", Some(&chat), json!({}))
+        .await;
+    let saved: protocol::PresentationSnapshot =
+        serde_json::from_value(saved["result"].clone()).unwrap();
+    let said: Vec<(String, Option<String>)> = saved
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            protocol::PresentationItem::User { text, about, .. } => {
+                Some((text.clone(), about.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            (drawn("A-->B"), None),
+            (drawn("A-->C"), Some("Diagram".to_owned())),
+            (drawn("X-->Y"), None),
+            (drawn("P-->Q"), None),
+        ]
+    );
+    let listed = client.about(&folder, list).await.unwrap();
+    assert_eq!(listed["revisions"][1]["predecessor"], first["revision_id"]);
+}
+
+/// A model that sends a drawing's elements as a list, where the server's
+/// schema takes JSON text, still draws: the call is repaired before it is sent,
+/// and the server receives exactly what it asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_sent_where_a_server_takes_text_is_repaired_before_the_call() {
+    let world = World::new();
+    let drawing = DrawingServer::start();
+    std::fs::create_dir_all(world.home()).unwrap();
+    std::fs::write(
+        world.home().join("config.toml"),
+        format!(
+            "[mcp.drawing]\nurl = \"{}\"\ntrust = \"trusted\"\n",
+            drawing.url
+        ),
+    )
+    .unwrap();
+    let backend = world.backend();
+    let folder = world.folder("repaired");
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    client
+        .until(|frame| {
+            frame["method"] == "mcp.status"
+                && frame["params"]["servers"]
+                    .as_array()
+                    .is_some_and(|servers| {
+                        servers.iter().any(|server| {
+                            server["server"] == "drawing" && server["state"] == "ready"
+                        })
+                    })
+        })
+        .await;
+    let screens = client.ask("mcp.screens", Some(&chat), json!({})).await;
+    let offered = &screens["result"]["tools"][0];
+    assert_eq!(offered["text_fields"], json!(["elements"]), "{screens}");
+
+    let accepted = client
+        .send(&chat, "DRAWLIST [{\"id\":\"shape\",\"x\":7}]")
+        .await;
+    assert!(accepted.get("error").is_none(), "{accepted}");
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let allowed = client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id":approval["params"]["gate_id"],"approve":true}),
+        )
+        .await;
+    assert_eq!(allowed["result"]["accepted"], true, "{allowed}");
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let saved = client.about(&folder, list).await.unwrap();
+    let drawn = &saved["revisions"][0]["screen"];
+    let sent: Value = serde_json::from_str(
+        drawn["input"]["elements"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the call records the text the server was sent: {drawn}")),
+    )
+    .unwrap();
+    assert_eq!(sent[0]["x"], 7, "{drawn}");
+    assert_eq!(
+        drawn["result"]["structuredContent"]["checkpointId"], "scene-1",
+        "the server parsed the text it was sent: {drawn}"
+    );
+    // The request after the call carries its result back to the model.
+    let _call = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let after = world.provider.seen.recv_timeout(WAIT).unwrap();
+    let result = after["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .map(|message| message["content"].to_string())
+        .unwrap_or_default();
+    assert!(
+        result.contains("was sent as an array and passed as a string"),
+        "the model is told what was changed: {result}"
+    );
 }

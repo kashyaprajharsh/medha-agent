@@ -21,6 +21,39 @@ const event = (kind, params = {}) => ({
   params: { kind, ...params },
 });
 
+test("pushed outputs are kept until they may be incomplete, then listed afresh", () => {
+  const record = (id) => ({ artifact_id: `file:${id}`, revision_id: `${id}:file`, predecessor: null, source_event: id, source_index: 0, ts: 1, kind: "page", name: id });
+  let state = reduceLive(startingLive(), event("outputs", { revisions: [record("a")] }));
+  state = reduceLive(state, event("outputs", { revisions: [record("b"), { bogus: true }] }));
+  assert.deepEqual(state.outputs.map((output) => output.revision_id), ["a:file", "b:file"]);
+  const epoch = state.outputsEpoch ?? 0;
+  // A rewind or switch, and a recovery after the stream was away, may each have
+  // missed what was sent: both drop the list and ask for a fresh listing.
+  const reset = reduceLive(state, event("presentation.reset", { revision: 2 }));
+  assert.deepEqual(reset.outputs, []);
+  assert.equal(reset.outputsEpoch, epoch + 1);
+  const recovered = reduceLive(state, { method: "session.presentation", params: { frames: [] } });
+  assert.deepEqual(recovered.outputs, []);
+  assert.equal(recovered.outputsEpoch, epoch + 1);
+  const flooded = reduceLive(state, event("outputs", { revisions: Array.from({ length: 2000 }, (_, n) => record(`n${n}`)) }));
+  assert.deepEqual(flooded.outputs, [], "past the bound the list is let go, not grown");
+  assert.equal(flooded.outputsEpoch, epoch + 1);
+});
+
+test("identical live replies bind to their own durable source events without losing rendered HTML", () => {
+  let state = reduceLive(startingLive(), event("turn.started", { turn: 1 }));
+  state = reduceLive(state, event("model.text", { delta: "same diagram", html: "<p>same diagram</p>" }));
+  state = reduceLive(state, event("model.text", { delta: "", source_event: "event-one" }));
+  assert.equal(state.items.at(-1).sourceEvent, "event-one");
+  assert.equal(state.items.at(-1).html, "<p>same diagram</p>");
+  state = reduceLive(state, event("turn.done"));
+  state = reduceLive(state, event("turn.started", { turn: 2 }));
+  state = reduceLive(state, event("message.accepted", { content: "again" }));
+  state = reduceLive(state, event("model.text", { delta: "same diagram", html: "<p>same diagram</p>" }));
+  state = reduceLive(state, event("model.text", { delta: "", source_event: "event-two" }));
+  assert.deepEqual(state.items.filter(item => item.kind === "text").map(item => item.sourceEvent), ["event-one", "event-two"]);
+});
+
 test("late attachment replaces active state and retains settings, prompts and agents", () => {
   let state = reduceLive(startingLive(), event("model.text", { delta: "stale" }));
   const snapshot = {
@@ -70,6 +103,20 @@ test("other viewers' messages appear while optimistic local messages appear once
   assert.deepEqual(state.items.filter((item) => item.kind === "user").map((item) => item.text), ["local", "other viewer"]);
   state = reduceLive(state, event("message.steered", { content: "other viewer steer" }));
   assert.equal(state.items.at(-1).text, "other viewer steer");
+});
+
+test("what a message was about is the backend's word, and never doubles the sent message", () => {
+  const sent = (about) => recordSent(startingLive(), { kind: "user", id: "local-id", text: "make it blue", ts: 1, about });
+  const users = (state) => state.items.filter((item) => item.kind === "user").map((item) => [item.id, item.text, item.about]);
+  // Acceptance carries the person's own words, so it matches the message already shown.
+  const confirmed = reduceLive(sent("Diagram: Read path"), event("message.accepted", { content: "make it blue", about: "Diagram: Read path" }));
+  assert.deepEqual(users(confirmed), [["local-id", "make it blue", "Diagram: Read path"]]);
+  // A reference the backend could not confirm loses its label.
+  const dropped = reduceLive(sent("Diagram: Read path"), event("message.accepted", { content: "make it blue" }));
+  assert.deepEqual(users(dropped), [["local-id", "make it blue", undefined]]);
+  // Another window, which never sent it, shows the same label.
+  const elsewhere = reduceLive({ ...startingLive(), status: "idle" }, event("message.accepted", { content: "make it blue", about: "Diagram: Read path" }));
+  assert.deepEqual(users(elsewhere).map(([, text, about]) => [text, about]), [["make it blue", "Diagram: Read path"]]);
 });
 
 test("image references reach other viewers and a recovered current turn", () => {
@@ -499,6 +546,23 @@ test("a call being written is kept only while it is useful, and never without bo
   const big = "x".repeat(600 * 1024);
   state = feed(feed(feed(state, "6", big), "6", big), "6", big);
   assert.ok(state.writing.at(-1).text.length <= 1024 * 1024);
+});
+
+test("reused provider call IDs attach a screen only to its own saved observation", () => {
+  let state = startingLive();
+  const call = () => { state = reduceLive(state, event("tool.call", { id: "reused", tool: "mcp__draw__view" })); };
+  const result = (source) => { state = reduceLive(state, event("tool.observation", { id: "reused", ok: true, source_event: source })); };
+  const screen = (source) => { state = reduceLive(state, event("tool.screen", { id: "reused", screen: { server: "draw", tool: "view", resource: "ui://draw", source_event: source } })); };
+  call(); result("first"); screen("first");
+  state = reduceLive(state, event("model.text", { delta: "Next drawing" }));
+  call(); result("second"); screen("second");
+  const groups = state.items.filter(item => item.kind === "tools");
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].steps[0].screen.source_event, "first");
+  assert.equal(groups[1].steps[0].screen.source_event, "second");
+  // A late duplicate must not overwrite the other drawing, either.
+  screen("first");
+  assert.equal(state.items.filter(item => item.kind === "tools")[1].steps[0].screen.source_event, "second");
 });
 
 test("a refused request shows the provider's reason instead of blaming the key", () => {

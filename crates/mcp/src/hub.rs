@@ -380,11 +380,12 @@ impl Link {
         qualified: &str,
         args: &Value,
         screen: bool,
+        identity: Option<&str>,
     ) -> Result<CallOutput, Error> {
         let output = self
             .request(
                 "call",
-                json!({"tool": qualified, "args": args, "screen": screen}),
+                json!({"tool": qualified, "args": args, "screen": screen, "identity": identity}),
             )
             .await?;
         serde_json::from_value(output).map_err(|error| Error::Protocol(error.to_string()))
@@ -578,7 +579,12 @@ async fn handle(
             // An older chat sends no flag, and is the model calling.
             let screen = request.params["screen"].as_bool().unwrap_or(false);
             let output = manager
-                .call_as(&text("tool"), &request.params["args"], screen)
+                .call_as(
+                    &text("tool"),
+                    &request.params["args"],
+                    screen,
+                    request.params["identity"].as_str(),
+                )
                 .await?;
             Ok(serde_json::to_value(output).unwrap_or(Value::Null))
         }

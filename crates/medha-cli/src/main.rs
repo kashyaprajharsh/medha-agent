@@ -1,6 +1,7 @@
 //! Medha CLI entrypoint. Configuration resolves from flags, environment,
 //! saved user settings, and finally first-run TUI setup.
 
+mod application_artifacts;
 mod application_catalog;
 mod application_commands;
 mod application_mcp;

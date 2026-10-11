@@ -32,6 +32,8 @@ export type HistoryEvent = {
   ts: number;
   text?: string;
   images?: MessageImage[];
+  /** The output a person's message was about, as the label shown beside it. */
+  about?: string;
   html?: string;
   tool_id?: string;
   status?: string;
@@ -126,6 +128,7 @@ export type LiveMethod =
   | "approval.respond"
   | "cancel"
   | "session.settings"
+  | "session.presentation"
   | "session.configure"
   | "agent.control"
   | "patch.list"
@@ -158,21 +161,42 @@ export type FileEntry = {
 export type ScreenOrigins = { connect: string[]; resources: string[]; frames: string[] };
 /** A screen a tool's server offers for a result: where its page is, and what it draws. */
 export type ToolScreen = {
+  identity?: string;
+  source_event?: string;
   server: string;
   tool: string;
   resource: string;
   /** The call's arguments as text, while the model is still writing them. */
   partial?: string;
+  /** Arguments the tool takes as text; a list or object written there is shown as JSON text, as the finished call will run. */
+  text_fields?: string[];
   input?: unknown;
   result?: unknown;
 };
+/** A page's local file. With a hash it was kept; without one it is read from the page's folder as it is now. */
+export type ArtifactAsset = { path: string; hash?: string; size: number; mime: string };
+export type ArtifactSnapshot = { path: string; kind: string; hash: string; size: number; assets: ArtifactAsset[]; missing: string[] };
+export type ArtifactRevision = { artifact_id: string; revision_id: string; predecessor: string | null; source_event: string; source_index: number; tool_call?: string; ts: number; kind: string; name: string; inline?: boolean; source_digest?: string; source?: string; snapshot?: ArtifactSnapshot; /** A file shown where it lies, as it is now. */ path?: string; screen?: ToolScreen };
+export type ArtifactPage = { revisions: ArtifactRevision[]; next_cursor: number | null; omitted: number };
 export type FilePreview = {
   kind: string;
   extension: string;
   size: number;
   text?: string;
   html?: string;
-  bytes?: number[];
+  bytes?: number[] | Uint8Array;
+  data?: string;
+  bundle?: string;
+  missing?: string[];
+  snapshot?: boolean;
+};
+
+const decodedPreview = (file: FilePreview): FilePreview => {
+  if (file.data === undefined) return file;
+  const text = atob(file.data);
+  const bytes = Uint8Array.from(text, (char) => char.charCodeAt(0));
+  const { data: _data, ...rest } = file;
+  return { ...rest, bytes };
 };
 export type GitFile = {
   path: string;
@@ -210,7 +234,10 @@ export const desktop = {
 export type Scope = { chatKey: string | null; sessionId: string | null };
 export function createApi(workspaceId: string, getScope: () => Scope) {
   const prefix = `${workspaceId}-`;
-  const keyFor = (key: string) => `${prefix}${key}`;
+  // Native viewers outlive the renderer. A resumed conversation may still
+  // belong to its original draft key, so every command uses the resolved key.
+  const routes = new Map<string, string>();
+  const keyFor = (key: string) => routes.get(key) ?? `${prefix}${key}`;
   const scope = () => {
     const value = getScope();
     return {
@@ -255,23 +282,24 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
     files: (directory = "") =>
       invoke<FileEntry[]>("files_list", { ...scope(), directory }),
     preview: (path: string) =>
-      invoke<FilePreview>("file_preview", { ...scope(), path }),
+      invoke<FilePreview>("file_preview", { ...scope(), path }).then(decodedPreview),
+    artifacts: (sessionId: string, cursor = 0) => invoke<ArtifactPage>("artifact_list", { workspaceId, sessionId, cursor }),
+    artifactPreview: (sessionId: string, revisionId: string) => invoke<FilePreview>("artifact_preview", { workspaceId, sessionId, revisionId }).then(decodedPreview),
+    artifactRelease: (bundle: string) => invoke<void>("artifact_release", { bundle }),
     openFile: (path: string) => invoke<void>("file_open", { ...scope(), path }),
     revealFile: (path: string) => invoke<void>("file_reveal", { ...scope(), path }),
     mediaLink: (path: string) =>
       invoke<{ url: string; size: number }>("media_link", { ...scope(), path }),
-    saveOutput: (name: string, content: { text: string } | { bytes: Uint8Array } | { path: string }) =>
+    saveOutput: (name: string, content: { text: string } | { bytes: Uint8Array } | { path: string } | { revisionId: string; sessionId: string }) =>
       invoke<boolean>("output_save", {
         ...scope(),
-        name,
-        path: "path" in content ? content.path : undefined,
-        data:
-          "path" in content
-            ? undefined
-            : Array.from("bytes" in content ? content.bytes : new TextEncoder().encode(content.text)),
+        sessionId: "revisionId" in content ? content.sessionId : scope().sessionId,
+        request: { name, content: "revisionId" in content ? { kind: "revision", revision_id: content.revisionId }
+          : "path" in content ? { kind: "file", path: content.path }
+          : { kind: "bytes", data: Array.from("bytes" in content ? content.bytes : new TextEncoder().encode(content.text)) } },
       }),
-    screenPut: (html: string, run: boolean, online: boolean, app?: ScreenOrigins) =>
-      invoke<string>("screen_put", { html, run, online, app }),
+    screenPut: (html: string, run: boolean, online: boolean, app?: ScreenOrigins, bundle?: string) =>
+      invoke<string>("screen_put", { html, run, online, app, bundle }),
     screenDrop: (url: string) => invoke<void>("screen_drop", { url }),
     screenKeep: (server: string, uri: string, page: unknown) =>
       invoke<void>("screen_keep", { server, uri, page }),
@@ -309,8 +337,15 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
       }),
     liveFocus: (key: string | null) =>
       invoke<void>("live_focus", { key: key ? keyFor(key) : null }),
-    liveOpen: (key: string, sessionId: string | null) =>
-      invoke<void>("live_open", { workspaceId, key: keyFor(key), sessionId }),
+    liveOpen: async (key: string, sessionId: string | null) => {
+      const opened = await invoke<{ key: string; reused: boolean }>("live_open", {
+        workspaceId, key: keyFor(key), sessionId,
+      });
+      if (!opened.key.startsWith(prefix)) throw new Error("Medha returned a chat from another workspace.");
+      routes.set(key, opened.key);
+      if (getScope().chatKey === key) void api.liveFocus(key).catch(() => {});
+      return opened.reused;
+    },
     liveRequest: (
       key: string,
       method: LiveMethod,
@@ -385,8 +420,10 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
       handler: (key: string, frame: LiveFrame) => void,
     ): Promise<UnlistenFn> =>
       listen<{ key: string; frame: LiveFrame }>("medha-live", (event) => {
-        if (event.payload.key.startsWith(prefix))
-          handler(event.payload.key.slice(prefix.length), event.payload.frame);
+        if (!event.payload.key.startsWith(prefix)) return;
+        const keys = new Set([event.payload.key.slice(prefix.length)]);
+        for (const [key, native] of routes) if (native === event.payload.key) keys.add(key);
+        for (const key of keys) handler(key, event.payload.frame);
       }),
   };
 

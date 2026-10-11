@@ -190,6 +190,10 @@ impl kernel::Executor for Rebound {
             None => self.inner.preview(intent).await,
         }
     }
+
+    async fn named_outputs(&self, text: &str, since: f64) -> Vec<serde_json::Value> {
+        self.inner.named_outputs(text, since).await
+    }
 }
 
 /// Delegate a bounded task to a child agent. The child is built from this

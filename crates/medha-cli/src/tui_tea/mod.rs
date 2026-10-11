@@ -1547,7 +1547,7 @@ impl ModelSetup {
             ModelSetupStep::ContextWindow => {
                 "Context window in tokens (optional; blank = unknown):"
             }
-            ModelSetupStep::ConfirmTest => "Test model? Type test for synthetic text/stream/tool checks (up to 4 billed requests, 45 seconds); blank saves without testing:",
+            ModelSetupStep::ConfirmTest => "Test model? Type test for synthetic text/stream/tool checks (up to 4 billed requests, 5 minutes per request, 8 minutes total); blank saves without testing:",
             ModelSetupStep::Testing => "Testing with synthetic messages; no tools run… (Esc closes this form)",
             ModelSetupStep::ReviewTest => "Review the test results above. Enter saves; Esc cancels:",
         }.into()

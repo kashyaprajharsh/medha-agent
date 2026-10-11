@@ -9,6 +9,22 @@ type Id = string | number;
 type Message = { jsonrpc?: string; id?: Id; method?: string; params?: unknown; result?: unknown };
 
 /**
+ * Half-written arguments shown the way the finished call will run: a list or
+ * object written where the tool takes text is passed as its JSON text. The
+ * fields come from the tool's own schema, as the backend reported them.
+ */
+export function asItWillRun(args: unknown, fields: unknown): unknown {
+  if (!Array.isArray(fields) || !args || typeof args !== "object" || Array.isArray(args)) return args;
+  let changed: Record<string, unknown> | undefined;
+  for (const field of fields) {
+    if (typeof field !== "string" || !Object.prototype.hasOwnProperty.call(args, field)) continue;
+    const value = (args as Record<string, unknown>)[field];
+    if (value && typeof value === "object") (changed ??= { ...(args as Record<string, unknown>) })[field] = JSON.stringify(value);
+  }
+  return changed ?? args;
+}
+
+/**
  * Reads arguments the model has only half written: whatever is open is closed,
  * and a trailing piece that cannot yet mean anything is left off. `undefined`
  * when there is nothing to read yet.
@@ -98,13 +114,15 @@ const LISTENING = 250;
 
 /** A bridge to one screen. `post` sends to its frame; `receive` takes what it sent. */
 export function bridge(host: Host, post: (message: object) => void, grace = LISTENING) {
+  let closed = false;
+  let inFlight = 0;
   let ready = false;
   let listening = false;
   let waiting: ReturnType<typeof setTimeout> | undefined;
   // What there is to draw, and how much of it the page in the frame has been told.
   let fed: Fed = {};
   let told = { input: false, result: false };
-  const notify = (method: string, params: unknown) => post({ jsonrpc: "2.0", method, params });
+  const notify = (method: string, params: unknown) => { if (!closed) post({ jsonrpc: "2.0", method, params }); };
   const known = (value: unknown) => value !== undefined && value !== null;
   // In the protocol's order: pieces of the input while it is written, the whole
   // input once, then the result once.
@@ -122,11 +140,14 @@ export function bridge(host: Host, post: (message: object) => void, grace = LIST
       notify("ui/notifications/tool-result", fed.result);
     }
   };
-  const answer = (id: Id, work: () => Promise<unknown>) =>
+  const answer = (id: Id, work: () => Promise<unknown>) => {
+    if (inFlight >= 32) { post({ jsonrpc: "2.0", id, error: { code: -32000, message: "This screen has too many pending requests." } }); return; }
+    inFlight++;
     void work().then(
-      (result) => post({ jsonrpc: "2.0", id, result: result ?? {} }),
-      (cause) => post({ jsonrpc: "2.0", id, error: { code: -32000, message: reason(cause) } }),
-    );
+      (result) => { if (!closed) post({ jsonrpc: "2.0", id, result: result ?? {} }); },
+      (cause) => { if (!closed) post({ jsonrpc: "2.0", id, error: { code: -32000, message: reason(cause) } }); },
+    ).finally(() => { inFlight--; });
+  };
 
   const asked: Record<string, (params: Record<string, unknown>) => Promise<unknown>> = {
     "ui/initialize": async () => {
@@ -167,6 +188,7 @@ export function bridge(host: Host, post: (message: object) => void, grace = LIST
   return {
     /** Handles one message from the frame. Anything not understood is refused, not ignored. */
     receive(data: unknown) {
+      if (closed) return;
       const message = record(data) as Message;
       if (message.jsonrpc !== "2.0" || typeof message.method !== "string") return;
       const params = record(message.params);
@@ -186,6 +208,7 @@ export function bridge(host: Host, post: (message: object) => void, grace = LIST
       }
       const handler = asked[message.method];
       const id = message.id;
+      if (typeof id !== "string" && typeof id !== "number") return;
       if (!handler) post({ jsonrpc: "2.0", id, error: { code: -32601, message: "Medha does not support this." } });
       else answer(id, () => handler(params));
     },
@@ -203,6 +226,7 @@ export function bridge(host: Host, post: (message: object) => void, grace = LIST
       clearTimeout(waiting);
       listening = false;
       if (ready) post({ jsonrpc: "2.0", id: "medha-teardown", method: "ui/resource-teardown", params: { reason: "closed" } });
+      closed = true;
     },
   };
 }

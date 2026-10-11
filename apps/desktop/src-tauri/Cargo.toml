@@ -20,6 +20,7 @@ opt-level = 3
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+sha2 = "0.10"
 tauri = { version = "2", features = ["macos-private-api"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

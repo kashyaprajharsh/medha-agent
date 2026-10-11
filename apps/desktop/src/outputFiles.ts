@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import type { FilePreview } from "./api";
 import { useWorkspaceApi } from "./Workspace";
+import { extensionOf, type Output } from "./outputBlocks";
 
 type Report = ((problem: string | undefined) => void) | undefined;
 
@@ -14,34 +15,47 @@ export function useKeyed<T>(key: string): [T | undefined, (value: T | undefined)
 }
 
 /** A file Medha made, read from the chat's folder. */
-export function useFile(path: string | undefined, onProblem: Report): FilePreview | undefined {
+export function useFile(request: string | Output | undefined, onProblem: Report): FilePreview | undefined {
   const api = useWorkspaceApi();
+  const path = typeof request === "string" ? request : request?.path;
+  const revision = typeof request === "object" ? request.revisionId : undefined;
+  const session = typeof request === "object" ? request.sessionId : undefined;
+  const stored = typeof request === "object" && !!(request.snapshot || request.storedSource);
   const [file, setFile] = useState<FilePreview>();
   useEffect(() => {
-    if (!path) return;
+    if (!path && !stored) { setFile(undefined); return; }
     let current = true;
+    let bundle: string | undefined;
     setFile(undefined);
-    void api
-      .preview(path)
+    const read = stored ? (revision && session ? api.artifactPreview(session, revision) : Promise.reject(new Error("This file has no saved revision identity."))) : api.preview(path!);
+    void read
       .then((read) => {
-        if (!current) return;
+        if (!current) { if (read.bundle) void api.artifactRelease(read.bundle); return; }
+        bundle = read.bundle;
         setFile(read);
         onProblem?.(undefined);
       })
       .catch((cause) => current && onProblem?.(reason(cause)));
     return () => {
       current = false;
+      if (bundle) void api.artifactRelease(bundle);
     };
-  }, [api, path, onProblem]);
+  }, [api, path, revision, session, stored, onProblem]);
   return file;
 }
 
 /** A link the window can play a video or a sound from, without reading it whole. */
-export function useMedia(path: string | undefined, onProblem: Report) {
+export function useMedia(request: string | Output | undefined, onProblem: Report) {
   const api = useWorkspaceApi();
+  const path = typeof request === "string" ? request : request?.path;
+  const stored = typeof request === "object" && !!request.snapshot;
+  const file = useFile(stored ? request : undefined, onProblem);
+  const extension = extensionOf(path ?? "");
+  const types: Record<string, string> = { mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", webm: "video/webm", mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", ogg: "audio/ogg", oga: "audio/ogg", flac: "audio/flac" };
+  const url = useBlobUrl(file?.bytes, types[extension] ?? "application/octet-stream");
   const [media, setMedia] = useState<{ url: string; size: number }>();
   useEffect(() => {
-    if (!path) return;
+    if (!path || stored) return;
     let current = true;
     void api
       .mediaLink(path)
@@ -50,12 +64,12 @@ export function useMedia(path: string | undefined, onProblem: Report) {
     return () => {
       current = false;
     };
-  }, [api, path, onProblem]);
-  return media;
+  }, [api, path, stored, onProblem]);
+  return useMemo(() => stored ? (url && file ? { url, size: file.size } : undefined) : media, [stored, url, file, media]);
 }
 
 /** Bytes shown through a URL that lives exactly as long as they are on screen. */
-export function useBlobUrl(bytes: number[] | undefined, type: string): string | undefined {
+export function useBlobUrl(bytes: number[] | Uint8Array | undefined, type: string): string | undefined {
   const [url, setUrl] = useState<string>();
   useEffect(() => {
     if (!bytes) return;

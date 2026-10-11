@@ -345,7 +345,7 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
         )}
 
         {(step === "models" || step === "manual") && <div className="fr-body">
-          <p className="fr-note">Test uses synthetic messages, up to four billed requests and 45 seconds. No files or tools are executed. Saving without testing is supported.</p>
+          <p className="fr-note">Test uses synthetic messages and up to four billed requests. Slow servers may take several minutes: up to 5 minutes per request, 8 minutes in total. No files or tools are executed. You can save without testing.</p>
           <button type="button" className="btn-line" disabled={busy || testing || !url || !(step === "manual" ? typed.trim() : picked)} onClick={() => void testModel()}>{testing ? "Testing model…" : "Test model"}</button>
           <ModelTest result={tested} />
         </div>}

@@ -299,6 +299,16 @@
   color: var(--dim);
   font-weight: 500;
 }
+/* The output open beside the chat is named in full where the line has room. */
+.token-output {
+  max-width: calc(var(--s-8) * 10);
+}
+.msg-token.token-output .icon {
+  flex: none;
+  width: var(--s-3);
+  height: var(--s-3);
+  opacity: 0.6;
+}
 .token-skill::after {
   content: "";
   position: absolute;
@@ -326,6 +336,17 @@
 }
 .msg-token.sent::after {
   display: none;
+}
+.msg-token.sent .icon {
+  display: inline;
+  margin-right: var(--s-1);
+  vertical-align: -1px;
+}
+/* A title can be a sentence long: it wraps with the message, never past it. */
+.msg-token.token-output.sent {
+  white-space: normal;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
 }
 .composer textarea {
   transition: text-indent 160ms var(--ease-out);

@@ -88,4 +88,10 @@ pub trait Executor: Send + Sync {
     fn background_tasks(&self) -> Vec<BackgroundTask> {
         Vec::new()
     }
+
+    /// Files a reply names that changed since `since` (Unix seconds), each as
+    /// `{"path", "kind"}`, for a surface to show beside the reply. Default: none.
+    async fn named_outputs(&self, _text: &str, _since: f64) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
 }

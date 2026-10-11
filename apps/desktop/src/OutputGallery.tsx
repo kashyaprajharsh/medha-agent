@@ -53,7 +53,7 @@ function Group({ title, outputs }: { title: string; outputs: Output[] }) {
 
 /** Everything made in this chat, newest first, each at its newest version. */
 export function Gallery() {
-  const { all } = useOutputs();
+  const { all, notice, retry } = useOutputs();
   const outputs = latestOf(all);
   if (!outputs.length)
     return (
@@ -62,6 +62,7 @@ export function Gallery() {
           <Icon name="maximize" />
           <b>Nothing made yet</b>
           <p>Diagrams, pages, images and files Medha makes in this chat open here at full size.</p>
+          {notice && <p role="alert">{notice} <button type="button" onClick={retry}>Retry</button></p>}
         </div>
       </div>
     );
@@ -74,6 +75,7 @@ export function Gallery() {
         <b>All outputs</b>
         <span>{outputs.length} in this chat</span>
       </header>
+      {notice && <p role="alert">{notice} <button type="button" onClick={retry}>Retry</button></p>}
       <Group title="This turn" outputs={outputs.filter((output) => turn(output) === newest)} />
       <Group title="Earlier in this chat" outputs={outputs.filter((output) => turn(output) !== newest)} />
     </div>

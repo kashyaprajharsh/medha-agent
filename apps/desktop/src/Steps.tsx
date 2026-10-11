@@ -121,8 +121,8 @@ export const StepGroup = memo(function StepGroup({
         <div>
           <FoldContent open={open} freeze={false}>
             <ol className="steps">
-              {steps.map((step) => (
-                <StepRow key={step.id} step={step} now={now} />
+              {steps.map((step, index) => (
+                <StepRow key={`${step.id}:${index}`} step={step} now={now} />
               ))}
             </ol>
           </FoldContent>

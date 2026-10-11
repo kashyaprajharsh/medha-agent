@@ -47,7 +47,7 @@ async fn canonical_text_reasoning_and_tool_calls_are_replayed_once_across_compac
         ),
         record(
             "intent",
-            "model.intent",
+            "model.tool_intent",
             json!({"id":"call", "tool":"read", "args":{"path":"file"}}),
         ),
         record(

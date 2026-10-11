@@ -35,6 +35,7 @@ reqwest = { workspace = true }
 scraper = "0.20"
 htmd = "0.5"
 urlencoding = "2"
+pulldown-cmark = { version = "0.13", default-features = false }
 pdf-extract = "0.12"
 sha2 = "0.10"
 fd-lock = "4"

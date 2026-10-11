@@ -655,7 +655,6 @@ pub(crate) struct ResponseDecoder {
     finished_parts: BTreeMap<u32, Vec<ContentPart>>,
     usage: Option<UsageRaw>,
     terminal: bool,
-    progressed: bool,
 }
 
 impl ResponseDecoder {
@@ -666,12 +665,10 @@ impl ResponseDecoder {
             finished_parts: BTreeMap::new(),
             usage: None,
             terminal: false,
-            progressed: false,
         }
     }
 
     pub(crate) fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
-        self.progressed = false;
         let data = event.data.trim();
         if data.is_empty() {
             return Ok(Vec::new());
@@ -776,8 +773,6 @@ impl ResponseDecoder {
                 "Gemini emitted duplicate step.start index {index}"
             )));
         }
-        self.progressed = !initial_blocks.is_empty()
-            || step.get("type").and_then(Value::as_str) == Some("function_call");
         Ok(initial_blocks)
     }
 
@@ -799,7 +794,6 @@ impl ResponseDecoder {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.progressed = !chunk.is_empty();
                 text.push_str(chunk);
                 Ok((!chunk.is_empty())
                     .then(|| Block::Text(chunk.to_string()))
@@ -813,7 +807,6 @@ impl ResponseDecoder {
                     .and_then(|content| content.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.progressed = !chunk.is_empty();
                 summary.push_str(chunk);
                 Ok((!chunk.is_empty())
                     .then(|| Block::Reasoning(chunk.to_string()))
@@ -825,7 +818,6 @@ impl ResponseDecoder {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.progressed = !chunk.is_empty();
                 summary.push_str(chunk);
                 Ok((!chunk.is_empty())
                     .then(|| Block::Reasoning(chunk.to_string()))
@@ -861,7 +853,6 @@ impl ResponseDecoder {
                         "Gemini function-call step {index} supplied both complete and streamed arguments"
                     )));
                 }
-                self.progressed = !chunk.is_empty();
                 argument_deltas.push_str(chunk);
                 // Passed on as written, under the id the finished call carries.
                 Ok((!chunk.is_empty())
@@ -975,9 +966,6 @@ impl ResponseDecoder {
         Ok(blocks)
     }
 
-    pub(crate) fn progressed(&self) -> bool {
-        self.progressed
-    }
     pub(crate) fn completed(&self) -> bool {
         self.terminal
     }

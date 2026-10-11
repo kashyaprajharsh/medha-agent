@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import ts from "typescript";
 import { JSDOM } from "jsdom";
 import React, { act } from "react";
+import JSZip from "jszip";
 
 const dom = new JSDOM('<!doctype html><div id="root"></div>', {
   pretendToBeVisual: true,
@@ -75,7 +76,7 @@ async function moduleUrl(name, cache = modules) {
     const dependency = match[1];
     const url = dependency.startsWith("./")
       ? await moduleUrl(dependency.slice(2), cache)
-      : import.meta.resolve(dependency);
+      : cache.get(dependency) ?? import.meta.resolve(dependency);
     outputText = outputText
       .replaceAll(`"${dependency}"`, JSON.stringify(url))
       .replaceAll(`'${dependency}'`, JSON.stringify(url));
@@ -296,6 +297,75 @@ test("session settings and effort changes update from the acknowledgement even w
   assert.equal(live.live.draft.settings.effort, "high");
   assert.equal(live.live.draft.settings.reasoning, "on");
   assert.equal(calls.length, 2);
+});
+
+test("a remounted renderer recovers its native chat and sends Stop to the same handle", async () => {
+  const cache = new Map(modules);
+  cache.delete("api");
+  cache.delete("useLive");
+  const stub = (name, source) => cache.set(name, "data:text/javascript," + encodeURIComponent(source));
+  stub("@tauri-apps/api/core", "export const invoke=(...args)=>globalThis.__medhaNative.invoke(...args); export class Channel {}");
+  stub("@tauri-apps/api/event", "export const listen=(...args)=>globalThis.__medhaNative.listen(...args)");
+  const { createApi } = await import(await moduleUrl("api", cache));
+  const { useLive: recoveredLive } = await import(await moduleUrl("useLive", cache));
+  const listeners = new Set(), requests = [];
+  const session = "01M4HZ00C8NHK59J3NRBZKMQS4";
+  const nativeKey = "personal-draft-original";
+  let next = 0, running = true;
+  const emit = (frame) => {
+    for (const callback of listeners) callback({ payload: { key: nativeKey, frame } });
+  };
+  globalThis.__medhaNative = {
+    listen: async (name, callback) => {
+      assert.equal(name, "medha-live");
+      listeners.add(callback);
+      return () => listeners.delete(callback);
+    },
+    invoke: async (name, args) => {
+      if (name === "live_open") return { key: nativeKey, reused: true };
+      if (name === "live_focus") { assert.equal(args.key, nativeKey); return; }
+      assert.equal(name, "live_request");
+      assert.equal(args.key, nativeKey, "resume, send and Stop must address the original native viewer");
+      requests.push(args.method);
+      const id = ++next;
+      if (args.method === "cancel") running = false;
+      const result = args.method === "session.presentation"
+        ? { session, running, settings, approvals: [], questions: [], agents: [], frames: running ? [
+            { method: "event", params: { kind: "model.text", delta: "Already streamed", html: "<p>Already streamed</p>" } },
+          ] : [] }
+        : {};
+      emit({ id, result, ...(args.method === "session.presentation" ? { method: "session.presentation" } : {}) });
+      if (args.method === "session.presentation" && running) {
+        emit({ method: "event", params: { kind: "model.text", delta: " after snapshot", html: "<p>Already streamed after snapshot</p>" } });
+        emit({ method: "event", params: { kind: "model.waiting" } });
+      }
+      if (args.method === "message.send") emit({ method: "event", params: { kind: "message.accepted", content: args.params.content } });
+      if (args.method === "cancel") emit({ method: "event", params: { kind: "turn.cancelled" } });
+      return id;
+    },
+  };
+  const api = createApi("personal", () => ({ chatKey: session, sessionId: session }));
+  globalThis.__medhaControlsTest.api = api;
+  let live;
+  function Harness() { live = recoveredLive(); return null; }
+  await act(() => root.render(h(Harness)));
+  await act(() => live.ensureOpen(session, session));
+  assert.equal(live.live[session].sessionId, session);
+  assert.equal(live.live[session].status, "running");
+  assert.equal(live.live[session].items[0].text, "Already streamed after snapshot", "recovery cannot overwrite frames arriving after its snapshot");
+  await act(() => live.send(session, session, "Follow up"));
+  await act(() => live.cancel(session));
+  assert.equal(live.live[session].status, "idle");
+  assert.deepEqual(requests, ["session.presentation", "message.send", "cancel"]);
+  // A first send after remount must survive the idle snapshot without being
+  // left as a second, unpositioned optimistic message.
+  await act(() => root.render(h(Harness, { key: "remounted" })));
+  await act(() => live.send(session, session, "Send after remount"));
+  const user = live.live[session].items.filter((item) => item.kind === "user");
+  assert.equal(user.length, 1);
+  assert.equal(user[0].id, live.live[session].sent[0].id);
+  await act(() => emit({ method: "exit", params: { stderr: "" } }));
+  assert.equal(live.live[session].status, "exited", "ended frames must use the recovered alias too");
 });
 
 test("stream bursts paint once without losing text; controls flush immediately", async (t) => {
@@ -790,6 +860,41 @@ test("directory and unknown targets never claim an exact file grant", async () =
   }
 });
 
+test("a tool call still being written says what Medha is doing, where a caret alone looked stuck", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  const event = (kind, params = {}) => ({ method: "event", params: { kind, ...params } });
+  const status = () => document.querySelector(".live-status > span:last-child")?.textContent;
+  let state = reduceLive(startingLive(), { method: "ready", params: { session: "s" } });
+  const then = async (kind, params) => {
+    state = reduceLive(state, event(kind, params));
+    await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
+  };
+  await then("message.accepted", { content: "make a page" });
+  await then("turn.started", { turn: 1 });
+  await then("model.text", { delta: "Building" });
+  assert.ok(document.querySelector(".prose.streaming"), "text that is still arriving keeps its caret");
+  assert.equal(status(), undefined);
+
+  // A large file takes minutes to arrive as one call. Nothing else is sent meanwhile.
+  await then("tool.started", { tool: "write" });
+  assert.equal(document.querySelector(".prose.streaming"), null, "the text is finished, so its caret goes");
+  assert.equal(status(), "Writing a file");
+  await then("tool.started", { tool: "write", target: "/work/site/react-agent.html" });
+  assert.equal(status(), "Writing react-agent.html");
+  assert.equal(state.activity.started > 0 && state.activity.tool, "write");
+
+  await then("tool.call", { id: "c1", tool: "write", verb: "Write", target: "react-agent.html" });
+  assert.equal(state.activity, undefined, "the call itself takes over as a running step");
+  assert.equal(status(), undefined);
+
+  // Any other tool keeps the plain line, never a raw tool name.
+  await then("tool.started", { tool: "mcp__drawing__create_view" });
+  assert.equal(status(), "Working");
+  await then("model.restarted");
+  assert.equal(state.activity, undefined, "a retry starts the reply again");
+});
+
 test("action approvals keep their action label", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive } = await import(await moduleUrl("live"));
@@ -1096,7 +1201,7 @@ test("a diagram grows while it is written, keeps its last good drawing, and open
   await reply("---\ntitle: Read path\n---\nflowchart LR\n  A --&gt; B\n  B --&gt; C", false);
   assert.equal(plate().querySelector(".out-status"), null);
   await click(plate().querySelector("button.out-name"));
-  assert.deepEqual(shown, [
+  assert.deepEqual(shown.map(({ anchor, kind, source, path, screen, name }) => ({ anchor, kind, source, path, screen, name })), [
     {
       anchor: "live-0:1",
       kind: "diagram",
@@ -1106,6 +1211,8 @@ test("a diagram grows while it is written, keeps its last good drawing, and open
       name: "Read path",
     },
   ]);
+  assert.equal(shown[0].sourceIndex, 0);
+  assert.equal(shown[0].sourceEvent, undefined, "unfinished live output has no invented durable identity");
 
   await reply("flowchart LR\n  A --&gt;", false);
   assert.match(plate().querySelector(".out-problem").textContent, /couldn't be drawn.*unfinished/);
@@ -1237,6 +1344,21 @@ test("a screen is told nothing until it is ready, and gets only what the person 
   assert.equal(asked.at(-1), "say Make the pool blue");
 });
 
+test("a list written where the tool takes text is drawn live as the finished call will run", async () => {
+  const { asItWillRun, halfWritten } = await import(await moduleUrl("outputBridge"));
+  // One model writes the elements as JSON text, another as the list itself.
+  const asText = halfWritten('{"elements":"[{\\"type\\":\\"rect\\"},{\\"type\\":\\"te');
+  const asList = halfWritten('{"elements":[{"type":"rect"},{"type":"te');
+  assert.deepEqual(asItWillRun(asList, ["elements"]), { elements: '[{"type":"rect"},{"type":"te"}]' });
+  assert.equal(asItWillRun(asText, ["elements"]), asText, "text is passed on untouched");
+  // Only fields the schema reported as text change; nothing without a report does.
+  const both = { elements: [1], points: [2] };
+  assert.deepEqual(asItWillRun(both, ["elements"]), { elements: "[1]", points: [2] });
+  assert.equal(asItWillRun(both, undefined), both);
+  assert.equal(asItWillRun(both, "elements"), both);
+  assert.equal(asItWillRun(undefined, ["elements"]), undefined);
+});
+
 test("a screen draws a call as the model writes it, and is told everything again after a reload", async () => {
   const { bridge, halfWritten } = await import(await moduleUrl("outputBridge"));
   // Arguments cut off anywhere still read as the part that is whole.
@@ -1292,15 +1414,29 @@ test("a revision takes the viewer with it, but never away from a version the per
   let outputs;
   let writing = -1;
   let free = true;
+  let shown = [];
+  let stamp = 0;
   const Probe = () => ((outputs = useOutputs()), null);
   const version = (body) =>
     `<pre data-lang="mermaid"><code>---\ntitle: Read path\n---\nflowchart LR\n  A --&gt; ${body}</code></pre>`;
+  const other = '<pre data-lang="mermaid"><code>flowchart LR\n  X --&gt; Y</code></pre>';
+  // Which replies are versions of one output is the saved catalogue's word alone.
+  globalThis.__medhaControlsTest.api = {
+    artifacts: async () => ({
+      revisions: shown.flatMap((html, index) => index === writing ? [] : [{
+        artifact_id: html === other ? `separate-${index}` : "read-path", revision_id: `r${index}:code:0`, predecessor: null,
+        source_event: `r${index}`, source_index: 0, ts: index + 1, kind: "diagram", name: "Read path", inline: true,
+      }]),
+      next_cursor: null, omitted: 0,
+    }),
+  };
   const chat = async (...replies) => {
+    shown = replies;
     await act(() =>
       root.render(
         h(
           OutputScope,
-          { chat: "c", viewing: true, onShow() {}, onMade: () => free, onAsk() {} },
+          { chat: "c", sessionId: "saved", stamp: String(++stamp), viewing: true, onShow() {}, onMade: () => free, onAsk() {} },
           h(Probe),
           replies.map((html, index) =>
             h(Markdown, { key: index, html, scope: `r${index}`, at: index, streaming: index === writing }),
@@ -1308,35 +1444,35 @@ test("a revision takes the viewer with it, but never away from a version the per
         ),
       ),
     );
-    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 150)));
   };
 
   await chat(version("B"));
   await act(() => outputs.show(outputs.all[0]));
-  assert.equal(outputs.open.anchor, "r0:0");
+  assert.equal(outputs.open.anchor, "r0:code:0");
 
   await chat(version("B"), version("C"));
-  assert.equal(outputs.open.anchor, "r1:0", "the viewer follows the revision");
+  assert.equal(outputs.open.anchor, "r1:code:0", "the viewer follows the revision");
   assert.equal(document.querySelectorAll(".out-plate").length, 1, "the first version keeps its plate");
   assert.match(document.querySelector(".out-revision.current").textContent, /Read path.*v2/);
 
   await act(() => outputs.follow(outputs.all[0]));
   await chat(version("B"), version("C"), version("D"));
-  assert.equal(outputs.open.anchor, "r0:0", "a chosen older version stays put");
-  assert.deepEqual(outputs.all.map((output) => output.anchor), ["r0:0", "r1:0", "r2:0"]);
+  assert.equal(outputs.open.anchor, "r0:code:0", "a chosen older version stays put");
+  assert.deepEqual(outputs.all.map((output) => output.anchor), ["r0:code:0", "r1:code:0", "r2:code:0"]);
 
   await chat(version("B"));
-  assert.deepEqual(outputs.all.map((output) => output.anchor), ["r0:0"], "a reply that leaves takes its outputs");
+  assert.deepEqual(outputs.all.map((output) => output.anchor), ["r0:code:0"], "a reply that leaves takes its outputs");
 
   // What Medha finishes writing opens by itself, unless the person is busy elsewhere.
-  const other = '<pre data-lang="mermaid"><code>flowchart LR\n  X --&gt; Y</code></pre>';
   await act(() => outputs.browse());
   writing = 1;
   await chat(version("B"), other);
   assert.equal(outputs.open, null, "nothing opens while it is still being written");
   writing = -1;
   await chat(version("B"), other);
-  assert.equal(outputs.open.anchor, "r1:0");
+  assert.equal(outputs.open.anchor, "r1:code:0");
+  assert.equal(document.querySelectorAll(".out-plate").length, 2, "a reply the catalogue keeps apart is its own output");
   await act(() => outputs.browse());
   free = false;
   writing = 2;
@@ -1344,6 +1480,184 @@ test("a revision takes the viewer with it, but never away from a version the per
   writing = -1;
   await chat(version("B"), other, other);
   assert.equal(outputs.open, null, "it stays out of the way of another panel");
+});
+
+test("reading or mentioning an input file cannot publish it or open Preview", async () => {
+  const { Markdown } = await import(await moduleUrl("Markdown"));
+  const { OutputsProvider, SHOWN_ONLY } = await import(await moduleUrl("outputContext"));
+  const published = [], opened = [];
+  globalThis.__medhaControlsTest.api = { files() { throw new Error("file existence must not infer publication"); } };
+  await act(() => root.render(h(OutputsProvider, { value: { ...SHOWN_ONLY, enter: (...args) => { published.push(args); return () => {}; }, made: (output) => opened.push(output) } }, h(Markdown, { html: '<p>I read <code>existing.html</code> and <a href="other.html">the other file</a>.</p><p><span class="md-image" data-src="photo.png">Photo</span></p>', scope: "input", fresh: true }))));
+  assert.equal(document.querySelectorAll(".out-plate").length, 0);
+  assert.equal(document.querySelectorAll(".prose a").length, 3, "references retain explicit preview actions");
+  assert.deepEqual([published, opened], [[], []]);
+});
+
+test("a drawing tool is recognised for live drawing even when another call starts before the screen list arrives", async () => {
+  const { useOffered, forgetScreens } = await import(await moduleUrl("OutputApp"));
+  const tool = "mcp__excalidraw__create_view";
+  const screens = { tools: [{ name: tool, server: "excalidraw", tool: "create_view", resource: "ui://excalidraw/view" }] };
+  const answers = [];
+  globalThis.__medhaControlsTest.api = { liveCall: () => new Promise((done) => answers.push(done)) };
+  let offered;
+  const Probe = ({ writing }) => ((offered = useOffered(writing)), null);
+  const draw = (count) => act(() => root.render(h(Probe, { writing: Array.from({ length: count }, () => ({ tool })) })));
+
+  globalThis.__medhaControlsTest.scope = { current: { chatKey: "racing" } };
+  await draw(1);
+  await draw(2);
+  assert.equal(answers.length, 1, "the tool is asked about once");
+  await act(async () => answers[0](screens));
+  assert.ok(offered(tool), "the answer that arrived late still switches live drawing on");
+
+  // An answer for a chat that ended meanwhile does not bring its cache back.
+  globalThis.__medhaControlsTest.scope = { current: { chatKey: "ended" } };
+  await draw(1);
+  forgetScreens("ended");
+  await act(async () => answers[1](screens));
+  assert.equal(offered(tool), undefined);
+  delete globalThis.__medhaControlsTest.scope;
+});
+
+test("failed MCP screens remain compact and do not replace a good revision", async () => {
+  const { Screens } = await import(await moduleUrl("OutputPlate"));
+  const { OutputsProvider, SHOWN_ONLY } = await import(await moduleUrl("outputContext"));
+  const entered = [], made = [], inspected = [];
+  const screen = { server: "drawing", tool: "create_view", resource: "ui://drawing", input: {}, result: { isError: true } };
+  await act(() => root.render(h(OutputsProvider, { value: { ...SHOWN_ONLY, enter: (output) => { entered.push(output); return () => {}; }, made: (output) => made.push(output), show: (output) => inspected.push(output) } }, h(Screens, { at: 0, fresh: true, steps: [{ id: "bad", status: "failed", screen, summary: "Invalid drawing" }, { id: "denied", status: "denied", screen, summary: "Denied" }] }))));
+  assert.equal(document.querySelectorAll(".out-failed").length, 2);
+  assert.equal(document.querySelectorAll(".out-plate").length, 0);
+  assert.deepEqual([entered, made], [[], []]);
+  await click([...document.querySelectorAll("button")].find((button) => button.textContent === "Inspect error screen"));
+  assert.equal(inspected[0].anchor, "error-screen:bad");
+});
+
+test("saved artifact identities and all revisions survive catalogue reloads", async () => {
+  const { OutputScope } = await import(await moduleUrl("OutputScope"));
+  const { useOutputs } = await import(await moduleUrl("outputContext"));
+  const records = [1, 2].map((n) => ({ artifact_id: "inline:flow:diagram", revision_id: `event-${n}:code:0`, predecessor: n > 1 ? `event-${n - 1}:code:0` : null, source_event: `event-${n}`, source_index: 0, ts: n, kind: "diagram", name: "Same title", inline: true, source: `flowchart LR\n A-->Node${n}` }));
+  globalThis.__medhaControlsTest.api = { artifacts: async () => ({ revisions: records, next_cursor: null, omitted: 0 }) };
+  let outputs;
+  const Probe = () => ((outputs = useOutputs()), null);
+  const mount = async (key) => { await act(() => root.render(h(OutputScope, { key, chat: "live", sessionId: "saved", viewing: true, onShow() {}, onMade: () => true, onAsk() {} }, h(Probe)))); await act(() => new Promise((done) => setTimeout(done, 80))); };
+  await mount("first");
+  assert.equal(outputs.all.length, 2);
+  await act(() => outputs.show(outputs.all[0]));
+  assert.equal(outputs.open.source, records[0].source);
+  await mount("reloaded");
+  assert.deepEqual(outputs.all.map((output) => output.anchor), records.map((record) => record.revision_id));
+  assert.deepEqual(outputs.all.map((output) => output.predecessor), [null, "event-1:code:0"]);
+});
+
+test("identical live outputs bind by source event and kind instead of titles, content or call IDs", async () => {
+  const { OutputScope } = await import(await moduleUrl("OutputScope"));
+  const { useOutputs } = await import(await moduleUrl("outputContext"));
+  const source = "flowchart LR\n A-->B";
+  const records = ["first", "second"].map((id, n) => ({ artifact_id: `independent-${id}`, revision_id: `${id}:code:0`, predecessor: null, source_event: id, source_index: 0, ts: n + 1, kind: "diagram", name: "Same title", inline: true, source }));
+  records.push({ ...records[1], kind: "app", artifact_id: "drawing", revision_id: "second:screen", inline: false, source: undefined, tool_call: "reused", screen: { server: "draw", tool: "view", resource: "ui://draw" } });
+  globalThis.__medhaControlsTest.api = { artifacts: async () => ({ revisions: records, next_cursor: null, omitted: 0 }) };
+  let outputs;
+  const Probe = () => ((outputs = useOutputs()), null);
+  await act(() => root.render(h(OutputScope, { chat: "c", sessionId: "saved", viewing: true, onShow() {}, onMade: () => true, onAsk() {} }, h(Probe))));
+  await act(() => new Promise(done => setTimeout(done, 80)));
+  const live = id => ({ anchor: `live-${id}:0`, kind: "diagram", name: "Same title", source, sourceEvent: id, sourceIndex: 0 });
+  assert.equal(outputs.resolve(live("first")).revisionId, "first:code:0");
+  assert.equal(outputs.resolve(live("second")).revisionId, "second:code:0");
+  assert.equal(outputs.resolve({ ...live("second"), kind: "app", toolCall: "reused" }).revisionId, "second:screen");
+  assert.equal(outputs.resolve({ ...live("unknown"), toolCall: "reused" }).revisionId, undefined);
+  assert.equal(outputs.resolve({ ...live("unknown"), sourceEvent: undefined, toolCall: "reused" }).revisionId, undefined);
+  assert.equal(outputs.all.length, 3);
+});
+
+test("oversized inline source is copied from its saved revision and action failures stay visible", async () => {
+  const { Preview } = await import(await moduleUrl("OutputPreview"));
+  const { OutputsProvider, SHOWN_ONLY } = await import(await moduleUrl("outputContext"));
+  const source = "flowchart LR\n A-->B\n";
+  const copied = [], reads = [], released = [], saves = [];
+  Object.defineProperty(globalThis.navigator, "clipboard", { configurable: true, value: { writeText: async (text) => copied.push(text) } });
+  const open = { anchor: "revision", revisionId: "revision", sessionId: "chat", kind: "diagram", name: "Diagram", source: "", storedSource: true };
+  globalThis.__medhaControlsTest.api = {
+    artifactPreview: async (...args) => { reads.push(args); return { text: source, size: source.length, bundle: "owned" }; },
+    artifactRelease: async (bundle) => released.push(bundle),
+    saveOutput: async (...args) => { saves.push(args); throw new Error("Disk is full"); },
+  };
+  await act(() => root.render(h(OutputsProvider, { value: { ...SHOWN_ONLY, open, all: [open] } }, h(Preview))));
+  await click(document.querySelector('[aria-label="Copy"]'));
+  assert.deepEqual(copied, [source]);
+  assert.ok(reads.every((args) => args[0] === "chat" && args[1] === "revision"));
+  assert.ok(released.includes("owned"));
+  await click(document.querySelector('[aria-label="Save a copy"]'));
+  assert.match(document.querySelector('[role="alert"]').textContent, /Disk is full.*Try the action again/);
+  assert.deepEqual(saves[0][1], { revisionId: "revision", sessionId: "chat" });
+  globalThis.__medhaControlsTest.api.saveOutput = async () => false;
+  await click(document.querySelector('[aria-label="Save a copy"]'));
+  assert.equal(document.querySelector('[role="alert"]'), null, "cancelling the file dialog is not an error");
+});
+
+test("a saved screen calls back only the connection that drew it", async () => {
+  const { AppScreen } = await import(await moduleUrl("OutputApp"));
+  const { OutputsProvider, SHOWN_ONLY } = await import(await moduleUrl("outputContext"));
+  const run = async (chat, recorded, live) => {
+    const calls = [];
+    const output = { anchor: chat, artifactId: chat, revisionId: chat, name: "Drawing", kind: "app", source: "", screen: { server: "draw", tool: "create_view", resource: "ui://draw/app.html", identity: recorded, input: { elements: "[]" } } };
+    globalThis.__medhaControlsTest.scope = { current: { chatKey: chat } };
+    globalThis.__medhaControlsTest.api = {
+      liveCall: async (_chat, method, params) => { calls.push([method, params]); return method === "mcp.screen" ? { html: "<html>Screen</html>", connect: [], resources: [], frames: [], identity: live } : { content: [] }; },
+      screenKeep: async () => {}, screenPut: async () => `medha://localhost/screen/${chat}`, screenDrop: async () => {},
+    };
+    await act(() => root.render(h(OutputsProvider, { value: { ...SHOWN_ONLY, all: [output] } }, h(AppScreen, { output, size: "full" }))));
+    const frame = document.querySelector("iframe");
+    const replies = [];
+    frame.contentWindow.postMessage = (value) => replies.push(value);
+    await act(() => window.dispatchEvent(new dom.window.MessageEvent("message", { source: frame.contentWindow, data: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "save_checkpoint", arguments: {} } } })));
+    const allow = [...document.querySelectorAll("button")].find((button) => button.textContent.includes("Allow once"));
+    if (allow) await click(allow);
+    await act(async () => {});
+    return { reply: replies.find((reply) => reply.id === 1), sent: calls.filter(([method]) => method === "mcp.screen.call") };
+  };
+  const moved = await run("screen-moved", "drawn-by", "replaced");
+  assert.match(moved.reply.error.message, /changed since this was made/);
+  assert.equal(moved.sent.length, 0, "a screen never reaches a server that replaced the one it was drawn by");
+  const same = await run("screen-same", "drawn-by", "drawn-by");
+  assert.equal(same.sent[0][1].identity, "drawn-by", "the backend checks the recorded connection, not the page's word");
+  const older = await run("screen-older", undefined, "current");
+  assert.equal(older.sent[0][1].identity, "current", "a screen recorded before identities calls its server as it always did");
+});
+
+test("PowerPoint previews retain missing-slide positions and disclose unsupported or truncated content", async () => {
+  globalThis.DOMParser = dom.window.DOMParser;
+  const { readDeck } = await import(await moduleUrl("outputDeckRead"));
+  const make = async (count, content) => {
+    const zip = new JSZip();
+    zip.file("ppt/presentation.xml", `<p:presentation xmlns:p="urn:p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst>${Array.from({length:count}, (_,n)=>`<p:sldId id="${n+1}" r:id="r${n+1}"/>`).join("")}</p:sldIdLst></p:presentation>`);
+    zip.file("ppt/_rels/presentation.xml.rels", `<Relationships>${Array.from({length:count},(_,n)=>`<Relationship Id="r${n+1}" Target="slides/slide${n+1}.xml"/>`).join("")}</Relationships>`);
+    for (let n=0; n<count; n++) if (content(n) !== undefined) zip.file(`ppt/slides/slide${n+1}.xml`, content(n));
+    return zip.generateAsync({type:"uint8array", compression:"DEFLATE"});
+  };
+  const grouped = '<p:sld xmlns:p="urn:p"><p:cSld><p:spTree><p:grpSp/></p:spTree></p:cSld></p:sld>';
+  const deck = await readDeck(await make(201, (n)=>n===0 ? grouped : undefined));
+  assert.equal(deck.total, 201);
+  assert.equal(deck.slides.length, 200);
+  assert.match(deck.slides[1], /Slide 2 could not be previewed/);
+  assert.match(deck.notices.join(" "), /Simplified PowerPoint.*Grouped shapes.*201 slides|Simplified PowerPoint.*201 slides.*Grouped shapes/);
+  const padded = `<p:sld xmlns:p="urn:p"><!--${"x".repeat(3 * 1024 * 1024)}--><p:cSld><p:spTree/></p:cSld></p:sld>`;
+  const bounded = await readDeck(await make(12, ()=>padded));
+  assert.equal(bounded.slides.length, 12);
+  assert.match(bounded.slides.at(-1), /Slide 12 could not be previewed/);
+  assert.match(bounded.notices.join(" "), /32 MiB total decompression limit/);
+});
+
+test("the screen bridge bounds pending work and drops stale replies when closed", async () => {
+  const { bridge } = await import(await moduleUrl("outputBridge"));
+  const sent = []; let done;
+  const waiting = new Promise((resolve) => { done = resolve; });
+  const link = bridge({ context: () => ({}), callTool: () => waiting }, (message) => sent.push(message));
+  for (let id = 0; id < 40; id++) link.receive({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "wait", arguments: {} } });
+  assert.equal(sent.filter((message) => message.error?.message.includes("too many")).length, 8);
+  link.close();
+  done({ ok: true });
+  await act(async () => {});
+  assert.equal(sent.some((message) => message.result), false);
 });
 
 test("a rejected follow-up does not mark an active agent idle", async () => {
@@ -1644,6 +1958,60 @@ test("a message sent with a skill leads with its token, and never shows the proc
   assert.doesNotMatch(document.body.textContent, /SECRET-PROCEDURE-BODY/);
 });
 
+test("the output a message is about rides in the composer as a token and leads the sent message", async () => {
+  const { UserText } = await import(await moduleUrl("UserText"));
+  let removed = 0;
+  const props = (about) => ({
+    value: "", onChange() {}, onSend() {}, onStop() {}, running: false, disabled: false, placeholder: "Task",
+    settings, settingsLocked: false, control: null, onControl() {}, onLoadSettings: async () => {},
+    onConfigure: async () => {}, showReasoning: false, onShowReasoning() {}, attachments: [], onAttachments() {},
+    onSurface() {}, onNew() {}, onRewind() {}, onSettings() {}, onExtensions() {},
+    about, onAbout: () => removed++,
+  });
+  globalThis.matchMedia = () => ({ matches: true });
+  await act(async () => root.render(h(Composer, props("Diagram: Read path"))));
+  const token = document.querySelector(".msg-token.token-output");
+  assert.equal(token.textContent, "Diagram: Read path");
+  await act(async () => token.querySelector("button").click());
+  assert.equal(removed, 1, "removing it makes the message about something new");
+  await act(async () => root.render(h(Composer, props(undefined))));
+  assert.equal(document.querySelector(".msg-token"), null);
+
+  await act(async () => root.render(h(UserText, { text: "make the tools blue", about: "Diagram: Read path" })));
+  const message = document.querySelector(".you-text p");
+  assert.equal(message.firstElementChild.className, "msg-token token-output sent");
+  assert.equal(message.textContent, "Diagram: Read pathmake the tools blue", "only the person's words follow the token");
+});
+
+test("what is open decides what the next message is about, and a fix is sent as that output's next version", async () => {
+  const { OutputScope } = await import(await moduleUrl("OutputScope"));
+  const { useOutputs } = await import(await moduleUrl("outputContext"));
+  const diagram = { artifact_id: "inline:medha-output-e1-0:diagram", revision_id: "e1:code:0", predecessor: null, source_event: "e1", source_index: 0, ts: 1, kind: "diagram", name: "Read path", inline: true, source: "---\ntitle: Read path\n---\nflowchart LR\n A-->B" };
+  const file ={ artifact_id: "file:/tmp/report.html", revision_id: "e2:file", predecessor: null, source_event: "e2", source_index: 0, ts: 2, kind: "page", name: "report.html", inline: false, snapshot: { path: "/tmp/report.html", kind: "page", hash: "h", size: 1, assets: [], missing: [] } };
+  globalThis.__medhaControlsTest.api = { artifacts: async () => ({ revisions: [diagram, file], next_cursor: null, omitted: 0 }) };
+  const about = [], fixed = [];
+  let outputs;
+  const Probe = () => ((outputs = useOutputs()), null);
+  const mount = async (viewing) => {
+    await act(() => root.render(h(OutputScope, { chat: "c", sessionId: "saved", viewing, onShow() {}, onMade: () => true, onAsk() {}, onAbout: (next) => about.push(next), onFix: (text, reference) => fixed.push([text, reference]) }, h(Probe))));
+    await act(() => new Promise((done) => setTimeout(done, 80)));
+  };
+  const reference = { artifact_id: diagram.artifact_id, revision_id: diagram.revision_id, label: "Diagram: Read path" };
+  await mount(true);
+  assert.equal(about.at(-1), undefined, "with nothing open, a message is about nothing");
+  await act(() => outputs.show(outputs.all[0]));
+  assert.deepEqual(about.at(-1), reference);
+  await act(() => outputs.show(outputs.all[1]));
+  assert.equal(about.at(-1), undefined, "a file is versioned by its path, never by a message");
+  await act(() => outputs.show(outputs.all[0]));
+  await mount(false);
+  assert.equal(about.at(-1), undefined, "a closed panel is about nothing");
+
+  await act(() => outputs.fix(outputs.all[0], "Please fix it."));
+  await act(() => outputs.fix({ anchor: "live-1:0", kind: "diagram", name: "Diagram", source: "flowchart" }, "Please fix it."));
+  assert.deepEqual(fixed, [["Please fix it.", reference], ["Please fix it.", undefined]], "one not saved yet is fixed without a reference");
+});
+
 test("Backspace at the start of the message marks the nearest token first, then removes it", async () => {
   let attachments = [{ id: "a1", name: "mock.png", mime: "image/png", data: "", preview: "data:," }];
   const removedSkills = [];
@@ -1864,6 +2232,114 @@ test("provider search saves its identity without reusing another endpoint's key 
   assert.equal(save.params.profile.base_url, providerFixture.url);
   assert.equal(save.params.key, "dummy-only-key");
   assert.ok(!calls.some((call) => call.method === "settings.model.test" || call.method === "settings.model.discover"));
+});
+
+test("provider refresh is a secondary labelled control and reports failure before a provider is chosen", async () => {
+  let finishRefresh, rejectRefresh;
+  await providerForm(async (method = "settings.list") => {
+    if (method === "settings.list") return providerSettings();
+    if (method === "application.providers.refresh") return new Promise((resolve, reject) => { finishRefresh = resolve; rejectRefresh = reject; });
+    assert.fail(method);
+  });
+  const refresh = document.querySelector('.model-provider-heading button[aria-label="Refresh provider catalogue"]');
+  assert.ok(refresh);
+  assert.equal(refresh.type, "button");
+  assert.ok(refresh.classList.contains("icon-btn"));
+  assert.ok(!refresh.classList.contains("btn-line"));
+  assert.equal(document.querySelector(".model-provider-heading label").htmlFor, namedButton("Choose a provider").id);
+  await click(refresh);
+  assert.equal(refresh.disabled, true);
+  assert.equal(refresh.getAttribute("aria-busy"), "true");
+  await act(async () => rejectRefresh(new Error("Catalogue is unavailable. Try again later.")));
+  assert.match(document.querySelector('[role="alert"]').textContent, /Catalogue is unavailable/);
+  assert.equal(refresh.disabled, false);
+  await click(namedButton("Choose a provider")); await click(option(providerFixture.name));
+  await inputValue(fieldInput("Model ID"), "my-model");
+  await click(refresh);
+  await act(async () => finishRefresh({}));
+  assert.ok(!document.querySelector('.model-provider-error'));
+  assert.equal(fieldInput("Model ID").value, "my-model", "refresh preserves the model draft");
+  assert.equal(fieldInput("API endpoint").value, providerFixture.url);
+});
+
+test("saved custom servers appear under Custom endpoint and reuse only their exact saved key", async () => {
+  const calls = [];
+  const address = "https://private-gateway.test/team-a/v1";
+  const existing = { name: "private", default: true, key_present: true, profile: { protocol: "open-ai-chat", model: "old", base_url: address, auth: "bearer" } };
+  await providerForm(async (method = "settings.list", params) => {
+    calls.push({ method, params });
+    if (method === "settings.list") return providerSettings([providerFixture], [existing]);
+    if (method === "settings.model.discover") return { models: [{ id: "fixture-model", context_length: 8000 }] };
+    if (method === "settings.model.save") return { saved: true };
+    assert.fail(method);
+  });
+  await click(namedButton("Choose a provider"));
+  assert.ok(!option("private-gateway.test"), "a user's own endpoint is not a public provider");
+  await click(option("Custom endpoint"));
+  assert.equal(fieldInput("API endpoint").value, "");
+  await click(namedButton("Enter a new endpoint"));
+  await click(option("private-gateway.test"));
+  assert.equal(fieldInput("API endpoint").value, address);
+  assert.match(fieldInput("API key").placeholder, /saved key/);
+  const discovery = calls.find((call) => call.method === "settings.model.discover");
+  assert.equal(discovery.params.profile.base_url, address);
+  assert.equal(discovery.params.profile.auth, "bearer");
+  assert.equal(discovery.params.key, "");
+  await inputValue(fieldInput("Model ID"), "another-model");
+  await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  const save = calls.find((call) => call.method === "settings.model.save");
+  assert.equal(save.params.profile.base_url, address);
+  assert.equal(save.params.profile.provider_id, null, "a custom server has no catalogue provider identity");
+
+  await act(() => root.render(null));
+  await providerForm(async () => providerSettings());
+  await click(namedButton("Choose a provider"));
+  assert.ok(!option("private-gateway.test"), "the endpoint does not appear in another user's empty setup");
+  await click(option("Custom endpoint"));
+  assert.ok(!namedButton("Enter a new endpoint"), "no saved-server picker is needed without saved servers");
+});
+
+test("model setup distinguishes a timeout from a rejected model and keeps saving available", async () => {
+  const writes = [];
+  await providerForm(async (method = "settings.list", params) => {
+    if (method === "settings.list") return providerSettings();
+    if (method === "settings.model.test") return {
+      text: { status: "failed", failure: "timeout", message: "The setup test reached its time limit. Model support is not confirmed." },
+      streaming: { status: "skipped", failure: null, message: "Not tested because an earlier check failed." },
+      tools: { status: "skipped", failure: null, message: "Not tested because an earlier check failed." },
+    };
+    if (method === "settings.model.save") { writes.push(params); return { saved: true }; }
+    assert.fail(method);
+  });
+  await click(namedButton("Choose a provider")); await click(option(providerFixture.name));
+  await inputValue(fieldInput("API key"), "dummy-only-key");
+  await inputValue(fieldInput("Model ID"), "fixture-model");
+  assert.match(document.body.textContent, /5 minutes per request, 8 minutes in total/);
+  await click(namedButton("Test model"));
+  assert.match(document.querySelector('[role="status"]').textContent, /Text: timed out/);
+  assert.ok(!document.querySelector('[role="status"]').textContent.includes("Text: failed"));
+  assert.match(document.querySelector('[role="status"]').textContent, /Streaming: skipped/);
+  await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.equal(writes.length, 1);
+});
+
+test("switching to a saved custom server never offers the previous provider's catalogue on discovery failure", async () => {
+  const saved = [
+    { name: "public", default: true, key_present: true, profile: { protocol: "open-ai-chat", model: "old", base_url: providerFixture.url, auth: "bearer" } },
+    { name: "private", default: false, key_present: true, profile: { protocol: "open-ai-chat", model: "old-private", base_url: "https://private-gateway.test/v1", auth: "bearer" } },
+  ];
+  await providerForm(async (method = "settings.list") => {
+    if (method === "settings.list") return providerSettings([providerFixture], saved);
+    if (method === "settings.model.discover") throw new Error("Discovery unavailable");
+    assert.fail(method);
+  });
+  await click(namedButton("Choose a provider")); await click(option(providerFixture.name));
+  assert.match(document.body.textContent, /Showing catalogue models/);
+  await click(namedButton(providerFixture.name)); await click(option("Custom endpoint"));
+  await click(namedButton("Enter a new endpoint")); await click(option("private-gateway.test"));
+  assert.ok(!document.body.textContent.includes("Showing catalogue models"));
+  assert.ok(!namedButton("Choose a model"));
+  assert.match(document.body.textContent, /enter the model ID manually/);
 });
 
 test("failed discovery offers catalogue models, clears stale context and permits manual save after an optional failed test", async () => {
@@ -2296,6 +2772,8 @@ test("a second model on a server whose key is saved asks for no key and lists it
   await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
   await click(namedButton("Add model"));
   await click(namedButton("Choose a provider"));
+  await click(option("Custom endpoint"));
+  await click(namedButton("Enter a new endpoint"));
   await click(option("integrate.api.nvidia.com"));
   await act(async () => {});
   assert.deepEqual(calls.map(([method, params]) => [method, params.profile.base_url, params.key]), [["settings.model.discover", nvidia, ""]], "the saved key is used; none is typed or sent");

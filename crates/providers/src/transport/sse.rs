@@ -10,6 +10,16 @@ pub(crate) struct SseEvent {
     pub data: String,
 }
 
+impl SseEvent {
+    /// Whether the provider sent something, as opposed to holding the line
+    /// open. A keep-alive comment never becomes an event at all, and an event
+    /// with no data says nothing. What the data means is not judged here: a
+    /// provider building a large tool call may send only empty deltas.
+    pub(crate) fn is_delivery(&self) -> bool {
+        !self.data.trim().is_empty()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
@@ -109,6 +119,39 @@ pub(crate) fn decode_record(record: &[u8]) -> Option<SseEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What keeps a quiet stream alive. A provider that builds a large tool
+    /// call before sending it may deliver nothing but empty deltas for minutes
+    /// and is still at work; one that only holds the connection open is not.
+    #[test]
+    fn any_delivered_event_is_activity_and_a_held_open_line_is_not() {
+        let mut decoder = SseDecoder::default();
+        let delivered = |bytes: &[u8], decoder: &mut SseDecoder| {
+            decoder
+                .push(bytes)
+                .unwrap()
+                .iter()
+                .any(SseEvent::is_delivery)
+        };
+        for alive in [
+            &br#"data: {"choices":[{"delta":{"content":"working"}}]}"#[..],
+            br#"data: {"choices":[{"delta":{}}]}"#,
+            br#"data: {"choices":[],"usage":{"prompt_tokens":10}}"#,
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}"#,
+            b"data: [DONE]",
+        ] {
+            let record = [alive, b"\n\n"].concat();
+            assert!(delivered(&record, &mut decoder), "{alive:?}");
+        }
+        for held_open in [
+            &b": keep-alive\n\n"[..],
+            b":\n\n",
+            b"data:\n\n",
+            b"data:   \n\n",
+        ] {
+            assert!(!delivered(held_open, &mut decoder), "{held_open:?}");
+        }
+    }
 
     #[test]
     fn frames_lf_crlf_cr_and_mixed_endings() {

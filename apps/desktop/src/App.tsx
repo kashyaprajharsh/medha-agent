@@ -26,6 +26,7 @@ import { Palette, type Action } from "./Palette";
 import { medhaIcon, Sidebar } from "./Sidebar";
 import { WorkSurface, type SurfaceTab } from "./WorkSurface";
 import { OutputScope } from "./OutputScope";
+import type { OutputAbout } from "./outputBlocks";
 import { toBlocks, type SubagentRun } from "./timeline";
 import { Transcript } from "./Transcript";
 import { UpdateReady } from "./UpdateReady";
@@ -155,6 +156,11 @@ export function App() {
   );
   const [skills, setSkills] = useState<{ name: string; description: string }[]>([]);
   const [skillFor, setSkillFor] = useState<Record<string, { name: string; message: string }>>({});
+  // The saved output open beside the chat. The next message is about it unless
+  // the person removes its token; opening a different output offers it again.
+  const [openOutput, setOpenOutput] = useState<OutputAbout>();
+  const [notAbout, setNotAbout] = useState<string>();
+  useEffect(() => setNotAbout(undefined), [openOutput?.artifact_id]);
   useEffect(() => {
     let active = true;
     const load = () =>
@@ -315,6 +321,8 @@ export function App() {
   const working =
     state?.status === "running" ||
     (state?.status === "starting" && state.sent.length > 0);
+  // A message sent while Medha works steers that turn, so it is about nothing new.
+  const about = !working && openOutput && openOutput.artifact_id !== notAbout ? openOutput : undefined;
   const toggleRun = useCallback((next: SubagentRun) => {
     setSurface("agents");
     setRun((open) => (open?.childId === next.childId ? null : next));
@@ -513,7 +521,7 @@ export function App() {
     setAway(false);
     setAttachments((all) => ({ ...all, [currentKey]: [] }));
     if (currentKey === spareDraft.current) spareDraft.current = null;
-    void send(currentKey, draftKey ? null : selected, body, attached).catch(
+    void send(currentKey, draftKey ? null : selected, body, attached, about).catch(
       () => {
         setText((all) => ({
           ...all,
@@ -760,6 +768,12 @@ export function App() {
   return (
     <OutputScope
       chat={currentKey}
+      sessionId={state?.sessionId ?? (draftKey ? undefined : selected ?? undefined)}
+      // Listed once per chat, and again only if the outputs the backend sends may have missed some.
+      stamp={String(state?.outputsEpoch ?? 0)}
+      pushed={state?.outputs}
+      ended={state?.status === "exited"}
+      running={state?.status === "running"}
       viewing={surface === "preview" && !preview}
       onShow={() => {
         setPreview(null);
@@ -776,6 +790,17 @@ export function App() {
           ...all,
           [currentKey]: [all[currentKey], request].filter(Boolean).join("\n\n"),
         }));
+      }}
+      onAbout={setOpenOutput}
+      onFix={(request, fixing) => {
+        if (!currentKey) return;
+        const key = currentKey;
+        const draft = () =>
+          setText((all) => ({ ...all, [key]: [all[key], request].filter(Boolean).join("\n\n") }));
+        // Without a model, or while Medha works, the request waits in the composer.
+        if (modelless || working) return draft();
+        setAway(false);
+        void send(key, draftKey ? null : selected, request, [], fixing).catch(draft);
       }}
     >
     <div
@@ -1066,6 +1091,8 @@ export function App() {
             onConnect={modelless ? () => setConnecting(true) : undefined}
             contextPercent={state?.contextPercent}
             skills={skills}
+            about={about?.label}
+            onAbout={() => setNotAbout(openOutput?.artifact_id)}
             skill={currentKey ? skillFor[currentKey]?.name : undefined}
             onSkill={(name) => {
               if (!currentKey) return;

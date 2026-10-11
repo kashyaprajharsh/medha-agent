@@ -504,3 +504,31 @@ async fn a_subagent_session_is_listed_under_the_chat_that_dispatched_it() {
     assert_eq!(view(parent.id).title, "Review the kernel");
     assert_eq!(view(unrelated.id).parent_id, None);
 }
+
+#[test]
+fn a_message_about_an_output_shows_the_persons_words_and_a_label_not_the_models_sentence() {
+    let session = Session::new();
+    let lead = "About the diagram you made earlier:\n\n";
+    let sent = |lead_bytes: usize| {
+        let mut message = kernel::Message::user(format!("{lead}make it blue"));
+        message.about = Some(kernel::OutputReference {
+            artifact_id: "inline:medha-output-x-0:diagram".into(),
+            revision_id: "x:code:0".into(),
+            label: "Diagram: Read path".into(),
+            lead: lead_bytes,
+        });
+        Event::user_input_message(&session, &message)
+    };
+    let page = page_events(&[sent(lead.len())], None, None).unwrap();
+    assert_eq!(page.events[0].text.as_deref(), Some("make it blue"));
+    assert_eq!(page.events[0].about.as_deref(), Some("Diagram: Read path"));
+    let wire = serde_json::to_string(&page).unwrap();
+    assert!(!wire.contains("medha-output") && !wire.contains("you made earlier"));
+    // A length that does not fit the text hides nothing and claims nothing.
+    let page = page_events(&[sent(10_000)], None, None).unwrap();
+    assert_eq!(
+        page.events[0].text.as_deref(),
+        Some("About the diagram you made earlier:\n\nmake it blue")
+    );
+    assert_eq!(page.events[0].about, None);
+}

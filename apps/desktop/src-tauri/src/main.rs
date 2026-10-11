@@ -1,3 +1,4 @@
+mod artifacts;
 mod attachments;
 mod backend;
 mod files;
@@ -300,7 +301,7 @@ fn live_open(
     workspace_id: String,
     key: String,
     session_id: Option<String>,
-) -> Result<(), String> {
+) -> Result<live::Opened, String> {
     state
         .workspaces
         .start(&workspace_id, Some(&key), session_id.as_deref())?
@@ -502,6 +503,44 @@ async fn file_preview(
 }
 
 #[tauri::command]
+async fn artifact_list(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    session_id: String,
+    cursor: usize,
+) -> Result<Value, String> {
+    let runtime = state
+        .workspaces
+        .resolve(&workspace_id, None, Some(&session_id))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.request_params(
+            "application.artifacts",
+            serde_json::json!({"session_id": session_id, "cursor": cursor}),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn artifact_preview(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    session_id: String,
+    revision_id: String,
+) -> Result<Value, String> {
+    let runtime = state
+        .workspaces
+        .resolve(&workspace_id, None, Some(&session_id))?;
+    let views = state.views.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        artifacts::preview(&runtime, &views, &session_id, &revision_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn file_open(
     state: State<'_, DesktopState>,
     workspace_id: String,
@@ -699,6 +738,11 @@ fn main() {
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol(view::SCHEME, outputs::serve)
+        .on_page_load(|webview, load| {
+            if load.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<DesktopState>().views.forget_all();
+            }
+        })
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 window.state::<DesktopState>().terminals.close_all();
@@ -728,6 +772,8 @@ fn main() {
             terminal_close,
             files_list,
             file_preview,
+            artifact_list,
+            artifact_preview,
             file_open,
             git_status,
             git_diff,
@@ -738,6 +784,7 @@ fn main() {
             attachments::attachment_choose,
             outputs::screen_put,
             outputs::screen_drop,
+            outputs::artifact_release,
             outputs::screen_keep,
             outputs::screen_kept,
             outputs::media_link,

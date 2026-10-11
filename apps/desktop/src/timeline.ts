@@ -18,6 +18,8 @@ export type Block =
       text: string;
       html?: string;
       images?: MessageImage[];
+      /** The output a person's message was about, as the label shown beside it. */
+      about?: string;
       ts: number;
     }
   | {
@@ -105,7 +107,8 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
           step.detail = event.detail;
           step.summary = event.summary;
           step.output = event.output;
-          step.screen = event.screen;
+          step.sourceEvent = event.id;
+          step.screen = event.screen ? { ...event.screen, source_event: event.id } : undefined;
           step.ended = event.ts;
         }
         break;
@@ -146,6 +149,7 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
           text: event.text ?? "",
           html: event.html,
           images: event.images,
+          about: event.about,
           ts: event.ts,
         });
     }

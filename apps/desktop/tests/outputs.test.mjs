@@ -7,7 +7,7 @@ const source = await readFile(new URL("../src/outputBlocks.ts", import.meta.url)
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 });
-const { splitOutputs, titleOf, lastLine, slidesOf, slidePage, versionsOf, latestOf, noteOf, growing, mentionsOf } = await import(
+const { splitOutputs, titleOf, lastLine, slidesOf, slidePage, versionsOf, latestOf, noteOf, growing, fileReference } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
 );
 
@@ -23,7 +23,7 @@ test("a drawn block leaves the prose around it and is unescaped exactly once", (
   const html = `<p>Before.</p>${block("mermaid", "A --&gt; B[&quot;x &amp;lt; y&quot;]")}<p>After.</p>`;
   assert.deepEqual(splitOutputs(html), [
     { type: "html", html: "<p>Before.</p>" },
-    { type: "output", kind: "diagram", source: 'A --> B["x &lt; y"]' },
+    { type: "output", kind: "diagram", source: 'A --> B["x &lt; y"]', sourceIndex: 0 },
     { type: "html", html: "<p>After.</p>" },
   ]);
 });
@@ -57,20 +57,17 @@ test("a whole page is shown, a fragment stays code, and a body of sections is a 
   assert.deepEqual(kinds(deck.replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;")), ["slides"]);
   const read = slidesOf(deck);
   assert.deepEqual(read.slides, ["<section>1<section>in</section></section>", "<section>2</section>"]);
-  assert.match(slidePage(read, 1), /<style>s\{\}<\/style>.*<body class="d"><section>2<\/section><\/body>/);
+  assert.match(slidePage(read, 1), /<style>s\{\}<\/style>.*<body class="d"><section>2<\/section>\s*<script>x<\/script><\/body>/);
   assert.equal(slidesOf("<body><section>1</section><p>loose</p><section>2</section></body>").slides.length, 0);
   // A deck still being written shows the slides that have arrived.
   assert.equal(slidesOf("<body><section>1</section><section>unfinished").slides.length, 1);
 });
 
-test("only a local file with a kind Medha can show becomes an output", () => {
+test("file links and images remain manual references, never inferred outputs", () => {
   const image = (path, alt = "") => `<span class="md-image" data-src="${path}">${alt}</span>`;
-  assert.deepEqual(splitOutputs(`<p>${image("out/a%20b.png", "Load")}\n${image("run.mp4")}</p>`), [
-    { type: "output", kind: "image", source: "", path: "out/a b.png", name: "Load" },
-    { type: "output", kind: "video", source: "", path: "run.mp4", name: "run.mp4" },
-  ]);
-  assert.deepEqual(splitOutputs('<p><a href="notes/read.pdf">notes</a></p>')[0].kind, "pdf");
   for (const kept of [
+    `<p>${image("out/a%20b.png", "Load")}\n${image("run.mp4")}</p>`,
+    '<p><a href="notes/read.pdf">notes</a></p>',
     `<p>See ${image("a.png")} here.</p>`,
     `<p>${image("a.png")}${image("main.rs")}</p>`,
     '<p><a href="https://x.example/a.png">a</a></p>',
@@ -80,37 +77,47 @@ test("only a local file with a kind Medha can show becomes an output", () => {
     assert.deepEqual(splitOutputs(kept), [{ type: "html", html: kept }]);
 });
 
-test("a file named in passing is a candidate only when Medha could show it", () => {
+test("file mentions are clickable references without a creation claim", () => {
   const html =
     "<p>Saved at <code>out/report.pdf</code> and <code>deck.pptx</code>; see <code>src/main.rs</code>, " +
     "<code>cargo test</code>, <code>*.png</code>, <code>https://x.example/a.png</code> and <code>out/report.pdf</code>.</p>";
-  assert.deepEqual(mentionsOf(html).map((mention) => [mention.kind, mention.path]), [
-    ["pdf", "out/report.pdf"],
-    ["deck", "deck.pptx"],
-  ]);
-  const many = Array.from({ length: 9 }, (_, i) => `<code>shot${i}.png</code>`).join(" ");
-  assert.equal(mentionsOf(many).length, 4, "a reply that lists many files does not flood the chat");
+  assert.deepEqual(splitOutputs(html), [{ type: "html", html }]);
+  assert.equal(fileReference("out/a%20b.pdf"), "out/a b.pdf");
+  for (const value of ["*.png", "https://x.example/a.png", "%E0%A4%A.png", "src/main.rs"]) assert.equal(fileReference(value), undefined);
 });
 
-test("a named output gathers its versions; a file and an unnamed one stand alone", () => {
-  const diagram = (anchor, body) => ({ anchor, kind: "diagram", source: `---\ntitle: Read path\n---\n${body}`, name: "Read path" });
-  const file = (anchor) => ({ anchor, kind: "image", source: "", name: "a.png", path: "a.png" });
+test("stable identities preserve all revisions without merging titles or input paths", () => {
+  const diagram = (anchor, body) => ({ anchor, artifactId: "flow", kind: "diagram", source: `---\ntitle: Read path\n---\n${body}`, name: "Read path" });
+  const file = (anchor) => ({ anchor, artifactId: "generated-file", kind: "image", source: "", name: "a.png", path: "a.png" });
   const plain = { anchor: "p", kind: "diagram", source: "A-->B", name: "Diagram" };
   const all = [diagram("1", "A"), file("2"), plain, diagram("4", "B"), file("5")];
   assert.deepEqual(versionsOf(all, all[3]).map((o) => o.anchor), ["1", "4"]);
   assert.deepEqual(versionsOf(all, plain), [plain]);
-  assert.deepEqual(versionsOf(all, all[1]), [all[1]]);
+  assert.deepEqual(versionsOf(all, all[1]).map((o) => o.anchor), ["2", "5"]);
   assert.deepEqual(latestOf(all).map((o) => o.anchor), ["5", "4", "p"]);
   assert.equal(noteOf({ ...plain, source: "flowchart LR\n accDescr: Added the pool\n A-->B" }), "Added the pool");
 
-  // Medha rarely names a diagram; a redraw that keeps most of its lines is still a revision.
+  // Similar text and matching generic titles do not supply identity.
   const lines = ["flowchart TB", "  Task --> Localizer", "  Localizer --> Tools", "  Tools --> Logger", "  Logger --> Refiner"];
   const drawn = (anchor, source) => ({ anchor, kind: "diagram", source, name: "Diagram" });
   const first = drawn("a", lines.join("\n"));
   const redrawn = drawn("b", [...lines, "  Refiner --> Gate"].join("\n"));
   const unrelated = drawn("c", "sequenceDiagram\n  Alice->>Bob: hello\n  Bob->>Alice: hi\n  Alice->>Bob: bye");
-  assert.deepEqual(versionsOf([first, unrelated, redrawn], redrawn).map((o) => o.anchor), ["a", "b"]);
+  assert.deepEqual(versionsOf([first, unrelated, redrawn], redrawn).map((o) => o.anchor), ["b"]);
   assert.deepEqual(versionsOf([first, unrelated, redrawn], unrelated), [unrelated]);
+  const revisions = [first, redrawn, unrelated].map((output) => ({ ...output, artifactId: "redraw" }));
+  assert.deepEqual(versionsOf(revisions, revisions[2]).map((o) => o.anchor), ["a", "b", "c"], "a complete redraw remains reachable by explicit identity");
+  assert.deepEqual(latestOf(revisions).map((o) => o.anchor), ["c"]);
+});
+
+test("source indices survive surrounding code blocks, and nothing a reply writes names an output", () => {
+  const html = block("rust", "ignored") + block("html", "<html><body>hi</body></html>");
+  const output = splitOutputs(html).find((part) => part.type === "output");
+  assert.equal(output.sourceIndex, 1);
+  assert.equal("artifactId" in output, false);
+  // An ID written in the fence, on its opening line or inside, is only text.
+  const named = '<pre data-lang="mermaid" data-artifact="other"><code>flowchart LR\n  A --&gt; B</code></pre>';
+  assert.equal(splitOutputs(named).some((part) => part.type === "output"), false);
 });
 
 test("a diagram still being written is drawn from what has arrived", () => {

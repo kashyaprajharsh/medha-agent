@@ -1,4 +1,19 @@
 /* Settings panels: MCP servers, keys, catalog, memory, tools, hooks and tasks. */
+.model-provider-field {
+  display: grid;
+  gap: var(--s-2);
+}
+.model-provider-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+.model-provider-error {
+  color: var(--err);
+  font-size: var(--text-sm);
+}
+
 .section-title,
 .usage-block h3,
 .bg-tasks h3 {

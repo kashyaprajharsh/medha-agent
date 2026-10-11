@@ -2382,6 +2382,105 @@ impl WorkspaceSandbox {
         .map_err(|e| SandboxError::Io(e.to_string()))?
     }
 
+    /// Bounded binary read of an already authorised canonical path. Anchored
+    /// non-following opens prevent a later symlink swap; nonblocking opens
+    /// reject pipes/devices without occupying a worker indefinitely.
+    pub async fn read_bytes_resolved(
+        &self,
+        resolved: &Path,
+        limit: usize,
+    ) -> Result<Vec<u8>, SandboxError> {
+        let resolved = resolved.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            #[cfg(unix)]
+            let file = {
+                let capability = UnixWriteCapability::open(&resolved)?;
+                let parent = capability
+                    .open_parent(false)?
+                    .ok_or_else(|| SandboxError::Io("file not found".into()))?;
+                open_regular_file_at(&parent, &capability.leaf)?
+                    .ok_or_else(|| SandboxError::Io("file not found".into()))?
+            };
+            #[cfg(not(unix))]
+            let file = {
+                let metadata = std::fs::symlink_metadata(&resolved)
+                    .map_err(|e| SandboxError::Io(e.to_string()))?;
+                if !metadata.is_file() {
+                    return Err(SandboxError::Io("not a regular file".into()));
+                }
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    options.custom_flags(0x00200000);
+                }
+                let file = options
+                    .open(&resolved)
+                    .map_err(|e| SandboxError::Io(e.to_string()))?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::{ffi::OsStringExt, fs::MetadataExt, io::AsRawHandle};
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn GetFinalPathNameByHandleW(
+                            file: *mut std::ffi::c_void,
+                            buffer: *mut u16,
+                            length: u32,
+                            flags: u32,
+                        ) -> u32;
+                    }
+                    let mut name = vec![0u16; 32768];
+                    let len = unsafe {
+                        GetFinalPathNameByHandleW(
+                            file.as_raw_handle(),
+                            name.as_mut_ptr(),
+                            name.len() as u32,
+                            0,
+                        )
+                    } as usize;
+                    let actual = if len > 0 && len < name.len() {
+                        PathBuf::from(std::ffi::OsString::from_wide(&name[..len]))
+                    } else {
+                        return Err(SandboxError::Io("could not verify the opened path".into()));
+                    };
+                    if actual != resolved
+                        || file
+                            .metadata()
+                            .map_err(|e| SandboxError::Io(e.to_string()))?
+                            .file_attributes()
+                            & 0x400
+                            != 0
+                    {
+                        return Err(SandboxError::Io(
+                            "the authorised file changed during opening".into(),
+                        ));
+                    }
+                }
+                file
+            };
+            let metadata = file
+                .metadata()
+                .map_err(|e| SandboxError::Io(e.to_string()))?;
+            if !metadata.is_file() || metadata.len() > limit as u64 {
+                return Err(SandboxError::Io(
+                    "not a regular file or exceeds the preview limit".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| SandboxError::Io(e.to_string()))?;
+            if bytes.len() > limit {
+                return Err(SandboxError::Io("file grew past the preview limit".into()));
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|e| SandboxError::Io(e.to_string()))?
+    }
+
     /// Read a 1-based line range without materializing or splitting the whole
     /// file. Both I/O scanned before the requested range and retained output
     /// have hard byte ceilings.

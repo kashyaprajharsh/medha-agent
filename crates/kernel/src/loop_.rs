@@ -506,8 +506,12 @@ const MAX_PROVIDER_STREAM_BLOCKS: usize = 262_144;
 const MAX_PROVIDER_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many times a turn's model stream is retried on a transient provider
-/// failure (429 / 5xx / network drop / stalled stream) before giving up.
+/// failure (429 / 5xx / network drop) before giving up.
 const MAX_TURN_RETRIES: u32 = 5;
+/// How many times a stream that went silent is reopened. Each try waits out the
+/// whole idle limit and resends the request, so a provider that is truly
+/// stuck costs three waits, not six.
+const MAX_STALL_RETRIES: u32 = 2;
 const MAX_TOOL_CALL_CORRECTIONS: u32 = 2;
 
 /// First backoff nap between stream retries.
@@ -720,6 +724,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     pub fn with_settle_grace(mut self, grace: std::time::Duration) -> Self {
         self.settle_grace = grace;
         self
+    }
+
+    /// The reply as it is saved, with the files it names that this run changed.
+    async fn reply_text(&self, session: &Session, text: &str, since: f64) -> Event {
+        let mut event = Event::model_text(session, text);
+        let outputs = self.executor.named_outputs(text, since).await;
+        if !outputs.is_empty() {
+            event.payload["outputs"] = serde_json::Value::Array(outputs);
+        }
+        event
     }
 
     /// Common tail for a graceful cancel: hand back steers that never reached
@@ -969,6 +983,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         tool: String,
         mut obs: Observation,
         discovered: Option<crate::context::DiscoveredContext>,
+        adjusted: &std::collections::HashMap<String, String>,
         window_events: &mut Vec<ulid::Ulid>,
         window_taint: &mut TrustLabel,
         web_tainted: &mut bool,
@@ -991,6 +1006,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let trust = obs
             .relayed_trust
             .map_or(trust, |relayed| trust.min(relayed));
+        // The model reads its result, so it also reads what Medha changed in
+        // the call, and can send the right types itself next time.
+        if let Some(note) = adjusted.get(&id)
+            && let Some(payload) = obs.payload.as_object_mut()
+        {
+            payload.insert("adjusted".into(), serde_json::json!(note));
+        }
         if let Some(discovered) = discovered {
             let context_event = self
                 .log
@@ -1020,9 +1042,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         let event = self
             .log
-            .append(Event::tool_obs(session, &obs, trust))
+            .append(Event::observed_tool(session, &obs, trust, &tool))
             .await?;
-        let screen = obs.payload.get(crate::events::TOOL_SCREEN_FIELD).cloned();
+        let screen = event.payload.get(crate::events::TOOL_SCREEN_FIELD).cloned();
         crate::events::strip_private_observation_fields(&mut obs.payload);
         window_events.push(event.id);
         *window_taint = window_taint.min(trust);
@@ -1032,7 +1054,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             *web_tainted = true;
         }
         let ok = matches!(obs.status, crate::types::ObsStatus::Ok);
-        sink.tool_result_with_id(&id, &tool, ok, &obs.payload);
+        sink.tool_result_saved(event.id, &id, &tool, ok, &obs.payload);
         if let Some(screen) = &screen {
             sink.tool_screen(&id, screen);
         }
@@ -1162,6 +1184,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
         // `None` (headless) → a token that never trips; every cancel path is dead.
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
+        let started = crate::events::now_ts();
         let planning = session.autonomy == crate::types::AutonomyLevel::Plan;
         let specs: Vec<_> = self
             .executor
@@ -1810,9 +1833,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             if turn_interrupted || cancel.is_cancelled() {
                 let canonical = strip_tool_calls(&canonical);
                 if !assistant.content.is_empty() {
-                    self.log
-                        .append(Event::model_text(session, &assistant.content))
-                        .await?;
+                    let reply = self.reply_text(session, &assistant.content, started).await;
+                    let saved = self.log.append(reply).await?;
+                    sink.text_saved(saved.id);
                 }
                 // An empty cancelled turn can create invalid adjacent roles on replay.
                 if !canonical.parts.is_empty() {
@@ -1841,9 +1864,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 return Ok((messages, StopReason::Interrupted));
             }
             if !assistant.content.is_empty() {
-                self.log
-                    .append(Event::model_text(session, &assistant.content))
-                    .await?;
+                let reply = self.reply_text(session, &assistant.content, started).await;
+                let saved = self.log.append(reply).await?;
+                sink.text_saved(saved.id);
             }
             self.log
                 .append(Event::model_message(session, &canonical))
@@ -1856,6 +1879,22 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Model-supplied trust/confidence/provenance is stripped and replaced
             // with taint-window values, which stop at this turn's dispatch.
             let mut intents = intents;
+            // Arguments of the wrong JSON type are repaired against the tool's
+            // own schema before policy, approval and dispatch see them. The
+            // saved reply above keeps what the model actually wrote.
+            let mut adjusted = std::collections::HashMap::new();
+            for it in &mut intents {
+                let Some(spec) = specs.iter().find(|spec| spec.name == it.tool) else {
+                    continue;
+                };
+                let repairs = crate::arg_repair::repair(&mut it.args, &spec.schema);
+                if let Some(note) = crate::arg_repair::note(&repairs) {
+                    let paths: Vec<&str> =
+                        repairs.iter().map(|repair| repair.path.as_str()).collect();
+                    tracing::info!(tool = %it.tool, arguments = ?paths, "tool call arguments repaired");
+                    adjusted.insert(it.id.clone(), note);
+                }
+            }
             for it in &mut intents {
                 if is_memory_tool(&it.tool) {
                     enrich_memory_intent(&mut it.args, window_taint, &window_events, session.id);
@@ -1867,7 +1906,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // gets an observation (real or synthesized). Replay order per id is
             // intent → policy.decision → observation (unavailable tools skip policy).
             for it in &intents {
-                self.log.append(Event::model_intent(session, it)).await?;
+                let mut event = Event::model_intent(session, it);
+                if let Some(note) = adjusted.get(&it.id) {
+                    event.payload["adjusted"] = serde_json::json!(note);
+                }
+                self.log.append(event).await?;
             }
             // Notify the surface of the calls before they run (live feedback).
             for it in &intents {
@@ -1948,6 +1991,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 tool,
                                 obs,
                                 discovered,
+                                &adjusted,
                                 &mut window_events,
                                 &mut window_taint,
                                 &mut web_tainted,
@@ -1984,6 +2028,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             tool,
                             Observation::error(&id, reason),
                             None,
+                            &adjusted,
                             &mut window_events,
                             &mut window_taint,
                             &mut web_tainted,
@@ -2053,6 +2098,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         tool,
                         obs,
                         discovered,
+                        &adjusted,
                         &mut window_events,
                         &mut window_taint,
                         &mut web_tainted,
@@ -2087,6 +2133,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         tool,
                         obs,
                         discovered,
+                        &adjusted,
                         &mut window_events,
                         &mut window_taint,
                         &mut web_tainted,
@@ -2235,6 +2282,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         KernelError,
     > {
         let mut attempt = 0u32;
+        let mut stalls = 0u32;
         let mut output_limit_retried = false;
         let mut request = prepared.clone();
         let (text, reasoning, intents, canonical, usage, interrupted) = loop {
@@ -2350,8 +2398,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         crate::provider::ProviderFailure::Transient
                         | crate::provider::ProviderFailure::Fatal => {}
                     }
-                    if e.is_retryable() && attempt < MAX_TURN_RETRIES {
+                    // Stalls have their own, smaller allowance inside the
+                    // turn's overall one, so earlier dropped connections
+                    // neither use it up nor are counted as stalls.
+                    let stalled = e.is_stream_stall();
+                    if e.is_retryable()
+                        && attempt < MAX_TURN_RETRIES
+                        && (!stalled || stalls < MAX_STALL_RETRIES)
+                    {
                         attempt += 1;
+                        stalls += u32::from(stalled);
                         // A stream that died after streaming part of a reply is
                         // the common shape of a transient failure, so refusing
                         // to retry once anything was emitted would strand
@@ -2372,9 +2428,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         // The provider's own number when it gave one; retrying
                         // sooner than asked just earns another refusal.
                         let wait = e.retry_after().unwrap_or_else(|| retry_backoff(attempt));
-                        sink.notice(&format!(
-                            "Model request failed. Retrying ({attempt}/{MAX_TURN_RETRIES})…"
-                        ));
+                        sink.notice(&if stalled {
+                            // Says what happened and what Medha is doing about it.
+                            let said = e.to_string();
+                            let said = said.strip_prefix("the model").unwrap_or(&said);
+                            format!("The model{said}. Reconnecting ({stalls}/{MAX_STALL_RETRIES})…")
+                        } else {
+                            format!(
+                                "Model request failed. Retrying ({attempt}/{MAX_TURN_RETRIES})…"
+                            )
+                        });
                         // The backoff nap races the cancel token too — Esc
                         // during a retry wait must stop the turn, not queue
                         // another attempt.
@@ -2407,6 +2470,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 );
                             }
                         }
+                    }
+                    if stalled && stalls > 0 {
+                        return Err(KernelError::Provider(format!(
+                            "{e}, {} times this turn; Medha stopped reconnecting",
+                            stalls + 1
+                        )));
                     }
                     return Err(KernelError::Provider(e.to_string()));
                 }
@@ -2498,6 +2567,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut emitted = false;
         let mut stream_blocks = 0usize;
         let mut stream_bytes = 0usize;
+        // Calls whose arguments have started to arrive. When the first piece
+        // lands shows whether a provider streams a call or sends it whole.
+        let mut arguments_started = std::collections::HashSet::new();
         loop {
             let block = tokio::select! {
                 block = stream.next() => block,
@@ -2583,6 +2655,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // Passed straight on and kept nowhere: the finished call below is
                 // what is counted against the stream's size, admitted and logged.
                 Ok(Block::ToolInput { id, name, delta }) => {
+                    if arguments_started.len() < MAX_TOOL_INTENTS_PER_TURN
+                        && arguments_started.insert(id.clone())
+                    {
+                        tracing::info!(
+                            elapsed_ms = request_started.elapsed().as_millis() as u64,
+                            tool = %name,
+                            "model first tool argument delta"
+                        );
+                    }
                     emitted = true;
                     sink.tool_input(&id, &name, &delta);
                 }

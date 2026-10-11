@@ -287,6 +287,11 @@ pub enum ProviderError {
         "the model made no progress for {waited_secs}s; stopped without automatically resending the request"
     )]
     ProgressTimeout { waited_secs: u64 },
+    /// An open response stream delivered nothing for this long. A fresh
+    /// connection often clears it, so the request is resent a bounded number
+    /// of times; see [`is_stream_stall`](Self::is_stream_stall).
+    #[error("the model sent nothing for {waited_secs}s")]
+    StreamStalled { waited_secs: u64 },
     #[error("decode error: {0}")]
     Decode(String),
     #[error(transparent)]
@@ -361,6 +366,12 @@ impl ProviderError {
         )
     }
 
+    /// A stream that went silent. Resending it repeats the whole request, so it
+    /// is given fewer tries than a dropped connection or a rate limit.
+    pub fn is_stream_stall(&self) -> bool {
+        matches!(self, ProviderError::StreamStalled { .. })
+    }
+
     /// How long the provider asked us to wait, when it said so. The retry
     /// schedule prefers this over its own backoff curve.
     pub fn retry_after(&self) -> Option<std::time::Duration> {
@@ -373,7 +384,9 @@ impl ProviderError {
     pub fn classify(&self) -> ProviderFailure {
         match self {
             ProviderError::InvalidToolCall(_) => ProviderFailure::InvalidToolCall,
-            ProviderError::Transport(_) | ProviderError::Stream(_) => ProviderFailure::Transient,
+            ProviderError::Transport(_)
+            | ProviderError::Stream(_)
+            | ProviderError::StreamStalled { .. } => ProviderFailure::Transient,
             ProviderError::Throttled { status, body, .. } => {
                 if *status == 429 || (500..600).contains(status) {
                     ProviderFailure::Transient

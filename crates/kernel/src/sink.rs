@@ -11,6 +11,9 @@ pub trait StreamSink: Send + Sync {
     fn notice(&self, _text: &str) {}
     /// A fragment of model text as it streams in.
     fn text(&self, _delta: &str) {}
+    /// The completed text segment is durable. Consumers use its exact event
+    /// identity to bind live artifact plates, never titles or text similarity.
+    fn text_saved(&self, _event: ulid::Ulid) {}
     /// A fragment of reasoning/thinking content, when the model streams one
     /// (vLLM/DeepSeek-R1-style `reasoning_content`). Scratch content — shown
     /// live for transparency, never fed back into subsequent-turn history.
@@ -35,6 +38,16 @@ pub trait StreamSink: Send + Sync {
     /// A tool result carrying the same correlation id as its call.
     fn tool_result_with_id(&self, _id: &str, tool: &str, ok: bool, payload: &Value) {
         self.tool_result(tool, ok, payload);
+    }
+    fn tool_result_saved(
+        &self,
+        _event: ulid::Ulid,
+        id: &str,
+        tool: &str,
+        ok: bool,
+        payload: &Value,
+    ) {
+        self.tool_result_with_id(id, tool, ok, payload);
     }
     /// A screen the tool's server offers for this result, and what it draws.
     /// For a surface that can show it; it is never part of the model's context.

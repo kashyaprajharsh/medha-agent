@@ -125,6 +125,40 @@ pub struct Message {
     /// plain user text and the taint the child accumulated is lost at the door.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<TrustLabel>,
+    /// The earlier output this user message is about. Recorded with the
+    /// message so its reply can be saved as that output's next revision; the
+    /// model is told in words, never given the IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<OutputReference>,
+}
+
+/// One saved revision of one generated output, named by the surface that sent
+/// the message and checked by the application before it is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputReference {
+    pub artifact_id: String,
+    pub revision_id: String,
+    /// What a surface calls the output beside the message, such as its title.
+    #[serde(default)]
+    pub label: String,
+    /// How many bytes at the start of the message text are the sentence that
+    /// tells the model which output is meant. A surface shows what follows.
+    #[serde(default)]
+    pub lead: usize,
+}
+
+impl Message {
+    /// The person's own words and the output they are about, with the sentence
+    /// written for the model left out.
+    pub fn shown(&self) -> (&str, Option<&str>) {
+        match &self.about {
+            Some(about) if self.content.is_char_boundary(about.lead) => (
+                &self.content[about.lead..],
+                Some(about.label.as_str()).filter(|label| !label.is_empty()),
+            ),
+            _ => (&self.content, None),
+        }
+    }
 }
 
 impl Message {
@@ -136,6 +170,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             trust: None,
+            about: None,
         }
     }
 
@@ -157,6 +192,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             trust: None,
+            about: None,
         }
     }
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -167,6 +203,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             trust: None,
+            about: None,
         }
     }
 }
@@ -457,6 +494,7 @@ impl TryFrom<&ModelMessage> for Message {
             tool_calls,
             tool_call_id,
             trust: message.trust,
+            about: None,
         })
     }
 }

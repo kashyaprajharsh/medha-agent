@@ -25,11 +25,14 @@ pub const AGENT_REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
 /// What a tool's screen draws: kept in the event log so a reopened chat can
 /// show the screen again, handed to the surface, and never put before a model.
 pub const TOOL_SCREEN_FIELD: &str = "_tool_screen";
+/// Publication manifests are for viewers, not a model's tool context.
+pub const TOOL_ARTIFACT_FIELD: &str = "generated_output";
 
 pub(crate) fn strip_private_observation_fields(payload: &mut Value) {
     if let Some(object) = payload.as_object_mut() {
         object.remove(AGENT_REPORT_ACKS_FIELD);
         object.remove(TOOL_SCREEN_FIELD);
+        object.remove(TOOL_ARTIFACT_FIELD);
     }
 }
 
@@ -262,6 +265,31 @@ impl Event {
             && self.payload.get("hook").is_none()
     }
 
+    /// A person's message as a surface shows it: their own words, and the label
+    /// of the output they were about. The sentence written for the model stays
+    /// in the log and out of sight.
+    pub fn shown_text(&self) -> (&str, Option<&str>) {
+        let text = self
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let about = self
+            .payload
+            .get("about")
+            .filter(|_| self.is_from_person())
+            .and_then(|about| {
+                let lead = usize::try_from(about.get("lead")?.as_u64()?).ok()?;
+                Some((lead, about.get("label")?.as_str()?))
+            });
+        match about {
+            Some((lead, label)) if text.is_char_boundary(lead) => {
+                (&text[lead..], Some(label).filter(|label| !label.is_empty()))
+            }
+            _ => (text, None),
+        }
+    }
+
     pub fn user_input_message(s: &Session, message: &Message) -> Self {
         let mut event = Self::user_input(
             s,
@@ -270,6 +298,13 @@ impl Event {
         );
         if !message.attachments.is_empty() {
             event.payload["attachments"] = serde_json::json!(message.attachments);
+        }
+        // Only what the user themselves sent can be about an output. A report
+        // or web content entering on the user channel never carries one.
+        if event.trust == TrustLabel::User
+            && let Some(about) = &message.about
+        {
+            event.payload["about"] = serde_json::json!(about);
         }
         event
     }
@@ -439,6 +474,22 @@ impl Event {
             payload["screen"] = screen;
         }
         Self::new(s, EventKind::ToolObs, payload, trust)
+    }
+
+    /// The executing tool's name is recorded outside its untrusted result.
+    /// This lets readers authenticate built-in publication manifests without
+    /// accepting a similarly named field returned by an arbitrary MCP tool.
+    pub fn observed_tool(s: &Session, o: &Observation, trust: TrustLabel, tool: &str) -> Self {
+        let mut event = Self::tool_obs(s, o, trust);
+        event.payload["tool"] = json!(tool);
+        if let Some(screen) = event
+            .payload
+            .get_mut("screen")
+            .and_then(Value::as_object_mut)
+        {
+            screen.insert("source_event".into(), json!(event.id.to_string()));
+        }
+        event
     }
 
     /// A memory mutation. `op` is the memory crate's `MemoryOp` JSON —
@@ -640,6 +691,42 @@ pub trait EventLog: Send + Sync {
     /// backends override this; ephemeral logs have no serialized trust boundary.
     async fn checked_events(&self, session: Ulid) -> Result<Vec<Event>, KernelError> {
         Ok(self.events(session).await)
+    }
+
+    /// Verified events that can contribute to a generated-output catalogue.
+    /// Durable stores select these before decoding, leaving unrelated tool
+    /// results and operational events on disk.
+    async fn output_events(&self, session: Ulid) -> Result<Vec<Event>, KernelError> {
+        Ok(self
+            .checked_events(session)
+            .await?
+            .into_iter()
+            .filter(|event| match event.kind {
+                // A user message can name the output its reply revises, and
+                // the next one ends that request, so each is a boundary.
+                EventKind::UserMessage | EventKind::ModelText | EventKind::ModelMessage => true,
+                EventKind::ModelIntent => {
+                    matches!(event.payload["tool"].as_str(), Some("write" | "edit"))
+                }
+                EventKind::ToolObs => {
+                    event.payload["status"] == "ok"
+                        && (event.payload.get(TOOL_SCREEN_FIELD).is_some()
+                            || event.payload["payload"].get(TOOL_ARTIFACT_FIELD).is_some()
+                            || event.payload["payload"]["new"].is_string())
+                }
+                _ => false,
+            })
+            .collect())
+    }
+
+    /// A verified source event in this conversation. Durable stores fetch one
+    /// indexed row, so chunked artifact reads do not reload the transcript.
+    async fn checked_event(&self, session: Ulid, id: Ulid) -> Result<Option<Event>, KernelError> {
+        Ok(self
+            .checked_events(session)
+            .await?
+            .into_iter()
+            .find(|event| event.id == id))
     }
 
     /// One verified history record at a fixed upper bound. Positions belong to
@@ -895,7 +982,7 @@ impl EventLog for InMemoryLog {
     }
 }
 
-fn now_ts() -> f64 {
+pub(crate) fn now_ts() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -918,9 +1005,16 @@ pub fn chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
 /// observable for valid JSON number spellings and object order, and the latter
 /// can vary across serializer implementations and platforms.
 pub fn chain_hash_with_payload(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
+    chain_hash_stored(prev, e, e.kind.as_str(), payload)
+}
+
+/// Hash an event with its kind exactly as stored. A newer build may have
+/// written a kind this one does not know; its row still verifies, so the
+/// chain stays whole while readers pass over what they cannot understand.
+pub fn chain_hash_stored(prev: &[u8; 32], e: &Event, kind: &str, payload: &[u8]) -> [u8; 32] {
     match e.hash_version {
-        1 => legacy_chain_hash_with_payload(prev, e, payload),
-        EVENT_HASH_VERSION => full_chain_hash(prev, e, payload),
+        1 => legacy_chain_hash_with_payload(prev, e, kind, payload),
+        EVENT_HASH_VERSION => full_chain_hash(prev, e, kind, payload),
         // Unknown versions must never accidentally verify as a known format.
         // Hashing a version-specific rejection domain gives callers a stable
         // mismatch while store verification reports the unsupported version.
@@ -939,14 +1033,19 @@ pub fn chain_hash_with_payload(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u
 /// can verify the old chain before rewriting it to the complete v2 encoding.
 pub fn legacy_chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
     let payload = e.payload.to_string();
-    legacy_chain_hash_with_payload(prev, e, payload.as_bytes())
+    legacy_chain_hash_with_payload(prev, e, e.kind.as_str(), payload.as_bytes())
 }
 
-fn legacy_chain_hash_with_payload(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
+fn legacy_chain_hash_with_payload(
+    prev: &[u8; 32],
+    e: &Event,
+    kind: &str,
+    payload: &[u8],
+) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(prev);
-    h.update(e.kind.as_str().as_bytes());
+    h.update(kind.as_bytes());
     h.update(e.session_id.to_string().as_bytes());
     h.update(payload);
     h.update(e.ts.to_le_bytes());
@@ -955,7 +1054,7 @@ fn legacy_chain_hash_with_payload(prev: &[u8; 32], e: &Event, payload: &[u8]) ->
     out
 }
 
-fn full_chain_hash(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
+fn full_chain_hash(prev: &[u8; 32], e: &Event, kind: &str, payload: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     fn framed(hasher: &mut Sha256, bytes: &[u8]) {
@@ -980,7 +1079,7 @@ fn full_chain_hash(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
         }
         None => h.update([0]),
     }
-    framed(&mut h, e.kind.as_str().as_bytes());
+    framed(&mut h, kind.as_bytes());
     framed(&mut h, payload);
     framed(&mut h, e.trust.as_str().as_bytes());
     framed(&mut h, e.provenance.source.as_bytes());
@@ -1252,6 +1351,8 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     .unwrap_or_default();
                     if e.trust != TrustLabel::User {
                         message.trust = Some(e.trust);
+                    } else if let Some(about) = e.payload.get("about") {
+                        message.about = serde_json::from_value(about.clone()).ok();
                     }
                     out.push(message);
                 }

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 #[cfg(test)]
 use kernel::events::chain_hash;
-use kernel::events::{EVENT_HASH_VERSION, chain_hash_with_payload};
+use kernel::events::{EVENT_HASH_VERSION, chain_hash_stored, chain_hash_with_payload};
 use kernel::{
     ArtifactStore, Event, EventKind, EventLog, KernelError, MutationLease, Provenance, SessionMeta,
     TrustLabel,
@@ -185,13 +185,10 @@ fn rebuild_verified_event_fts(conn: &Connection) -> Result<(), StoreError> {
     verify_chain_anchor(conn)?;
     // Retain the authenticated rows before any index DML. Even a shadow-table
     // trigger must not make us decode history changed by our own FTS writes.
-    let rows = load_chain_rows(conn)?;
+    let events = decode_events(load_chain_rows(conn)?)?;
     conn.execute("DELETE FROM events_fts", [])
         .map_err(|error| StoreError::Db(error.to_string()))?;
-    for (_, row, _) in rows {
-        let event = row
-            .into_event()
-            .ok_or_else(|| StoreError::Db("verified event could not be decoded".into()))?;
+    for event in events {
         let Some(text) = search_text(&event.kind, &event.payload) else {
             continue;
         };
@@ -1210,6 +1207,59 @@ impl EventLog for SqliteLog {
             .map_err(|e| KernelError::Log(e.to_string()))
     }
 
+    async fn checked_event(&self, session: Ulid, id: Ulid) -> Result<Option<Event>, KernelError> {
+        self.run_store_task(move |log| {
+            log.with_verified_snapshot(false, |conn| {
+                let mut query = conn.prepare(
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                     prev_hash, hash, hash_version, ts FROM events WHERE session_id = ?1 AND id = ?2"
+                ).map_err(|e| StoreError::Db(e.to_string()))?;
+                let rows = query.query_map(rusqlite::params![session.to_string(), id.to_string()], chain_row)
+                    .map_err(|e| StoreError::Db(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>().map_err(|e| StoreError::Db(e.to_string()))?;
+                Ok(decode_events(rows)?.pop())
+            })
+        }).await.map_err(|e| KernelError::Log(e.to_string()))
+    }
+
+    async fn output_events(&self, session: Ulid) -> Result<Vec<Event>, KernelError> {
+        self.run_store_task(move |log| {
+            log.with_verified_snapshot(false, |conn| {
+                let mut query = conn
+                    .prepare(
+                        "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                     prev_hash, hash, hash_version, ts FROM events WHERE session_id = ?1 AND (
+                        kind IN (?2, ?3, ?4)
+                        OR (kind = ?5 AND json_extract(payload, '$.tool') IN ('write','edit'))
+                        OR (kind = ?6 AND json_extract(payload, '$.status') = 'ok' AND (
+                            json_type(payload, '$.screen') IS NOT NULL
+                            OR json_type(payload, '$.payload.generated_output') IS NOT NULL
+                            OR json_type(payload, '$.payload.new') = 'text')))
+                     ORDER BY rowid ASC",
+                    )
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                let rows = query
+                    .query_map(
+                        rusqlite::params![
+                            session.to_string(),
+                            EventKind::ModelText.as_str(),
+                            EventKind::ModelMessage.as_str(),
+                            EventKind::UserMessage.as_str(),
+                            EventKind::ModelIntent.as_str(),
+                            EventKind::ToolObs.as_str()
+                        ],
+                        chain_row,
+                    )
+                    .map_err(|e| StoreError::Db(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                decode_events(rows)
+            })
+        })
+        .await
+        .map_err(|e| KernelError::Log(e.to_string()))
+    }
+
     async fn checked_history_record(
         &self,
         session: Ulid,
@@ -1235,13 +1285,13 @@ impl EventLog for SqliteLog {
                      prev_hash, hash, hash_version, ts FROM events
                      WHERE session_id = ?1 AND rowid <= ?2 AND rowid = ?3
                      AND kind IN ('user.message', 'model.text', 'model.message',
-                                  'model.intent', 'model.reasoning', 'tool.observation') LIMIT 1"
+                                  'model.tool_intent', 'model.reasoning', 'tool.observation') LIMIT 1"
                 } else {
                     "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
                      prev_hash, hash, hash_version, ts FROM events
                      WHERE session_id = ?1 AND rowid <= ?2 AND rowid > ?3
                      AND kind IN ('user.message', 'model.text', 'model.message',
-                                  'model.intent', 'model.reasoning', 'tool.observation')
+                                  'model.tool_intent', 'model.reasoning', 'tool.observation')
                      ORDER BY rowid LIMIT 1"
                 };
                 let mut query = conn
@@ -1423,8 +1473,11 @@ fn chain_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Row, Vec<u8>)> {
     ))
 }
 
+/// Verified events this build understands. A kind written by a newer build is
+/// passed over, so its chat still opens here; any other undecodable row fails.
 fn decode_events(rows: Vec<(i64, Row, Vec<u8>)>) -> Result<Vec<Event>, StoreError> {
     rows.into_iter()
+        .filter(|(_, row, _)| EventKind::parse(&row.kind).is_some())
         .map(|(_, row, _)| {
             row.into_event()
                 .ok_or_else(|| StoreError::Db("verified event could not be decoded".into()))
@@ -1437,6 +1490,8 @@ fn decode_events(rows: Vec<(i64, Row, Vec<u8>)>) -> Result<Vec<Event>, StoreErro
 /// ordinary Row decoder remains responsible for payloads returned to readers.
 struct HashRow<'a> {
     event: Event,
+    /// The kind as stored, which is what the chain covers.
+    kind: &'a str,
     payload: &'a [u8],
     stored_hash: &'a [u8],
 }
@@ -1449,21 +1504,24 @@ fn hashing_row<'a>(row: &'a rusqlite::Row<'_>) -> rusqlite::Result<Option<HashRo
     if previous.len() == 32 {
         prev_hash.copy_from_slice(previous);
     }
-    let (Ok(id), Ok(session_id), Some(kind), Some(trust)) = (
+    let kind = row.get_ref(4)?.as_str()?;
+    let (Ok(id), Ok(session_id), Some(trust)) = (
         Ulid::from_string(row.get_ref(1)?.as_str()?),
         Ulid::from_string(row.get_ref(2)?.as_str()?),
-        EventKind::parse(row.get_ref(4)?.as_str()?),
         TrustLabel::parse(row.get_ref(6)?.as_str()?),
     ) else {
         return Ok(None);
     };
     let parent_id: Option<String> = row.get(3)?;
     Ok(Some(HashRow {
+        kind,
         event: Event {
             id,
             session_id,
             parent_id: parent_id.and_then(|parent| Ulid::from_string(&parent).ok()),
-            kind,
+            // Never hashed: the chain covers `kind` as stored, which this
+            // build may not know.
+            kind: EventKind::Session,
             // Never exposed to a reader: chain_hash_with_payload uses payload.
             payload: serde_json::Value::Null,
             trust,
@@ -1494,6 +1552,7 @@ fn validated_chain(conn: &Connection) -> Result<(u64, [u8; 32]), StoreError> {
     {
         let HashRow {
             event,
+            kind,
             payload,
             stored_hash,
         } = hashing_row(row)
@@ -1510,7 +1569,7 @@ fn validated_chain(conn: &Connection) -> Result<(u64, [u8; 32]), StoreError> {
                 "hash chain broken at event index {count}: prev_hash does not link"
             )));
         }
-        let computed = chain_hash_with_payload(&prev, &event, payload);
+        let computed = chain_hash_stored(&prev, &event, kind, payload);
         if computed.as_slice() != stored_hash {
             return Err(StoreError::Db(format!(
                 "hash chain broken at event index {count}: content does not match stored hash"
@@ -1634,11 +1693,26 @@ mod tests {
         let writer = SqliteLog::open(&db).unwrap();
         let session = kernel::Session::new();
         log.verify().unwrap();
-        writer
+        let saved = writer
             .append(Event::model_text(&session, "external"))
             .await
             .unwrap();
         assert_eq!(log.checked_events(session.id).await.unwrap().len(), 1);
+        assert_eq!(log.output_events(session.id).await.unwrap().len(), 1);
+        assert_eq!(
+            log.checked_event(session.id, saved.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            saved.id
+        );
+        assert!(
+            log.checked_event(Ulid::new(), saved.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             log.verification_count
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1650,6 +1724,8 @@ mod tests {
             .unwrap();
         // The requested session has no rows, but global tampering still fails.
         assert!(log.checked_events(Ulid::new()).await.is_err());
+        assert!(log.checked_event(session.id, saved.id).await.is_err());
+        assert!(log.output_events(session.id).await.is_err());
         assert!(log.all_events().is_err());
         drop((attacker, writer, log));
         std::fs::remove_dir_all(dir).unwrap();
@@ -2773,6 +2849,97 @@ mod tests {
         assert_eq!(decoded[0].provenance.source, event.provenance.source);
         assert_eq!(decoded[0].ts, event.ts);
         drop((writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Chats from before tool calls were saved inside the reply keep them as
+    /// separate events; paged history must return those, or an editor
+    /// reopening such a chat shows replies with their tool calls missing.
+    #[tokio::test]
+    async fn paged_history_returns_tool_calls_saved_as_their_own_events() {
+        let dir = test_support::scratch("medha-history-intents");
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let session = kernel::Session::default();
+        log.append(Event::user_message(&session, "read it"))
+            .await
+            .unwrap();
+        let intent = kernel::ToolIntent {
+            id: "call".into(),
+            tool: "read".into(),
+            args: serde_json::json!({"path": "file"}),
+        };
+        log.append(Event::model_intent(&session, &intent))
+            .await
+            .unwrap();
+        let (_, first) = log
+            .checked_history_record(session.id, 0, None, false)
+            .await
+            .unwrap();
+        let (position, _) = first.unwrap();
+        let (_, next) = log
+            .checked_history_record(session.id, position, None, false)
+            .await
+            .unwrap();
+        let (_, call) = next.expect("the tool call is part of the history");
+        assert_eq!(call.kind, EventKind::ModelIntent);
+        assert_eq!(call.payload["id"], "call");
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A kind written by a newer build neither locks this build out of the store
+    /// nor escapes verification: it is passed over by readers, and still covered.
+    #[tokio::test]
+    async fn a_kind_from_a_newer_build_is_verified_and_passed_over() {
+        let dir = test_support::scratch("medha-future-kind");
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::new();
+        log.append(Event::model_text(&session, "known"))
+            .await
+            .unwrap();
+        let future = log
+            .append(Event::model_text(&session, "from a newer build"))
+            .await
+            .unwrap();
+        let payload = serde_json::to_string(&future.payload).unwrap();
+        let hash = chain_hash_stored(
+            &future.prev_hash,
+            &future,
+            "future.kind",
+            payload.as_bytes(),
+        );
+        {
+            let mut writer = Connection::open(&db).unwrap();
+            let tx = writer.transaction().unwrap();
+            tx.execute(
+                "UPDATE events SET kind = 'future.kind', hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash.as_slice(), future.id.to_string()],
+            )
+            .unwrap();
+            set_chain_anchor(&tx, 2, &hash).unwrap();
+            tx.commit().unwrap();
+        }
+
+        log.verify().unwrap();
+        let read = log.checked_events(session.id).await.unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].payload["text"], "known");
+        log.append(Event::model_text(&session, "after"))
+            .await
+            .unwrap();
+        assert_eq!(log.checked_events(session.id).await.unwrap().len(), 2);
+
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE events SET payload = '{\"text\":\"rewritten\"}' WHERE kind = 'future.kind'",
+                [],
+            )
+            .unwrap();
+        let err = log.verify().unwrap_err();
+        assert!(format!("{err}").contains("hash chain broken"), "got: {err}");
+        drop(log);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import DOMPurify from "dompurify";
-export default function DocumentPreview({ bytes }: { bytes: number[] }) {
+export default function DocumentPreview({ bytes }: { bytes: number[] | Uint8Array }) {
   const [html, setHtml] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {

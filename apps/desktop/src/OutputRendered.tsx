@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useWorkspace } from "./Workspace";
 import { growing, lastLine, slidesOf, type Deck } from "./outputBlocks";
 import type { RenderProps } from "./outputContext";
-import { useFile } from "./outputFiles";
+import { useFile, useNear } from "./outputFiles";
 import { AppScreen } from "./OutputApp";
 import { Picture, Sound, Video } from "./OutputMedia";
 import { Page, Slides } from "./OutputPage";
@@ -13,8 +13,19 @@ const BEAT = 200;
 
 /** Any output, drawn: the same call for a plate in the chat, a thumbnail and the viewer. */
 export function Rendered(props: RenderProps) {
+  if (props.output.snapshot || props.output.storedSource && !props.output.source) return <Stored {...props} />;
+  return <Content {...props} />;
+}
+
+function Stored(props: RenderProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  const near = useNear(ref, false);
+  return <div ref={ref} className="out-stored">{near ? <Content {...props} /> : <div className="out-wait" />}</div>;
+}
+
+function Content(props: RenderProps) {
   const { kind, path } = props.output;
-  if (kind === "app") return <AppScreen {...props} />;
+  if (kind === "app") return props.output.screen ? <AppScreen {...props} /> : <ScreenFile {...props} />;
   if (kind === "image") return <Picture {...props} />;
   if (kind === "video") return <Video {...props} />;
   if (kind === "audio") return <Sound {...props} />;
@@ -25,21 +36,31 @@ export function Rendered(props: RenderProps) {
       </Suspense>
     );
   if (kind === "deck") return path?.toLowerCase().endsWith(".pptx") ? <DeckFile {...props} /> : <Unopened {...props} />;
-  if (path) return <FromFile {...props} />;
+  if (path || props.output.storedSource && !props.output.source) return <FromFile {...props} />;
   if (kind === "diagram") return <Diagram {...props} />;
   if (kind === "drawing") return <Drawing {...props} />;
   if (kind === "slides") return <Slides {...props} />;
   return <Page {...props} />;
 }
 
+function ScreenFile(props: RenderProps) {
+  const file = useFile(props.output, props.onProblem);
+  const screen = useMemo(() => {
+    if (!file?.text) return undefined;
+    try { return JSON.parse(file.text); } catch { return undefined; }
+  }, [file]);
+  useEffect(() => { if (file && !screen) props.onProblem?.("The saved screen could not be read."); }, [file, screen, props.onProblem]);
+  return screen ? <AppScreen {...props} output={{ ...props.output, screen }} /> : <div className="out-wait" />;
+}
+
 /** A diagram, a drawing or a page that Medha saved as a file is drawn from the file's text. */
 function FromFile(props: RenderProps) {
   const { output } = props;
-  const file = useFile(output.path, props.onProblem);
+  const file = useFile(output, props.onProblem);
   const read = useMemo(() => {
     if (file?.text === undefined) return undefined;
     const deck = output.kind === "page" && slidesOf(file.text).slides.length > 1;
-    return { ...output, kind: deck ? ("slides" as const) : output.kind, source: file.text, path: undefined };
+    return { ...output, kind: deck ? ("slides" as const) : output.kind, source: file.text, path: undefined, snapshot: undefined, storedSource: false, bundle: file.bundle, missing: file.missing };
   }, [file, output]);
   return read ? <Rendered {...props} output={read} /> : <div className="out-wait" />;
 }
@@ -47,7 +68,7 @@ function FromFile(props: RenderProps) {
 /** A PowerPoint file, read into the same deck a page of sections makes. */
 function DeckFile(props: RenderProps) {
   const { onProblem } = props;
-  const file = useFile(props.output.path, onProblem);
+  const file = useFile(props.output, onProblem);
   const [deck, setDeck] = useState<Deck>();
   useEffect(() => {
     if (!file?.bytes) return;

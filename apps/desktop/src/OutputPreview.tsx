@@ -5,8 +5,7 @@ import { SourceCode } from "./Markdown";
 import { useWorkspaceApi } from "./Workspace";
 import { hasScripts, labelOf, noteOf, slidesOf, versionsOf, type Output, type OutputKind } from "./outputBlocks";
 import { useOutputs, type Detail } from "./outputContext";
-import { useKeyed } from "./outputFiles";
-import { unreachable } from "./outputFrame";
+import { useFile, useKeyed } from "./outputFiles";
 import { Gallery } from "./OutputGallery";
 import { Unshown } from "./OutputPlate";
 import { Rendered } from "./OutputRendered";
@@ -25,7 +24,7 @@ const EXTENSION: Partial<Record<OutputKind, string>> = {
   slides: "html",
 };
 const ZOOMS = [0.5, 0.75, 1, 1.5, 2, 3];
-const OFFLINE = "It can't reach the internet or your files.";
+const OFFLINE = "Offline. Only this revision's saved local assets are available. Preview permission is separate from the agent's network permission.";
 
 function Tool(props: { icon: IconName; label: string; onClick: () => void; pressed?: boolean; disabled?: boolean }) {
   return (
@@ -83,12 +82,15 @@ function Viewer({ open }: { open: Output }) {
   const { all, stopped, online, stop, allow, follow, browse } = useOutputs();
   const [code, setCode] = useState(false);
   const [large, setLarge] = useState(false);
-  const shown = `${open.source}\0${open.path}\0${open.screen ? open.anchor : ""}`;
+  const shown = `${open.anchor}\0${open.source}\0${open.path}`;
   const [problem, setProblem] = useKeyed<string>(shown);
   const [detail, setDetail] = useKeyed<Detail>(shown);
   const [zoom, setZoom] = useState<number>();
   const [slide, setSlide] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [actionError, setActionError] = useKeyed<string>(shown);
+  const [busy, setBusy] = useState(false);
+  const codeFile = useFile(code && (open.path || open.storedSource && !open.source) ? open : undefined, setProblem);
   const canvas = useRef<HTMLDivElement>(null);
   const { anchor, kind, source, path, name } = open;
   useEffect(() => {
@@ -120,39 +122,41 @@ function Viewer({ open }: { open: Output }) {
   const label = labelOf(open);
   // What a screen was given to draw stands in for its source when copied or saved.
   const text = open.screen ? JSON.stringify(open.screen.result ?? {}, null, 2) : source;
-  const scripted = (kind === "page" && hasScripts(source)) || undefined;
+  const scripted = ((kind === "page" || kind === "slides") && (hasScripts(source) || !!path)) || undefined;
   const live = !stopped.includes(anchor);
   const web = online.includes(anchor);
-  const page = kind === "page" && !path;
-  const wanted = page ? unreachable(source) : [];
+  const page = kind === "page" || kind === "slides" || kind === "deck";
   const note = noteOf(open);
-  const touch = web
-    ? "Can reach the internet. It still can't see your files or the rest of Medha."
-    : wanted.length
-      ? `Offline. It asked for ${wanted.slice(0, 3).join(", ")}${wanted.length > 3 ? " and more" : ""}, which it can't reach.`
-      : page
-        ? `Runs here, offline. ${OFFLINE}`
-        : slides && !path
-          ? `Shown here, offline. ${OFFLINE}`
-          : undefined;
+  const touch = web && live
+    ? "HTTPS internet is allowed for this preview. It cannot access other workspace files or Medha. This does not grant the agent network access."
+    : page ? OFFLINE : undefined;
 
-  const copy = () =>
-    void navigator.clipboard
-      .writeText(path ?? text)
-      .then(() => setCopied(true))
-      .catch(() => {});
+  const perform = (action: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(true); setActionError(undefined);
+    void action().catch((error) => setActionError(String(error).replace(/^Error:\s*/, ""))).finally(() => setBusy(false));
+  };
+
+  const exactText = async () => {
+    if (text || !(open.storedSource || open.snapshot)) return text;
+    if (!open.sessionId || !open.revisionId) throw new Error("This output has no saved revision identity.");
+    const preview = await api.artifactPreview(open.sessionId, open.revisionId);
+    try {
+      if (preview.text === undefined) throw new Error("This output has no text source.");
+      return preview.text;
+    } finally { if (preview.bundle) await api.artifactRelease(preview.bundle); }
+  };
+  const copy = () => perform(async () => { await navigator.clipboard.writeText(path ?? await exactText()); setCopied(true); });
   const save = () =>
-    void api
-      .saveOutput(
+    perform(() => api.saveOutput(
         path ? (path.split(/[\\/]/).at(-1) ?? name) : `${name}.${EXTENSION[kind] ?? "txt"}`,
-        path ? { path } : { text },
-      )
-      .catch(() => {});
+        open.revisionId && open.sessionId && (open.snapshot || open.storedSource) ? { revisionId: open.revisionId, sessionId: open.sessionId } : path ? { path } : { text },
+      ));
   const powerpoint = () =>
-    void import("./outputDeckWrite")
-      .then((writer) => writer.writeDeck(slidesOf(source), name))
+    perform(async () => import("./outputDeckWrite")
+      .then(async (writer) => writer.writeDeck(slidesOf(await exactText()), name))
       .then((bytes) => api.saveOutput(`${name}.pptx`, { bytes }))
-      .catch(() => {});
+      );
   const zoomBy = (by: number) => {
     const at = ZOOMS.indexOf(zoom ?? 1);
     setZoom(ZOOMS[Math.min(ZOOMS.length - 1, Math.max(0, at + by))]);
@@ -166,7 +170,7 @@ function Viewer({ open }: { open: Output }) {
           <b>{name}</b>
           {name !== label && <span>{label}</span>}
         </div>
-        {!path && LANGUAGE[kind] && (
+        {LANGUAGE[kind] && (
           <div className="out-switch" role="group" aria-label="View">
             <button type="button" aria-pressed={!code} onClick={() => setCode(false)}>
               Preview
@@ -194,13 +198,14 @@ function Viewer({ open }: { open: Output }) {
             </>
           )}
           {kind === "slides" && !path && (
-            <button type="button" className="out-fit" onClick={powerpoint}>
+            <button type="button" className="out-fit" disabled={busy} onClick={powerpoint}>
               Save as PowerPoint
             </button>
           )}
           {slides && <Tool icon="present" label="Present" onClick={() => setLarge(true)} />}
           <Tool icon={copied ? "check" : "copy"} label={path ? "Copy path" : "Copy"} onClick={copy} />
-          <Tool icon="save" label="Save a copy" onClick={save} />
+          <Tool icon="save" label={busy ? "Saving…" : "Save a copy"} disabled={busy} onClick={save} />
+          {path && <button type="button" className="out-fit" disabled={busy} onClick={() => perform(() => api.openFile(path))}>Open current file</button>}
           <Tool
             icon={large ? "x" : "maximize"}
             label={large ? "Close large view" : "Open large"}
@@ -231,7 +236,7 @@ function Viewer({ open }: { open: Output }) {
         )}
       <div className={`out-canvas kind-${kind}`} ref={canvas}>
         {code ? (
-          <SourceCode text={source} language={LANGUAGE[kind]} />
+          <SourceCode text={codeFile?.text ?? source} language={LANGUAGE[kind]} />
         ) : problem && path ? (
           <Unshown output={open} problem={problem} />
         ) : problem && open.screen ? (
@@ -259,15 +264,17 @@ function Viewer({ open }: { open: Output }) {
       </div>
       </div>
       <footer className="out-foot">
+        {actionError && <p role="alert">{actionError} Try the action again.</p>}
+        {open.snapshot && <p>Saved revision.{path ? " Open current file uses today's file on disk." : ""}{open.snapshot.assets.some((asset) => !asset.hash) ? " Its styles, scripts and images are shown as they are in the folder now." : ""}{open.snapshot.assets.length ? " Save a copy saves the document; its local dependencies are in the original folder." : ""}</p>}
         {note && <p>{note}</p>}
         {detail?.foot && <p>{detail.foot}</p>}
         {touch && (
           <p>
             <Icon name={web ? "globe" : "lock"} />
             {touch}
-            {(web || wanted.length > 0) && (
+            {page && (
               <button type="button" className="out-allow" onClick={() => allow?.(open, !web)}>
-                {web ? "Go offline" : "Allow internet for this page"}
+                {web ? "Go offline" : "Allow HTTPS internet for this preview"}
               </button>
             )}
           </p>

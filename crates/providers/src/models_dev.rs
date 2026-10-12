@@ -445,9 +445,10 @@ fn flatten(providers: BTreeMap<String, Provider>) -> BTreeMap<String, ModelMeta>
     // An unqualified id is safe only when models.dev contains one such model.
     // Ambiguous ids require the caller to pass provider/model, preventing a
     // capability from one provider being applied to another deployment.
-    for (id, candidates) in unqualified {
-        if candidates.len() == 1 {
-            flat.insert(id, candidates.into_iter().next().expect("one candidate"));
+    for (id, mut candidates) in unqualified {
+        // One host's "maker/model" spelling never replaces that maker's own entry.
+        if candidates.len() == 1 && !flat.contains_key(&id) {
+            flat.insert(id, candidates.remove(0));
         }
     }
     flat
@@ -592,22 +593,17 @@ pub async fn profile_context_window(profile: &crate::ProviderProfile) -> Option<
     profile_meta(profile, &data.entries, true).and_then(|meta| meta.context)
 }
 
-/// List price for a profile: input, output, then cache re-read and cache write
-/// where the catalogue publishes them.
 /// The request field this model must be sent its own earlier thinking under,
 /// as the catalogue records it; `None` when it names none.
-pub(crate) fn thinking_field(profile: &crate::ProviderProfile) -> Option<String> {
-    let data = crate::catalogue::snapshot();
-    thinking_field_in(profile, &data.entries)
-}
-
-fn thinking_field_in(
+pub(crate) fn thinking_field_in(
     profile: &crate::ProviderProfile,
     entries: &BTreeMap<String, ModelMeta>,
 ) -> Option<String> {
     profile_meta(profile, entries, true)?.thinking_field.clone()
 }
 
+/// List price for a profile: input, output, then cache re-read and cache write
+/// where the catalogue publishes them.
 pub async fn profile_pricing(
     profile: &crate::ProviderProfile,
 ) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
@@ -698,6 +694,25 @@ mod tests {
         };
         assert_eq!(prices("caching"), (Some(0.3), Some(3.75)));
         assert_eq!(prices("plain"), (None, None));
+    }
+
+    /// A host that resells a model lists it as "maker/model", which is also how
+    /// the maker's own entry is filed. The maker's own price and limits stand.
+    #[test]
+    fn another_hosts_spelling_does_not_replace_a_makers_own_entry() {
+        let raw = serde_json::from_value(serde_json::json!({
+            "maker":{"models":{"m":{"limit":{"context":64000},"cost":{"input":1.0,"output":2.0}}}},
+            "reseller":{"models":{
+                "maker/m":{"limit":{"context":8000},"cost":{"input":9.0,"output":9.0}},
+                "other/n":{"limit":{"context":4000}}}},
+        }))
+        .unwrap();
+        let entries = flatten(raw);
+        assert_eq!(entries["maker/m"].input_per_mtok, Some(1.0));
+        assert_eq!(entries["maker/m"].context, Some(64000));
+        assert_eq!(entries["reseller/maker/m"].input_per_mtok, Some(9.0));
+        // A spelling nobody else owns is still found on its own.
+        assert_eq!(entries["other/n"].context, Some(4000));
     }
 
     /// The catalogue says, model by model, whether earlier thinking must be

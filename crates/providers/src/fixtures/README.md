@@ -1,7 +1,7 @@
 # Offline model/provider metadata
 
 `provider-catalogue.json` is a compact projection of the public
-[models.dev API](https://models.dev/api.json), captured on 10 October 2026.
+[models.dev API](https://models.dev/api.json), captured on 13 October 2026.
 It contains metadata, not provider code, credentials, or live verification claims.
 The accompanying models.dev license applies to this data.
 

@@ -7,7 +7,7 @@ import urllib.request
 URL = "https://models.dev/api.json"
 LIMIT = 16 * 1024 * 1024
 FIELDS = ("name", "api", "env", "npm", "doc")
-MODEL_FIELDS = ("name", "limit", "cost", "modalities", "attachment", "tool_call", "reasoning", "reasoning_options")
+MODEL_FIELDS = ("name", "limit", "cost", "modalities", "attachment", "tool_call", "reasoning", "reasoning_options", "interleaved")
 
 
 def main():

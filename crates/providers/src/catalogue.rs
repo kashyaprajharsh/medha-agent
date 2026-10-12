@@ -14,7 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) const SCHEMA: u32 = 5;
+pub(crate) const SCHEMA: u32 = 6;
 const API_URL: &str = "https://models.dev/api.json";
 const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const RETRY: Duration = Duration::from_secs(5 * 60);
@@ -367,7 +367,11 @@ impl Catalogue {
                 };
             } else if cache.schema_version < SCHEMA && cache.entries.len() <= 60000 {
                 // Keep old offline context/prices/capabilities while refreshing.
-                for (id, meta) in cache.entries {
+                for (id, mut meta) in cache.entries {
+                    // What an older cache could not know, the bundle still says.
+                    if let (None, Some(known)) = (&meta.thinking_field, bundled.entries.get(&id)) {
+                        meta.thinking_field = known.thinking_field.clone();
+                    }
                     bundled.entries.insert(id, meta);
                 }
                 bundled.revision = revision(&bundled.providers, &bundled.entries);

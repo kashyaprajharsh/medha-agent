@@ -251,6 +251,33 @@ fn corrupted_current_cache_does_not_masquerade_as_a_legacy_cache() {
     );
 }
 
+/// A cache saved before Medha knew which models want their thinking back
+/// does not hide that for a week: the catalogue shipped with the app answers
+/// at once, the cache's own facts are kept, and it is refreshed.
+#[test]
+fn a_cache_from_an_earlier_version_still_knows_which_models_take_thinking_back() {
+    let shipped = Catalogue::new(None, String::new());
+    let marked = |data: &Snapshot| {
+        let marked = data.entries.iter();
+        marked
+            .filter_map(|(id, meta)| Some((id.clone(), meta.thinking_field.clone()?)))
+            .collect::<Vec<_>>()
+    };
+    let known = marked(&shipped.current.read().unwrap());
+    assert!(known.len() > 500, "the shipped catalogue lost the field");
+    let (id, field) = known[0].clone();
+
+    let temp = Temp::new();
+    let earlier = serde_json::json!({"schema_version":SCHEMA - 1,"fetched_at_unix":now(),
+        "entries":{id.clone():{"context":64000}}});
+    std::fs::write(temp.cache(), earlier.to_string()).unwrap();
+    let catalogue = Catalogue::new(Some(temp.cache()), String::new());
+    let data = catalogue.current.read().unwrap();
+    assert_eq!(data.entries[&id].context, Some(64000));
+    assert_eq!(data.entries[&id].thinking_field, Some(field));
+    assert_eq!(data.fetched_at_unix, 0, "an earlier cache is refreshed");
+}
+
 #[tokio::test]
 async fn an_unwritable_cache_does_not_prevent_an_in_memory_refresh() {
     let temp = Temp::new();

@@ -40,6 +40,13 @@ pub(crate) struct ChatMessage {
     pub tool_calls: Vec<OutgoingToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// An assistant turn's own thinking, as it was stored. Never sent as it is.
+    #[serde(skip)]
+    pub thinking: String,
+    /// The thinking sent back, set only for a server that requires it; any
+    /// other server refuses a request that carries this field at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +84,7 @@ pub(crate) fn prepare_body(
     streaming: bool,
     reasoning_effort: Option<&'static str>,
     max_tokens: Option<u64>,
+    echo_thinking: bool,
 ) -> Result<serde_json::Value, ProviderError> {
     let canonical_names: Vec<String> = context.tools.iter().map(|tool| tool.name.clone()).collect();
     let wire_to_canonical = wire_name_map(&canonical_names);
@@ -84,7 +92,8 @@ pub(crate) fn prepare_body(
         .iter()
         .map(|(wire, canonical)| (canonical.as_str(), wire.as_str()))
         .collect();
-    let messages = lower_chat_messages(&context.ordered_messages(), &canonical_to_wire)?;
+    let ordered = context.ordered_messages();
+    let messages = lower_chat_messages_for(&ordered, &canonical_to_wire, echo_thinking)?;
     let tools = context
         .tools
         .iter()
@@ -134,9 +143,21 @@ pub(crate) fn build_chat_messages(
 /// fail closed when lowering would destroy OpenAI-Chat-tagged state or part
 /// order. State owned by another protocol is deliberately ignored: protocol
 /// adapters may consume only state tagged for themselves.
+#[cfg(test)]
 fn lower_chat_messages(
     messages: &[ModelMessage],
     canonical_to_wire: &HashMap<&str, &str>,
+) -> Result<Vec<ChatMessage>, ProviderError> {
+    lower_chat_messages_for(messages, canonical_to_wire, false)
+}
+
+/// As [`lower_chat_messages`]. With `echo`, every assistant turn carries its
+/// thinking back, or a single space when it had none: a server that wants the
+/// field wants it on each turn, and refuses an empty one.
+fn lower_chat_messages_for(
+    messages: &[ModelMessage],
+    canonical_to_wire: &HashMap<&str, &str>,
+    echo: bool,
 ) -> Result<Vec<ChatMessage>, ProviderError> {
     let mut system = String::new();
     let mut rest = Vec::with_capacity(messages.len());
@@ -153,8 +174,23 @@ fn lower_chat_messages(
             Role::System => unreachable!("system messages were handled above"),
             Role::User => push_user(&mut rest, lower_user(&message.parts)?),
             Role::Assistant => {
-                let next = lower_assistant(&message.parts, canonical_to_wire)?;
-                push_assistant(&mut rest, next);
+                let mut next = lower_assistant(&message.parts, canonical_to_wire)?;
+                if echo {
+                    let thought = std::mem::take(&mut next.thinking);
+                    next.reasoning_content = Some(match thought.is_empty() {
+                        true => " ".into(),
+                        false => thought,
+                    });
+                }
+                // A turn with no words and no action is not sent, thinking or
+                // not: servers refuse an empty turn, and one that ends a request.
+                let said = next
+                    .content
+                    .as_str()
+                    .is_none_or(|text| !text.trim().is_empty());
+                if said || !next.tool_calls.is_empty() {
+                    push_assistant(&mut rest, next);
+                }
             }
             Role::Tool => rest.extend(lower_tool_results(&message.parts)?),
         }
@@ -167,6 +203,8 @@ fn lower_chat_messages(
             content: system.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            thinking: String::new(),
+            reasoning_content: None,
         });
     }
     out.extend(rest);
@@ -189,6 +227,11 @@ fn push_assistant(messages: &mut Vec<ChatMessage>, next: ChatMessage) {
     }
     text.push_str(more);
     before.tool_calls.extend(next.tool_calls);
+    // The earlier turn's thinking stands; a later one fills only a blank.
+    let blank = |held: &Option<String>| held.as_deref().is_none_or(|held| held.trim().is_empty());
+    if blank(&before.reasoning_content) && !blank(&next.reasoning_content) {
+        before.reasoning_content = next.reasoning_content;
+    }
 }
 
 /// Add a user message, joined to the one before it when both are plain text.
@@ -209,6 +252,8 @@ fn push_user(messages: &mut Vec<ChatMessage>, content: serde_json::Value) {
         content,
         tool_calls: Vec::new(),
         tool_call_id: None,
+        thinking: String::new(),
+        reasoning_content: None,
     });
 }
 
@@ -316,6 +361,7 @@ fn lower_assistant(
     canonical_to_wire: &HashMap<&str, &str>,
 ) -> Result<ChatMessage, ProviderError> {
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     let mut saw_tool_call = false;
     for part in parts {
@@ -347,6 +393,7 @@ fn lower_assistant(
             }
             ContentPart::Reasoning(part) => {
                 check_replay_state(&part.provider_state)?;
+                thinking.push_str(part.text.as_deref().unwrap_or_default());
             }
             ContentPart::Media(part) => {
                 check_replay_state(&part.provider_state)?;
@@ -367,6 +414,8 @@ fn lower_assistant(
         content: content.into(),
         tool_calls,
         tool_call_id: None,
+        thinking,
+        reasoning_content: None,
     })
 }
 
@@ -380,6 +429,8 @@ fn lower_tool_results(parts: &[ContentPart]) -> Result<Vec<ChatMessage>, Provide
             content: lower_text_only(parts, "tool")?.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            thinking: String::new(),
+            reasoning_content: None,
         }]);
     }
 
@@ -393,6 +444,8 @@ fn lower_tool_results(parts: &[ContentPart]) -> Result<Vec<ChatMessage>, Provide
                     content: part.content.clone().into(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(part.tool_call_id.clone()),
+                    thinking: String::new(),
+                    reasoning_content: None,
                 });
             }
             ContentPart::Reasoning(part) => check_replay_state(&part.provider_state)?,
@@ -1469,7 +1522,7 @@ mod tests {
             tools: vec![tool("a.b"), tool("a_b")],
         };
 
-        let body = prepare_body(&context, "model", true, None, Some(1_000)).unwrap();
+        let body = prepare_body(&context, "model", true, None, Some(1_000), false).unwrap();
         let definitions: Vec<&str> = body["tools"]
             .as_array()
             .unwrap()
@@ -1496,7 +1549,7 @@ mod tests {
             ordered: None,
             tools: Vec::new(),
         };
-        let body = prepare_body(&context, "model", true, Some("high"), Some(2_000)).unwrap();
+        let body = prepare_body(&context, "model", true, Some("high"), Some(2_000), false).unwrap();
         assert_eq!(body["model"], "model");
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["max_tokens"], 2_000);
@@ -1559,6 +1612,60 @@ mod tests {
                 ("user", &serde_json::json!("third")),
             ]
         );
+    }
+
+    /// Where a server requires a model's thinking back, every assistant turn
+    /// carries it: its own, or a single space when it had none. Any other
+    /// server is sent none of it. A turn that was thinking only goes to neither.
+    #[test]
+    fn thinking_goes_back_only_where_a_server_requires_it() {
+        use kernel::{ReasoningPart, TextPart};
+        let thought = |text: &str| {
+            ContentPart::Reasoning(ReasoningPart {
+                text: Some(text.into()),
+                provider_state: Vec::new(),
+            })
+        };
+        let said = |text: &str| {
+            ContentPart::Text(TextPart {
+                text: text.into(),
+                provider_state: Vec::new(),
+            })
+        };
+        let turn = |role, parts| ModelMessage {
+            role,
+            parts,
+            trust: None,
+        };
+        let messages = vec![
+            turn(Role::User, vec![said("add 2 and 2")]),
+            turn(Role::Assistant, vec![thought("weighing it"), said("4")]),
+            turn(Role::User, vec![said("and 3 and 3?")]),
+            turn(Role::Assistant, vec![said("6")]),
+            turn(Role::User, vec![said("and 5 and 5?")]),
+            turn(Role::Assistant, vec![thought("five and five make ten")]),
+        ];
+        let sent = |echo| {
+            let lowered = lower_chat_messages_for(&messages, &HashMap::new(), echo).unwrap();
+            serde_json::to_value(lowered).unwrap()
+        };
+
+        let required = sent(true);
+        assert_eq!(required[1]["reasoning_content"], "weighing it");
+        assert_eq!(
+            required[3]["reasoning_content"], " ",
+            "a blank would be refused"
+        );
+        let strict = sent(false);
+        let strict = strict.as_array().unwrap();
+        assert!(strict.iter().all(|m| m.get("reasoning_content").is_none()));
+
+        // The turn that was thinking only goes to neither: no request ends on
+        // the model's own turn, which servers refuse.
+        for sent in [required.as_array().unwrap(), strict] {
+            assert_eq!(sent.len(), 5, "{sent:?}");
+            assert_eq!(sent[4]["role"], "user");
+        }
     }
 
     /// Two turns of the model in a row are refused by the same templates. They

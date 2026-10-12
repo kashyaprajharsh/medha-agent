@@ -217,6 +217,10 @@ pub struct ModelMeta {
     /// Exact effort values, separate from toggle/budget reasoning controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    /// The request field under which this model must be sent its own earlier
+    /// thinking, when the catalogue names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_field: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +254,10 @@ struct ModelEntry {
     reasoning: Option<bool>,
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
+    /// `{"field": "..."}` when the model's earlier thinking must be sent back
+    /// to it under that field; `true` or absent names no field.
+    #[serde(default)]
+    interleaved: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -414,11 +422,16 @@ fn flatten(providers: BTreeMap<String, Provider>) -> BTreeMap<String, ModelMeta>
                     .has_known_value()
                     .then_some(capability_values),
                 reasoning_efforts,
+                thinking_field: model
+                    .interleaved
+                    .as_ref()
+                    .and_then(|named| named.get("field")?.as_str().map(str::to_owned)),
             };
             if meta.context.is_some()
                 || meta.input_per_mtok.is_some()
                 || meta.capabilities.is_some()
                 || meta.reasoning_efforts.is_some()
+                || meta.thinking_field.is_some()
             {
                 let normalized_id = id.to_lowercase();
                 flat.insert(
@@ -581,6 +594,20 @@ pub async fn profile_context_window(profile: &crate::ProviderProfile) -> Option<
 
 /// List price for a profile: input, output, then cache re-read and cache write
 /// where the catalogue publishes them.
+/// The request field this model must be sent its own earlier thinking under,
+/// as the catalogue records it; `None` when it names none.
+pub(crate) fn thinking_field(profile: &crate::ProviderProfile) -> Option<String> {
+    let data = crate::catalogue::snapshot();
+    thinking_field_in(profile, &data.entries)
+}
+
+fn thinking_field_in(
+    profile: &crate::ProviderProfile,
+    entries: &BTreeMap<String, ModelMeta>,
+) -> Option<String> {
+    profile_meta(profile, entries, true)?.thinking_field.clone()
+}
+
 pub async fn profile_pricing(
     profile: &crate::ProviderProfile,
 ) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
@@ -671,6 +698,42 @@ mod tests {
         };
         assert_eq!(prices("caching"), (Some(0.3), Some(3.75)));
         assert_eq!(prices("plain"), (None, None));
+    }
+
+    /// The catalogue says, model by model, whether earlier thinking must be
+    /// sent back and under which field. It is read as written there: a model
+    /// marked only `true` names no field, and one not marked has none.
+    #[test]
+    fn the_field_a_model_wants_its_thinking_back_in_is_read_from_the_catalogue() {
+        let raw = serde_json::from_value(serde_json::json!({
+            "deepseek":{"models":{
+                "deepseek-reasoner":{"limit":{"context":64000},"interleaved":{"field":"reasoning_content"}},
+                "deepseek-chat":{"limit":{"context":64000}}}},
+            "openrouter":{"models":{
+                "vendor/detailed":{"limit":{"context":8000},"interleaved":{"field":"reasoning_details"}},
+                "vendor/native":{"limit":{"context":8000},"interleaved":true}}},
+        }))
+        .unwrap();
+        let entries = flatten(raw);
+        let field = |provider: &str, model: &str| {
+            let mut profile = crate::ProviderProfile::openai_chat(
+                "https://server.test/v1",
+                model,
+                crate::AuthKind::Bearer,
+            );
+            profile.provider_id = Some(provider.into());
+            thinking_field_in(&profile, &entries)
+        };
+        assert_eq!(
+            field("deepseek", "deepseek-reasoner").as_deref(),
+            Some("reasoning_content")
+        );
+        assert_eq!(field("deepseek", "deepseek-chat"), None);
+        assert_eq!(
+            field("openrouter", "vendor/detailed").as_deref(),
+            Some("reasoning_details")
+        );
+        assert_eq!(field("openrouter", "vendor/native"), None);
     }
 
     #[test]
@@ -882,6 +945,7 @@ mod tests {
                 cache_write_per_mtok: None,
                 capabilities: None,
                 reasoning_efforts: None,
+                thinking_field: None,
             },
         );
         m.insert(
@@ -894,6 +958,7 @@ mod tests {
                 cache_write_per_mtok: None,
                 capabilities: None,
                 reasoning_efforts: None,
+                thinking_field: None,
             },
         );
 
@@ -922,6 +987,7 @@ mod tests {
             cache_write_per_mtok: None,
             capabilities: None,
             reasoning_efforts: None,
+            thinking_field: None,
         };
         let specific = ModelMeta {
             context: Some(131_072),
@@ -931,6 +997,7 @@ mod tests {
             cache_write_per_mtok: None,
             capabilities: None,
             reasoning_efforts: None,
+            thinking_field: None,
         };
         let entries = BTreeMap::from([
             ("qwen3".to_string(), generic),

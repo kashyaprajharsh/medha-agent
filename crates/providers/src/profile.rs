@@ -117,6 +117,10 @@ pub struct ProviderProfile {
     pub prompt_cache: Option<bool>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub cache_ttl: crate::prompt_cache::CacheTtl,
+    /// Send this model its own earlier thinking back, or never do. Missing
+    /// means the model catalogue decides; set it for a server it does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_echo: Option<bool>,
     /// A file of certificates, in PEM form, that this server's own certificate
     /// may be signed by: a company proxy's, or a self-signed server's. They
     /// are trusted for this server as well as the public ones, never instead.
@@ -157,6 +161,7 @@ impl ProviderProfile {
             stream_idle_seconds: None,
             prompt_cache: None,
             cache_ttl: Default::default(),
+            reasoning_echo: None,
             ca_cert_file: None,
         }
     }
@@ -325,6 +330,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             #[serde(default)]
             cache_ttl: crate::prompt_cache::CacheTtl,
             #[serde(default)]
+            reasoning_echo: Option<bool>,
+            #[serde(default)]
             ca_cert_file: Option<String>,
         }
 
@@ -352,6 +359,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             stream_idle_seconds: raw.stream_idle_seconds,
             prompt_cache: raw.prompt_cache,
             cache_ttl: raw.cache_ttl,
+            reasoning_echo: raw.reasoning_echo,
             ca_cert_file: raw.ca_cert_file.filter(|file| !file.trim().is_empty()),
         })
     }

@@ -55,6 +55,8 @@ pub struct PipelineEngine {
     /// the whole history, where the error compounds with conversation length.
     pending_estimate: AtomicU32,
     estimate_at_last_usage: AtomicU32,
+    /// Thinking that goes back to the model, written since the last reported count.
+    thinking_unseen: AtomicU32,
     summarizer: Arc<dyn Summarizer>,
     last_summary: std::sync::Mutex<Option<String>>,
     history_notes: std::sync::Mutex<String>,
@@ -96,6 +98,7 @@ impl PipelineEngine {
             summary_failure: std::sync::Mutex::new(None),
             pending_estimate: AtomicU32::new(0),
             estimate_at_last_usage: AtomicU32::new(0),
+            thinking_unseen: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
             last_summary: std::sync::Mutex::new(None),
             history_notes: std::sync::Mutex::new(String::new()),
@@ -211,6 +214,7 @@ impl ContextEngine for PipelineEngine {
             self.last_prompt_tokens.store(0, Ordering::Relaxed);
             self.estimate_at_last_usage.store(0, Ordering::Relaxed);
             self.pending_estimate.store(0, Ordering::Relaxed);
+            self.thinking_unseen.store(0, Ordering::Relaxed);
             self.pending_usage_verification
                 .store(false, Ordering::Relaxed);
             self.ineffective.store(0, Ordering::Relaxed);
@@ -322,6 +326,7 @@ impl ContextEngine for PipelineEngine {
         } else {
             (actual as f32).max(before as f32)
         };
+        let basis = basis + self.unseen(preflight);
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
         let full = forced || basis >= usable * self.policy.trigger_ratio || near_hard_ceiling;
         let prune = basis >= usable * self.policy.microcompact_ratio
@@ -350,6 +355,8 @@ impl ContextEngine for PipelineEngine {
         // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens
             .store(prompt_tokens, Ordering::Relaxed);
+        // It counts every bit of thinking that request carried, too.
+        self.thinking_unseen.store(0, Ordering::Relaxed);
         // Pin the local estimate of the *same* request alongside it. The pair
         // is the anchor: any later estimate above it is new material.
         self.estimate_at_last_usage.store(
@@ -414,6 +421,11 @@ impl ContextEngine for PipelineEngine {
         self.tool_overhead.store(n, Ordering::Relaxed);
     }
 
+    fn note_thinking_sent_back(&self, thinking: &str) {
+        let tokens = self.counter.count(thinking);
+        self.thinking_unseen.fetch_add(tokens, Ordering::Relaxed);
+    }
+
     fn note_request(&self, ctx: &kernel::CompiledContext) {
         if let Ok(mut slot) = self.last_request.lock() {
             *slot = Some(Arc::new(ctx.clone()));
@@ -461,6 +473,15 @@ impl ContextEngine for PipelineEngine {
 }
 
 impl PipelineEngine {
+    /// Size no message holds and no count has seen. A count of the request
+    /// as it will be sent already has it.
+    fn unseen(&self, preflight: u32) -> f32 {
+        match preflight {
+            0 => self.thinking_unseen.load(Ordering::Relaxed) as f32,
+            _ => 0.0,
+        }
+    }
+
     async fn compile_inner(
         &self,
         messages: &[Message],
@@ -517,6 +538,7 @@ impl PipelineEngine {
         } else {
             (actual as f32).max(before as f32)
         };
+        let basis = basis + self.unseen(preflight);
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
         *self.pressure.lock().unwrap() = Some(kernel::ContextPressure::new(
             basis as u64,
@@ -2169,6 +2191,35 @@ mod tests {
             "the anchor, not the extra message, is what tripped compaction"
         );
         assert!(fresh.pressure().unwrap().input_tokens < 6_000);
+    }
+
+    /// Thinking a server takes back rides in every later request but in no
+    /// message sized here. The newest turn's is in no reported count either,
+    /// so it is added until a count that includes it arrives, and never twice.
+    #[tokio::test]
+    async fn thinking_that_goes_back_counts_toward_the_next_request() {
+        let input_limit = Some(local_input_limit(10_000));
+        let mut msgs = vec![Message::system("S")];
+        for _ in 0..30 {
+            msgs.push(user(&"a".repeat(664)));
+        }
+        let eng = engine(CompactionPolicy::default());
+        eng.compile(&msgs, input_limit).await;
+        eng.update_usage(5_000, 5_200);
+
+        // The reply thought for about 1,500 tokens and wrote a few words.
+        eng.note_thinking_sent_back(&"t".repeat(6_000));
+        msgs.push(user("go on"));
+        assert!(eng.compaction_planned(&msgs, input_limit));
+        eng.compile(&msgs, input_limit).await;
+        let sized = eng.pressure().unwrap().input_tokens;
+        assert!(sized >= 6_500, "the thinking was left out: {sized}");
+
+        // The server's next count has that thinking in it.
+        eng.update_usage(6_510, 6_600);
+        eng.compile(&msgs, input_limit).await;
+        let sized = eng.pressure().unwrap().input_tokens;
+        assert!((6_510..6_600).contains(&sized), "counted twice: {sized}");
     }
 
     #[tokio::test]

@@ -1172,6 +1172,11 @@ impl Provider for ProviderClient {
         Ok(Some(request.with_body(body)))
     }
 
+    fn replays_reasoning(&self) -> bool {
+        let profile = self.connection.lock().unwrap().profile.clone();
+        profile.protocol == Protocol::OpenAiChat && crate::reasoning_echo::expected(&profile)
+    }
+
     fn standing_in(&self) -> Option<(String, String)> {
         let fallbacks = self.fallbacks.lock().unwrap();
         let (own, _) = fallbacks.own.as_ref()?;
@@ -1293,6 +1298,7 @@ impl Provider for ProviderClient {
                     streaming,
                     self.reasoning_effort_value(),
                     connection.profile.max_output_tokens,
+                    crate::reasoning_echo::expected(&connection.profile),
                 )?;
                 if connection.profile.chat_token_limit_field() == "max_completion_tokens"
                     && let Some(cap) = body.as_object_mut().and_then(|o| o.remove("max_tokens"))

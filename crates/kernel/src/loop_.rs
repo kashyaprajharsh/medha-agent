@@ -325,6 +325,14 @@ fn kept_text(
     )
 }
 
+/// Leave only what was shown of a continued reply: no repeat, nothing still held.
+fn only_shown(seam: &Option<crate::seam::Seam>, text: &mut String, message: &mut ModelMessage) {
+    if let Some(seam) = seam {
+        crate::seam::without_start(text, seam.hidden());
+        crate::seam::without_start_of(message, seam.hidden());
+    }
+}
+
 fn message_from_stream_parts(parts: Vec<ContentPart>) -> ModelMessage {
     ModelMessage {
         role: Role::Assistant,
@@ -1484,6 +1492,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let (mut retired_said, mut unreadable_said) = (0, false);
         // Replies that stopped early in this run and were asked to go on.
         let mut cut_offs = 0u32;
+        // What such a reply has written so far, so its next piece does not repeat it.
+        let mut join = crate::seam::Join::default();
         // Times this run waited for a server that was only away for now.
         let mut waits = 0u32;
         // Empty replies: whether the one nudge was used, the tries made since the
@@ -2096,6 +2106,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         sink,
                         &cancel,
                         wall_deadline,
+                        &mut join,
                     )
                     .await
                 {
@@ -2411,6 +2422,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 .parts
                 .iter()
                 .any(|part| matches!(part, ContentPart::Reasoning(_)));
+            // A piece that only wrote the end of the last one again adds nothing:
+            // the reply was already whole, and the turn ends as it is.
+            let said_again = empty && join.cut > 0;
+            // The text so far is carried only while the reply is still going on.
+            match &go_on {
+                Some(_) => join.written.push_str(&assistant.content),
+                None if !empty || said_again => join.written.clear(),
+                None => {}
+            }
             // A sub-agent sharing this connection may have moved it to a stand-in:
             // the answer is still marked, and the person is still told.
             if let (None, Some((was, now))) = (&stood_in, self.provider.standing_in()) {
@@ -2431,6 +2451,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let nothing_kept =
                 matches!(go_on, Some(GoOn::Stalled(_))) && canonical.parts.is_empty();
             if !empty && !nothing_kept {
+                // Thinking this server takes back is part of the next request's size.
+                if thought && self.provider.replays_reasoning() {
+                    let thinking = canonical.parts.iter().filter_map(|part| match part {
+                        ContentPart::Reasoning(part) => part.text.as_deref(),
+                        _ => None,
+                    });
+                    self.context
+                        .note_thinking_sent_back(&thinking.collect::<String>());
+                }
                 // Text followed only by tidying up is a finished answer.
                 tidied_after_text = !assistant.content.trim().is_empty()
                     && !intents.is_empty()
@@ -2517,7 +2546,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // An empty reply after an answer and its tidying up ends the turn as
             // it is. Any other is nudged or asked for again, then another model
             // is tried, and only then is the person told.
-            if empty && !tidied_after_text {
+            if empty && !tidied_after_text && !said_again {
                 let after_tools = messages.last().is_some_and(|m| m.role == Role::Tool);
                 if after_tools && !empty_nudged {
                     empty_nudged = true;
@@ -2547,12 +2576,22 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 };
                 if empty_tries < tries && !certain {
                     empty_tries += 1;
-                    let wait = crate::empty_reply::wait(empty_tries, jitter_nanos());
-                    sink.notice(&format!(
-                        "The model answered with nothing. Asking again in {}s \
-                         ({empty_tries}/{tries})…",
-                        wait.as_secs()
-                    ));
+                    // A model that thought is on a server that answers: no wait helps it.
+                    let wait = match thought {
+                        true => std::time::Duration::ZERO,
+                        false => crate::empty_reply::wait(empty_tries, jitter_nanos()),
+                    };
+                    sink.notice(&match thought {
+                        true => format!(
+                            "The model thought but wrote no answer. Asking again \
+                             ({empty_tries}/{tries})…"
+                        ),
+                        false => format!(
+                            "The model answered with nothing. Asking again in {}s \
+                             ({empty_tries}/{tries})…",
+                            wait.as_secs()
+                        ),
+                    });
                     let heard = interrupts.as_ref().map(|q| q.activity());
                     if !matches!(
                         waited_out(wait, &cancel, heard, sink).await,
@@ -2911,6 +2950,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
         cancel: &tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
+        join: &mut crate::seam::Join,
     ) -> Result<
         (
             Message,
@@ -2946,7 +2986,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .await;
             let mut cut = crate::cut_off::CutOff::default();
             let outcome = self
-                .stream_turn(&request, sink, cancel, wall_deadline, &mut cut)
+                .stream_turn(&request, sink, cancel, wall_deadline, &mut cut, join)
                 .await;
             self.observe_hook_with(
                 session,
@@ -3406,6 +3446,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         cancel: &tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
         cut: &mut crate::cut_off::CutOff,
+        join: &mut crate::seam::Join,
     ) -> Result<
         (
             String,
@@ -3417,6 +3458,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         ),
         (crate::provider::ProviderError, bool),
     > {
+        // A reply that goes on from an earlier piece has its start held back
+        // until it is known not to repeat that piece's end.
+        join.cut = 0;
+        let mut seam = (!join.written.is_empty()).then(|| crate::seam::Seam::after(&join.written));
         // Connection and prompt processing must remain cancellable before the
         // first stream byte arrives.
         let request_started = std::time::Instant::now();
@@ -3466,17 +3511,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Cancelled mid-stream: keep what streamed (the user saw
                     // it), drop un-dispatched intents — they were never
                     // admitted, so nothing in the log dangles.
-                    let canonical = completed
+                    let mut canonical = completed
                         .as_ref()
                         .map(strip_tool_calls)
                         .unwrap_or_else(|| strip_tool_calls(&message_from_stream_parts(parts)));
+                    only_shown(&seam, &mut text, &mut canonical);
                     return Ok((text, reasoning, Vec::new(), canonical, usage, true));
                 }
                 _ = wait_for_deadline(wall_deadline) => {
-                    let canonical = completed
+                    let mut canonical = completed
                         .as_ref()
                         .map(strip_tool_calls)
                         .unwrap_or_else(|| strip_tool_calls(&message_from_stream_parts(parts)));
+                    only_shown(&seam, &mut text, &mut canonical);
                     return Ok((text, reasoning, Vec::new(), canonical, usage, true));
                 }
             };
@@ -3504,8 +3551,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     charge_stream_bytes(&mut stream_bytes, t.len())
                         .map_err(|error| (error, emitted))?;
-                    emitted = true;
-                    sink.text(&t);
+                    match seam.as_mut().map(|seam| seam.feed(&t)) {
+                        // Still held: nothing has reached the screen yet.
+                        Some(shown) if shown.is_empty() => {}
+                        Some(shown) => {
+                            emitted = true;
+                            sink.text(&shown);
+                        }
+                        None => {
+                            emitted = true;
+                            sink.text(&t);
+                        }
+                    }
                     text.push_str(&t);
                     match parts.last_mut() {
                         Some(ContentPart::Text(part)) => part.text.push_str(&t),
@@ -3622,12 +3679,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     cut.tool_call =
                         tool_started || !intents.is_empty() || !arguments_started.is_empty();
                     cut.text = std::mem::take(&mut text);
+                    // A start that was held or cut was never shown, and is not kept.
+                    if let Some(seam) = &seam {
+                        crate::seam::without_start(&mut cut.text, seam.hidden());
+                    }
                     cut.tools = std::mem::take(&mut called);
                     return Err((e, emitted));
                 }
             }
         }
-        let canonical = completed.unwrap_or_else(|| message_from_stream_parts(parts));
+        let mut canonical = completed.unwrap_or_else(|| message_from_stream_parts(parts));
         let (canonical_text, canonical_reasoning, canonical_intents) =
             completed_control_view(&canonical).map_err(|error| (error, emitted))?;
         if canonical_intents.len() > MAX_TOOL_INTENTS_PER_TURN {
@@ -3668,8 +3729,24 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             ));
         }
         if text.is_empty() && !canonical_text.is_empty() {
-            sink.text(&canonical_text);
+            // A reply that arrived whole is read for a repeat like any other.
+            match seam.as_mut().map(|seam| seam.feed(&canonical_text)) {
+                Some(shown) if shown.is_empty() => {}
+                Some(shown) => sink.text(&shown),
+                None => sink.text(&canonical_text),
+            }
             text = canonical_text;
+        }
+        // The reply is over: what was held is shown, less a repeat, and the
+        // repeat is left out of what is saved as well.
+        if let Some(seam) = seam.as_mut() {
+            let held = seam.finish();
+            if !held.is_empty() {
+                sink.text(&held);
+            }
+            join.cut = seam.cut;
+            crate::seam::without_start(&mut text, seam.cut);
+            crate::seam::without_start_of(&mut canonical, seam.cut);
         }
         if reasoning.is_empty() && !canonical_reasoning.is_empty() {
             sink.reasoning(&canonical_reasoning);

@@ -46,6 +46,8 @@ struct Scripted {
     own_rate: Mutex<Option<kernel::Pricing>>,
     /// How many times the person lets a turn wait for a server that is away.
     server_waits: Mutex<u32>,
+    /// The own model's server takes a model's earlier thinking back.
+    takes_thinking_back: Mutex<bool>,
     /// How long each model that was left was to be rested.
     rests: Mutex<Vec<Rest>>,
     /// After this many requests the own model answers again.
@@ -85,6 +87,7 @@ impl Scripted {
             restores: Mutex::new(0),
             own_rate: Mutex::new(None),
             server_waits: Mutex::new(kernel::recovery::WAITS),
+            takes_thinking_back: Mutex::new(false),
             rests: Mutex::new(Vec::new()),
             down_for: Mutex::new(usize::MAX),
             moved_at: Mutex::new(usize::MAX),
@@ -175,6 +178,10 @@ impl Provider for Scripted {
         (standing_in > 0).then(|| ("own-model".into(), format!("stand-in-{standing_in}")))
     }
 
+    fn replays_reasoning(&self) -> bool {
+        *self.takes_thinking_back.lock().unwrap()
+    }
+
     fn stand_in_left(&self) -> bool {
         *self.standing_in.lock().unwrap() < self.stand_ins
     }
@@ -238,10 +245,16 @@ impl Provider for Scripted {
     }
 }
 
-struct Passthrough;
+/// Sends the chat as it is, and keeps the thinking it was told goes back.
+#[derive(Default)]
+struct Passthrough(Mutex<String>);
 
 #[async_trait]
 impl ContextEngine for Passthrough {
+    fn note_thinking_sent_back(&self, thinking: &str) {
+        self.0.lock().unwrap().push_str(thinking);
+    }
+
     async fn compile(&self, messages: &[Message], _: Option<u32>) -> CompileResult {
         CompileResult {
             messages: messages.to_vec(),
@@ -297,12 +310,31 @@ impl Executor for Notes {
     }
 }
 
+/// The reply text a person would see, taken back when the kernel says so.
+#[derive(Default)]
+struct Screen(Mutex<String>);
+
+impl kernel::StreamSink for Screen {
+    fn text(&self, delta: &str) {
+        self.0.lock().unwrap().push_str(delta);
+    }
+    fn restarted(&self) {
+        self.0.lock().unwrap().clear();
+    }
+    fn supports_restart(&self) -> bool {
+        true
+    }
+}
+
 struct Ran {
     stop: Result<StopReason, String>,
     messages: Vec<Message>,
     log: Arc<InMemoryLog>,
     session: Session,
     executed: usize,
+    shown: String,
+    /// Thinking the size estimate was told goes back to the model.
+    sized: String,
 }
 
 async fn run(provider: Arc<Scripted>) -> Ran {
@@ -315,11 +347,12 @@ async fn run_hearing(provider: Arc<Scripted>, heard: Option<InterruptQueue>) -> 
     let notes = Arc::new(Notes::default());
     let own_rate = *provider.own_rate.lock().unwrap();
     let waits = *provider.server_waits.lock().unwrap();
+    let context = Arc::new(Passthrough::default());
     let kernel = Kernel::new(
         provider,
         log.clone(),
         notes.clone(),
-        Arc::new(Passthrough),
+        context.clone(),
         Arc::new(NoArtifacts),
         Arc::new(AllowAll),
         Arc::new(AutoDeny),
@@ -329,7 +362,8 @@ async fn run_hearing(provider: Arc<Scripted>, heard: Option<InterruptQueue>) -> 
     .with_server_waits(waits);
     let session = Session::new();
     let asked = vec![Message::user("write it")];
-    let turn = kernel.run_session(&session, asked, Budget::default(), &kernel::NullSink, heard);
+    let screen = Screen::default();
+    let turn = kernel.run_session(&session, asked, Budget::default(), &screen, heard);
     let (stop, messages) = match turn.await {
         Ok((messages, stop)) => (Ok(stop), messages),
         Err(error) => (Err(error.to_string()), Vec::new()),
@@ -341,6 +375,8 @@ async fn run_hearing(provider: Arc<Scripted>, heard: Option<InterruptQueue>) -> 
         log,
         session,
         executed,
+        shown: screen.0.into_inner().unwrap(),
+        sized: context.0.lock().unwrap().clone(),
     }
 }
 
@@ -859,11 +895,14 @@ async fn an_empty_reply_is_asked_for_again_and_never_saved() {
     assert_eq!(provider.asked.lock().unwrap().len(), 2, "not asked again");
 
     // Thinking but never answering: three more tries, then the person is told.
+    // Its server is plainly answering, so it is not kept waiting between tries.
     let thinking = (vec![Block::Reasoning("hmm".into())], Whole);
-    let stuck = Scripted::new(Vec::new(), thinking.clone());
+    let stuck = Scripted::new(Vec::new(), thinking);
+    let began = tokio::time::Instant::now();
     let error = run(stuck.clone()).await.stop.unwrap_err();
     assert!(error.contains("kept answering with nothing"), "{error}");
     assert_eq!(stuck.asked.lock().unwrap().len(), 4);
+    assert!(began.elapsed().is_zero(), "{:?}", began.elapsed());
 
     // No output at all, twice running: a third try would be the same, so none is made.
     let silent = Scripted::new(Vec::new(), nothing);
@@ -956,14 +995,119 @@ async fn an_answer_whose_stream_dies_is_kept_and_continued_not_sent_for_again() 
     assert_eq!(saved, 2, "both parts are in the saved chat");
 
     // A connection that dies every time: three continuations, and all four parts kept.
-    let stuck = Scripted::new(Vec::new(), (vec![text("a bit more, ")], Stalled));
+    let more = |said| (vec![text(said)], Stalled);
+    let stuck = Scripted::new(
+        vec![
+            more("The first part, "),
+            more("then a second, "),
+            more("then a third, "),
+        ],
+        more("and a fourth, "),
+    );
     let ran = run(stuck.clone()).await;
     assert_eq!(ran.stop, Ok(StopReason::Finished));
     assert_eq!(stuck.asked.lock().unwrap().len(), 4);
+    let all = "The first part, then a second, then a third, and a fourth, ";
+    assert_eq!(ran.shown, all);
 
     // Nothing written yet: the stream is reopened as before, twice, then given up.
     let silent = Scripted::new(Vec::new(), (Vec::new(), Stalled));
     let error = run(silent.clone()).await.stop.unwrap_err();
     assert!(error.contains("stopped reconnecting"), "{error}");
     assert_eq!(silent.asked.lock().unwrap().len(), 3);
+}
+
+/// Thinking counts toward the next request only where it will be in it.
+/// Counted elsewhere, a chat is summarised early for nothing; left out here,
+/// a request can be sent too big.
+#[tokio::test]
+async fn thinking_is_sized_only_where_it_goes_back_to_the_model() {
+    let reply = || {
+        (
+            vec![Block::Reasoning("weighing it".into()), text("4")],
+            Whole,
+        )
+    };
+    let takes = Scripted::new(Vec::new(), reply());
+    *takes.takes_thinking_back.lock().unwrap() = true;
+    assert_eq!(run(takes).await.sized, "weighing it");
+
+    let strict = Scripted::new(Vec::new(), reply());
+    assert_eq!(run(strict).await.sized, "");
+}
+
+/// A model asked to go on often starts by writing the end of its last piece
+/// again. The person never sees it twice, it is not saved twice, and it does
+/// not go back to the model twice.
+#[tokio::test(start_paused = true)]
+async fn a_continued_reply_that_starts_by_repeating_itself_is_joined_once() {
+    let first = "The parser keeps a stack of open blocks. When a block closes it is folded \
+        into its parent, and the parent's span";
+    let again = "When a block closes it is folded into its parent, and the parent's span";
+    let texts = |messages: &[kernel::ModelMessage]| -> Vec<String> {
+        let assistants = messages.iter().filter(|m| m.role == Role::Assistant);
+        let text = |m: &kernel::ModelMessage| -> String {
+            let parts = m.parts.iter().filter_map(|part| match part {
+                kernel::ContentPart::Text(part) => Some(part.text.as_str()),
+                _ => None,
+            });
+            parts.collect()
+        };
+        assistants.map(text).collect()
+    };
+
+    // The repeat arrives in pieces, as a stream delivers it, then the new text.
+    let provider = Scripted::new(
+        vec![
+            (vec![text(first)], Stalled),
+            (
+                vec![
+                    text(&again[..20]),
+                    text(&again[20..]),
+                    text(" is widened"),
+                    text("."),
+                ],
+                Cut,
+            ),
+        ],
+        (vec![text(" Errors are collected.")], Whole),
+    );
+    let ran = run(provider.clone()).await;
+    assert_eq!(ran.stop, Ok(StopReason::Finished));
+    let whole = format!("{first} is widened. Errors are collected.");
+    assert_eq!(ran.shown, whole, "shown once, with nothing lost");
+    let saved = kernel::project_ordered_messages(&ran.log.events(ran.session.id).await);
+    assert_eq!(texts(&saved).concat(), whole, "saved once");
+    let third = provider.asked.lock().unwrap()[2].clone();
+    let sent = texts(&third.context.ordered_messages());
+    assert_eq!(sent, [first, " is widened."], "sent back to the model once");
+
+    // A reply that ends normally right after its repeat is joined the same way.
+    let ended = Scripted::new(
+        vec![(vec![text(first)], Stalled)],
+        (vec![text(again), text(" is widened.")], Whole),
+    );
+    let ran = run(ended.clone()).await;
+    assert_eq!(ran.shown, format!("{first} is widened."));
+    let saved = kernel::project_ordered_messages(&ran.log.events(ran.session.id).await);
+    assert_eq!(texts(&saved), [first, " is widened."]);
+
+    // Nothing but the repeat: the reply was already whole, so the turn ends
+    // there. It is not an empty reply, and it is not asked for again.
+    let only = Scripted::new(
+        vec![(vec![text(first)], Stalled)],
+        (vec![text(again)], Whole),
+    );
+    let ran = run(only.clone()).await;
+    assert_eq!(ran.stop, Ok(StopReason::Finished));
+    assert_eq!(ran.shown, first);
+    assert_eq!(only.asked.lock().unwrap().len(), 2);
+
+    // A continuation that simply goes on is shown and saved exactly as written.
+    let plain = Scripted::new(
+        vec![(vec![text(first)], Stalled)],
+        (vec![text(" is "), text("widened.")], Whole),
+    );
+    let ran = run(plain.clone()).await;
+    assert_eq!(ran.shown, format!("{first} is widened."));
 }

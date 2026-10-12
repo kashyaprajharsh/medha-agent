@@ -21,6 +21,7 @@ pub mod redact;
 mod rejections;
 mod repetition;
 pub mod request_images;
+mod seam;
 pub mod sink;
 pub mod tool_snapshot;
 pub mod turn_instruction;

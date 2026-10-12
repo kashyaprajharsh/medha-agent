@@ -1033,6 +1033,7 @@ fn resolve_inner(
         stream_idle_seconds: configured.and_then(|p| p.stream_idle_seconds),
         prompt_cache: configured.and_then(|p| p.prompt_cache),
         cache_ttl: configured.map(|p| p.cache_ttl).unwrap_or_default(),
+        reasoning_echo: configured.and_then(|p| p.reasoning_echo),
         ca_cert_file: configured.and_then(|p| p.ca_cert_file.clone()),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
@@ -2311,6 +2312,7 @@ mod tests {
             stream_idle_seconds: None,
             prompt_cache: None,
             cache_ttl: Default::default(),
+            reasoning_echo: None,
             ca_cert_file: None,
         }
     }

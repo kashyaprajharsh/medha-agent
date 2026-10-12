@@ -209,6 +209,10 @@ pub trait ContextEngine: Send + Sync {
     /// Note the session's tool set so tool-definition overhead is sized once.
     fn note_tools(&self, _tools: &[ToolSpec]) {}
 
+    /// Thinking the model just wrote that goes back with its next request.
+    /// No message the engine sizes holds it, so its size is noted here.
+    fn note_thinking_sent_back(&self, _thinking: &str) {}
+
     /// Note the context being sent, so a compaction summary can replay it.
     fn note_request(&self, _ctx: &CompiledContext) {}
 

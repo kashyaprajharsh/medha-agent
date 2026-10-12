@@ -1060,6 +1060,11 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this server is sent a model's earlier thinking back with each request.
+    fn replays_reasoning(&self) -> bool {
+        false
+    }
+
     /// Whether another saved key for this server could be used right now.
     fn another_key(&self) -> bool {
         false

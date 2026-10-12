@@ -963,6 +963,47 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                     }
                     return;
                 }
+                if let PickerKind::ModelKeys(profiles) = &picker.kind {
+                    let name = profiles.get(picker.selected).map(|p| p.name.clone());
+                    model.picker = None;
+                    if let Some(name) = name {
+                        open_model_keys(model, name);
+                    }
+                    return;
+                }
+                if let PickerKind::ModelCertificate(profiles) = &picker.kind {
+                    let name = profiles.get(picker.selected).map(|p| p.name.clone());
+                    model.picker = None;
+                    if let Some(name) = name {
+                        begin_model_certificate(model, &name);
+                    }
+                    return;
+                }
+                if let PickerKind::ModelKeySlots { name, slots } = &picker.kind {
+                    // The first row adds a key; each row after it forgets one.
+                    let (name, slot) = (name.clone(), picker.selected.checked_sub(1));
+                    let slot = slot.map(|at| slots.get(at).copied());
+                    model.picker = None;
+                    match slot {
+                        None => begin_model_key_add(model, &name),
+                        Some(Some(slot)) => remove_model_key(model, &name, slot),
+                        Some(None) => {}
+                    }
+                    return;
+                }
+                if let PickerKind::ModelFallback { profiles, listed } = &picker.kind {
+                    // A listed model is taken out, another goes last; the row after them clears.
+                    let mut names = listed.clone();
+                    match profiles.get(picker.selected) {
+                        Some(profile) => match names.iter().position(|n| *n == profile.name) {
+                            Some(at) => drop(names.remove(at)),
+                            None => names.push(profile.name.clone()),
+                        },
+                        None => names.clear(),
+                    }
+                    set_fallback(model, names);
+                    return;
+                }
                 if let PickerKind::Model { profiles, active } = &picker.kind {
                     // Rows 0..n are the models themselves — Enter switches
                     // directly. Management actions sit after the list.
@@ -1003,6 +1044,18 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                                     Some(Picker::new(PickerKind::ModelRemove(removable)));
                             }
                         }
+                        4 => {
+                            model.picker = None;
+                            open_fallback_picker(model);
+                        }
+                        5 => {
+                            model.picker =
+                                Some(Picker::new(PickerKind::ModelKeys(profiles.clone())));
+                        }
+                        6 => {
+                            let choose = PickerKind::ModelCertificate(profiles.clone());
+                            model.picker = Some(Picker::new(choose));
+                        }
                         _ => {}
                     }
                     return;
@@ -1037,6 +1090,9 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                         | PickerKind::ModelCredential(_)
                         | PickerKind::ModelDefault(_)
                         | PickerKind::ModelRemove(_)
+                        | PickerKind::ModelKeys(_)
+                        | PickerKind::ModelCertificate(_)
+                        | PickerKind::ModelKeySlots { .. }
                 ) {
                     open_model_picker(model);
                 } else if matches!(picker.kind, PickerKind::SearchProvider) {
@@ -1556,6 +1612,8 @@ pub(super) enum SlashAction {
     EnableSkill(String),
     DisableSkill(String),
     ModelPicker,
+    /// `/fallback` — choose the saved models that stand in.
+    FallbackPicker,
     AddModel,
     /// `/model <name>` — switch to a saved profile without opening the picker.
     SwitchModel(String),
@@ -1662,6 +1720,7 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
         "skill" => SlashAction::SkillPicker,
         "model" => SlashAction::ModelPicker,
         "model add" => SlashAction::AddModel,
+        "fallback" => SlashAction::FallbackPicker,
         "search" => SlashAction::SearchConfig,
         "mode" => SlashAction::ModePicker,
         "plan" => SlashAction::SwitchMode("plan".into()),

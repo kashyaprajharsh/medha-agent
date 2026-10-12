@@ -31,6 +31,8 @@ export type HistoryEvent = {
   plan?: { explanation?: string; steps: { title: string; status: string }[] };
   ts: number;
   text?: string;
+  /** Set on an answer written by a model that stood in for the chat's own. */
+  stand_in?: { model: string; for: string };
   images?: MessageImage[];
   /** The output a person's message was about, as the label shown beside it. */
   about?: string;

@@ -197,7 +197,7 @@ fn settings(cfg: &config::Config) -> Value {
                 "auth": auth, "discovery": available, "providers": presets})
         })
         .collect();
-    json!({ "models": models, "protocols": protocols, "catalogue_revision": catalogue.revision, "unavailable_providers": catalogue.providers.iter().filter(|p| !p.available).map(|p| json!({"id":p.id,"name":p.name,"reason":p.unavailable_reason})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
+    json!({ "models": models, "fallback": cfg.fallback, "protocols": protocols, "catalogue_revision": catalogue.revision, "unavailable_providers": catalogue.providers.iter().filter(|p| !p.available).map(|p| json!({"id":p.id,"name":p.name,"reason":p.unavailable_reason})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
 }
 fn instruction_path(workspace: &Path, kind: &str) -> Result<std::path::PathBuf> {
     match kind {
@@ -291,6 +291,23 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
         }
         "settings.model.remove" => {
             config::edit(|cfg| cfg.remove_model(text(params, "name")?).map(|_| ()))?;
+            Ok(json!({"saved": true}))
+        }
+        "settings.model.certificate" => {
+            // The file is read when the model connects, so a wrong path is said then.
+            let file = params["file"].as_str().map(str::trim).unwrap_or_default();
+            config::edit(|cfg| {
+                let name = text(params, "name")?;
+                let model = cfg.models.get_mut(name);
+                let model = model.ok_or_else(|| anyhow!("no saved model named '{name}'"))?;
+                model.ca_cert_file = (!file.is_empty()).then(|| file.to_owned());
+                Ok(())
+            })?;
+            Ok(json!({"saved": true}))
+        }
+        "settings.fallback.save" => {
+            let names: Vec<String> = serde_json::from_value(params["names"].clone())?;
+            config::edit(|cfg| cfg.set_fallback(names))?;
             Ok(json!({"saved": true}))
         }
         "settings.key.remove" => {

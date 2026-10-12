@@ -125,7 +125,13 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             r#"{"error":{"message":"request rejected by the gateway","code":400}}"#,
         );
     }
-    if asked.contains("HOLD") {
+    // A message left unanswered arrives joined to the next; the newest part decides.
+    if asked
+        .rsplit("\n\n")
+        .next()
+        .unwrap_or(&asked)
+        .contains("HOLD")
+    {
         let _ = release.lock().unwrap().recv_timeout(WAIT);
     }
     if body["stream"] == false {
@@ -3311,7 +3317,8 @@ async fn a_force_stop_settles_all_viewers_before_another_turn_runs() {
         }
         text.push_str(frame["params"]["delta"].as_str().unwrap());
     }
-    assert_eq!(text, "echo: a fresh turn");
+    // The stopped message was never answered, so it arrives joined to this one.
+    assert_eq!(text, "echo: HOLD the answer\n\na fresh turn");
 }
 
 /// The window removes a server for the folder, the shared host lets go of it at

@@ -76,6 +76,7 @@ export function Settings({
   const [protocols, setProtocols] = useState<ModelProtocol[]>([]);
   const [tab, setTab] = useState("models");
   const [models, setModels] = useState<Model[]>([]);
+  const [standIns, setStandIns] = useState<string[]>([]);
   const [search, setSearch] = useState<Search>();
   const [instructions, setInstructions] = useState<Instruction[]>([]);
   const [error, setError] = useState("");
@@ -105,6 +106,7 @@ export function Settings({
           setInstructions(result.files as Instruction[]);
         else {
           setModels(result.models as Model[]);
+          setStandIns((result.fallback as string[] | undefined) ?? []);
           setProtocols(result.protocols as ModelProtocol[]);
           setSearch(result.search as Search);
         }
@@ -171,7 +173,10 @@ export function Settings({
         {tab === "memory" && <Memory sessionKey={sessionKey} ensureOpen={ensureOpen} />}
         {tab === "models" && (
           <>
-            <PageTop title="Models">The models you have saved. Pick one for a chat from the box you type in.</PageTop>
+            <PageTop title="Models">
+              The models you have saved. Pick one for a chat from the box you type in. Stand-ins take over, in number
+              order, when a chat's model cannot answer.
+            </PageTop>
             <ViewBar>
               <Add
                 label="Add model"
@@ -200,6 +205,9 @@ export function Settings({
                       </span>
                     </button>
                     {model.default && <span className="ix-chip gold">Default</span>}
+                    {standIns.includes(model.name) && (
+                      <span className="ix-chip">Stand-in {standIns.indexOf(model.name) + 1}</span>
+                    )}
                     <small className={`ix-note ${keyOf(model).missing ? "warn" : ""}`}>{keyOf(model).label}</small>
                   </div>
                 ))}
@@ -225,6 +233,12 @@ export function Settings({
                   <dd>{protocols.find((protocol) => protocol.value === open.profile.protocol)?.label ?? open.profile.protocol}</dd>
                   <dt>Key</dt>
                   <dd className={keyOf(open).missing ? "warn" : ""}>{keyOf(open).label}</dd>
+                  <dt>Stand-in</dt>
+                  <dd>
+                    {standIns.includes(open.name)
+                      ? `Yes, position ${standIns.indexOf(open.name) + 1}`
+                      : "No"}
+                  </dd>
                 </dl>
                 <div className="sheet-actions">
                   <button className="btn-gold" onClick={() => aside(() => setEditing(open))}>
@@ -239,6 +253,19 @@ export function Settings({
                       Make default
                     </button>
                   )}
+                  <button
+                    className="btn-line"
+                    disabled={busy}
+                    onClick={() =>
+                      void act("settings.fallback.save", {
+                        names: standIns.includes(open.name)
+                          ? standIns.filter((name) => name !== open.name)
+                          : [...standIns, open.name],
+                      }).catch(() => {})
+                    }
+                  >
+                    {standIns.includes(open.name) ? "Stop using as stand-in" : "Use as stand-in"}
+                  </button>
                   {open.key_present && (
                     <button className="btn-line" onClick={() => aside(() => setConfirm({ model: open, key: true }))}>
                       Remove API key
@@ -440,6 +467,7 @@ function ModelForm({
   const [output, setOutput] = useState(
     String(model?.profile.max_output_tokens || ""),
   );
+  const [certificate, setCertificate] = useState(String(model?.profile.ca_cert_file || ""));
   const [reasoning, setReasoning] = useState(
     String(model?.profile.reasoning || "unknown"),
   );
@@ -534,6 +562,7 @@ function ModelForm({
       auth,
       max_ctx: context ? Number(context) : null,
       max_output_tokens: output ? Number(output) : null,
+      ca_cert_file: certificate.trim() || null,
       reasoning,
       reasoning_efforts: efforts.length ? efforts : null,
       image_input: images,
@@ -815,6 +844,22 @@ function ModelForm({
                 onChange={(event) => setOutput(event.target.value)}
               />
             </label>
+            <label>
+              Certificate file
+              <input
+                value={certificate}
+                spellCheck={false}
+                placeholder="Only for a company proxy or a self-signed server"
+                onChange={(event) => {
+                  setCertificate(event.target.value);
+                  resetDiscovery();
+                }}
+              />
+            </label>
+            <p className="quiet">
+              The full path of a .pem file with the certificate this server is signed by. Medha then trusts it for
+              this server, as well as the usual public ones.
+            </p>
             <label>
               Authentication
               <Select

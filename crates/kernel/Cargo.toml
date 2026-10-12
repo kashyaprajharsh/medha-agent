@@ -25,4 +25,4 @@ regex = "1"
 medha-extension-api = { path = "../extension-api" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

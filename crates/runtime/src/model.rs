@@ -205,7 +205,27 @@ pub async fn resolve(
         Ok(home) => provider.remembering(home.join("learned_models.json")),
         Err(_) => provider,
     };
-    let provider = Arc::new(provider);
+    // One the user listed that cannot be used is said now, not when it is needed.
+    for unusable in stand_ins(&model_profiles.lock().unwrap(), &active_profile).1 {
+        notices.say(&unusable);
+    }
+    // The list is read from the saved settings each time a model fails, so a
+    // change made while this chat is open applies to it.
+    let (opened_with, own) = (model_profiles.clone(), active_profile.clone());
+    let provider = provider.with_fallbacks(move || {
+        let saved = config::load().ok().flatten();
+        let saved = saved.unwrap_or_else(|| opened_with.lock().unwrap().clone());
+        stand_ins(&saved, &own).0
+    });
+    // A key given for this run alone has no saved ones to turn to. Saved keys
+    // are read when one fails, so one added while this chat is open is used.
+    let from_store = !matches!(resolved.credential_source, config::CredSource::Env);
+    let provider = Arc::new(
+        provider.with_keys(move |server| match (from_store, config::load()) {
+            (true, Ok(Some(saved))) => crate::key_pool::keys(&saved, server),
+            _ => Vec::new(),
+        }),
+    );
 
     let reasoning = options
         .reasoning
@@ -241,4 +261,22 @@ pub async fn resolve(
         open_setup,
         credential,
     })
+}
+
+/// The saved models that stand in for `own`, in the order to try them, and
+/// what to say about each one listed that cannot be used.
+fn stand_ins(
+    saved: &config::Config,
+    own: &str,
+) -> (Vec<(providers::ProviderProfile, String)>, Vec<String>) {
+    let (mut usable, mut unusable) = (Vec::new(), Vec::new());
+    for name in saved.fallback.iter().filter(|name| *name != own) {
+        match config::resolve_model_as(saved, name, None) {
+            Ok(found) => usable.push((found.provider, found.credential.to_string())),
+            Err(error) => unusable.push(format!(
+                "stand-in model '{name}' cannot be used and is skipped: {error:#}"
+            )),
+        }
+    }
+    (usable, unusable)
 }

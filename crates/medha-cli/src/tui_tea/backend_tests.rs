@@ -558,6 +558,7 @@ async fn fixture() -> Fixture {
         },
         models: protocol::ModelCatalogue {
             profiles: Vec::new(),
+            fallback: Vec::new(),
             providers: Vec::new(),
             revision: String::new(),
             search: protocol::SearchProvider::Duckduckgo,
@@ -1033,6 +1034,129 @@ async fn rejected_slash_request_restores_the_original_command_beside_new_text() 
         },
     );
     assert_eq!(f.model.input, "new draft\n/skill info missing");
+}
+
+/// In a model's key list the first row opens the form for one more key, saved
+/// beside the others and not over them; each row after it forgets that key only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_key_list_adds_one_more_key_or_forgets_the_one_chosen() {
+    let listed = protocol::ModelProfile {
+        provider_id: None,
+        auth: None,
+        name: "main".into(),
+        model: "m".into(),
+        protocol: protocol::ModelProtocol::OpenAiChat,
+        base_url: "https://a.example/v1".into(),
+        context_limit: None,
+        default: true,
+        key_present: true,
+        requires_key: true,
+        extra_keys: vec![2, 5],
+    };
+    let open = |f: &mut Fixture, row: usize| {
+        f.model.remote.as_mut().unwrap().models.profiles = vec![listed.clone()];
+        let kind = PickerKind::ModelKeySlots {
+            name: "main".into(),
+            slots: vec![2, 5],
+        };
+        f.model.picker = Some(Picker::with_selected(kind, row));
+        setup_enter(&mut f.model);
+    };
+
+    let mut f = fixture().await;
+    open(&mut f, 0);
+    let form = f.model.model_setup.as_ref().expect("the key form opened");
+    assert!(form.extra_key, "the new key would replace the first one");
+    assert_eq!(form.base_url, "https://a.example/v1");
+    input::handle_paste(&mut f.model, "dummy-second-key".into());
+    setup_enter(&mut f.model);
+    let pending = &mut f.model.remote.as_mut().unwrap().pending;
+    let Some(Pending {
+        effect: Effect::Change(protocol::ChangeResource::AddModelKey { name, key }, _),
+        ..
+    }) = pending.pop_back()
+    else {
+        panic!("the key was not sent as one more key");
+    };
+    assert_eq!(
+        (name.as_str(), key.0.as_str()),
+        ("main", "dummy-second-key")
+    );
+    assert!(f.model.model_setup.is_none(), "the form stayed open");
+
+    // A certificate file is one plain line for the same server; blank removes it.
+    for (typed, file) in [
+        ("/etc/ssl/company.pem", Some("/etc/ssl/company.pem")),
+        ("", None),
+    ] {
+        let mut f = fixture().await;
+        f.model.remote.as_mut().unwrap().models.profiles = vec![listed.clone()];
+        begin_model_certificate(&mut f.model, "main");
+        let form = f.model.model_setup.as_ref().expect("the form opened");
+        assert!(!form.is_secret(), "a path was hidden like a key");
+        input::handle_paste(&mut f.model, typed.into());
+        setup_enter(&mut f.model);
+        let pending = &mut f.model.remote.as_mut().unwrap().pending;
+        let Some(Pending {
+            effect:
+                Effect::Change(protocol::ChangeResource::SetModelCertificate { name, file: sent }, _),
+            ..
+        }) = pending.pop_back()
+        else {
+            panic!("the certificate file was not sent");
+        };
+        assert_eq!((name.as_str(), sent.as_deref()), ("main", file));
+    }
+
+    let mut f = fixture().await;
+    open(&mut f, 2);
+    let pending = &mut f.model.remote.as_mut().unwrap().pending;
+    let Some(Pending {
+        effect: Effect::Change(protocol::ChangeResource::RemoveModelKey { name, slot }, _),
+        ..
+    }) = pending.pop_back()
+    else {
+        panic!("no key was removed");
+    };
+    assert_eq!(
+        (name.as_str(), slot),
+        ("main", 5),
+        "the third key, not the second"
+    );
+}
+
+/// Enter puts a model that is not a stand-in last, takes out one that is,
+/// and on the row after the models clears the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stand_in_picker_adds_last_takes_out_and_clears() {
+    let saved = |name: &str| config::ModelProfile {
+        name: name.into(),
+        provider: providers::ProviderProfile::openai_chat(
+            "http://localhost/v1",
+            name,
+            providers::AuthKind::None,
+        ),
+        is_default: false,
+    };
+    let rows: [(usize, &[&str]); 3] = [(0, &["b", "a"]), (1, &[]), (2, &[])];
+    for (row, sent) in rows {
+        let mut f = fixture().await;
+        let kind = PickerKind::ModelFallback {
+            profiles: vec![saved("a"), saved("b")],
+            listed: vec!["b".into()],
+        };
+        f.model.picker = Some(Picker::with_selected(kind, row));
+        setup_enter(&mut f.model);
+        let pending = &mut f.model.remote.as_mut().unwrap().pending;
+        let Some(Pending {
+            effect: Effect::Change(protocol::ChangeResource::SetFallback { names }, After::Fallback),
+            ..
+        }) = pending.pop_back()
+        else {
+            panic!("row {row} sent no change");
+        };
+        assert_eq!(names, sent, "row {row}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

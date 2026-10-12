@@ -75,6 +75,44 @@ fn unnamed_discovered_models_have_unique_valid_names_and_both_catalogues_refresh
         toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
     assert_eq!(config.models.len(), 2);
     assert_eq!(config.default_model.as_deref(), Some("gemini-3-8-flash-2"));
+
+    // More keys for the same server are kept in the order they were added,
+    // the same key is not taken twice, and no key is ever written to settings.
+    let server = "https://generativelanguage.googleapis.com/v1";
+    let another = |key: &str| json!({"group": "model", "id": server, "key": key, "add": true});
+    bridge.ok("settings.keys.set", another("dummy-second-key"));
+    bridge.ok("settings.keys.set", another("dummy-third-key"));
+    for taken in ["dummy-gemini-key", "dummy-third-key"] {
+        let twice = bridge.call("settings.keys.set", another(taken));
+        assert!(twice.get("error").is_some(), "{twice}");
+    }
+    let extra =
+        |bridge: &mut Bridge| bridge.ok("settings.keys", json!({}))["models"][0]["extra"].clone();
+    let both = json!([{"slot": 2, "present": true}, {"slot": 3, "present": true}]);
+    assert_eq!(extra(&mut bridge), both);
+    let settings = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(
+        !settings.contains("dummy-"),
+        "a key was written to settings"
+    );
+
+    bridge.ok(
+        "settings.keys.remove",
+        json!({"group": "model", "id": server, "slot": 2}),
+    );
+    assert_eq!(extra(&mut bridge), json!([{"slot": 3, "present": true}]));
+    let reply = bridge.ok(
+        protocol::ReadResource::METHOD,
+        json!(protocol::ReadResource::Models),
+    );
+    let protocol::ResourceResult::Models(catalogue) = serde_json::from_value(reply).unwrap() else {
+        panic!("the TUI model catalogue was not returned");
+    };
+    assert_eq!(
+        catalogue.profiles[0].extra_keys,
+        [3],
+        "the terminal sees the same keys"
+    );
 }
 
 #[test]
@@ -288,11 +326,17 @@ fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
         json!({"name":"simple-test","enabled":true}),
     );
     assert!(!home.join("skills/simple-test/SKILL.disabled").exists());
-    bridge.ok("settings.model.remove", json!({"name":"local-test"}));
-    assert!(
-        bridge.ok("settings.list", json!({}))["models"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    // A stand-in must be a saved model, and leaves the list when it is removed.
+    let unknown = bridge.call("settings.fallback.save", json!({"names":["nobody"]}));
+    assert!(unknown.get("error").is_some(), "{unknown}");
+    bridge.ok(
+        "settings.fallback.save",
+        json!({"names":["local-test","local-test"]}),
     );
+    let listed = bridge.ok("settings.list", json!({}));
+    assert_eq!(listed["fallback"], json!(["local-test"]));
+    bridge.ok("settings.model.remove", json!({"name":"local-test"}));
+    let emptied = bridge.ok("settings.list", json!({}));
+    assert!(emptied["models"].as_array().unwrap().is_empty());
+    assert_eq!(emptied["fallback"], json!([]));
 }

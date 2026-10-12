@@ -11,6 +11,8 @@ type Key = {
   in_use?: boolean;
   oauth?: boolean;
   signed_in?: boolean;
+  /** More keys for the same model server, in the order they are tried after the first. */
+  extra?: { slot: number; present: boolean }[];
 };
 type Listing = { models: Key[]; search: Key[]; mcp: Key[]; store: string; keychain: boolean; forced: boolean };
 
@@ -36,11 +38,11 @@ export function Keys() {
     };
   }, [refresh]);
 
-  async function run(method: string, key: Key, secret?: string) {
+  async function run(method: string, key: Key, secret?: string, which: { add?: boolean; slot?: number } = {}) {
     setBusy(true);
     setError("");
     try {
-      await api.settings(method, { group: key.group, id: key.id, key: secret });
+      await api.settings(method, { group: key.group, id: key.id, key: secret, ...which });
       setEditing("");
       setRemoving("");
       setValue("");
@@ -78,23 +80,26 @@ export function Keys() {
           ? "Signed in with OAuth"
           : "Signs in with OAuth"
         : "Not set";
-    return (
+    const extra = key.extra ?? [];
+    const adding = editing === `${slot}:add`;
+    return [
       <li key={slot} className="ix-row key">
         <span className="ix-main" title={key.label}>
           <b>{key.label}</b>
           <code className="ix-sum mono">{key.detail?.replace(/^https:\/\//, "")}</code>
         </span>
         {key.in_use && <span className="ix-chip gold">In use</span>}
+        {extra.length > 0 && <span className="ix-chip">Key 1 of {extra.length + 1}</span>}
         <small className={`ix-note ${key.present || key.signed_in ? "ok" : ""}`}>{status}</small>
-        {editing === slot ? (
+        {editing === slot || adding ? (
           <form
             className="key-edit"
             onSubmit={(event) => {
               event.preventDefault();
-              void run("settings.keys.set", key, value);
+              void run("settings.keys.set", key, value, adding ? { add: true } : {});
             }}
           >
-            <input type="password" autoComplete="new-password" autoFocus aria-label={`Key for ${key.label}`} value={value} onChange={(event) => setValue(event.target.value)} />
+            <input type="password" autoComplete="new-password" autoFocus aria-label={adding ? `Another key for ${key.label}` : `Key for ${key.label}`} placeholder={adding ? "Another key" : undefined} value={value} onChange={(event) => setValue(event.target.value)} />
             <button className="btn-gold" disabled={busy || !value.trim()}>Save</button>
             <button type="button" className="link-btn" onClick={() => { setEditing(""); setValue(""); }}>Cancel</button>
           </form>
@@ -108,11 +113,41 @@ export function Keys() {
             <button className="link-btn" onClick={() => { setEditing(slot); setRemoving(""); }}>
               {key.present ? "Replace" : "Set key"}
             </button>
+            {key.present && key.group === "model" && (
+              <button className="link-btn" onClick={() => { setEditing(`${slot}:add`); setRemoving(""); }}>
+                Add another
+              </button>
+            )}
             {key.present && <button className="link-btn" onClick={() => setRemoving(slot)}>Remove</button>}
           </span>
         )}
-      </li>
-    );
+      </li>,
+      // The keys tried after the first, in order, when one is refused or limited.
+      ...extra.map((more, at) => {
+        const own = `${slot}:${more.slot}`;
+        return (
+          <li key={own} className="ix-row key">
+            <span className="ix-main">
+              <b>Key {at + 2}</b>
+              <code className="ix-sum mono">{key.detail?.replace(/^https:\/\//, "")}</code>
+            </span>
+            <small className={`ix-note ${more.present ? "ok" : ""}`}>{more.present ? "Set" : "Not set"}</small>
+            <span className="key-actions">
+              {removing === own ? (
+                <>
+                  <button className="link-btn" onClick={() => setRemoving("")}>Keep</button>
+                  <button className="link-btn danger" disabled={busy} onClick={() => void run("settings.keys.remove", key, undefined, { slot: more.slot })}>
+                    Remove
+                  </button>
+                </>
+              ) : (
+                <button className="link-btn" onClick={() => { setRemoving(own); setEditing(""); }}>Remove</button>
+              )}
+            </span>
+          </li>
+        );
+      }),
+    ];
   };
 
   const groups: [string, Key[]][] = listing
@@ -125,7 +160,8 @@ export function Keys() {
   return (
     <div className="keys-page">
       <PageTop title="Keys">
-        Every key Medha uses. Values are never shown.
+        Every key Medha uses. Values are never shown. A model's server can have more than one: when a key is
+        refused or limited, the next one is used.
       </PageTop>
       {error && <p className="surface-error" role="alert">{error}</p>}
       {listing && (
@@ -158,7 +194,7 @@ export function Keys() {
               <h3>
                 {title} <span>{keys.length}</span>
               </h3>
-              <ul className="ix key-list">{keys.map(row)}</ul>
+              <ul className="ix key-list">{keys.flatMap(row)}</ul>
             </section>
           ),
       )}

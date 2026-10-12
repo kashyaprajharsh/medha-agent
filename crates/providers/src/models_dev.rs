@@ -584,6 +584,14 @@ pub async fn profile_context_window(profile: &crate::ProviderProfile) -> Option<
 pub async fn profile_pricing(
     profile: &crate::ProviderProfile,
 ) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
+    list_price(profile)
+}
+
+/// The catalogue's price for this model: input, output, cached read and cache
+/// write, each per million tokens. Read from memory, never from the network.
+pub fn list_price(
+    profile: &crate::ProviderProfile,
+) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
     let data = crate::catalogue::snapshot();
     let meta = profile_meta(profile, &data.entries, true)?;
     Some((

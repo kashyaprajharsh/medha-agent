@@ -543,10 +543,8 @@ impl Rows {
             if !keep { removed += bytes; }
             keep
         });
+        // Why it was taken back is said by the notice the kernel sends next.
         self.bytes -= removed;
-        self.push(Item::Notice {
-            text: "the model's connection dropped — retrying".into(),
-        });
     }
 
     fn snapshot(&self) -> Vec<Item> {

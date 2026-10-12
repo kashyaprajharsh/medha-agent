@@ -417,6 +417,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::LockSkills => lock_skills(model),
         A::SyncSkills => sync_skills(model),
         A::ModelPicker => open_model_picker(model),
+        A::FallbackPicker => open_fallback_picker(model),
         A::AddModel => begin_model_setup(model),
         A::SwitchModel(name) => switch_saved_model(model, &name),
         A::SearchConfig => begin_search_setup(model),
@@ -582,6 +583,28 @@ fn advance_model_setup(model: &mut Model) {
     let Some(setup) = model.model_setup.as_mut() else {
         return;
     };
+    // One line that changes a saved model's server, not the model in use: the
+    // form is done with once the change is on its way, and the menu follows.
+    let aside = match (&setup.mode, &setup.step) {
+        (ModelSetupMode::Certificate { profile }, ModelSetupStep::Certificate) => {
+            let file = (!value.is_empty()).then(|| value.clone());
+            let name = profile.clone();
+            Some(Change::SetModelCertificate { name, file })
+        }
+        (ModelSetupMode::UpdateKey { profile }, ModelSetupStep::ApiKey)
+            if setup.extra_key && !value.is_empty() =>
+        {
+            let (name, key) = (profile.clone(), protocol::Secret(value.clone()));
+            Some(Change::AddModelKey { name, key })
+        }
+        _ => None,
+    };
+    if let Some(change) = aside {
+        if request(model, Effect::Change(change, After::Models)) {
+            model.model_setup = None;
+        }
+        return;
+    }
     let effect = match setup.step {
         ModelSetupStep::EndpointParameter if !value.is_empty() => {
             let provider = setup.provider.as_ref().expect("provider parameter form");
@@ -828,6 +851,52 @@ pub(super) fn set_default_model(model: &mut Model, name: &str) {
         Effect::Change(Change::SetDefaultModel { name: name.into() }, After::Models),
     );
 }
+/// The saved model called `name`, as the backend last listed it.
+fn listed_model(model: &Model, name: &str) -> Option<protocol::ModelProfile> {
+    let listed = &model.remote.as_ref()?.models.profiles;
+    listed.iter().find(|profile| profile.name == name).cloned()
+}
+pub(super) fn open_model_keys(model: &mut Model, name: String) {
+    let slots = listed_model(model, &name).map_or_else(Vec::new, |listed| listed.extra_keys);
+    model.picker = Some(Picker::new(PickerKind::ModelKeySlots { name, slots }));
+}
+pub(super) fn begin_model_key_add(model: &mut Model, name: &str) {
+    let Some(listed) = listed_model(model, name).filter(|_| boundary_allowed(model)) else {
+        return;
+    };
+    model.form_generation = model.form_generation.wrapping_add(1);
+    model.search_setup = None;
+    model.mcp_credential = None;
+    let protocol = kernel_protocol(listed.protocol);
+    model.model_setup = Some(ModelSetup::add_key(listed.name, protocol, listed.base_url));
+}
+pub(super) fn begin_model_certificate(model: &mut Model, name: &str) {
+    let Some(listed) = listed_model(model, name).filter(|_| boundary_allowed(model)) else {
+        return;
+    };
+    model.form_generation = model.form_generation.wrapping_add(1);
+    model.search_setup = None;
+    model.mcp_credential = None;
+    let protocol = kernel_protocol(listed.protocol);
+    let form = ModelSetup::certificate(listed.name, protocol, listed.base_url);
+    model.model_setup = Some(form);
+}
+pub(super) fn remove_model_key(model: &mut Model, name: &str, slot: u32) {
+    let name = name.into();
+    request(
+        model,
+        Effect::Change(Change::RemoveModelKey { name, slot }, After::Models),
+    );
+}
+pub(super) fn open_fallback_picker(model: &mut Model) {
+    request(model, Effect::Read(Read::Models, After::Fallback));
+}
+pub(super) fn set_fallback(model: &mut Model, names: Vec<String>) {
+    request(
+        model,
+        Effect::Change(Change::SetFallback { names }, After::Fallback),
+    );
+}
 pub(super) fn open_mode_picker(model: &mut Model) {
     let selected = AUTONOMY_MODES
         .iter()
@@ -933,7 +1002,7 @@ pub(super) fn after_reload(model: &mut Model, after: After) {
     let read = match after {
         After::Skills => Read::Skills,
         After::Sources => Read::SkillSources,
-        After::Models => Read::Models,
+        After::Models | After::Fallback => Read::Models,
         After::Notice => Read::Models,
         After::DiscoverPlugins => Read::Marketplaces,
         After::PluginsAt(_) => Read::Plugins,
@@ -959,11 +1028,15 @@ pub(super) fn resource_reply(model: &mut Model, resource: Resource, after: After
                 },
                 After::SearchSaved => { model.search_setup = None; request(model, Effect::Reload(After::Notice)); },
                 After::Reload(next) => { request(model, Effect::Reload(*next)); },
-                After::Models | After::Skills | After::Sources | After::Plugins | After::PluginsAt(_) | After::DiscoverPlugins => after_reload(model, after),
+                After::Models | After::Fallback | After::Skills | After::Sources | After::Plugins | After::PluginsAt(_) | After::DiscoverPlugins => after_reload(model, after),
                 _ => {},
             }
         },
-        Resource::Models(catalogue) => { let rows = profiles(&catalogue); model.remote.as_mut().expect("viewer").models = catalogue;
+        Resource::Models(catalogue) => { let rows = profiles(&catalogue); let listed = catalogue.fallback.clone(); model.remote.as_mut().expect("viewer").models = catalogue;
+            if matches!(after, After::Fallback) {
+                // A list just changed is shown again with the cursor where it was.
+                let at = model.picker.as_ref().filter(|open| matches!(open.kind, PickerKind::ModelFallback { .. })).map_or(0, |open| open.selected);
+                model.picker = Some(Picker::with_selected(PickerKind::ModelFallback { profiles: rows.clone(), listed }, at)); }
             if matches!(after, After::Models) { let selected = rows.iter().position(|profile| profile.name == model.active_profile).unwrap_or_default();
                 model.picker = Some(Picker::with_selected(PickerKind::Model { profiles: rows, active: model.active_profile.clone() }, selected)); } },
         Resource::ModelSaved { name, catalogue } => {

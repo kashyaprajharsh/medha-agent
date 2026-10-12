@@ -75,6 +75,9 @@ struct EventView {
     /// The output a person's message was about, as a label to show beside it.
     #[serde(skip_serializing_if = "Option::is_none")]
     about: Option<String>,
+    /// On an answer a stand-in wrote: that model, and the one it stood in for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stand_in: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -611,11 +614,11 @@ fn page_events(
         }
         EventKind::ModelText => {
             text_before_canonical = true;
-            Some(event_view(
-                event,
-                "assistant",
-                event.payload.get("text")?.as_str()?.to_owned(),
-            ))
+            let text = event.payload.get("text")?.as_str()?.to_owned();
+            Some(EventView {
+                stand_in: event.payload.get("stand_in").cloned(),
+                ..event_view(event, "assistant", text)
+            })
         }
         EventKind::ModelMessage => {
             let skip = text_before_canonical;

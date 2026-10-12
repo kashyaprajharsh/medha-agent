@@ -55,6 +55,7 @@ fn credential_ids(cfg: &Config) -> Vec<String> {
             .filter_map(search_cred_id)
             .map(str::to_owned),
     );
+    ids.extend(crate::key_pool::ids(cfg));
     for (id, server) in &cfg.mcp {
         ids.push(mcp_key_id(id, server));
         if !server.url.is_empty() {

@@ -88,6 +88,10 @@ const MAX_RETRY_AFTER_MS: f64 = 60_000.0;
 /// never errors. Deliberately no total-request timeout: that would kill a long
 /// stream which is working correctly.
 pub(crate) fn client() -> reqwest::Client {
+    builder().build().expect("provider HTTP client")
+}
+
+fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -98,8 +102,46 @@ pub(crate) fn client() -> reqwest::Client {
         // Pin credentials to the configured deployment, including custom
         // authentication headers which redirect implementations may retain.
         .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("provider HTTP client")
+}
+
+/// The connection for one server: the usual one, also trusting the
+/// certificates its model was saved with.
+pub(crate) fn client_for(profile: &ProviderProfile) -> Result<reqwest::Client, ProviderError> {
+    let Some(file) = profile.ca_cert_file.as_deref() else {
+        return Ok(client());
+    };
+    let unusable = |why: String| ProviderError::Certificate(why);
+    trusting(builder(), file)?.build().map_err(|error| {
+        unusable(format!(
+            "The certificate file {file} could not be used: {error}"
+        ))
+    })
+}
+
+/// Trust the certificates in `file` as well as the public ones. A file that
+/// cannot be read or holds none is an error: it is never silently ignored.
+pub(crate) fn trusting(
+    builder: reqwest::ClientBuilder,
+    file: &str,
+) -> Result<reqwest::ClientBuilder, ProviderError> {
+    let unusable = |why: String| ProviderError::Certificate(why);
+    let pem = std::fs::read(file).map_err(|error| {
+        unusable(format!(
+            "The certificate file {file} could not be read: {error}"
+        ))
+    })?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|error| {
+        unusable(format!(
+            "The certificate file {file} is not in PEM form: {error}"
+        ))
+    })?;
+    if certificates.is_empty() {
+        return Err(unusable(format!(
+            "The certificate file {file} holds no certificate."
+        )));
+    }
+    let trust = |builder: reqwest::ClientBuilder, one| builder.add_root_certificate(one);
+    Ok(certificates.into_iter().fold(builder, trust))
 }
 
 /// Discovery/catalogue callers select a smaller byte and total-read budget.
@@ -156,10 +198,39 @@ pub(crate) async fn send_model_request(
                     waited_secs: started.elapsed().as_secs(),
                 })
             } else {
-                Err(ProviderError::Transport(error.without_url().to_string()))
+                Err(connection_failed(error))
             }
         }
     }
+}
+
+/// Said when a server's certificate cannot be verified. Medha trusts the public
+/// certificate authorities it was built with and has no setting to add another.
+const CERTIFICATE: &str = "Medha could not verify the security certificate of the model's \
+    server, so it did not connect. This fails the same way on every try. The certificate may \
+    be self-signed, expired, made for another address, or issued by a private authority such \
+    as a company proxy. For a server on this computer, use http:// in the model's address.";
+
+/// A connection that failed, as an error. A certificate that cannot be verified
+/// is told apart from a server that is away: only the second is worth another try.
+pub(crate) fn connection_failed(error: reqwest::Error) -> ProviderError {
+    match certificate_fault(&error) {
+        Some(why) => ProviderError::Certificate(format!("{CERTIFICATE} Detail: {why}")),
+        None => ProviderError::Transport(error.without_url().to_string()),
+    }
+}
+
+/// The cause in an error's chain that names a certificate, when there is one.
+fn certificate_fault(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        let said = inner.to_string();
+        if said.to_ascii_lowercase().contains("certificate") {
+            return Some(said);
+        }
+        cause = inner.source();
+    }
+    None
 }
 
 pub(crate) fn stalled_stream(waited: Duration) -> ProviderError {
@@ -384,6 +455,40 @@ fn is_sensitive_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error whose words say nothing, wrapping the cause that does.
+    #[derive(Debug)]
+    struct Wrapped(&'static str, Option<Box<Wrapped>>);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            out.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|inner| inner as _)
+        }
+    }
+
+    /// A certificate that cannot be verified is found under the outer words
+    /// "error sending request", which are the same for a server that is away.
+    #[test]
+    fn a_certificate_fault_is_found_beneath_a_plain_connection_error() {
+        let wrap = |inner: &'static str| {
+            let cause = Wrapped(inner, None);
+            let middle = Wrapped("client error (Connect)", Some(Box::new(cause)));
+            Wrapped("error sending request", Some(Box::new(middle)))
+        };
+        let untrusted = wrap("invalid peer certificate: UnknownIssuer");
+        assert_eq!(
+            certificate_fault(&untrusted).as_deref(),
+            Some("invalid peer certificate: UnknownIssuer")
+        );
+        assert_eq!(
+            certificate_fault(&wrap("Connection refused (os error 61)")),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn successful_responses_are_bounded_with_or_without_content_length() {

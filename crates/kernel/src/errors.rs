@@ -35,4 +35,37 @@ pub enum KernelError {
     /// it smaller or leave it out. Holds the server's words.
     #[error("{0}")]
     ImageUnfit(String),
+
+    /// A text reply was cut off at the output limit. Holds what was written,
+    /// which the caller keeps and may ask the model to continue.
+    #[error("model response was truncated at its output limit")]
+    Truncated(String),
+
+    /// The stream died while a text reply was being written. Holds what was
+    /// written, which the caller keeps and asks the model to continue from.
+    #[error("the model's stream ended before its reply was complete")]
+    Dropped(String),
+
+    /// The model call failed for good; the caller may try the next model the
+    /// user listed. `shown` is whether part of a reply had reached the screen.
+    #[error("{said}")]
+    ModelUnavailable {
+        /// The model the failed request was sent to.
+        model: String,
+        why: &'static str,
+        said: String,
+        shown: bool,
+        rest: crate::recovery::Rest,
+        /// Set when the server is only away for now: the wait it asked for, if any.
+        back: Option<Option<std::time::Duration>>,
+    },
+
+    /// The stream kept dying while the model wrote a tool call. Holds the text
+    /// before the call, the tools named, and the error if this cannot be recovered.
+    #[error("{said}")]
+    CallStalled {
+        text: String,
+        tools: Vec<String>,
+        said: String,
+    },
 }

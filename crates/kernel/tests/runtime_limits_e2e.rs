@@ -553,17 +553,17 @@ async fn a_silent_stream_is_reopened_twice_and_then_the_turn_stops() {
         )
     };
 
-    // Silent twice, the second time after half a reply; the third try answers.
+    // Silent twice, the second time after it began to think; the third try answers.
     let (result, calls, notices, restarts) = run(vec![
         Turn::Failed(Vec::new(), silent()),
-        Turn::Failed(vec![Block::Text("half a rep".into())], silent()),
+        Turn::Failed(vec![Block::Reasoning("weighing it".into())], silent()),
     ])
     .await;
     assert_eq!(result.unwrap().0.last().unwrap().content, "done");
     assert_eq!(calls, 3);
     assert_eq!(
         restarts, 1,
-        "the half reply is taken back before it is written again"
+        "the half-shown thinking is taken back before the next try"
     );
     assert_eq!(
         notices,

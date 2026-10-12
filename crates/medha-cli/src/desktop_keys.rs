@@ -26,7 +26,12 @@ pub(crate) fn list(cfg: &config::Config) -> Value {
     let models: Vec<Value> = endpoints
         .into_iter()
         .map(|(url, names)| {
-            json!({"group": "model", "id": url, "label": names.join(", "), "detail": url, "present": config::key_present(&url)})
+            // Extra keys for the same server, in the order they are tried after the first.
+            let extra: Vec<Value> = runtime::key_pool::slots(cfg, &url)
+                .into_iter()
+                .map(|(slot, present)| json!({"slot": slot, "present": present}))
+                .collect();
+            json!({"group": "model", "id": url, "label": names.join(", "), "detail": url, "present": config::key_present(&url), "extra": extra})
         })
         .collect();
     let active = cfg.search_provider();
@@ -83,6 +88,10 @@ pub(crate) fn set(cfg: &config::Config, params: &Value) -> Result<()> {
         bail!("Paste the key first");
     }
     match params["group"].as_str() {
+        // Another key for the same server, tried after the ones already saved.
+        Some("model") if params["add"] == true => {
+            runtime::key_pool::add(endpoint(cfg, id)?, key).map(|_| ())
+        }
         Some("model") => config::store_key(endpoint(cfg, id)?, key),
         Some("search") => config::store_key(search_id(id)?, key),
         Some("mcp") => {
@@ -98,6 +107,13 @@ pub(crate) fn set(cfg: &config::Config, params: &Value) -> Result<()> {
 
 pub(crate) fn remove(cfg: &config::Config, params: &Value) -> Result<()> {
     let id = params["id"].as_str().unwrap_or_default();
+    let slot = params["slot"]
+        .as_u64()
+        .and_then(|slot| u32::try_from(slot).ok());
+    // One of a server's extra keys, not its first.
+    if let (Some("model"), Some(slot)) = (params["group"].as_str(), slot) {
+        return runtime::key_pool::remove(endpoint(cfg, id)?, slot);
+    }
     match params["group"].as_str() {
         Some("model") => config::remove_key(endpoint(cfg, id)?),
         Some("search") => config::remove_key(search_id(id)?),

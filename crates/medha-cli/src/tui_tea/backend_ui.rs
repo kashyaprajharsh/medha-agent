@@ -56,6 +56,7 @@ pub(super) enum After {
     Startup,
     Notice,
     Models,
+    Fallback,
     Skills,
     Sources,
     Plugins,
@@ -255,6 +256,7 @@ pub(super) fn request(model: &mut Model, effect: Effect) -> bool {
             | Effect::Change(
                 protocol::ChangeResource::SaveModel(_)
                     | protocol::ChangeResource::UpdateModelKey { .. }
+                    | protocol::ChangeResource::AddModelKey { .. }
                     | protocol::ChangeResource::Search { .. },
                 _
             )
@@ -703,6 +705,7 @@ pub(crate) async fn run(
         },
         models: protocol::ModelCatalogue {
             profiles: Vec::new(),
+            fallback: Vec::new(),
             providers: Vec::new(),
             revision: String::new(),
             search: protocol::SearchProvider::Duckduckgo,

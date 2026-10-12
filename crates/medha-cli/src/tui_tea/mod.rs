@@ -43,6 +43,8 @@ const MAX_AGENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPOSER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const PREVIEW_NOTICE: &str = "\n… preview limited; the full content remains in saved history.";
+/// Shown in a sub-agent's pane when its partial reply is withdrawn for another try.
+const TAKEN_BACK: &str = "the reply so far was taken back. Trying again";
 /// Maximum diff lines rendered inline.
 const MAX_DIFF_LINES: usize = 60;
 /// Maximum raw tool I/O lines rendered per call.
@@ -824,6 +826,20 @@ enum PickerKind {
     ModelDefault(Vec<config::ModelProfile>),
     /// Pick a saved profile to remove before entering confirmation.
     ModelRemove(Vec<config::ModelProfile>),
+    /// Pick the saved model whose server gets, or loses, an extra key.
+    ModelKeys(Vec<config::ModelProfile>),
+    /// Pick the saved model whose server is given a certificate file to trust.
+    ModelCertificate(Vec<config::ModelProfile>),
+    /// Add another key for one model's server, or forget one of its extra keys.
+    ModelKeySlots {
+        name: String,
+        slots: Vec<u32>,
+    },
+    /// Add or remove the saved models that stand in; `listed` is their order.
+    ModelFallback {
+        profiles: Vec<config::ModelProfile>,
+        listed: Vec<String>,
+    },
     /// Destructive profile removal always gets a second, explicit confirmation.
     RemoveModel(String),
     /// `/search` step 1: pick the web-search backend. Rows are the entries of
@@ -1015,6 +1031,18 @@ impl PickerKind {
             }
             PickerKind::ModelRemove(_) => {
                 " choose model to remove — ↑↓ move · Enter/→ continue · Esc/← back ".into()
+            }
+            PickerKind::ModelFallback { .. } => {
+                " stand-in models: tried in order when yours cannot answer · ↑↓ move · Enter add or remove · Esc close ".into()
+            }
+            PickerKind::ModelKeys(_) => {
+                " extra keys: choose the model whose server they are for · ↑↓ move · Enter continue · Esc/← back ".into()
+            }
+            PickerKind::ModelCertificate(_) => {
+                " certificate file: choose the model whose server it is for · ↑↓ move · Enter continue · Esc/← back ".into()
+            }
+            PickerKind::ModelKeySlots { name, .. } => {
+                format!(" keys for '{name}': the next is used when one is refused or limited · ↑↓ move · Enter choose · Esc/← back ")
             }
             PickerKind::RemoveModel(name) => {
                 format!(" remove '{name}'? — ↑↓ move · Enter/→ confirm · Esc/← back ")
@@ -1242,6 +1270,9 @@ impl PickerKind {
                             "🔑 Add or update an API key".to_string(),
                             "★ Set the default model".to_string(),
                             remove.to_string(),
+                            "↻ Choose stand-in models, for when one cannot answer".to_string(),
+                            "🔑 Add or remove extra keys for a model's server".to_string(),
+                            "🔒 Trust a certificate file for a model's server".to_string(),
                         ]
                         .map(|s| format!("  {s}")),
                     )
@@ -1270,6 +1301,22 @@ impl PickerKind {
             PickerKind::ModelRemove(profiles) => profiles
                 .iter()
                 .map(|p| format!("{} — {}", p.name, p.provider.model))
+                .collect(),
+            PickerKind::ModelKeys(profiles) | PickerKind::ModelCertificate(profiles) => profiles
+                .iter()
+                .map(|p| format!("{} · {}", p.name, p.provider.base_url))
+                .collect(),
+            PickerKind::ModelKeySlots { slots, .. } => std::iter::once("＋ Add another key".into())
+                .chain((0..slots.len()).map(|at| format!("− Remove key {}", at + 2)))
+                .collect(),
+            PickerKind::ModelFallback { profiles, listed } => profiles
+                .iter()
+                .map(|p| {
+                    let place = listed.iter().position(|name| *name == p.name);
+                    let mark = place.map_or("   ".to_string(), |at| format!("{}. ", at + 1));
+                    format!("{mark}{} · {}", p.name, p.provider.model)
+                })
+                .chain(std::iter::once("   − Clear the list".to_string()))
                 .collect(),
             PickerKind::RemoveModel(name) => vec![
                 "Cancel".to_string(),
@@ -1421,6 +1468,8 @@ enum ModelSetupStep {
     EndpointParameter,
     Resolving,
     ApiKey,
+    /// The path of a certificate file to trust for the server; shown as typed.
+    Certificate,
     /// `/v1/models` is being queried in the background; Enter is inert until
     /// the result arrives (picker on success, manual ModelId on failure).
     Discovering,
@@ -1454,6 +1503,8 @@ struct ModelSetup {
     provider: Option<protocol::ModelProvider>,
     parameters: BTreeMap<String, String>,
     parameter: usize,
+    /// The key being typed is another one for the server, not a replacement.
+    extra_key: bool,
 }
 
 struct McpCredential {
@@ -1464,7 +1515,13 @@ struct McpCredential {
 
 enum ModelSetupMode {
     Add,
-    UpdateKey { profile: String },
+    UpdateKey {
+        profile: String,
+    },
+    /// Only the certificate file of a saved model's server is being set.
+    Certificate {
+        profile: String,
+    },
 }
 
 impl ModelSetup {
@@ -1483,6 +1540,26 @@ impl ModelSetup {
             provider: None,
             parameters: BTreeMap::new(),
             parameter: 0,
+            extra_key: false,
+        }
+    }
+
+    /// One line for the certificate file of a saved model's server.
+    fn certificate(profile: String, protocol: kernel::Protocol, base_url: String) -> Self {
+        Self {
+            mode: ModelSetupMode::Certificate {
+                profile: profile.clone(),
+            },
+            step: ModelSetupStep::Certificate,
+            ..Self::update_key(profile, protocol, base_url)
+        }
+    }
+
+    /// The same form as replacing a key, saved as one more key for the server.
+    fn add_key(profile: String, protocol: kernel::Protocol, base_url: String) -> Self {
+        Self {
+            extra_key: true,
+            ..Self::update_key(profile, protocol, base_url)
         }
     }
 
@@ -1501,6 +1578,7 @@ impl ModelSetup {
             provider: None,
             parameters: BTreeMap::new(),
             parameter: 0,
+            extra_key: false,
         }
     }
 
@@ -1534,10 +1612,13 @@ impl ModelSetup {
                 ModelSetupMode::Add => {
                     "API key (blank for a local server or to keep this endpoint's saved key):"
                 }
-                ModelSetupMode::UpdateKey { .. } => {
+                ModelSetupMode::UpdateKey { .. } | ModelSetupMode::Certificate { .. } => {
                     "New API key (stored securely, never in config.toml):"
                 }
             },
+            ModelSetupStep::Certificate => {
+                "Full path of a .pem certificate file to trust for this server (blank removes it):"
+            }
             ModelSetupStep::Discovering => "Querying the server for its models… (Esc cancels)",
             ModelSetupStep::Saving => {
                 "Saving the model… (Esc leaves the form; an accepted save can still finish)"
@@ -2018,10 +2099,10 @@ fn append_agent_step(pane: &mut VecDeque<Entry>, step: AgentStep) {
             let mut tail = pane.split_off(attempt_start);
             tail.retain(|entry| {
                 !matches!(entry.item, Item::Assistant(_) | Item::Thinking(_))
-                    && !matches!(&entry.item, Item::Notice(text) if text == "the model's connection dropped — retrying")
+                    && !matches!(&entry.item, Item::Notice(text) if text == TAKEN_BACK)
             });
             pane.append(&mut tail);
-            Item::Notice("the model's connection dropped — retrying".into())
+            Item::Notice(TAKEN_BACK.into())
         }
         AgentStep::SteerQueued(text) => Item::Notice(queued_notice(&text)),
         AgentStep::Steered(text) => {

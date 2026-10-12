@@ -794,6 +794,11 @@ pub async fn start(
         .max_parallel_tools
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
+    let server_waits = model_profiles
+        .lock()
+        .ok()
+        .and_then(|c| c.agent.server_waits);
+    let server_waits = server_waits.unwrap_or(kernel::recovery::WAITS);
     let hook_runner = session_plugins.hook_runner(&cwd, &sbx_cfg.home);
     for diagnostic in session_plugins
         .warnings()
@@ -812,13 +817,16 @@ pub async fn start(
         surface.gate,
         verifier,
     )
-    .with_pricing(pricing)
+    // Only the operator's own rate is fixed for the chat; a list price is asked
+    // of the model in use at each call, so it follows a change of model.
+    .with_pricing(pricing.filter(|price| !price.indicative))
     .with_secrets(kernel::redact::Secrets::new(
         credential
             .into_iter()
             .chain(kernel::redact::Secrets::in_environment()),
     ))
     .with_max_parallel_tools(max_parallel_tools)
+    .with_server_waits(server_waits)
     .with_result_limits(lock.budget.tool_result_bytes, lock.budget.tool_round_bytes)
     .with_hooks(Arc::new(hook_runner))
     .with_image_shrinker(Arc::new(vision::Shrinker))

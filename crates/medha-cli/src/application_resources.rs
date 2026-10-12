@@ -58,17 +58,33 @@ pub(crate) fn models() -> Result<protocol::ModelCatalogue, String> {
                 default: saved.is_default,
                 key_present: config::key_present(&profile.base_url),
                 requires_key: profile.auth.requires_credential(),
+                extra_keys: runtime::key_pool::slots(&cfg, &profile.base_url)
+                    .into_iter()
+                    .map(|(slot, _)| slot)
+                    .collect(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let catalogue = provider_catalogue(&providers::catalogue::snapshot())?;
     Ok(protocol::ModelCatalogue {
         profiles,
+        fallback: cfg.fallback.clone(),
         providers: catalogue.providers,
         revision: catalogue.revision,
         search: decoded(json!(cfg.search_provider().as_str()))?,
         searxng_url: cfg.search.searxng_url,
     })
+}
+
+/// The address of the server a saved model talks to: what its keys are kept under.
+fn server_of(model: &str) -> Result<String, String> {
+    let cfg = config::load()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let profile = cfg.model_profile(model);
+    profile
+        .map(|profile| profile.base_url.clone())
+        .ok_or_else(|| format!("No saved model named {model}"))
 }
 
 fn provider_catalogue(
@@ -495,6 +511,7 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
         }
         Change::SetDefaultModel { name } => ("settings.model.default", json!({"name": name})),
         Change::RemoveModel { name } => ("settings.model.remove", json!({"name": name})),
+        Change::SetFallback { names } => ("settings.fallback.save", json!({"names": names})),
         Change::UpdateModelKey { name, key } => {
             config::edit(|cfg| {
                 let profile = cfg
@@ -513,6 +530,19 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
                 catalogue: models()?,
             });
         }
+        // Extra keys go through the same settings methods the desktop's Keys page uses.
+        Change::AddModelKey { name, key } => (
+            "settings.keys.set",
+            json!({"group": "model", "id": server_of(&name)?, "key": key, "add": true}),
+        ),
+        Change::RemoveModelKey { name, slot } => (
+            "settings.keys.remove",
+            json!({"group": "model", "id": server_of(&name)?, "slot": slot}),
+        ),
+        Change::SetModelCertificate { name, file } => (
+            "settings.model.certificate",
+            json!({"name": name, "file": file}),
+        ),
         Change::Search { provider, key, url } => (
             "settings.search.save",
             json!({"provider": provider, "key": key, "url": url}),

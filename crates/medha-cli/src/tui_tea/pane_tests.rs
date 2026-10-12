@@ -112,7 +112,7 @@ fn a_child_retry_rewinds_the_partial_attempt_before_streaming_again() {
         notices(&m),
         vec![
             "↳ queued for this agent: keep the queue",
-            "the model's connection dropped — retrying"
+            "the reply so far was taken back. Trying again"
         ]
     );
 }

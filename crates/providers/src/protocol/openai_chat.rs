@@ -151,14 +151,10 @@ fn lower_chat_messages(
         }
         match message.role {
             Role::System => unreachable!("system messages were handled above"),
-            Role::User => rest.push(ChatMessage {
-                role: "user",
-                content: lower_user(&message.parts)?,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }),
+            Role::User => push_user(&mut rest, lower_user(&message.parts)?),
             Role::Assistant => {
-                rest.push(lower_assistant(&message.parts, canonical_to_wire)?);
+                let next = lower_assistant(&message.parts, canonical_to_wire)?;
+                push_assistant(&mut rest, next);
             }
             Role::Tool => rest.extend(lower_tool_results(&message.parts)?),
         }
@@ -175,6 +171,45 @@ fn lower_chat_messages(
     }
     out.extend(rest);
     Ok(out)
+}
+
+/// Add an assistant message, folded into the one before it when that is the
+/// assistant's too: its text on a new line, its tool calls after the others.
+/// Strict chat templates refuse two assistant messages in a row as well.
+fn push_assistant(messages: &mut Vec<ChatMessage>, next: ChatMessage) {
+    let before = messages.last_mut().filter(|last| last.role == "assistant");
+    let (Some(before), serde_json::Value::String(more)) = (before, &next.content) else {
+        return messages.push(next);
+    };
+    let serde_json::Value::String(text) = &mut before.content else {
+        return messages.push(next);
+    };
+    if !text.trim().is_empty() && !more.trim().is_empty() {
+        text.push('\n');
+    }
+    text.push_str(more);
+    before.tool_calls.extend(next.tool_calls);
+}
+
+/// Add a user message, joined to the one before it when both are plain text.
+/// Strict chat templates refuse two user messages in a row.
+fn push_user(messages: &mut Vec<ChatMessage>, content: serde_json::Value) {
+    let before = messages.last_mut().filter(|last| last.role == "user");
+    if let (Some(serde_json::Value::String(before)), serde_json::Value::String(next)) =
+        (before.map(|last| &mut last.content), &content)
+    {
+        if !before.is_empty() && !next.is_empty() {
+            before.push_str("\n\n");
+        }
+        before.push_str(next);
+        return;
+    }
+    messages.push(ChatMessage {
+        role: "user",
+        content,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
 }
 
 fn check_replay_state(states: &[ProviderState]) -> Result<(), ProviderError> {
@@ -758,7 +793,9 @@ pub(crate) fn process_sse_event(
         return Ok(blocks);
     }
     let chunk: StreamChunk = serde_json::from_str(data).map_err(|error| {
-        ProviderError::Decode(format!("invalid completion stream frame: {error}"))
+        ProviderError::Garbled(format!(
+            "the server sent part of its reply in a form that could not be read: {error}"
+        ))
     })?;
     if let Some(error) = chunk.error {
         return Err(ProviderError::Response(error_message(error)));
@@ -857,8 +894,8 @@ pub(crate) fn finalize_tool_calls(
 
 fn validate_refusal(refusal: Option<&serde_json::Value>) -> Result<(), ProviderError> {
     if let Some(refusal) = refusal.filter(|value| !value.is_null() && value.as_str() != Some("")) {
-        return Err(ProviderError::Decode(format!(
-            "model refused the request: {refusal}"
+        return Err(ProviderError::Refused(format!(
+            "the model declined to answer: {refusal}"
         )));
     }
     Ok(())
@@ -867,8 +904,8 @@ fn validate_refusal(refusal: Option<&serde_json::Value>) -> Result<(), ProviderE
 fn validate_finish_reason(reason: Option<&str>) -> Result<(), ProviderError> {
     match reason {
         Some("length" | "max_tokens") => Err(ProviderError::Truncated),
-        Some("content_filter") => Err(ProviderError::Decode(
-            "provider filtered the response; no tools from this response were executed".into(),
+        Some("content_filter") => Err(ProviderError::Refused(
+            "the provider's content filter stopped the reply; no tools from it were run".into(),
         )),
         _ => Ok(()),
     }
@@ -1251,7 +1288,7 @@ mod tests {
             (
                 "stop",
                 serde_json::json!({"content":"filler", "refusal":"cannot summarize"}),
-                "refused",
+                "declined to answer",
             ),
         ] {
             let body = serde_json::json!({"choices":[{"finish_reason":finish, "message":message}]})
@@ -1491,6 +1528,65 @@ mod tests {
             serde_json::to_value(lowered).unwrap(),
             serde_json::to_value(compatibility).unwrap()
         );
+    }
+
+    /// A strict chat template answers 400 to two user messages in a row, which
+    /// Medha's history holds after feedback or a report. They go as one, in
+    /// order; a turn from the model between them keeps them apart.
+    #[test]
+    fn user_messages_in_a_row_are_sent_as_one() {
+        let history = vec![
+            Message::system("system"),
+            Message::user("first"),
+            Message::user("second"),
+            Message::user(""),
+            Message::assistant_calls("answer", Vec::new()),
+            Message::user("third"),
+        ];
+        let sent = serde_json::to_value(build_chat_messages(&history, &HashMap::new())).unwrap();
+        let said: Vec<_> = sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| (message["role"].as_str().unwrap(), &message["content"]))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("system", &serde_json::json!("system")),
+                ("user", &serde_json::json!("first\n\nsecond")),
+                ("assistant", &serde_json::json!("answer")),
+                ("user", &serde_json::json!("third")),
+            ]
+        );
+    }
+
+    /// Two turns of the model in a row are refused by the same templates. They
+    /// go as one: the text on separate lines, and every tool call kept, in order.
+    #[test]
+    fn assistant_messages_in_a_row_are_sent_as_one_with_all_their_calls() {
+        let call = |id: &str| ToolIntent {
+            id: id.into(),
+            tool: "read".into(),
+            args: serde_json::json!({ "path": id }),
+        };
+        let history = vec![
+            Message::user("go"),
+            Message::assistant_calls("Looking.", vec![call("a")]),
+            Message::assistant_calls("", vec![call("b")]),
+            Message::assistant_calls("Both read.", Vec::new()),
+        ];
+        let sent = serde_json::to_value(build_chat_messages(&history, &HashMap::new())).unwrap();
+        let sent = sent.as_array().unwrap();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1]["content"], "Looking.\nBoth read.");
+        let calls: Vec<_> = sent[1]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(calls, ["a", "b"]);
     }
 
     #[test]

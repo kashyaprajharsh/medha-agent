@@ -29,6 +29,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "switch models, or /model <name>; add presets/custom endpoints and keys",
     ),
     (
+        "/fallback",
+        "choose saved models to stand in, in order, when yours cannot answer",
+    ),
+    (
         "/search",
         "choose the web-search provider (Tavily/Brave/SearXNG) & key; DuckDuckGo fallback",
     ),

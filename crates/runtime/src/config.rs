@@ -20,6 +20,14 @@ pub struct Config {
     pub models: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Saved models to try, in order, when the chat's own cannot be used.
+    /// Empty means a chat never switches models by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
+    /// Extra keys per model server, beyond its first: their slots, in the order
+    /// they are tried. The keys themselves stay in the credential store.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_keys: BTreeMap<String, Vec<u32>>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -224,6 +232,10 @@ pub struct SearchConfig {
 pub struct AgentConfig {
     #[serde(default)]
     pub identity: Option<String>,
+    /// How many times a turn waits for a model server that is away, once
+    /// retries and stand-in models are used up. Unset is 5; 0 never waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_waits: Option<u32>,
 }
 
 /// Models used beside the main one for work it cannot do itself.
@@ -363,7 +375,23 @@ impl Config {
         if self.default_model.as_deref() == Some(name) {
             self.default_model = self.models.keys().next().cloned();
         }
+        self.fallback.retain(|listed| listed != name);
         Ok(removed)
+    }
+
+    /// The saved models that stand in, in the order they are tried.
+    pub fn set_fallback(&mut self, names: Vec<String>) -> Result<()> {
+        let mut listed: Vec<String> = Vec::new();
+        for name in names {
+            if self.model_profile(&name).is_none() {
+                return Err(anyhow::anyhow!("no saved model named '{name}'"));
+            }
+            if !listed.contains(&name) {
+                listed.push(name);
+            }
+        }
+        self.fallback = listed;
+        Ok(())
     }
 
     pub fn search_provider(&self) -> tools::SearchProvider {
@@ -1005,6 +1033,7 @@ fn resolve_inner(
         stream_idle_seconds: configured.and_then(|p| p.stream_idle_seconds),
         prompt_cache: configured.and_then(|p| p.prompt_cache),
         cache_ttl: configured.map(|p| p.cache_ttl).unwrap_or_default(),
+        ca_cert_file: configured.and_then(|p| p.ca_cert_file.clone()),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
     if provider.auth.requires_credential() && api_key.is_empty() {
@@ -2282,6 +2311,7 @@ mod tests {
             stream_idle_seconds: None,
             prompt_cache: None,
             cache_ttl: Default::default(),
+            ca_cert_file: None,
         }
     }
 

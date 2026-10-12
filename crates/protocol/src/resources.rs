@@ -61,11 +61,17 @@ pub struct ModelProfile {
     pub default: bool,
     pub key_present: bool,
     pub requires_key: bool,
+    /// Slots of the extra keys saved for this model's server, in the order tried.
+    #[serde(default)]
+    pub extra_keys: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCatalogue {
     pub profiles: Vec<ModelProfile>,
+    /// Names of the saved models that stand in, in the order they are tried.
+    #[serde(default)]
+    pub fallback: Vec<String>,
     #[serde(default)]
     pub providers: Vec<super::ModelProvider>,
     #[serde(default)]
@@ -404,9 +410,28 @@ pub enum ChangeResource {
     RemoveModel {
         name: String,
     },
+    /// The saved models that stand in, in the order they are tried.
+    SetFallback {
+        names: Vec<String>,
+    },
     UpdateModelKey {
         name: String,
         key: Secret,
+    },
+    /// Another key for the model's server, tried after the ones already saved.
+    AddModelKey {
+        name: String,
+        key: Secret,
+    },
+    /// Forget one of the extra keys saved for the model's server.
+    RemoveModelKey {
+        name: String,
+        slot: u32,
+    },
+    /// The certificate file to trust for the model's server; `None` clears it.
+    SetModelCertificate {
+        name: String,
+        file: Option<String>,
     },
     Search {
         provider: SearchProvider,

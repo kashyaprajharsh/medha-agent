@@ -308,6 +308,17 @@ pub enum ProviderError {
     StreamStalled { waited_secs: u64 },
     #[error("decode error: {0}")]
     Decode(String),
+    /// The server sent a reply that could not be read. It may come through
+    /// whole on another try, so it is asked for again, a few times only.
+    #[error("{0}")]
+    Garbled(String),
+    /// The model or its server declined to answer this request, in its own words.
+    #[error("{0}")]
+    Refused(String),
+    /// The server's security certificate could not be verified. Trying again
+    /// cannot change that, so it is never retried or waited for.
+    #[error("{0}")]
+    Certificate(String),
     #[error(transparent)]
     InvalidToolCall(InvalidToolCall),
     #[error(
@@ -363,12 +374,11 @@ impl ProviderError {
         })
     }
 
-    /// Transient failures worth retrying with backoff: network/transport drops,
-    /// rate limits (429), and server errors (5xx). A context-length 400 is NOT
-    /// retryable as-is (retrying sends the same over-long request) — it's handled
-    /// separately by compaction; see [`is_context_overflow`](Self::is_context_overflow).
+    /// Worth sending again after a wait: dropped connections, rate limits and
+    /// server errors. Read from the one table in [`crate::recovery`].
     pub fn is_retryable(&self) -> bool {
-        matches!(self.classify(), ProviderFailure::Transient)
+        use crate::recovery::First;
+        matches!(self.recovery().first, First::Retry | First::Reconnect)
     }
 
     /// The provider rejected the request for exceeding the model's context
@@ -385,7 +395,7 @@ impl ProviderError {
     /// A stream that went silent. Resending it repeats the whole request, so it
     /// is given fewer tries than a dropped connection or a rate limit.
     pub fn is_stream_stall(&self) -> bool {
-        matches!(self, ProviderError::StreamStalled { .. })
+        self.recovery().first == crate::recovery::First::Reconnect
     }
 
     /// How long the provider asked us to wait, when it said so. The retry
@@ -402,6 +412,7 @@ impl ProviderError {
             ProviderError::InvalidToolCall(_) => ProviderFailure::InvalidToolCall,
             ProviderError::Transport(_)
             | ProviderError::Stream(_)
+            | ProviderError::Garbled(_)
             | ProviderError::StreamStalled { .. } => ProviderFailure::Transient,
             ProviderError::Throttled { status, body, .. } => {
                 if *status == 429 || (500..600).contains(status) {
@@ -411,6 +422,8 @@ impl ProviderError {
                 }
             }
             ProviderError::Decode(_)
+            | ProviderError::Refused(_)
+            | ProviderError::Certificate(_)
             | ProviderError::Truncated
             | ProviderError::ResponseTimeout { .. }
             | ProviderError::ProgressTimeout { .. } => ProviderFailure::Fatal,
@@ -1026,6 +1039,64 @@ pub trait Provider: Send + Sync {
             body,
             ctx.clone(),
         ))
+    }
+
+    /// Switch to the next model the user listed, because `failed` cannot be used,
+    /// and leave that one alone for `rest`. Returns the names of the one left
+    /// and the one now used; `None` when no other is left. When another caller
+    /// sharing this connection already left `failed`, nothing further is switched.
+    /// An empty `failed` means the model in use now.
+    fn fall_back(&self, _failed: &str, _rest: crate::recovery::Rest) -> Option<(String, String)> {
+        None
+    }
+
+    /// This request with its tool descriptions free of `pattern` and `format`
+    /// rules, which some local servers cannot turn into a grammar. Later requests
+    /// leave them out too. `None` when there was nothing to remove.
+    fn with_plain_schemas(
+        &self,
+        _request: &PreparedModelRequest,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        Ok(None)
+    }
+
+    /// Whether another saved key for this server could be used right now.
+    fn another_key(&self) -> bool {
+        false
+    }
+
+    /// Rest the key that the server just answered `status` to, for as long as
+    /// it `asked` or as that failure calls for, and turn to the next saved key
+    /// that is not resting. Returns that key's place and how many are saved;
+    /// `None` when there is no other to turn to.
+    fn next_key(
+        &self,
+        _status: u16,
+        _asked: Option<std::time::Duration>,
+    ) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The user's own model and the one answering for it, while one stands in.
+    fn standing_in(&self) -> Option<(String, String)> {
+        None
+    }
+
+    /// The list price of the model in use right now, when the adapter knows
+    /// one. Asked per call: a chat that changes model is not billed at its old rate.
+    fn list_price(&self) -> Option<crate::types::Pricing> {
+        None
+    }
+
+    /// Whether a model the user listed could still take over from this one.
+    fn stand_in_left(&self) -> bool {
+        false
+    }
+
+    /// Return to the user's own model after a turn that fell back. While that
+    /// model is still resting, stay: the names of it and of the one standing in.
+    fn restore_primary(&self) -> Option<(String, String)> {
+        None
     }
 
     /// Prepare a request as part of one conversation, so a server that caches

@@ -676,6 +676,7 @@ async fn settings_request(
         "settings.model.context",
         "settings.model.default",
         "settings.model.remove",
+        "settings.fallback.save",
         "settings.key.remove",
         "settings.search.save",
         "settings.health",

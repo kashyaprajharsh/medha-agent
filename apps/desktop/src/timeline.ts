@@ -67,6 +67,8 @@ const STATUS: Record<string, Step["status"]> = {
 export function toBlocks(events: HistoryEvent[]): Block[] {
   const blocks: Block[] = [];
   const steps = new Map<string, Step>();
+  // The stand-in model already named since the person's last message.
+  let stoodIn = "";
   for (const event of events) {
     if (event.omitted?.length) {
       blocks.push({ kind: "notice", id: `${event.id}-omitted`, ts: event.ts,
@@ -143,6 +145,13 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
         });
         break;
       default:
+        // Said once per message of the person's, above the first such answer.
+        if (event.kind === "user") stoodIn = "";
+        if (event.stand_in && event.stand_in.model !== stoodIn) {
+          stoodIn = event.stand_in.model;
+          blocks.push({ kind: "notice", id: `${event.id}-stand-in`, ts: event.ts,
+            text: `Answered by ${event.stand_in.model}, standing in for ${event.stand_in.for}.` });
+        }
         blocks.push({
           kind: event.kind,
           id: event.id,

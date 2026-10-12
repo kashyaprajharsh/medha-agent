@@ -33,7 +33,17 @@ pub struct ProviderClient {
     /// What servers showed about their models, per protocol/endpoint/model.
     learned: crate::learned::Learned,
     stable_system: Mutex<Option<String>>,
+    fallbacks: Mutex<Fallbacks>,
+    /// Set once a server could not use the pattern rules in tool descriptions.
+    plain_schemas: std::sync::atomic::AtomicBool,
+    /// Looks up every key saved for a server, in the order they are tried.
+    keys: Mutex<Option<KeySource>>,
+    /// Connections that also trust a certificate file, by that file's path.
+    trusting: Mutex<std::collections::HashMap<String, reqwest::Client>>,
 }
+
+/// Every key saved for the server at this address, first to last.
+type KeySource = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
 /// Compatibility name retained while callers migrate to the protocol/profile
 /// client introduced by the provider refactor.
@@ -43,6 +53,47 @@ pub type OpenAiCompat = ProviderClient;
 struct Connection {
     profile: ProviderProfile,
     credential: String,
+}
+
+/// Looks up the models that stand in, in the user's order, when one is needed.
+type StandIns = Box<dyn Fn() -> Vec<(ProviderProfile, String)> + Send + Sync>;
+
+/// How long a limited model is rested when its server does not say.
+const REST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The models to try, in the user's order, when their own cannot be used.
+#[derive(Default)]
+struct Fallbacks {
+    source: Option<StandIns>,
+    /// While the user's own model is left alone after a limit.
+    rested_until: Option<tokio::time::Instant>,
+    listed: Vec<Connection>,
+    next: usize,
+    /// The user's own model and its reasoning setting, held while one stands in.
+    own: Option<(Connection, ReasoningConfig)>,
+}
+
+impl Fallbacks {
+    /// Read the list when the own model first fails this turn, not when the
+    /// chat opened, leaving out the model that failed: it never stands in for itself.
+    fn read(&mut self, client: &ProviderClient) {
+        if self.own.is_some() || self.next != 0 {
+            return;
+        }
+        let failed = client.connection.lock().unwrap().profile.clone();
+        let listed = self.source.as_ref().map(|source| source());
+        self.listed = listed
+            .into_iter()
+            .flatten()
+            .filter(|(profile, _)| {
+                profile.model != failed.model || profile.base_url != failed.base_url
+            })
+            .map(|(profile, credential)| Connection {
+                profile,
+                credential,
+            })
+            .collect();
+    }
 }
 
 fn validate_reasoning(
@@ -197,7 +248,52 @@ impl ProviderClient {
             streaming: std::sync::atomic::AtomicBool::new(true),
             learned: crate::learned::Learned::default(),
             stable_system: Mutex::new(None),
+            fallbacks: Mutex::default(),
+            plain_schemas: std::sync::atomic::AtomicBool::new(false),
+            keys: Mutex::new(None),
+            trusting: Mutex::default(),
         }
+    }
+
+    /// Where to look up the keys saved for a server. With more than one, a key
+    /// that fails rests and the next takes over. Asked each time, so a key
+    /// added while a chat is open is used by it.
+    pub fn with_keys(self, source: impl Fn(&str) -> Vec<String> + Send + Sync + 'static) -> Self {
+        *self.keys.lock().unwrap() = Some(Box::new(source));
+        self
+    }
+
+    /// The connection to use for a server: the shared one, or one that also
+    /// trusts the certificate file its model was saved with. Built once per file.
+    fn http_for(&self, profile: &ProviderProfile) -> Result<reqwest::Client, ProviderError> {
+        let Some(file) = profile.ca_cert_file.as_ref() else {
+            return Ok(self.http.clone());
+        };
+        let mut trusting = self.trusting.lock().unwrap();
+        if let Some(known) = trusting.get(file) {
+            return Ok(known.clone());
+        }
+        let built = http::client_for(profile)?;
+        trusting.insert(file.clone(), built.clone());
+        Ok(built)
+    }
+
+    /// The keys saved for the server in use now, in the order they are tried.
+    fn saved_keys(&self) -> Vec<String> {
+        let server = self.connection.lock().unwrap().profile.base_url.clone();
+        let keys = self.keys.lock().unwrap();
+        keys.as_ref()
+            .map_or_else(Vec::new, |source| source(&server))
+    }
+
+    /// Where to look up the models that stand in, in order, when this one cannot
+    /// be used. It is asked each time, so a list changed since is the one used.
+    pub fn with_fallbacks(
+        self,
+        source: impl Fn() -> Vec<(ProviderProfile, String)> + Send + Sync + 'static,
+    ) -> Self {
+        self.fallbacks.lock().unwrap().source = Some(Box::new(source));
+        self
     }
 
     /// The start of the system prompt that every chat shares; a caching server
@@ -454,7 +550,7 @@ impl ProviderClient {
         );
         http::debug_json_request("POST", &url, &request.body);
 
-        let mut post = self.http.post(&url);
+        let mut post = self.http_for(&connection.profile)?.post(&url);
         for (name, value) in &request.headers {
             post = post.header(name, value);
         }
@@ -565,8 +661,11 @@ impl ProviderClient {
         let connection = self.connection.lock().unwrap().clone();
         let url = vllm_tokenize_url(&connection.profile.base_url);
         let body = vllm_tokenize_body_from_prepared(request);
+        let client = self
+            .http_for(&connection.profile)
+            .map_err(|error| TokenCountError::Transport(error.to_string()))?;
         let http_request = http::with_profile(
-            self.http.post(&url),
+            client.post(&url),
             &connection.profile,
             &connection.credential,
         )
@@ -680,7 +779,13 @@ pub async fn list_models_for_profile(
         .timeout(std::time::Duration::from_secs(6))
         // Model discovery carries the credential too — see transport::http::client.
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    // A server behind a private certificate must be reachable to be listed at all.
+    let client = match profile.ca_cert_file.as_deref() {
+        Some(file) => http::trusting(client, file)?,
+        None => client,
+    };
+    let client = client
         .build()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
     let discovery = async {
@@ -735,7 +840,7 @@ async fn list_openai_chat_models(
     let resp = http::with_profile(client.get(url), profile, credential)?
         .send()
         .await
-        .map_err(|error| ProviderError::Transport(error.without_url().to_string()))?;
+        .map_err(crate::transport::http::connection_failed)?;
     let body = http::bounded_body(http::require_success(resp).await?, DISCOVERY_MAX_BYTES).await?;
     let parsed: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
         ProviderError::Decode(
@@ -820,7 +925,7 @@ async fn list_gemini_models(
         let resp = http::with_profile(request, profile, credential)?
             .send()
             .await
-            .map_err(|error| ProviderError::Transport(error.without_url().to_string()))?;
+            .map_err(crate::transport::http::connection_failed)?;
         let body = http::bounded_body(http::require_success(resp).await?, remaining).await?;
         remaining -= body.len();
         let page: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
@@ -1025,6 +1130,121 @@ impl Provider for ProviderClient {
         self.streaming.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn fall_back(&self, failed: &str, rest: kernel::recovery::Rest) -> Option<(String, String)> {
+        let mut fallbacks = self.fallbacks.lock().unwrap();
+        let was = self.active_model();
+        // Another caller already left the model that failed: the one standing
+        // in has not failed, and is not passed over for the next.
+        if fallbacks.own.is_some() && !failed.is_empty() && failed != was {
+            return Some((failed.to_owned(), was));
+        }
+        fallbacks.read(self);
+        // One that cannot be switched to is passed over for the next.
+        while let Some(next) = fallbacks.listed.get(fallbacks.next).cloned() {
+            fallbacks.next += 1;
+            let before = (self.connection.lock().unwrap().clone(), self.reasoning());
+            if self
+                .switch_provider_profile(next.profile, next.credential)
+                .is_ok()
+            {
+                // Only the user's own model is rested: a stand-in that fails is passed.
+                if let (None, kernel::recovery::Rest::Limited(wait)) = (&fallbacks.own, rest) {
+                    let until = tokio::time::Instant::now() + wait.unwrap_or(REST);
+                    fallbacks.rested_until = Some(until);
+                }
+                fallbacks.own.get_or_insert(before);
+                return Some((was, self.active_model()));
+            }
+        }
+        None
+    }
+
+    fn with_plain_schemas(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        let mut body = request.body.clone();
+        if crate::schema_rules::strip(&mut body) == 0 {
+            return Ok(None);
+        }
+        let stays = std::sync::atomic::Ordering::Relaxed;
+        self.plain_schemas.store(true, stays);
+        Ok(Some(request.with_body(body)))
+    }
+
+    fn standing_in(&self) -> Option<(String, String)> {
+        let fallbacks = self.fallbacks.lock().unwrap();
+        let (own, _) = fallbacks.own.as_ref()?;
+        Some((own.profile.model.clone(), self.active_model()))
+    }
+
+    fn list_price(&self) -> Option<kernel::Pricing> {
+        let profile = self.connection.lock().unwrap().profile.clone();
+        let (input, output, cached, written) = crate::models_dev::list_price(&profile)?;
+        Some(kernel::Pricing {
+            input_per_mtok: input,
+            output_per_mtok: output,
+            cached_input_per_mtok: cached,
+            cache_write_per_mtok: written,
+            indicative: true,
+        })
+    }
+
+    fn stand_in_left(&self) -> bool {
+        let mut fallbacks = self.fallbacks.lock().unwrap();
+        fallbacks.read(self);
+        fallbacks.next < fallbacks.listed.len()
+    }
+
+    fn restore_primary(&self) -> Option<(String, String)> {
+        let mut fallbacks = self.fallbacks.lock().unwrap();
+        let resting = fallbacks
+            .rested_until
+            .is_some_and(|until| tokio::time::Instant::now() < until);
+        if let (true, Some((own, _))) = (resting, &fallbacks.own) {
+            return Some((own.profile.model.clone(), self.active_model()));
+        }
+        fallbacks.next = 0;
+        fallbacks.rested_until = None;
+        if let Some((own, reasoning)) = fallbacks.own.take() {
+            *self.reasoning.lock().unwrap() = reasoning;
+            *self.connection.lock().unwrap() = own;
+        }
+        drop(fallbacks);
+        // Each message starts from the first saved key that is not resting.
+        let keys = self.saved_keys();
+        if let (true, Some((_, key))) = (keys.len() > 1, crate::key_rotation::first_ready(&keys)) {
+            self.connection.lock().unwrap().credential = key.clone();
+        }
+        None
+    }
+
+    fn another_key(&self) -> bool {
+        if self.fallbacks.lock().unwrap().own.is_some() {
+            return false;
+        }
+        let current = self.connection.lock().unwrap().credential.clone();
+        let keys = self.saved_keys();
+        keys.iter()
+            .any(|key| *key != current && !crate::key_rotation::resting(key))
+    }
+
+    fn next_key(&self, status: u16, asked: Option<std::time::Duration>) -> Option<(usize, usize)> {
+        // Only the chat's own model has keys of its own to turn to.
+        if self.fallbacks.lock().unwrap().own.is_some() {
+            return None;
+        }
+        let keys = self.saved_keys();
+        if keys.len() < 2 {
+            return None;
+        }
+        let current = self.connection.lock().unwrap().credential.clone();
+        crate::key_rotation::rest_key(&current, crate::key_rotation::rest(status, asked));
+        let (at, key) = crate::key_rotation::first_ready(&keys)?;
+        self.connection.lock().unwrap().credential = key.clone();
+        Some((at, keys.len()))
+    }
+
     fn prepare_request(
         &self,
         ctx: &CompiledContext,
@@ -1078,6 +1298,12 @@ impl Provider for ProviderClient {
                     && let Some(cap) = body.as_object_mut().and_then(|o| o.remove("max_tokens"))
                 {
                     body["max_completion_tokens"] = cap;
+                }
+                if self
+                    .plain_schemas
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    crate::schema_rules::strip(&mut body);
                 }
                 // Last, so the marks sit on the request exactly as it is sent.
                 headers = crate::prompt_cache::apply(
@@ -1256,7 +1482,7 @@ impl Provider for ProviderClient {
         // exact prepared JSON for every call.
         http::debug_json_request("POST", &url, &request.body);
 
-        let mut post = self.http.post(&url);
+        let mut post = self.http_for(&connection.profile)?.post(&url);
         for (name, value) in &request.headers {
             post = post.header(name, value);
         }

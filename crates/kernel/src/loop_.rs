@@ -2,6 +2,7 @@
 //! authorizes, verifies, and executes them.
 
 use crate::context::ContextEngine;
+use crate::cut_off::GoOn;
 use crate::errors::KernelError;
 use crate::events::{Event, EventKind, EventLog};
 use crate::executor::Executor;
@@ -296,6 +297,34 @@ fn reconcile_ordered(
         .collect()
 }
 
+/// The model's turn when only this text of a reply that stopped early is kept.
+#[allow(clippy::type_complexity)]
+fn kept_text(
+    text: String,
+) -> (
+    Message,
+    ModelMessage,
+    Vec<ToolIntent>,
+    Option<crate::types::Usage>,
+    bool,
+) {
+    let parts = match text.is_empty() {
+        true => Vec::new(),
+        false => vec![ContentPart::Text(TextPart {
+            text: text.clone(),
+            provider_state: Vec::new(),
+        })],
+    };
+    let turn = Message::assistant_calls(text, Vec::new());
+    (
+        turn,
+        message_from_stream_parts(parts),
+        Vec::new(),
+        None,
+        false,
+    )
+}
+
 fn message_from_stream_parts(parts: Vec<ContentPart>) -> ModelMessage {
     ModelMessage {
         role: Role::Assistant,
@@ -476,12 +505,16 @@ pub struct Kernel<P: Provider, L: EventLog> {
     image_side: std::sync::atomic::AtomicU32,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
+    /// Times a turn waits for a server that is away, after all else is used up.
+    server_waits: u32,
     /// (per result, per round) limits set in config; each one unset is worked
     /// out from the model's context window.
     result_limits: (Option<usize>, Option<usize>),
     /// Removed from every tool result before the model reads it.
     secrets: Arc<crate::redact::Secrets>,
     pricing: Option<crate::types::Pricing>,
+    /// The model `pricing` was set for; any other is priced from its list price.
+    priced_model: Option<String>,
     /// Serializes human-gate prompts: parallel tool dispatch must not pop
     /// several approval cards at once.
     ///
@@ -617,6 +650,51 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
         .min(RETRY_MAX_BACKOFF)
 }
 
+/// How a wait inside a turn ended.
+enum Waited {
+    Out,
+    /// The person stopped the turn.
+    Stopped,
+    /// The person typed a message: it is not kept waiting.
+    Spoken,
+}
+
+/// Wait `wait` out, saying the turn is alive every few seconds so no watcher
+/// takes the silence for a dead one. A stop or a typed message ends it at once.
+async fn waited_out(
+    wait: std::time::Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut heard: Option<crate::interrupts::Activity>,
+    sink: &dyn StreamSink,
+) -> Waited {
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        sink.phase_ticked();
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Waited::Out;
+        }
+        let spoken = async {
+            let arrived = match heard.as_mut() {
+                Some(heard) => heard.changed().await.is_ok(),
+                None => false,
+            };
+            if !arrived {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(left.min(std::time::Duration::from_secs(5))) => {}
+            _ = cancel.cancelled() => return Waited::Stopped,
+            // A stop is announced on the same channel; the token tells them apart.
+            _ = spoken => return match cancel.is_cancelled() {
+                true => Waited::Stopped,
+                false => Waited::Spoken,
+            },
+        }
+    }
+}
+
 /// A cheap source of spread for [`retry_backoff`]. Jitter needs decorrelation,
 /// not unpredictability, so the clock serves and no dependency is needed.
 fn jitter_nanos() -> u64 {
@@ -654,9 +732,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             image_side: crate::request_images::SIDE.into(),
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            server_waits: crate::recovery::WAITS,
             result_limits: (None, None),
             secrets: Arc::default(),
             pricing: None,
+            priced_model: None,
             gate_serial: Arc::new(futures::lock::Mutex::new(())),
             lanes: Arc::default(),
             leases: Arc::default(),
@@ -692,9 +772,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             image_side: crate::request_images::SIDE.into(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
+            server_waits: self.server_waits,
             result_limits: self.result_limits,
             secrets: Arc::clone(&self.secrets),
             pricing: self.pricing,
+            priced_model: self.priced_model.clone(),
             // Shared, not rebuilt: see the field's own note. A fresh lane here
             // is what let three children pop three cards at one surface.
             gate_serial: Arc::clone(&self.gate_serial),
@@ -738,8 +820,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         self
     }
 
-    /// Set resolved model pricing so the governor meters real dollars.
+    /// What a model call costs now: the operator's own rate while the model it
+    /// was set for is answering, else the list price of whichever model is.
+    fn price(&self) -> Option<crate::types::Pricing> {
+        let own_model = self.priced_model.as_deref() == Some(&*self.provider.context_identity());
+        let own = self.pricing.filter(|_| own_model);
+        own.or_else(|| self.provider.list_price())
+    }
+
+    /// Set the operator's own rate, so the governor meters real dollars. It is
+    /// a rate for the model in use now, not for one the chat changes to later.
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
+        self.priced_model = pricing.map(|_| self.provider.context_identity());
         self.pricing = pricing;
         self
     }
@@ -1002,6 +1094,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     }
 
     /// Override the per-turn concurrency cap.
+    /// How many times a turn waits for a model server that is away; 0 never waits.
+    pub fn with_server_waits(mut self, waits: u32) -> Self {
+        self.server_waits = waits;
+        self
+    }
+
     pub fn with_max_parallel_tools(mut self, n: usize) -> Self {
         self.max_parallel_tools = n.clamp(1, MAX_TOOL_INTENTS_PER_TURN);
         self
@@ -1370,9 +1468,31 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             conversation: session.id.to_string(),
             unattended: self.sub_agent || interrupts.is_none(),
         };
+        // A turn that fell back to another model does not decide the next one,
+        // unless the user's own is still resting after a limit.
+        let resting = match self.sub_agent {
+            true => None,
+            false => self.provider.restore_primary(),
+        };
+        if let Some((was, now)) = &resting {
+            sink.notice(&format!(
+                "{was} is still resting after its limit. Using {now} for this message."
+            ));
+        }
         let started = crate::events::now_ts();
         let mut images_left_out_said = false;
         let (mut retired_said, mut unreadable_said) = (0, false);
+        // Replies that stopped early in this run and were asked to go on.
+        let mut cut_offs = 0u32;
+        // Times this run waited for a server that was only away for now.
+        let mut waits = 0u32;
+        // Empty replies: whether the one nudge was used, the tries made since the
+        // last real reply, and whether the last empty one produced no output at all.
+        let (mut empty_nudged, mut empty_tries, mut empty_was_silent) = (false, 0u32, false);
+        // The last real reply was text followed only by tidying-up tools.
+        let mut tidied_after_text = false;
+        // The model that failed and the one answering for it, once one stood in.
+        let mut stood_in: Option<(String, String)> = resting;
         // Where a refusal left this run's images; later requests start there.
         let mut image_floor = match self.shrinks_images.load(Ordering::Relaxed) {
             true => Sending::Shrunk,
@@ -1571,7 +1691,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut web_tainted = messages
             .iter()
             .any(|message| message.trust == Some(TrustLabel::Web));
-        loop {
+        'turns: loop {
             // Turn boundary: honor a pending cancel first (queued steers go
             // BACK to the surface, not into a turn that won't run), then
             // inject queued steers as user messages.
@@ -1624,6 +1744,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // full prepare → count → compile loop. If compaction changes the
             // candidate, the request is rebuilt and re-counted before sending.
             let mut overflow_retried = false;
+            // Set when this call's reply stopped early and the model is to go on.
+            let mut go_on: Option<GoOn> = None;
             // How this request sends its images, and what the last try carried.
             let mut sending = image_floor;
             let mut sent = Sent::default();
@@ -2090,6 +2212,106 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         image_refusal.get_or_insert(refusal);
                         continue 'model_call;
                     }
+                    // A text reply cut off at its limit is kept as the model's turn;
+                    // whether it is then continued is decided once it is saved.
+                    // One piece of text repeated until the limit: more of it is all a
+                    // continuation would bring, so the reply is dropped, not saved.
+                    Err(KernelError::Truncated(text)) if crate::repetition::looping(&text) => {
+                        return Err(KernelError::Provider(crate::cut_off::REPEATING.into()));
+                    }
+                    Err(KernelError::Truncated(text)) if !text.is_empty() => {
+                        go_on = Some(GoOn::Cut(prepared_input_tokens));
+                        let tools = prepared.context.tools.iter();
+                        break (
+                            kept_text(text),
+                            tools.map(|spec| spec.name.clone()).collect(),
+                        );
+                    }
+                    // What was written before the connection died is the model's
+                    // turn too: kept, and continued from, not paid for again.
+                    Err(KernelError::Dropped(text)) => {
+                        go_on = Some(GoOn::Dropped(prepared_input_tokens));
+                        let tools = prepared.context.tools.iter();
+                        break (
+                            kept_text(text),
+                            tools.map(|spec| spec.name.clone()).collect(),
+                        );
+                    }
+                    Err(KernelError::Truncated(_)) => {
+                        return Err(KernelError::Provider(
+                            crate::cut_off::NOTHING_WRITTEN.into(),
+                        ));
+                    }
+                    // The text before the half-written call is kept as the model's turn,
+                    // and the model is then told to do the work in smaller calls.
+                    Err(KernelError::CallStalled { text, tools, said }) => {
+                        if cut_offs + 1 >= crate::cut_off::ROUNDS {
+                            return Err(KernelError::Provider(said));
+                        }
+                        go_on = Some(GoOn::Stalled(tools));
+                        let tools = prepared.context.tools.iter();
+                        break (
+                            kept_text(text),
+                            tools.map(|spec| spec.name.clone()).collect(),
+                        );
+                    }
+                    // The request is rebuilt for the next model the user listed;
+                    // with none left, the provider's own error is the answer.
+                    Err(KernelError::ModelUnavailable {
+                        model,
+                        why,
+                        said,
+                        shown,
+                        rest,
+                        back,
+                    }) => {
+                        let Some((was, now)) = self.provider.fall_back(&model, rest) else {
+                            // Nobody to hand over to, and the server is only away
+                            // for now: wait for it, a few times, then try again.
+                            let Some(asked) = back.filter(|_| waits < self.server_waits) else {
+                                return Err(KernelError::Provider(said));
+                            };
+                            waits += 1;
+                            let wait =
+                                crate::recovery::wait_for_server(waits, asked, jitter_nanos());
+                            if shown {
+                                sink.restarted();
+                            }
+                            sink.notice(&format!(
+                                "The model's server is still not answering. Trying again in \
+                                 {}s ({waits}/{}). Stop the turn to give up.",
+                                wait.as_secs(),
+                                self.server_waits
+                            ));
+                            let heard = interrupts.as_ref().map(|q| q.activity());
+                            match waited_out(wait, &cancel, heard, sink).await {
+                                Waited::Out => continue 'model_call,
+                                // Back to where a typed message is taken in.
+                                Waited::Spoken => continue 'turns,
+                                Waited::Stopped => {}
+                            }
+                            if let Some(q) = interrupts.as_mut() {
+                                return self.finish_interrupted(session, messages, q, sink).await;
+                            }
+                            return Ok((messages, StopReason::Interrupted));
+                        };
+                        // What the failed model had begun to show is taken back.
+                        if shown {
+                            sink.restarted();
+                        }
+                        let again = match rest {
+                            crate::recovery::Rest::NextMessage => "your next message tries",
+                            crate::recovery::Rest::Limited(_) => {
+                                "once its limit has had time to lift, a message tries"
+                            }
+                        };
+                        sink.notice(&format!(
+                            "{was} could not be used: {why}. Using {now} for the rest of this \
+                             turn; {again} {was} again."
+                        ));
+                        stood_in = Some((was, now));
+                        continue 'model_call;
+                    }
                     Err(KernelError::ContextOverflow { reported_limit }) if !overflow_retried => {
                         overflow_retried = true;
                         if let Some(limit) = reported_limit {
@@ -2139,7 +2361,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             if let Some(u) = usage {
                 self.context.update_usage(u.prompt_tokens, u.total_tokens);
             }
-            if let Some(p) = self.pricing {
+            if let Some(p) = self.price() {
                 sink.cost(gov.cost_usd(), p.indicative);
             }
             // Interrupted mid-stream, or cancelled between the stream ending
@@ -2149,7 +2371,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             if turn_interrupted || cancel.is_cancelled() {
                 let canonical = strip_tool_calls(&canonical);
                 if !assistant.content.is_empty() {
-                    let reply = self.reply_text(session, &assistant.content, started).await;
+                    let mut reply = self.reply_text(session, &assistant.content, started).await;
+                    if let Some((was, now)) = &stood_in {
+                        reply.payload["stand_in"] = serde_json::json!({ "model": now, "for": was });
+                    }
                     let saved = self.log.append(reply).await?;
                     sink.text_saved(saved.id);
                 }
@@ -2179,16 +2404,184 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
                 return Ok((messages, StopReason::Interrupted));
             }
-            if !assistant.content.is_empty() {
-                let reply = self.reply_text(session, &assistant.content, started).await;
+            // No words and no action: not an answer, and never saved as one.
+            let empty =
+                assistant.content.trim().is_empty() && intents.is_empty() && go_on.is_none();
+            let thought = canonical
+                .parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::Reasoning(_)));
+            // A sub-agent sharing this connection may have moved it to a stand-in:
+            // the answer is still marked, and the person is still told.
+            if let (None, Some((was, now))) = (&stood_in, self.provider.standing_in()) {
+                sink.notice(&format!(
+                    "{was} could not be used, so {now} is answering for the rest of this turn."
+                ));
+                stood_in = Some((was, now));
+            }
+            if !assistant.content.is_empty() && !empty {
+                let mut reply = self.reply_text(session, &assistant.content, started).await;
+                if let Some((was, now)) = &stood_in {
+                    reply.payload["stand_in"] = serde_json::json!({ "model": now, "for": was });
+                }
                 let saved = self.log.append(reply).await?;
                 sink.text_saved(saved.id);
             }
-            self.log
-                .append(Event::model_message(session, &canonical))
-                .await?;
-            ordered_messages.push(canonical);
-            messages.push(assistant);
+            // A stream that died before any text leaves no turn of the model's to save.
+            let nothing_kept =
+                matches!(go_on, Some(GoOn::Stalled(_))) && canonical.parts.is_empty();
+            if !empty && !nothing_kept {
+                // Text followed only by tidying up is a finished answer.
+                tidied_after_text = !assistant.content.trim().is_empty()
+                    && !intents.is_empty()
+                    && intents
+                        .iter()
+                        .all(|call| crate::empty_reply::tidies_up(&call.tool));
+                self.log
+                    .append(Event::model_message(session, &canonical))
+                    .await?;
+                ordered_messages.push(canonical);
+                messages.push(assistant);
+            }
+
+            // A reply that stopped early is saved above; the model is asked to go
+            // on from it, unless it keeps stopping or the chat has no room left.
+            if let Some(why) = go_on.take() {
+                cut_offs += 1;
+                let window = self.provider.context_window().map(u64::from);
+                let rounds = crate::cut_off::ROUNDS - 1;
+                let no_room = |prompt: Option<u64>| {
+                    prompt.zip(window).is_some_and(|(prompt, window)| {
+                        prompt.saturating_add(crate::cut_off::HEADROOM) >= window
+                    })
+                };
+                let mut stopped = "cut off";
+                let (asked, telling, full) = match why {
+                    GoOn::Cut(prompt) => (
+                        crate::cut_off::CONTINUE.to_owned(),
+                        format!(
+                            "The reply was cut off at the model's output limit. Asking it to \
+                             continue ({cut_offs}/{rounds})…"
+                        ),
+                        no_room(prompt),
+                    ),
+                    GoOn::Dropped(prompt) => {
+                        stopped = "interrupted";
+                        (
+                            crate::cut_off::RESUME.to_owned(),
+                            format!(
+                                "The connection dropped while the model was writing. What it \
+                                 wrote is kept; asking it to continue ({cut_offs}/{rounds})…"
+                            ),
+                            no_room(prompt),
+                        )
+                    }
+                    GoOn::Stalled(tools) => {
+                        let limits = self.provider.model_limits();
+                        let allowance = self
+                            .provider
+                            .requested_output_tokens()
+                            .or(limits.max_output_tokens);
+                        (
+                            crate::cut_off::split_advice(&tools, allowance),
+                            format!(
+                                "The connection kept dropping while the model wrote a large \
+                                 action. Asking it to work in smaller steps ({cut_offs}/{rounds})…"
+                            ),
+                            false,
+                        )
+                    }
+                };
+                if cut_offs < crate::cut_off::ROUNDS && !full {
+                    let mut event = Event::user_input(session, &asked, TrustLabel::Tool);
+                    event.payload["length_continuation"] = serde_json::json!(cut_offs);
+                    self.log.append(event).await?;
+                    let nudge = Message::user(asked).carrying(TrustLabel::Tool);
+                    ordered_messages.push(nudge.ordered());
+                    messages.push(nudge);
+                    sink.notice(&telling);
+                    continue;
+                }
+                sink.notice(&match full {
+                    true => format!(
+                        "The reply was {stopped}, and the chat already fills the model's \
+                         window, so it was not continued. What was written is kept."
+                    ),
+                    false => format!(
+                        "The reply was still {stopped} after being continued. What was \
+                         written is kept."
+                    ),
+                });
+            }
+
+            // An empty reply after an answer and its tidying up ends the turn as
+            // it is. Any other is nudged or asked for again, then another model
+            // is tried, and only then is the person told.
+            if empty && !tidied_after_text {
+                let after_tools = messages.last().is_some_and(|m| m.role == Role::Tool);
+                if after_tools && !empty_nudged {
+                    empty_nudged = true;
+                    let asked = crate::empty_reply::NUDGE;
+                    let mut event = Event::user_input(session, asked, TrustLabel::Tool);
+                    event.payload["empty_reply"] = serde_json::json!(true);
+                    self.log.append(event).await?;
+                    let nudge = Message::user(asked).carrying(TrustLabel::Tool);
+                    ordered_messages.push(nudge.ordered());
+                    messages.push(nudge);
+                    sink.notice(
+                        "The model answered its tools' results with nothing. Asking it to carry on…",
+                    );
+                    continue;
+                }
+                // Twice in a row with no output at all: a third try would be the same.
+                let silent = !thought && usage.is_none_or(|used| used.completion_tokens == 0);
+                let certain = silent && empty_was_silent;
+                empty_was_silent = silent;
+                let cost = self
+                    .price()
+                    .zip(usage)
+                    .map(|(price, used)| price.cost(&used));
+                let tries = match cost {
+                    Some(cost) if cost >= crate::empty_reply::COSTLY_USD => 1,
+                    _ => crate::empty_reply::TRIES,
+                };
+                if empty_tries < tries && !certain {
+                    empty_tries += 1;
+                    let wait = crate::empty_reply::wait(empty_tries, jitter_nanos());
+                    sink.notice(&format!(
+                        "The model answered with nothing. Asking again in {}s \
+                         ({empty_tries}/{tries})…",
+                        wait.as_secs()
+                    ));
+                    let heard = interrupts.as_ref().map(|q| q.activity());
+                    if !matches!(
+                        waited_out(wait, &cancel, heard, sink).await,
+                        Waited::Stopped
+                    ) {
+                        continue;
+                    }
+                    if let Some(q) = interrupts.as_mut() {
+                        return self.finish_interrupted(session, messages, q, sink).await;
+                    }
+                    return Ok((messages, StopReason::Interrupted));
+                }
+                let rest = crate::recovery::Rest::NextMessage;
+                let Some((was, now)) = self.provider.fall_back("", rest) else {
+                    return Err(KernelError::Provider(crate::empty_reply::GAVE_UP.into()));
+                };
+                sink.notice(&format!(
+                    "{was} kept answering with nothing. Using {now} for the rest of this \
+                     turn; your next message tries {was} again."
+                ));
+                stood_in = Some((was, now));
+                (empty_tries, empty_was_silent) = (0, false);
+                continue;
+            }
+            if !empty {
+                (empty_tries, empty_was_silent) = (0, false);
+                // Each round of tools may be followed by one nudge of its own.
+                empty_nudged &= intents.is_empty();
+            }
 
             let finishing = intents.is_empty();
 
@@ -2530,11 +2923,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     > {
         let mut attempt = 0u32;
         let mut stalls = 0u32;
+        let mut cut_call_retries = 0u32;
+        let mut thinking_off_tried = false;
+        let (mut reasoning_reset, mut schemas_plain) = (false, false);
+        // A rate-limited key was already given its one more try.
+        let mut limit_retried = false;
         let mut output_limit_retried = false;
         let mut request = prepared.clone();
+        // The model does not change inside one call, so neither does its price.
+        let price = self.price();
         let (text, reasoning, intents, canonical, usage, interrupted) = loop {
             let reservation = governor
-                .reserve_model(prepared_input_tokens, reserved_output_tokens, self.pricing)
+                .reserve_model(prepared_input_tokens, reserved_output_tokens, price)
                 .map_err(KernelError::Budget)?;
             sink.phase(crate::progress::Phase::Generating);
             self.observe_hook_with(
@@ -2544,8 +2944,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 cancel,
             )
             .await;
+            let mut cut = crate::cut_off::CutOff::default();
             let outcome = self
-                .stream_turn(&request, sink, cancel, wall_deadline)
+                .stream_turn(&request, sink, cancel, wall_deadline, &mut cut)
                 .await;
             self.observe_hook_with(
                 session,
@@ -2565,7 +2966,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             match outcome {
                 Ok(data) => {
                     reservation
-                        .reconcile(data.4, self.pricing)
+                        .reconcile(data.4, price)
                         .map_err(KernelError::Budget)?;
                     break data;
                 }
@@ -2574,8 +2975,80 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // may nevertheless have reached the provider, so consume
                     // its full worst-case reservation.
                     reservation
-                        .reconcile(None, self.pricing)
+                        .reconcile(None, price)
                         .map_err(KernelError::Budget)?;
+                    if matches!(e, crate::provider::ProviderError::Truncated) {
+                        if !cut.tool_call {
+                            // Thinking used the whole allowance and nothing was
+                            // written: asked once more, this time without thinking.
+                            let quiet = crate::provider::ReasoningConfig {
+                                enabled: Some(false),
+                                effort: None,
+                            };
+                            let again = (cut.text.is_empty()
+                                && !thinking_off_tried
+                                && (!emitted || sink.supports_restart()))
+                            .then(|| self.provider.with_request_reasoning(&request, &quiet));
+                            if let Some(Ok(Some(adjusted))) = again {
+                                thinking_off_tried = true;
+                                let control = crate::context::CompileControl::new(
+                                    cancel.clone(),
+                                    wall_deadline,
+                                );
+                                let recount = self.validated_preflight(&adjusted, &control).await?;
+                                prepared_input_tokens = recount.as_ref().map(|count| count.tokens);
+                                request = adjusted;
+                                if emitted {
+                                    sink.restarted();
+                                }
+                                sink.notice(
+                                    "The model used its whole output allowance on thinking and \
+                                     wrote nothing. Asking once more with thinking off…",
+                                );
+                                continue;
+                            }
+                            return Err(KernelError::Truncated(cut.text));
+                        }
+                        // The same call again with more room; a screen that
+                        // cannot take back what it showed is not sent it twice.
+                        let limits = self.provider.model_limits();
+                        let room = crate::cut_off::more_room(
+                            self.provider.requested_output_tokens(),
+                            reserved_output_tokens,
+                            cut_call_retries + 1,
+                            limits.max_output_tokens,
+                        );
+                        let retry = cut_call_retries < crate::cut_off::ROUNDS
+                            && (!emitted || sink.supports_restart());
+                        let adjusted = match retry {
+                            true => self
+                                .provider
+                                .with_output_limit(&request, room)
+                                .map_err(|error| KernelError::Provider(error.to_string()))?,
+                            false => None,
+                        };
+                        let Some(adjusted) = adjusted else {
+                            return Err(KernelError::Provider(
+                                crate::cut_off::CALL_STAYED_CUT.into(),
+                            ));
+                        };
+                        cut_call_retries += 1;
+                        let control =
+                            crate::context::CompileControl::new(cancel.clone(), wall_deadline);
+                        let recount = self.validated_preflight(&adjusted, &control).await?;
+                        prepared_input_tokens = recount.as_ref().map(|count| count.tokens);
+                        reserved_output_tokens = Some(room);
+                        request = adjusted;
+                        if emitted {
+                            sink.restarted();
+                        }
+                        sink.notice(&format!(
+                            "The model's tool call was cut off at its output limit. Retrying \
+                             with more room ({cut_call_retries}/{})…",
+                            crate::cut_off::ROUNDS
+                        ));
+                        continue;
+                    }
                     match e.classify() {
                         crate::provider::ProviderFailure::InputContextOverflow {
                             reported_limit,
@@ -2668,12 +3141,122 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         crate::provider::ProviderFailure::Transient
                         | crate::provider::ProviderFailure::Fatal => {}
                     }
+                    // A setting or a tool description this server will not take
+                    // is left out, once, and stays out for the rest of the chat.
+                    let adjusted = match e.recovery().first {
+                        crate::recovery::First::DefaultReasoning if !reasoning_reset => {
+                            reasoning_reset = true;
+                            let own = crate::provider::ReasoningConfig::default();
+                            let adjusted = self.provider.with_request_reasoning(&request, &own);
+                            adjusted.ok().flatten().inspect(|_| {
+                                let _ = self.provider.set_reasoning(own);
+                                sink.notice(
+                                    "This server refused the reasoning setting. Using its own \
+                                     default for the rest of this chat…",
+                                );
+                            })
+                        }
+                        crate::recovery::First::PlainSchemas if !schemas_plain => {
+                            schemas_plain = true;
+                            let adjusted = self.provider.with_plain_schemas(&request);
+                            adjusted.ok().flatten().inspect(|_| {
+                                sink.notice(
+                                    "This server could not use the pattern rules in the tool \
+                                     descriptions. Sending them without those rules…",
+                                );
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(adjusted) = adjusted.filter(|_| !emitted) {
+                        let control =
+                            crate::context::CompileControl::new(cancel.clone(), wall_deadline);
+                        let recount = self.validated_preflight(&adjusted, &control).await?;
+                        prepared_input_tokens = recount.as_ref().map(|count| count.tokens);
+                        request = adjusted;
+                        continue;
+                    }
+                    // A stream that died with text already on screen: the text is
+                    // kept and continued from, never sent for again from the start.
+                    if e.is_retryable() && !cut.text.trim().is_empty() {
+                        if !cut.tool_call {
+                            return Err(KernelError::Dropped(cut.text));
+                        }
+                        // A half-written call cannot stay on screen; the text can.
+                        if sink.supports_restart() {
+                            sink.restarted();
+                            sink.text(&cut.text);
+                            return Err(KernelError::CallStalled {
+                                text: cut.text,
+                                tools: cut.tools,
+                                said: e.to_string(),
+                            });
+                        }
+                    }
                     // Stalls have their own, smaller allowance inside the
                     // turn's overall one, so earlier dropped connections
                     // neither use it up nor are counted as stalls.
                     let stalled = e.is_stream_stall();
+                    // A key the server turned away is swapped for the next saved
+                    // one before another model is thought of. A rate limit is
+                    // first given one more try on the same key.
+                    let said = match &e {
+                        crate::provider::ProviderError::Status(_, said)
+                        | crate::provider::ProviderError::Throttled { body: said, .. } => {
+                            said.to_ascii_lowercase()
+                        }
+                        _ => String::new(),
+                    };
+                    let key_fault = match &e {
+                        crate::provider::ProviderError::Status(status, _)
+                        | crate::provider::ProviderError::Throttled { status, .. }
+                            if matches!(status, 401 | 402 | 403 | 429) && !emitted =>
+                        {
+                            // A limit further upstream, or a server overloaded for
+                            // everyone, is not the key's: resting it would cost a good key.
+                            let healthy = match status {
+                                429 => crate::rejections::not_the_keys_limit(&said),
+                                // A block page in front of the server never saw the key.
+                                403 => crate::rejections::blocked_on_the_way(&said),
+                                _ => false,
+                            };
+                            (!healthy).then_some(*status)
+                        }
+                        _ => None,
+                    };
+                    let once_more = key_fault == Some(429)
+                        && !limit_retried
+                        && !crate::rejections::plan_limit(&said)
+                        && self.provider.another_key();
+                    let swapped = key_fault.filter(|_| !once_more).and_then(|status| {
+                        Some((status, self.provider.next_key(status, e.retry_after())?))
+                    });
+                    if let Some((status, (at, of))) = swapped {
+                        limit_retried = false;
+                        let why = match status {
+                            402 => "has no credit",
+                            429 => "is rate limited",
+                            _ => "was refused",
+                        };
+                        sink.notice(&format!(
+                            "The key in use {why}. Using your next key for this server \
+                             ({at} of {of})…"
+                        ));
+                        continue;
+                    }
+                    limit_retried |= once_more;
+                    // With another model listed, a rate limit is not waited out
+                    // and a server that cannot be reached is tried only twice more.
+                    let patience = match e.recovery().hand_over_after {
+                        _ if once_more => attempt + 1,
+                        Some(tries) if self.provider.stand_in_left() => tries,
+                        _ => MAX_TURN_RETRIES,
+                    };
+                    // Some failures are given fewer tries than the rest, the first counted.
+                    let most = e.recovery().tries.map_or(patience, |tries| tries - 1);
+                    let patience = patience.min(most);
                     if e.is_retryable()
-                        && attempt < MAX_TURN_RETRIES
+                        && attempt < patience.min(MAX_TURN_RETRIES)
                         && (!stalled || stalls < MAX_STALL_RETRIES)
                     {
                         attempt += 1;
@@ -2741,13 +3324,45 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             }
                         }
                     }
-                    if stalled && stalls > 0 {
-                        return Err(KernelError::Provider(format!(
+                    let said = match stalled && stalls > 0 {
+                        true => format!(
                             "{e}, {} times this turn; Medha stopped reconnecting",
                             stalls + 1
-                        )));
+                        ),
+                        false => e.to_string(),
+                    };
+                    // A block under the provider's content rules is said in plain words.
+                    let declined = e.recovery().stand_in == Some("it declined to answer");
+                    let said = match declined {
+                        true => format!("{} Its words: {said}", crate::rejections::BLOCKED),
+                        false => said,
+                    };
+                    // A stream that keeps dying under one tool call: the screen drops
+                    // the half-written call, and the model is told to send less at once.
+                    if e.is_retryable() && cut.tool_call && sink.supports_restart() {
+                        sink.restarted();
+                        if !cut.text.is_empty() {
+                            sink.text(&cut.text);
+                        }
+                        return Err(KernelError::CallStalled {
+                            text: cut.text,
+                            tools: cut.tools,
+                            said,
+                        });
                     }
-                    return Err(KernelError::Provider(e.to_string()));
+                    // No retry is left, or none would help: another model may answer.
+                    let stand_in = e.recovery().stand_in;
+                    if let Some(why) = stand_in.filter(|_| !emitted || sink.supports_restart()) {
+                        return Err(KernelError::ModelUnavailable {
+                            model: request.model.clone(),
+                            why,
+                            said,
+                            shown: emitted,
+                            rest: e.rest(),
+                            back: e.recovery().comes_back.then(|| e.retry_after()),
+                        });
+                    }
+                    return Err(KernelError::Provider(said));
                 }
             }
         };
@@ -2762,7 +3377,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 self.provider.context_identity(),
                 &request,
                 &usage,
-                self.pricing,
+                price,
             );
             if let Err(error) = self
                 .log
@@ -2790,6 +3405,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
         cancel: &tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
+        cut: &mut crate::cut_off::CutOff,
     ) -> Result<
         (
             String,
@@ -2835,6 +3451,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut completed: Option<ModelMessage> = None;
         let mut usage: Option<crate::types::Usage> = None;
         let mut emitted = false;
+        let mut tool_started = false;
+        // Names of the tool calls the model has begun, for advice if the stream dies.
+        let mut called: Vec<String> = Vec::new();
         let mut stream_blocks = 0usize;
         let mut stream_bytes = 0usize;
         // Calls whose arguments have started to arrive. When the first piece
@@ -2920,6 +3539,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
                 Ok(Block::ToolStarted { name, target }) => {
                     emitted = true;
+                    tool_started = true;
+                    if !called.contains(&name) {
+                        called.push(name.clone());
+                    }
                     sink.tool_started(&name, target.as_deref());
                 }
                 // Passed straight on and kept nowhere: the finished call below is
@@ -2994,7 +3617,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .map_err(|error| (error, emitted))?;
                     completed = Some(message);
                 }
-                Err(e) => return Err((e, emitted)),
+                Err(e) => {
+                    // What a reply had written when it stopped decides how it is recovered.
+                    cut.tool_call =
+                        tool_started || !intents.is_empty() || !arguments_started.is_empty();
+                    cut.text = std::mem::take(&mut text);
+                    cut.tools = std::mem::take(&mut called);
+                    return Err((e, emitted));
+                }
             }
         }
         let canonical = completed.unwrap_or_else(|| message_from_stream_parts(parts));

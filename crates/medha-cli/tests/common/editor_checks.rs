@@ -372,7 +372,11 @@ async fn editor_prompt_waits_for_completion_and_cancellation_does_not_start_queu
     let finished = editor.ask("message.send", json!({"content":"editor finished"}));
     assert_eq!(finished["result"]["stopReason"], "end_turn", "{finished}");
     assert!(world.provider.asked().contains("editor finished"));
-    assert!(chunks(&editor, &session, "agent_message_chunk").contains("echo: editor finished"));
+    // The cancelled prompt was never answered, so it arrives joined to this one.
+    assert!(
+        chunks(&editor, &session, "agent_message_chunk")
+            .contains("echo: HOLD editor prompt\n\neditor finished")
+    );
     assert_eq!(
         chunks(&editor, &session, "user_message_chunk"),
         "",

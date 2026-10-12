@@ -730,7 +730,17 @@ impl PermissionManager {
             let _ = self.audit_network("denied (no human gate)");
             return NetworkDecision::Deny;
         };
-        match human_gate.confirm_network(detail, escalated).await {
+        let decision = human_gate.confirm_network(detail, escalated).await;
+        let decision = if escalated
+            && matches!(
+                decision,
+                NetworkDecision::Session | NetworkDecision::Persistent
+            ) {
+            NetworkDecision::Once
+        } else {
+            decision
+        };
+        match decision {
             NetworkDecision::Once => {
                 let _ = self.audit_network("allowed (user approved, once)");
                 NetworkDecision::Once
@@ -1316,6 +1326,7 @@ impl PermissionManager {
 }
 #[cfg(test)]
 mod tests {
+    include!("network_trust_tests.rs");
     #[test]
     fn invalid_persisted_timestamps_return_errors_without_panicking() {
         let value =

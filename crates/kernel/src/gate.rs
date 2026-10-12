@@ -125,7 +125,8 @@ pub trait HumanGate: Send + Sync {
             .await
         {
             Approval::Once => NetworkDecision::Once,
-            Approval::Always => NetworkDecision::Persistent,
+            Approval::Always if !escalated => NetworkDecision::Persistent,
+            Approval::Always => NetworkDecision::Once,
             Approval::Deny => NetworkDecision::Deny,
         }
     }

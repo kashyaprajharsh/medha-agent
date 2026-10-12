@@ -179,6 +179,22 @@ pub fn scan_text(path: &str, text: &str, out: &mut Vec<Finding>) {
     scan_text_with_mode(path, text, script_kind(path, text, false), out);
 }
 
+/// Instruction files are read as prose; executable packages retain command checks.
+pub fn scan_instructions(path: &str, text: &str, out: &mut Vec<Finding>) {
+    for risk in kernel::injection::scan(text) {
+        out.push(Finding {
+            file: path.to_owned(),
+            line: None,
+            severity: if risk.dangerous {
+                Severity::Dangerous
+            } else {
+                Severity::Caution
+            },
+            reason: format!("possible prompt injection: {}", risk.id),
+        });
+    }
+}
+
 fn scan_text_with_mode(path: &str, text: &str, script: Option<ScriptKind>, out: &mut Vec<Finding>) {
     scan_hidden_unicode(path, text, out);
     scan_injection(path, text, out);

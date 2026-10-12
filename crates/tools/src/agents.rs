@@ -674,6 +674,7 @@ fn parse_agent_spec(args: &Value) -> Result<orchestrator::AgentSpec, ToolError> 
     Ok(orchestrator::AgentSpec {
         name: optional_string("name")?.unwrap_or_default(),
         objective: arg_str(args, "objective")?,
+        objective_trust: Some(kernel::provenance::execution_trust()),
         contract: optional_string("contract")?,
         tools: optional_string_list(args, "tools")?,
         max_turns,
@@ -1090,8 +1091,18 @@ impl Tool for AgentControlTool {
                 // Reporting success for text nobody received is the worst
                 // outcome: the caller carries on believing it corrected a run.
                 let delivered = match self.action {
-                    AgentAction::Steer => self.control.steer(&from, &id, &text),
-                    _ => self.control.message(&from, &id, &text),
+                    AgentAction::Steer => self.control.steer_from_agent(
+                        &from,
+                        &id,
+                        &text,
+                        kernel::provenance::execution_trust(),
+                    ),
+                    _ => self.control.message_labelled(
+                        &from,
+                        &id,
+                        &text,
+                        kernel::provenance::execution_trust(),
+                    ),
                 }
                 .map_err(|error| ToolError::Failed(error.to_string()))?;
                 Ok(json!({ "sent_to": delivered, "delivers": "at the agent's next step" }))
@@ -1107,10 +1118,11 @@ impl Tool for AgentControlTool {
                 let caller = self.caller.resolve()?;
                 let agent = self
                     .control
-                    .followup(
+                    .followup_labelled(
                         &caller,
                         &id,
                         &text,
+                        kernel::provenance::execution_trust(),
                         parent,
                         child_budget(&self.control, &caller, self.max_turns),
                     )
@@ -1387,6 +1399,10 @@ impl Tool for AgentApply {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_input_trust_tests.rs"]
+mod input_trust_tests;
 
 #[cfg(test)]
 mod argument_tests {

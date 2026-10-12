@@ -757,7 +757,11 @@ Turn 6: AI calls shell.exec("cargo test")
 > | Purpose | Trust-flow **escalation** | What trust a **memory write** gets |
 > | Type | `bool` — a one-way latch | `TrustLabel` — a floor |
 > | Reset by a new user message? | **No** | **Yes** |
-> | Scope | The whole `run_session` | Since the last user input |
+> | Scope | The whole chat, across prompts, restarts and compaction | Since the last user input |
+>
+> One rule joins them: while `web_tainted` is set, a memory write is labelled
+> `Web` whatever the window says. A page stays in the model's view after the
+> person's next message, so it must not be saved as something they said.
 
 1. **Flows to the Floor:** Trust takes the lowest level seen. If any event in the
    window is `Web`, the window is tainted — `User.min(Web) = Web`,
@@ -765,11 +769,12 @@ Turn 6: AI calls shell.exec("cargo test")
 2. **`web_tainted` is a latch.** It is seeded from injected content at session start
    and set `true` the moment a `Web`-labelled observation lands. Nothing in
    `run_session` ever sets it back to `false` — not a new user message, not a
-   completed turn. Only a fresh session starts clean. This is deliberate: once the
-   model has read a page, everything it does afterwards may derive from it.
-3. **`window_taint` does reset.** Fresh user input clears the memory-evidence window
-   and re-seeds the floor from that input's own label — so a sub-agent's web-derived
-   report re-taints it rather than entering as `User`.
+   completed turn. It is read back from the chat's saved events, so a restart or a
+   compaction does not clear it. Only a new chat starts clean. This is deliberate:
+   once the model has read a page, everything it does afterwards may derive from it.
+3. **`window_taint` does reset.** Input the person typed clears the memory-evidence
+   window and re-seeds the floor. Anything else that arrives, such as a sub-agent's
+   report, only lowers the floor and never opens a fresh window.
 4. **Global scope.** The latch applies to every tool called afterwards, regardless of
    that tool's own category.
 

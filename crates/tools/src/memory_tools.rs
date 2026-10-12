@@ -156,6 +156,7 @@ fn saved_response(op: MemoryOp, note: &str) -> Value {
         "name": name,
         "scope": scope,
         "trust": trust,
+        crate::RELAYED_TRUST: TrustLabel::Memory.min(TrustLabel::parse(trust).unwrap_or(TrustLabel::Memory)).as_str(),
         "confidence": confidence,
         "note": note,
     })
@@ -641,9 +642,20 @@ pub struct SessionsSearch {
 }
 
 impl SessionsSearch {
+    /// What text taken from that chat is worth: web text, once the chat read any.
+    async fn session_trust(&self, session: Ulid) -> Result<TrustLabel, ToolError> {
+        let web = self.log.touched_web_async(session).await;
+        let web = web.map_err(|error| ToolError::Failed(format!("session provenance: {error}")))?;
+        Ok(match web {
+            true => TrustLabel::Web,
+            false => TrustLabel::Tool,
+        })
+    }
+
     async fn event_record(&self, event: Event) -> Value {
         let role = match &event.kind {
-            EventKind::UserMessage => "user",
+            EventKind::UserMessage if event.trust == TrustLabel::User => "user",
+            EventKind::UserMessage => "context",
             EventKind::ModelText => "assistant",
             EventKind::ToolObs => "tool",
             _ => event.kind.as_str(),
@@ -682,6 +694,7 @@ impl SessionsSearch {
         json!({
             "event_id": event.id,
             "role": role,
+            "trust": event.trust.as_str(),
             "text": text,
             "ts": event.ts,
             "source": event.provenance.source,
@@ -743,10 +756,12 @@ impl Tool for SessionsSearch {
                 .map_err(|error| ToolError::Failed(format!("session search store: {error}")))?;
             let mut seen = std::collections::HashSet::new();
             let mut sessions = Vec::new();
+            let mut trust = TrustLabel::Tool;
             for hit in hits {
                 if !seen.insert(hit.session_id) {
                     continue;
                 }
+                trust = trust.min(self.session_trust(hit.session_id).await?);
                 let window_events = self
                     .log
                     .window_async(hit.session_id, hit.event_id, 5)
@@ -775,7 +790,9 @@ impl Tool for SessionsSearch {
                     break;
                 }
             }
-            return Ok(json!({ "mode": "discover", "query": query, "sessions": sessions }));
+            return Ok(
+                json!({ "mode": "discover", "query": query, "sessions": sessions, crate::RELAYED_TRUST: trust.as_str() }),
+            );
         }
 
         let has_session = args.get("session_id").is_some();
@@ -787,6 +804,7 @@ impl Tool for SessionsSearch {
                 ));
             }
             let session_id = Self::parse_id(args, "session_id")?;
+            let trust = self.session_trust(session_id).await?;
             let around_event_id = Self::parse_id(args, "around_event_id")?;
             let radius = args
                 .get("radius")
@@ -807,6 +825,7 @@ impl Tool for SessionsSearch {
                 "session_id": session_id,
                 "around_event_id": around_event_id,
                 "events": events,
+                crate::RELAYED_TRUST: trust.as_str(),
             }));
         }
 
@@ -815,6 +834,7 @@ impl Tool for SessionsSearch {
             .and_then(Value::as_u64)
             .unwrap_or(10)
             .clamp(1, 20) as usize;
+        // A list of the person's own first lines relays no chat's content.
         let sessions = self
             .log
             .list_sessions_async()
@@ -873,11 +893,15 @@ impl Tool for MemorySearch {
             .unwrap_or(10)
             .clamp(1, 50) as usize;
         let now = now_secs();
-        let results = self
+        let entries = self
             .store
             .search_async(query, limit)
             .await
-            .map_err(store_err)?
+            .map_err(store_err)?;
+        let trust = entries
+            .iter()
+            .fold(TrustLabel::Memory, |trust, entry| trust.min(entry.trust));
+        let results = entries
             .into_iter()
             .map(|entry| {
                 let age_days = ((now - entry.updated).max(0.0) / 86_400.0).floor() as u64;
@@ -897,7 +921,9 @@ impl Tool for MemorySearch {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "query": query, "count": results.len(), "results": results }))
+        Ok(
+            json!({ "query": query, "count": results.len(), "results": results, crate::RELAYED_TRUST: trust.as_str() }),
+        )
     }
 }
 

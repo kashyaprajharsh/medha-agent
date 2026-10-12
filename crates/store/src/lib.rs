@@ -1043,6 +1043,26 @@ impl SqliteLog {
         self.run_store_task(|log| log.verify()).await
     }
 
+    /// Whether anything this chat recorded came from the web.
+    pub fn touched_web(&self, session_id: Ulid) -> Result<bool, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let web = TrustLabel::Web.as_str();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 AND trust = ?2)",
+            rusqlite::params![session_id.to_string(), web],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Db(error.to_string()))
+    }
+
+    pub async fn touched_web_async(&self, session_id: Ulid) -> Result<bool, StoreError> {
+        self.run_store_task(move |log| log.touched_web(session_id))
+            .await
+    }
+
     pub async fn list_sessions_async(&self) -> Result<Vec<SessionMeta>, StoreError> {
         self.run_store_task(|log| log.list_sessions()).await
     }

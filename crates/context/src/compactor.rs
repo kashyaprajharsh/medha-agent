@@ -350,11 +350,13 @@ fn length_target(output_cap: u64) -> String {
 fn replay_instruction(previous: Option<&str>, anchor: Option<&str>, output_cap: u64) -> String {
     let base = crate::prompts::compaction_summary() + &length_target(output_cap);
     let prev = previous.map_or_else(String::new, |prev| {
+        let prev = kernel::provenance::boundary(prev, kernel::TrustLabel::Tool);
         format!("\n\n=== previous summary (update it) ===\n{prev}")
     });
     let scope = anchor.map_or_else(
         || "\n\nSummarize the conversation above.".to_string(),
         |anchor| {
+            let anchor = kernel::provenance::boundary(anchor, kernel::TrustLabel::Tool);
             format!(
                 "\n\nSummarize the conversation above, ending with the message that \
                  begins: {anchor}\nMessages after it are kept verbatim — do not summarize them."
@@ -374,15 +376,18 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
                 ));
             }
             body.push_str("=== previous summary (update it) ===\n");
-            body.push_str(prev);
+            body.push_str(&kernel::provenance::boundary(
+                prev,
+                kernel::TrustLabel::Tool,
+            ));
             body.push_str("\n=== conversation to fold in ===\n");
         }
         for it in items {
             if it.role == Role::Assistant && previous == Some(it.content.as_str()) {
                 continue; // The previous handoff is already included once above.
             }
-            let additional = it
-                .content
+            let content = kernel::provenance::model_text(&it.content, it.trust);
+            let additional = content
                 .len()
                 .saturating_add(role_label(&it.role).len())
                 .saturating_add(64);
@@ -398,7 +403,7 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
                 body.push(']');
             }
             body.push_str(": ");
-            body.push_str(&it.content);
+            body.push_str(&content);
             body.push('\n');
         }
         Ok(body)
@@ -441,9 +446,10 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
         let input_limit = limits.input_allowance(Some(output_cap)).ok_or_else(|| {
             SummarizeError::Unavailable("summary model context limit is unknown".into())
         })?;
+        let model_context = kernel::provenance::for_model(ctx);
         let request = self
             .provider
-            .prepare_request(ctx)
+            .prepare_request(&model_context)
             .map_err(SummarizeError::Provider)?;
         let request = self
             .provider

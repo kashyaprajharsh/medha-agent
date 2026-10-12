@@ -990,6 +990,28 @@ impl kernel::HumanGate for AttributedGate {
             })
             .await
     }
+
+    async fn confirm_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        let detail = format!("agent '{}' · {}", self.agent, detail.unwrap_or_default());
+        self.inner.confirm_network(Some(&detail), escalated).await
+    }
+
+    async fn confirm_access(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        let detail = format!("agent '{}' · {}", self.agent, detail.unwrap_or_default());
+        self.inner.confirm_access(Some(&detail), escalated).await
+    }
+
+    fn denial_reason(&self) -> &'static str {
+        self.inner.denial_reason()
+    }
 }
 
 /// A step in a child agent's own transcript.
@@ -1082,7 +1104,10 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         };
         let budget = run.budget.clone();
         let mut messages = run.history.clone();
-        messages.push(Message::new(Role::User, child_prompt(&run)));
+        messages.push(
+            Message::new(Role::User, child_prompt(&run))
+                .carrying(run.spec.objective_trust.unwrap_or(kernel::TrustLabel::User)),
+        );
 
         // The child's chain opens with what it was asked to do, so its session
         // stands on its own when read back later.
@@ -1183,8 +1208,9 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
                 .events(run.session)
                 .await
                 .into_iter()
-                .filter(|event| event.kind == EventKind::ToolObs)
-                .map(|event| event.trust),
+                .map(|event| event.trust)
+                .chain(run.history.iter().filter_map(|message| message.trust))
+                .chain(run.spec.objective_trust),
         );
         let status = match stop {
             StopReason::VerificationFailed | StopReason::Blocked => AgentStatus::Failed,

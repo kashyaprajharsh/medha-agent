@@ -482,6 +482,15 @@ impl Event {
     pub fn observed_tool(s: &Session, o: &Observation, trust: TrustLabel, tool: &str) -> Self {
         let mut event = Self::tool_obs(s, o, trust);
         event.payload["tool"] = json!(tool);
+        // Text from outside is read for instructions aimed at the model; what
+        // it looks like is kept with the result, and nothing is held back.
+        if trust.rank() < TrustLabel::Tool.rank() {
+            let found = crate::injection::scan(&observation_for_model(&event.payload));
+            let risks: Vec<_> = found.into_iter().map(|risk| risk.id).collect();
+            if !risks.is_empty() {
+                event.payload["risk"] = json!(risks);
+            }
+        }
         if let Some(screen) = event
             .payload
             .get_mut("screen")
@@ -628,6 +637,10 @@ impl Event {
         messages: &[Message],
         ordered: &[ModelMessage],
     ) -> Self {
+        let trust = messages
+            .iter()
+            .filter_map(|message| message.trust)
+            .fold(TrustLabel::System, TrustLabel::min);
         Self::new(
             s,
             EventKind::Compaction,
@@ -641,7 +654,7 @@ impl Event {
                     "ordered": ordered,
                 },
             }),
-            TrustLabel::System,
+            trust,
         )
     }
 }
@@ -1322,6 +1335,7 @@ pub(crate) fn project_request_messages(events: &[Event]) -> Vec<Message> {
 }
 
 fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Vec<Message> {
+    let mut trust = crate::event_trust::ReplayTrust::default();
     let mut out: Vec<Message> = Vec::new();
     let mut text = String::new();
     let mut intents: Vec<ToolIntent> = Vec::new();
@@ -1346,6 +1360,7 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
     }
 
     for e in events {
+        trust.observe(e);
         match e.kind {
             EventKind::UserMessage => {
                 flush(&mut out, &mut text, &mut intents, &mut assistant_open);
@@ -1450,13 +1465,16 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     .get("intent_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                out.push(Message::tool_result(id, observation_for_model(&e.payload)));
+                out.push(
+                    Message::tool_result(id, observation_for_model(&e.payload)).carrying(e.trust),
+                );
                 if let Some(carrier) = replayed_tool_media(&e.payload, e.trust) {
                     out.push(carrier);
                 }
             }
             EventKind::Compaction => {
                 if let Some(mut snapshot) = compacted_legacy_snapshot(&e.payload) {
+                    trust.legacy(&mut snapshot, e.payload["summary"].as_str());
                     canonical_call_ids.clear();
                     if !retain_checkpoint_system {
                         // Transcript surfaces regenerate their system prompt;
@@ -1488,7 +1506,7 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     text.clear();
                     intents.clear();
                     assistant_open = false;
-                    out.push(Message::new(crate::types::Role::Assistant, summary));
+                    out.push(trust.summary(Message::new(crate::types::Role::Assistant, summary)));
                 }
             }
             _ => {} // reasoning / policy / session — not conversation
@@ -1515,6 +1533,7 @@ fn project_ordered_messages_impl(
     events: &[Event],
     retain_checkpoint_system: bool,
 ) -> Vec<ModelMessage> {
+    let mut trust = crate::event_trust::ReplayTrust::default();
     let mut out = Vec::new();
     let mut assistant_parts = Vec::new();
     let mut canonical_call_ids = std::collections::HashSet::new();
@@ -1531,6 +1550,7 @@ fn project_ordered_messages_impl(
     }
 
     for event in events {
+        trust.observe(event);
         match event.kind {
             EventKind::UserMessage => {
                 flush(&mut out, &mut assistant_parts);
@@ -1634,7 +1654,7 @@ fn project_ordered_messages_impl(
                         content,
                         provider_state: Vec::new(),
                     })],
-                    trust: None,
+                    trust: Some(event.trust),
                 });
                 if let Some(carrier) = replayed_tool_media(&event.payload, event.trust) {
                     out.push(carrier.ordered());
@@ -1642,6 +1662,7 @@ fn project_ordered_messages_impl(
             }
             EventKind::Compaction => {
                 if let Some(mut snapshot) = compacted_ordered_snapshot(&event.payload) {
+                    trust.ordered(&mut snapshot, event.payload["summary"].as_str());
                     canonical_call_ids.clear();
                     if !retain_checkpoint_system {
                         snapshot.retain(|message| message.role != crate::types::Role::System);
@@ -1663,7 +1684,11 @@ fn project_ordered_messages_impl(
                         out.clear();
                     }
                     assistant_parts.clear();
-                    out.push(Message::new(crate::types::Role::Assistant, summary).ordered());
+                    out.push(
+                        trust
+                            .summary(Message::new(crate::types::Role::Assistant, summary))
+                            .ordered(),
+                    );
                 }
             }
             _ => {}

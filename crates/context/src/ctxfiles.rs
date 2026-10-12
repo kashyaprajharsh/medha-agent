@@ -116,7 +116,7 @@ impl ContextFileLoader {
         // allocated merely to decide that it will be omitted.
         let admitted = truncate(&raw, effective_max_chars, &path);
         let mut findings = Vec::new();
-        guard::scan_text(&path.to_string_lossy(), &admitted, &mut findings);
+        guard::scan_instructions(&path.to_string_lossy(), &admitted, &mut findings);
         if findings
             .iter()
             .any(|finding| finding.severity == Severity::Dangerous)
@@ -126,7 +126,7 @@ impl ContextFileLoader {
         if !findings.is_empty() {
             let judged_content = truncate(&admitted, JUDGE_MAX_CHARS, &path);
             let mut visible_findings = Vec::new();
-            guard::scan_text(
+            guard::scan_instructions(
                 &path.to_string_lossy(),
                 &judged_content,
                 &mut visible_findings,
@@ -516,6 +516,10 @@ impl kernel::ProgressiveContext for ProgressiveContextFiles {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "ctxfiles_injection_tests.rs"]
+mod injection_tests;
 
 #[cfg(test)]
 mod tests {

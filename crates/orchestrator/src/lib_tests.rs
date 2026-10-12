@@ -3,6 +3,9 @@ use async_trait::async_trait;
 use kernel::{BlastRadius, Message, Observation, Role, ToolCategory, ToolIntent, ToolSpec};
 use serde_json::json;
 
+#[path = "agent_trust_tests.rs"]
+mod agent_trust_tests;
+
 #[test]
 fn oversized_concurrency_does_not_panic() {
     let (_, control) = control();

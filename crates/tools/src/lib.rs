@@ -9899,3 +9899,7 @@ mod mcp_status_tests;
 #[cfg(test)]
 #[path = "lane_keys_tests.rs"]
 mod lane_keys_tests;
+
+#[cfg(test)]
+#[path = "injection_flow_tests.rs"]
+mod injection_flow_tests;

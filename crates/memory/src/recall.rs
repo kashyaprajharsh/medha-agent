@@ -32,7 +32,7 @@ fn line(entry: &MemoryEntry, now: f64, description: &str, stale_after_days: u32)
     } else {
         ""
     };
-    format!(
+    let text = format!(
         "• [{} · {}{}] {} — {} ({}d{})",
         rung(entry),
         entry.trust.as_str(),
@@ -41,7 +41,9 @@ fn line(entry: &MemoryEntry, now: f64, description: &str, stale_after_days: u32)
         description,
         age,
         stale,
-    )
+    );
+    // A memory that came from a page stays marked as that page's words.
+    kernel::provenance::model_text(&text, Some(entry.trust)).into_owned()
 }
 
 pub(crate) fn index_eligible(entry: &MemoryEntry, now: f64, stale_after_days: u32) -> bool {
@@ -162,15 +164,24 @@ fn fit_pinned_description(
     best
 }
 
-fn compile_with_counter(
+#[derive(Debug, Clone)]
+pub struct RecallSnapshot {
+    pub text: String,
+    pub trust: kernel::TrustLabel,
+}
+
+fn compile_snapshot_with_counter(
     store: &MemoryProjection,
     budget_tokens: u32,
     now: f64,
     stale_after_days: u32,
     counter: &dyn TokenCounter,
-) -> Result<String, MemoryError> {
+) -> Result<RecallSnapshot, MemoryError> {
     if budget_tokens == 0 {
-        return Ok(String::new());
+        return Ok(RecallSnapshot {
+            text: String::new(),
+            trust: kernel::TrustLabel::Memory,
+        });
     }
     let mut entries = store.list()?;
     entries.retain(|entry| index_eligible(entry, now, stale_after_days));
@@ -184,7 +195,10 @@ fn compile_with_counter(
 
     let empty = render(&[], budget_tokens, now, stale_after_days, counter);
     if counter.count(&empty) > budget_tokens {
-        return Ok(String::new());
+        return Ok(RecallSnapshot {
+            text: String::new(),
+            trust: kernel::TrustLabel::Memory,
+        });
     }
 
     let mut selected: Vec<(MemoryEntry, String)> = Vec::new();
@@ -215,13 +229,41 @@ fn compile_with_counter(
             selected.push((entry, clipped));
         }
     }
-    Ok(render(
-        &selected,
+    let trust = selected
+        .iter()
+        .fold(kernel::TrustLabel::Memory, |trust, (entry, _)| {
+            trust.min(entry.trust)
+        });
+    Ok(RecallSnapshot {
+        text: render(&selected, budget_tokens, now, stale_after_days, counter),
+        trust,
+    })
+}
+
+fn compile_with_counter(
+    store: &MemoryProjection,
+    budget_tokens: u32,
+    now: f64,
+    stale_after_days: u32,
+    counter: &dyn TokenCounter,
+) -> Result<String, MemoryError> {
+    compile_snapshot_with_counter(store, budget_tokens, now, stale_after_days, counter)
+        .map(|snapshot| snapshot.text)
+}
+
+pub fn compile_k3_snapshot(
+    store: &MemoryProjection,
+    budget_tokens: u32,
+    now: f64,
+    stale_after_days: u32,
+) -> Result<RecallSnapshot, MemoryError> {
+    compile_snapshot_with_counter(
+        store,
         budget_tokens,
         now,
         stale_after_days,
-        counter,
-    ))
+        &BpeCounter::o200k(),
+    )
 }
 
 /// Compile the deterministic recall snapshot. `now` is injected so replay and
@@ -268,6 +310,8 @@ mod tests {
     use context::HeuristicCounter;
     use kernel::TrustLabel;
     use ulid::Ulid;
+
+    include!("recall_trust_tests.rs");
 
     fn store(tag: &str) -> (MemoryProjection, test_support::Scratch) {
         let dir = test_support::scratch(&format!("medha-recall-{tag}"));
@@ -332,8 +376,8 @@ mod tests {
 
         let counter = HeuristicCounter;
         let block =
-            compile_with_counter(&store, 120, now, DEFAULT_STALE_AFTER_DAYS, &counter).unwrap();
-        assert!(counter.count(&block) <= 120);
+            compile_with_counter(&store, 160, now, DEFAULT_STALE_AFTER_DAYS, &counter).unwrap();
+        assert!(counter.count(&block) <= 160);
         assert!(block.find("pinned-web").unwrap() < block.find("recent-user").unwrap());
         assert!(!block.contains("old-candidate"));
         assert!(block.contains("⚠ verify before asserting"));

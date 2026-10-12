@@ -511,6 +511,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     shrinks_images: AtomicBool,
     /// The longest image side, in pixels, this server is known to take.
     image_side: std::sync::atomic::AtomicU32,
+    /// Stored results that came from outside; reading one back is outside text too.
+    outside_stored: std::sync::Mutex<std::collections::HashSet<String>>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
     /// Times a turn waits for a server that is away, after all else is used up.
@@ -738,6 +740,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             shrinker: None,
             shrinks_images: Default::default(),
             image_side: crate::request_images::SIDE.into(),
+            outside_stored: Default::default(),
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             server_waits: crate::recovery::WAITS,
@@ -778,6 +781,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             shrinker: self.shrinker.clone(),
             shrinks_images: Default::default(),
             image_side: crate::request_images::SIDE.into(),
+            outside_stored: Default::default(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
             server_waits: self.server_waits,
@@ -1151,7 +1155,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // tool gets TOOL_SETTLE_GRACE to finish and keep its real
             // observation. Only after the grace is it dropped and replaced by
             // a synthetic result, preserving intent → observation.
-            let fut = self.dispatch_one(session, &intent, web_tainted, &cancel, lane, sink);
+            let trust = if web_tainted {
+                TrustLabel::Web
+            } else {
+                TrustLabel::Tool
+            };
+            let fut = crate::provenance::execution_trust_scope(
+                trust,
+                self.dispatch_one(session, &intent, web_tainted, &cancel, lane, sink),
+            );
             tokio::pin!(fut);
             tokio::select! {
                 biased;
@@ -1290,9 +1302,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             (Some(ToolCategory::Web), _) | (_, Some(BlastRadius::External)) => TrustLabel::Web,
             _ => TrustLabel::Tool,
         };
-        let trust = obs
+        let mut trust = obs
             .relayed_trust
             .map_or(trust, |relayed| trust.min(relayed));
+        // A result naming a stored output that came from outside is that text again.
+        let read_back = obs.payload.get("hash").and_then(serde_json::Value::as_str);
+        if read_back.is_some_and(|hash| self.outside_stored.lock().unwrap().contains(hash)) {
+            trust = TrustLabel::Web;
+        }
         // The model reads its result, so it also reads what Medha changed in
         // the call, and can send the right types itself next time.
         if let Some(note) = adjusted.get(&id)
@@ -1301,6 +1318,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             payload.insert("adjusted".into(), serde_json::json!(note));
         }
         if let Some(discovered) = discovered {
+            trust = trust.min(discovered.trust);
             let context_event = self
                 .log
                 .append(Event::context_file(
@@ -1331,6 +1349,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut event = Event::observed_tool(session, &obs, trust, &tool);
         if let Some(hash) = &stored {
             event.payload["stored"] = serde_json::json!(hash);
+            if trust.rank() < TrustLabel::Tool.rank() {
+                self.outside_stored.lock().unwrap().insert(hash.clone());
+            }
         }
         let event = self.log.append(event).await?;
         let screen = event.payload.get(crate::events::TOOL_SCREEN_FIELD).cloned();
@@ -1348,7 +1369,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             sink.tool_screen(&id, screen);
         }
         let message =
-            Message::tool_result(&id, crate::events::observation_for_model(&event.payload));
+            Message::tool_result(&id, crate::events::observation_for_model(&event.payload))
+                .carrying(trust);
         ordered_messages.push(message.ordered());
         messages.push(message);
         if !obs.media.is_empty() {
@@ -1639,6 +1661,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
         let mut logged_events = self.log.checked_events(session.id).await?;
+        self.outside_stored.lock().unwrap().extend(
+            logged_events
+                .iter()
+                .filter(|event| event.trust.rank() < TrustLabel::Tool.rank())
+                .filter_map(|event| event.payload["stored"].as_str().map(str::to_owned)),
+        );
         tracing::info!(
             elapsed_ms = history_started.elapsed().as_millis() as u64,
             "session history prepared"
@@ -1696,11 +1724,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // spill. Both views are rewritten independently.
         self.spill_hydrated_tool_results(&mut messages, &mut ordered_messages)
             .await;
-        // Flips true once a web-labeled observation enters this request, so a
-        // later consequential action derived from it escalates. Request-scoped.
+        // Compaction changes the visible window, never the session's exposure.
         let mut web_tainted = messages
             .iter()
-            .any(|message| message.trust == Some(TrustLabel::Web));
+            .any(|message| message.trust == Some(TrustLabel::Web))
+            || logged_events
+                .iter()
+                .any(|event| event.trust == TrustLabel::Web);
         'turns: loop {
             // Turn boundary: honor a pending cancel first (queued steers go
             // BACK to the surface, not into a turn that won't run), then
@@ -1714,14 +1744,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .log
                         .append(Event::user_input(session, &s, trust))
                         .await?;
-                    // Fresh user input starts a new memory-evidence window.
-                    window_events.clear();
+                    if trust == TrustLabel::User {
+                        window_events.clear();
+                        window_taint = trust;
+                    } else {
+                        window_taint = window_taint.min(trust);
+                    }
                     window_events.push(e.id);
                     logged_events.push(e);
                     history_scope = None;
                     // A sub-agent's report arrives on this queue too, and it is
                     // worth what the agent touched, not what the operator says.
-                    window_taint = trust;
                     if matches!(trust, TrustLabel::Web) {
                         web_tainted = true;
                     }
@@ -1838,9 +1871,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             });
                         }
                     }
+                    let model_candidate = crate::provenance::for_model(&candidate);
                     let prepared = self
                         .provider
-                        .prepare_request_in(&candidate, &request_owner)
+                        .prepare_request_in(&model_candidate, &request_owner)
                         .map_err(|error| KernelError::Provider(error.to_string()))?;
 
                     let request_scope = format!(
@@ -2081,6 +2115,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     ordered_messages = compacted_ordered;
                     messages = compiled.messages;
+                    web_tainted |= messages
+                        .iter()
+                        .any(|message| message.trust == Some(TrustLabel::Web));
                     // With no real limit there is no next preflight ceiling to
                     // re-check. The synthetic recovery pass must itself prove
                     // enough reduction; checkpoint its work, then stop if not.
@@ -2647,7 +2684,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
             for it in &mut intents {
                 if is_memory_tool(&it.tool) {
-                    enrich_memory_intent(&mut it.args, window_taint, &window_events, session.id);
+                    // A page stays in the model's view after the person's next
+                    // message, so what is saved in this chat is not their words.
+                    let trust = match web_tainted {
+                        true => TrustLabel::Web,
+                        false => window_taint,
+                    };
+                    enrich_memory_intent(&mut it.args, trust, &window_events, session.id);
                 }
             }
 
@@ -3965,11 +4008,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         } else {
             self.policy.authorize(session.autonomy, intent, radius)
         };
-        // Trust-flow escalations must never be auto-approved.
-        let raw_permissive = matches!(raw, crate::types::Decision::Allow);
-        let mut decision =
-            escalate_for_trust_flow(raw, radius, web_tainted, self.executor.containment());
-        let trust_escalated = raw_permissive && matches!(decision, crate::types::Decision::Human);
+        // Trust-flow escalations must never be auto-approved. That holds for a
+        // call policy already sends to a human: its card is marked all the same.
+        let containment = self.executor.containment();
+        let mut decision = escalate_for_trust_flow(raw, radius, web_tainted, containment);
+        let trust_escalated = follows_web(radius, web_tainted, containment)
+            && matches!(decision, crate::types::Decision::Human);
         let mut hook_approval_reason = None;
         if !matches!(decision, crate::types::Decision::Deny { .. }) {
             let trust = if web_tainted {
@@ -4045,18 +4089,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             if !access.is_empty() {
                 // This card reviews both the command and its missing capabilities,
                 // so a policy Human decision does not create a second prompt.
-                let access_escalated = escalated
-                    || (access.network
-                        && web_tainted
-                        && matches!(
-                            escalate_for_trust_flow(
-                                crate::types::Decision::Allow,
-                                radius,
-                                true,
-                                crate::types::Containment::OsFsJail,
-                            ),
-                            crate::types::Decision::Human
-                        ));
+                let jailed = crate::types::Containment::OsFsJail;
+                let access_escalated =
+                    escalated || (access.network && follows_web(radius, web_tainted, jailed));
                 sink.phase(crate::progress::Phase::AwaitingApproval {
                     action: approval_key(intent),
                 });
@@ -4242,15 +4277,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // Trust-flow escalation only, not the policy engine: argv is unchanged, so
         // policy would repeat the verdict that already admitted this intent. Given
         // `Allow` the result can only widen to `Human`, never narrow to `Deny`.
-        let escalated = matches!(
-            escalate_for_trust_flow(
-                crate::types::Decision::Allow,
-                radius,
-                web_tainted,
-                crate::types::Containment::OsFsJail,
-            ),
-            crate::types::Decision::Human
-        );
+        let escalated = follows_web(radius, web_tainted, crate::types::Containment::OsFsJail);
         let decision = {
             let _one_gate = self.gate_serial.lock().await;
             let detail = net_grant_detail(intent, web_tainted, &obs);
@@ -4360,6 +4387,20 @@ fn enrich_memory_intent(
     );
 }
 
+/// An action that cannot be undone or reaches outside, taken after web text
+/// was read, where the box it runs in leaves the network open.
+fn follows_web(
+    radius: Option<BlastRadius>,
+    web_tainted: bool,
+    containment: crate::types::Containment,
+) -> bool {
+    let consequential = matches!(
+        radius,
+        Some(BlastRadius::IrreversibleLocal | BlastRadius::External)
+    );
+    web_tainted && consequential && !containment.confines_network()
+}
+
 /// Tighten web-tainted consequential actions unless network is confined.
 fn escalate_for_trust_flow(
     decision: crate::types::Decision,
@@ -4368,15 +4409,7 @@ fn escalate_for_trust_flow(
     containment: crate::types::Containment,
 ) -> crate::types::Decision {
     use crate::types::Decision;
-    let consequential = matches!(
-        radius,
-        Some(BlastRadius::IrreversibleLocal | BlastRadius::External)
-    );
-    if matches!(decision, Decision::Allow)
-        && web_tainted
-        && consequential
-        && !containment.confines_network()
-    {
+    if matches!(decision, Decision::Allow) && follows_web(radius, web_tainted, containment) {
         Decision::Human
     } else {
         decision
@@ -4692,90 +4725,8 @@ mod approval_key_tests {
 }
 
 #[cfg(test)]
-mod trust_flow_tests {
-    use super::escalate_for_trust_flow;
-    use crate::types::{BlastRadius, Containment, Decision};
-
-    #[test]
-    fn escalates_web_tainted_consequential_action_in_a_leaky_box() {
-        // Irreversible action, web-tainted, FS jail but network reachable → gate.
-        let d = escalate_for_trust_flow(
-            Decision::Allow,
-            Some(BlastRadius::IrreversibleLocal),
-            true,
-            Containment::OsFsJail,
-        );
-        assert!(matches!(d, Decision::Human));
-        // External action on the bare host → gate.
-        let d = escalate_for_trust_flow(
-            Decision::Allow,
-            Some(BlastRadius::External),
-            true,
-            Containment::None,
-        );
-        assert!(matches!(d, Decision::Human));
-    }
-
-    #[test]
-    fn no_escalation_when_the_box_confines_network() {
-        // A network-denied jail can't exfiltrate, so the same action runs freely.
-        let d = escalate_for_trust_flow(
-            Decision::Allow,
-            Some(BlastRadius::IrreversibleLocal),
-            true,
-            Containment::OsFsJailNoNet,
-        );
-        assert!(matches!(d, Decision::Allow));
-    }
-
-    #[test]
-    fn no_escalation_without_taint_or_for_low_risk_classes() {
-        // No web taint → unchanged.
-        assert!(matches!(
-            escalate_for_trust_flow(
-                Decision::Allow,
-                Some(BlastRadius::IrreversibleLocal),
-                false,
-                Containment::None
-            ),
-            Decision::Allow
-        ));
-        // Read-class is never consequential.
-        assert!(matches!(
-            escalate_for_trust_flow(
-                Decision::Allow,
-                Some(BlastRadius::Read),
-                true,
-                Containment::None
-            ),
-            Decision::Allow
-        ));
-        // Reversible-local (snapshotted + jailed) is left alone to avoid nagging.
-        assert!(matches!(
-            escalate_for_trust_flow(
-                Decision::Allow,
-                Some(BlastRadius::ReversibleLocal),
-                true,
-                Containment::None
-            ),
-            Decision::Allow
-        ));
-    }
-
-    #[test]
-    fn only_tightens_never_relaxes() {
-        // A denial stays denied even under taint (escalation is one-directional).
-        let d = escalate_for_trust_flow(
-            Decision::Deny {
-                reason: "blocked".into(),
-            },
-            Some(BlastRadius::External),
-            true,
-            Containment::None,
-        );
-        assert!(matches!(d, Decision::Deny { .. }));
-    }
-}
+#[path = "trust_flow_tests.rs"]
+mod trust_flow_tests;
 
 #[cfg(test)]
 mod retry_tests {

@@ -694,22 +694,25 @@ pub async fn start(
                 context::LlmSummarizer::new(summary_provider).with_replay(replay_summary),
             ))
             .with_artifacts(artifacts.clone())
-            .with_full_compaction_refresh(Arc::new(move |system| {
+            .with_trusted_compaction_refresh(Arc::new(move |system| {
                 if !memory_enabled {
-                    return system.to_string();
+                    return (system.to_string(), None);
                 }
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_secs_f64())
                     .unwrap_or(0.0);
-                match memory::recall::compile_k3_configured(
+                match memory::recall::compile_k3_snapshot(
                     &recall_store,
                     k3_budget_tokens,
                     now,
                     stale_after_days,
                 ) {
-                    Ok(block) => memory::recall::replace_k3(system, &block),
-                    Err(_) => system.to_string(),
+                    Ok(snapshot) => (
+                        memory::recall::replace_k3(system, &snapshot.text),
+                        Some(snapshot.trust),
+                    ),
+                    Err(_) => (system.to_string(), None),
                 }
             })),
     );
@@ -937,13 +940,23 @@ pub async fn start(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
-        let k3 = memory::recall::compile_k3_configured(
+        let k3 = memory::recall::compile_k3_snapshot(
             &memory_store,
             k3_budget_tokens,
             now,
             stale_after_days,
         )?;
-        system = memory::recall::replace_k3(&system, &k3);
+        system = memory::recall::replace_k3(&system, &k3.text);
+        if !k3.text.is_empty() {
+            log.append(kernel::Event::context_file(
+                &session,
+                "memory recall index",
+                &k3.text,
+                false,
+                k3.trust,
+            ))
+            .await?;
+        }
     }
     session.autonomy = autonomy;
     if autonomy == kernel::AutonomyLevel::Plan {

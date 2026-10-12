@@ -64,7 +64,8 @@ impl UsageAnchor {
             (None, None) => {}
             _ => return None,
         }
-        let prepared = provider.prepare_request_in(&prefix, scope).ok()?;
+        let model_prefix = crate::provenance::for_model(&prefix);
+        let prepared = provider.prepare_request_in(&model_prefix, scope).ok()?;
         (prepared.request_fingerprint == self.fingerprint).then_some(prefix)
     }
 }
@@ -176,6 +177,10 @@ impl Drop for AttemptUsage<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "usage_provenance_tests.rs"]
+mod provenance_tests;
 
 #[cfg(test)]
 mod tests {

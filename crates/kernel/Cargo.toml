@@ -22,6 +22,7 @@ sha2 = "0.10"
 base64 = "0.22"
 tracing = "0.1"
 regex = "1"
+unicode-normalization = "0.1"
 medha-extension-api = { path = "../extension-api" }
 
 [dev-dependencies]

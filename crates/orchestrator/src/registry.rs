@@ -298,6 +298,15 @@ impl AgentRegistry {
     /// settled one. Splitting the state check from `steer` loses a follow-up
     /// when settlement removes the live handle in between.
     pub(crate) fn followup(&self, path: &AgentPath, text: &str) -> Option<Followup> {
+        self.followup_labelled(path, text, kernel::TrustLabel::User)
+    }
+
+    pub(crate) fn followup_labelled(
+        &self,
+        path: &AgentPath,
+        text: &str,
+        trust: kernel::TrustLabel,
+    ) -> Option<Followup> {
         let tree = self.lock();
         let agent = tree.agents.get(path)?.clone();
         match agent.state {
@@ -305,7 +314,7 @@ impl AgentRegistry {
             State::Running => {
                 let live = tree.live.get(path)?;
                 live.steer
-                    .steer_labelled(text, kernel::TrustLabel::User)
+                    .steer_labelled(text, trust)
                     .then_some(Followup::Delivered(agent))
             }
         }

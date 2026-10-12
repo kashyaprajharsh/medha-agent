@@ -10,7 +10,7 @@ use kernel::{CompileResult, ContextEngine, InputTokenCount, Message, Role, Token
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-type SystemRefresh = dyn Fn(&str) -> String + Send + Sync;
+type SystemRefresh = dyn Fn(&str) -> (String, Option<kernel::TrustLabel>) + Send + Sync;
 
 pub struct PipelineEngine {
     policy: CompactionPolicy,
@@ -123,7 +123,15 @@ impl PipelineEngine {
     }
 
     /// Refresh frozen system-prompt sections only after a Full compaction.
-    pub fn with_full_compaction_refresh(mut self, refresh: Arc<SystemRefresh>) -> Self {
+    pub fn with_full_compaction_refresh(
+        mut self,
+        refresh: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    ) -> Self {
+        self.full_compaction_refresh = Some(Arc::new(move |system| (refresh(system), None)));
+        self
+    }
+
+    pub fn with_trusted_compaction_refresh(mut self, refresh: Arc<SystemRefresh>) -> Self {
         self.full_compaction_refresh = Some(refresh);
         self
     }
@@ -150,7 +158,7 @@ fn count_msg(m: &Message, counter: &dyn TokenCounter) -> u32 {
     // encodings out of the text tokenizer; authoritative endpoint counts and
     // observed usage still take precedence through the existing calibration.
     let mut t = counter
-        .count(&m.content)
+        .count(&kernel::provenance::model_text(&m.content, m.trust))
         .saturating_add((m.attachments.len() as u32).saturating_mul(4096));
     for tc in &m.tool_calls {
         t += counter.count(&tc.tool) + counter.count(&tc.args.to_string()) + 4;
@@ -777,7 +785,15 @@ impl PipelineEngine {
                 let text = format!("{frame}{text}");
                 summary_text = Some(text.clone());
                 out.push(TrackedMessage {
-                    message: Message::new(Role::Assistant, text),
+                    message: {
+                        let trust = middle
+                            .iter()
+                            .filter_map(|tracked| tracked.message.trust)
+                            .fold(kernel::TrustLabel::Tool, kernel::TrustLabel::min);
+                        let mut message = Message::new(Role::Assistant, text);
+                        message.trust = Some(trust);
+                        message
+                    },
                     source_index: None,
                 });
                 // The text summarizer cannot see pixels. Preserve older images
@@ -853,10 +869,19 @@ impl PipelineEngine {
                     .find(|tracked| tracked.message.role == Role::System),
             )
         {
-            system.message.content = refresh(&system.message.content);
+            let (content, trust) = refresh(&system.message.content);
+            system.message.content = content;
             // A refreshed system sheath is generated content, even if a
             // particular refresh happens to return the same visible text.
             system.source_index = None;
+            if let Some(trust) = trust
+                && let Some(summary) = out.iter_mut().find(|tracked| {
+                    tracked.source_index.is_none() && tracked.message.role == Role::Assistant
+                })
+            {
+                summary.message.trust =
+                    Some(summary.message.trust.map_or(trust, |old| old.min(trust)));
+            }
         }
         let after = out
             .iter()
@@ -1185,6 +1210,7 @@ fn tail_start_index(
 
 #[cfg(test)]
 mod tests {
+    include!("engine_trust_tests.rs");
     use super::*;
     use crate::tokens::HeuristicCounter;
     use kernel::ToolIntent;

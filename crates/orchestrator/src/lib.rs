@@ -255,6 +255,8 @@ pub struct AgentSpec {
     /// Short human-readable label, for the UI and for addressing the agent.
     pub name: String,
     pub objective: String,
+    /// Set by the execution bridge, never by tool arguments.
+    pub objective_trust: Option<TrustLabel>,
     /// What the result must contain. Carried into the child's system prompt so
     /// the summary the parent gets back is shaped, not free-form.
     pub contract: Option<String>,
@@ -996,6 +998,16 @@ impl AgentControl {
         reference: &str,
         text: &str,
     ) -> Result<AgentPath, Error> {
+        self.message_labelled(from, reference, text, TrustLabel::Tool)
+    }
+
+    pub fn message_labelled(
+        &self,
+        from: &AgentPath,
+        reference: &str,
+        text: &str,
+        trust: TrustLabel,
+    ) -> Result<AgentPath, Error> {
         if text.trim().is_empty() {
             return Err(Error::NoObjective);
         }
@@ -1014,7 +1026,7 @@ impl AgentControl {
         // Never `User`: `Tool` is the floor for agent-authored content.
         match self
             .registry
-            .steer_labelled(&agent.path, &note, TrustLabel::Tool)
+            .steer_labelled(&agent.path, &note, TrustLabel::Tool.min(trust))
         {
             true => Ok(agent.path),
             false => Err(Error::Settled(reference.to_string())),
@@ -1141,6 +1153,27 @@ impl AgentControl {
         match self.registry.steer(&agent.path, text) {
             true => Ok(agent.path),
             false => Err(Error::UnknownAgent(reference.to_string())),
+        }
+    }
+
+    pub fn steer_from_agent(
+        &self,
+        from: &AgentPath,
+        reference: &str,
+        text: &str,
+        trust: TrustLabel,
+    ) -> Result<AgentPath, Error> {
+        if text.trim().is_empty() {
+            return Err(Error::NoObjective);
+        }
+        let agent = self.reach(from, reference)?;
+        if self
+            .registry
+            .steer_labelled(&agent.path, text, TrustLabel::Tool.min(trust))
+        {
+            Ok(agent.path)
+        } else {
+            Err(Error::UnknownAgent(reference.to_string()))
         }
     }
 
@@ -1406,11 +1439,37 @@ impl AgentControl {
         parent_executor: Arc<dyn Executor>,
         parent_budget: kernel::Budget,
     ) -> Result<Agent, Error> {
+        self.followup_labelled(
+            caller,
+            reference,
+            text,
+            TrustLabel::User,
+            parent_executor,
+            parent_budget,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn followup_labelled(
+        &self,
+        caller: &Caller,
+        reference: &str,
+        text: &str,
+        trust: TrustLabel,
+        parent_executor: Arc<dyn Executor>,
+        parent_budget: kernel::Budget,
+    ) -> Result<Agent, Error> {
         if text.trim().is_empty() {
             return Err(Error::NoObjective);
         }
         let found = self.reach(&caller.path, reference)?;
-        let agent = match self.registry.followup(&found.path, text) {
+        let followup = if trust == TrustLabel::User {
+            self.registry.followup(&found.path, text)
+        } else {
+            self.registry.followup_labelled(&found.path, text, trust)
+        };
+        let agent = match followup {
             Some(registry::Followup::Delivered(agent)) => return Ok(agent),
             Some(registry::Followup::Resume(agent)) => agent,
             None => return Err(Error::UnknownAgent(reference.to_string())),
@@ -1418,6 +1477,7 @@ impl AgentControl {
         let spec = AgentSpec {
             name: agent.path.name().to_string(),
             objective: text.to_string(),
+            objective_trust: Some(trust),
             // Whole, and its own: a follow-up to an agent that has forgotten
             // what it already did would pay to redo it.
             fork: Fork::All,
@@ -1594,6 +1654,12 @@ async fn execute(
         progress,
     } = admitted;
     let started = Instant::now();
+    let input_trust = least_trusted(
+        history
+            .iter()
+            .filter_map(|message| message.trust)
+            .chain(spec.objective_trust),
+    );
     let run = runner.run(ChildRun {
         session,
         surface_session,
@@ -1684,6 +1750,7 @@ async fn execute(
             elapsed,
         ),
     };
+    result.trust = result.trust.min(input_trust);
     // A stall reads as exhaustion, not as cancellation: nobody asked for it to
     // stop, and a report labelled "cancelled" invites the reader to assume the
     // operator did it. The partial findings still travel either way.

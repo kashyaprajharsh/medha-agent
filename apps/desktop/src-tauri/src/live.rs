@@ -750,6 +750,10 @@ fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) ->
     };
     segment.clear();
     *steps = Steps::default();
+    let trust = snapshot.items.iter().rev().find_map(|row| match row {
+        protocol::PresentationItem::ProjectTrust { review } => Some(review.clone()),
+        _ => None,
+    });
     let mut frames: Vec<Value> = snapshot.current_turn_from.map(|from| {
         snapshot.items.into_iter().skip(from).map(|row| {
             use protocol::{PresentationItem as Row, TurnEvent as Event};
@@ -762,11 +766,16 @@ fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) ->
                 Row::Compaction { before, after, summarized, summary } => Event::Compaction { before, after, summarized, summary },
                 Row::Verify { ok, summary } => Event::Verify { ok, summary },
                 Row::Notice { text } => Event::Notice { text },
+                Row::ProjectTrust { review } => Event::ProjectTrust { review },
                 Row::PreviewOmitted { subject, bytes, .. } => Event::Notice { text: format!("{subject} preview omitted ({bytes} bytes); the full result remains in saved history.") },
             };
             render(sanitize(json!({"method":"event", "params":event}), steps), segment)
         }).collect()
     }).unwrap_or_default();
+    if let Some(review) = trust {
+        frames
+            .push(json!({"method":"event", "params":protocol::TurnEvent::ProjectTrust { review }}));
+    }
     if let Some(usage) = &snapshot.metrics.last_usage {
         frames.push(
             json!({"method":"event", "params": {"kind":"usage", "prompt_tokens":usage.prompt_tokens,

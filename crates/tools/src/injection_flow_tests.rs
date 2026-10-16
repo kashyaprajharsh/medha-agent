@@ -234,7 +234,11 @@ async fn session_recall_and_artifact_pages_relay_provenance() {
 /// local output is neither, in this run or after the chat is reopened.
 #[tokio::test]
 async fn a_stored_result_read_back_keeps_the_source_it_came_from() {
-    for (tool, source) in [("long_page", Some(TrustLabel::Web)), ("long_local", None)] {
+    for (tool, source) in [
+        ("long_page", Some(TrustLabel::Web)),
+        ("long_skill", Some(TrustLabel::Skill)),
+        ("long_local", None),
+    ] {
         let root = test_support::scratch("injection-stored");
         let log = Arc::new(store::SqliteLog::open(root.join("events.db")).unwrap());
         let session = Session {
@@ -281,7 +285,7 @@ async fn a_stored_result_read_back_keeps_the_source_it_came_from() {
         let sent = read(&seen.last().unwrap().messages);
         assert_eq!(
             sent.content.contains("<untrusted_content"),
-            source.is_some(),
+            source.is_some_and(|label| label.rank() < TrustLabel::Tool.rank()),
             "{tool}"
         );
     }

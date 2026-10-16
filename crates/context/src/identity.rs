@@ -18,6 +18,37 @@ pub fn system_prompt_for_tools(
     }
 }
 
+#[derive(Clone)]
+pub struct ProjectSlot {
+    prefix: String,
+    tail: String,
+}
+
+impl ProjectSlot {
+    pub fn after(prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_owned(),
+            tail: String::new(),
+        }
+    }
+
+    pub fn render(&self, project: &str) -> String {
+        let mut output = String::with_capacity(self.prefix.len() + project.len() + self.tail.len());
+        output.push_str(&self.prefix);
+        output.push_str(project);
+        output.push_str(&self.tail);
+        output
+    }
+
+    pub fn set_tail(&mut self, tail: String) {
+        self.tail = tail;
+    }
+}
+
+#[cfg(test)]
+#[path = "identity_project_tests.rs"]
+mod project_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

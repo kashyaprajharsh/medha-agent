@@ -21,6 +21,7 @@ pub use agents::{ParentHandle, SessionHandle};
 pub mod hub;
 pub mod judge;
 pub mod memory_tools;
+pub mod project_skill_scan;
 pub mod skills;
 pub use hub::{LockEntry, SearchResults, SkillHit, SkillLock, Tap, TapStore};
 pub use judge::{JudgeOutcome, JudgeRequest, JudgeVerdict, SkillJudge};
@@ -465,16 +466,13 @@ impl Tool for LspStart {
             .resolve(&path)
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let preview = self
+            .manager
+            .start_preview_for(&absolute, server)
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
         let mut installed = None;
         if args.get("install").and_then(Value::as_bool) == Some(true) {
-            let target = match server {
-                Some(id) => id.to_string(),
-                None => self
-                    .manager
-                    .start_preview_for(absolute.clone(), None)
-                    .map(|preview| preview.server)
-                    .map_err(|error| ToolError::Failed(error.to_string()))?,
-            };
+            let target = preview.server;
             installed = Some(
                 lsp::install_server(&target, self.manager.install_timeout())
                     .await
@@ -767,6 +765,7 @@ pub struct ToolRegistry {
     /// Optional MCP host. Its tools are projected dynamically each turn (so a
     /// server that connects mid-session appears without rebuilding the registry).
     mcp: Option<Arc<mcp::McpManager>>,
+    skills: Option<Arc<SkillStore>>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
     /// The executor a child inherits from — this registry itself, installed
     /// after the kernel is built. A child's tools are narrowed from it.
@@ -791,6 +790,7 @@ impl ToolRegistry {
             clarify: Arc::new(Mutex::new(None)),
             lsp: Arc::new(Mutex::new(None)),
             mcp: None,
+            skills: None,
             artifacts: None,
             agent_parent: Arc::new(Mutex::new(None)),
             agent_session: Arc::new(Mutex::new(None)),
@@ -895,6 +895,7 @@ impl ToolRegistry {
     /// themselves in the frozen static capability set, while consulting MCP's
     /// live catalogue for availability on every skill call.
     pub fn register_skills(&mut self, store: Arc<SkillStore>) -> &mut Self {
+        self.skills = Some(store.clone());
         let mut names = self.tool_names();
         names.extend(["skill", "skill.save"].map(String::from));
         let known = Arc::new(names);
@@ -1044,6 +1045,7 @@ impl ToolRegistry {
         // artifact store here would give the child a place to write that the
         // parent cannot read.
         let artifacts = self.artifacts.clone()?;
+        let project_skills = sandbox.root().join(".medha/skills");
         let mut fresh = Self::with_workspace(sandbox, artifacts);
         // Re-registered rather than copied: the `lsp.*` tools hold a sandbox
         // too, so carrying them over would reintroduce the parent's root
@@ -1065,6 +1067,9 @@ impl ToolRegistry {
             if !fresh.tools.contains_key(name) {
                 fresh.tools.insert(name.clone(), Arc::clone(tool));
             }
+        }
+        if let Some(skills) = &self.skills {
+            fresh.register_skills(Arc::new(skills.rebase(project_skills)));
         }
         Some(fresh)
     }
@@ -9209,7 +9214,11 @@ mod tests {
         )
         .unwrap();
 
-        let store = Arc::new(SkillStore::new(project, Some(dir.join("user"))));
+        let cache = dir.join("scans");
+        let store = Arc::new(
+            SkillStore::new(project.canonicalize().unwrap(), Some(dir.join("user")))
+                .with_project_source(Arc::new(move |_, _| Some(cache.clone()))),
+        );
         let mut reg = ToolRegistry::new();
         reg.register_skills(store);
         let names = reg.tool_names();
@@ -9903,3 +9912,7 @@ mod lane_keys_tests;
 #[cfg(test)]
 #[path = "injection_flow_tests.rs"]
 mod injection_flow_tests;
+
+#[cfg(test)]
+#[path = "project_skill_rebase_tests.rs"]
+mod project_skill_rebase_tests;

@@ -26,7 +26,8 @@ try {
   const address = server.httpServer.address();
   if (!address || typeof address === "string") throw new Error("The fixture did not listen.");
   await new Promise((done, reject) => {
-    const child = spawn("swift", ["-module-cache-path", join(scratch, "swift"), join(root, "verify.swift"), `http://127.0.0.1:${address.port}/`], { stdio: "inherit" });
+    const trust = process.argv.includes("--trust");
+    const child = spawn("swift", ["-module-cache-path", join(scratch, "swift"), join(root, "verify.swift"), `http://127.0.0.1:${address.port}/${trust ? "trust.html" : ""}`, ...(trust && process.env.MEDHA_VISUAL_DIR ? [process.env.MEDHA_VISUAL_DIR] : [])], { stdio: "inherit" });
     const deadline = setTimeout(() => child.kill("SIGKILL"), 90_000);
     child.once("error", error => { clearTimeout(deadline); reject(error); });
     child.once("exit", (code, signal) => { clearTimeout(deadline); code === 0 ? done() : reject(new Error(`WebKit rendering check failed: ${code ?? signal}`)); });

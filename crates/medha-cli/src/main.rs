@@ -225,13 +225,7 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
 
     let workspace = std::env::current_dir()?;
     let workspace = workspace.canonicalize().unwrap_or(workspace);
-    let state = config::state_dir(&workspace)?;
-    let lock = apply_lock_trust(
-        lockfile::MedhaLock::load_default()?,
-        &workspace.join("medha.lock"),
-        &workspace,
-        &state,
-    );
+    let lock = runtime::workspace::load_lock(&workspace, &Stderr)?;
     let seeds = gc.seeds.unwrap_or(lock.gate.seeds);
     let threshold = gc.threshold.unwrap_or(lock.gate.pass_threshold);
     gate::validate_run_inputs(seeds, threshold, gc.yes)
@@ -822,7 +816,7 @@ async fn main() -> Result<()> {
         return run_lsp_command(&raw[2..]).await;
     }
     if raw.get(1).map(|s| s == "trust").unwrap_or(false) {
-        return run_trust_command(&raw[2..]);
+        return run_trust_command(&raw[2..]).await;
     }
     if raw.get(1).map(|s| s == "serve").unwrap_or(false) {
         return serve::run(&raw[2..]).await;
@@ -900,7 +894,7 @@ async fn main() -> Result<()> {
         verify_command: verify_cmd,
         verify_required,
         verify_timeout,
-    } = runtime::session::Choices::of(&lock, &options)?;
+    } = runtime::session::Choices::of(&lock, &options, &lock_cwd)?;
 
     let model = runtime::model::resolve(&lock, &options, &Stderr).await?;
 
@@ -1450,35 +1444,61 @@ async fn authorize_mcp(manager: &mcp::McpManager, id: &str) {
     let _ = printer.await;
 }
 
-/// `medha trust [--revoke]` — accept this workspace's `medha.lock` privilege.
-fn run_trust_command(args: &[String]) -> anyhow::Result<()> {
+/// One action accepts checkout trust and the exact settings shown.
+async fn run_trust_command(args: &[String]) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let state = config::state_dir(&cwd)?;
-    let record = state.join("lock_trust.toml");
-    let key = cwd.display().to_string();
-    let mut accepted = lockfile::AcceptedLocks::load(&record);
+    let backend = medha_client::Backend::shared(|| {
+        std::env::current_exe().map_err(|error| error.to_string())
+    });
+    let connection = backend.connection().map_err(anyhow::Error::msg)?;
     if args.iter().any(|arg| arg == "--revoke") {
-        accepted.revoke(&key);
-        accepted.save(&record).map_err(anyhow::Error::msg)?;
-        println!("revoked lockfile privilege for {key}");
+        connection
+            .call_async(
+                protocol::Scope::Folder(&cwd),
+                &protocol::ChangeResource::RevokeProjectTrust,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "Revoked checkout trust and accepted settings; local language servers stopped. Other processes stop theirs at next use."
+        );
         return Ok(());
     }
-    let risky = lockfile::MedhaLock::load_default()?.risky_settings();
-    if risky.is_empty() {
-        println!("medha.lock asks for no privilege here — nothing to accept.");
-        return Ok(());
-    }
-    println!("{} asks for:", cwd.join("medha.lock").display());
-    for setting in &risky {
-        println!("  · {setting}");
+    let protocol::ResourceResult::ProjectTrust(Some(review)) = connection
+        .call_async(
+            protocol::Scope::Folder(&cwd),
+            &protocol::ReadResource::ProjectTrust,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?
+    else {
+        anyhow::bail!("The home folder is not a project.")
+    };
+    println!("Trust checkout: {}", serde_json::to_string(&review.root)?);
+    for setting in &review.settings {
+        println!(
+            "  {} = {} ({})",
+            setting.key,
+            serde_json::to_string(&setting.value)?,
+            setting.effect
+        );
     }
     if !args.iter().any(|arg| arg == "--yes") {
-        println!("\nre-run with `medha trust --yes` to accept these for this workspace.");
+        println!("\nRun medha trust --yes to trust this checkout and accept these exact settings.");
         return Ok(());
     }
-    accepted.accept(&key, &risky);
-    accepted.save(&record).map_err(anyhow::Error::msg)?;
-    println!("\naccepted for {key}; editing any of these values asks again.");
+    connection
+        .call_async(
+            protocol::Scope::Folder(&cwd),
+            &protocol::ChangeResource::TrustProject {
+                root: review.root,
+                folder: review.folder,
+                fingerprint: review.fingerprint,
+            },
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    println!("Checkout trusted; changed risky values remain disabled until accepted.");
     Ok(())
 }
 
@@ -1491,15 +1511,6 @@ impl runtime::Notices for Stderr {
     fn say(&self, line: &str) {
         eprintln!("{line}");
     }
-}
-
-fn apply_lock_trust(
-    lock: lockfile::MedhaLock,
-    lock_path: &std::path::Path,
-    workspace: &std::path::Path,
-    state: &std::path::Path,
-) -> lockfile::MedhaLock {
-    runtime::workspace::apply_lock_trust(lock, lock_path, workspace, state, &Stderr)
 }
 
 /// Terminal approval prompt.
@@ -1848,6 +1859,20 @@ where
                 if let Some(cmd) = line.strip_prefix('/') {
                     let cmd = cmd.trim();
                     let (name, rest) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                    if name == "trust" {
+                        let argument = match rest.trim() {
+                            "" => "--yes",
+                            "--revoke" => "--revoke",
+                            _ => {
+                                println!("usage: /trust [--revoke]");
+                                continue;
+                            }
+                        };
+                        if let Err(error) = run_trust_command(&[argument.to_owned()]).await {
+                            eprintln!("{error}");
+                        }
+                        continue;
+                    }
                     if name == "plan" || name == "mode" {
                         let choice = if name == "plan" { "plan" } else { rest.trim() };
                         if choice.is_empty() {
@@ -1858,6 +1883,7 @@ where
                         } else {
                             match kernel::AutonomyLevel::parse(choice) {
                                 Ok(level) => {
+                                    kernel.policy.operator_autonomy(level);
                                     session.autonomy = level;
                                     println!("mode: {}", level.as_str());
                                 }
@@ -1966,6 +1992,7 @@ fn print_help() {
         "commands:\n  \
          /help                        show this\n  \
          /status                      model, context window, current pressure\n  \
+         /trust [--revoke]             trust this checkout and shown settings, or revoke both\n  \
          /reasoning [on|off|auto|status]  control reasoning\n  \
          /effort LEVEL (auto|none|minimal|low|medium|high|xhigh|max|ultra)\n\
                                       set reasoning depth (turns thinking on)\n  \

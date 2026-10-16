@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_SKILL_MD_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_SKILL_MD_BYTES: usize = 128 * 1024;
 const MAX_MANIFEST_LIST_ITEMS: usize = 64;
 const MAX_MANIFEST_CHARS: usize = 32 * 1024;
 const MAX_INSTALL_FILES: usize = 256;
@@ -164,6 +164,15 @@ pub struct Skill {
     pub body: String,
     pub scope: SkillScope,
     pub path: PathBuf,
+    package: Option<Arc<crate::project_skill_scan::Snapshot>>,
+}
+
+impl Skill {
+    pub fn warnings(&self) -> &[String] {
+        self.package
+            .as_ref()
+            .map_or(&[], |package| package.findings.as_slice())
+    }
 }
 
 /// A skill as surfaced to `/skills` and the manifest: the skill plus the derived
@@ -187,6 +196,7 @@ impl SkillListing {
 /// session.
 #[derive(Debug, Clone, Default)]
 pub struct Discovery {
+    pub project_present: bool,
     pub listings: Vec<SkillListing>,
     pub errors: Vec<(PathBuf, String)>,
 }
@@ -210,7 +220,10 @@ pub struct SkillStore {
     /// so editing the package after approval cannot change what the model loads.
     /// Replaced wholesale when plugins are enabled or disabled mid-session.
     plugin_skills: std::sync::RwLock<Vec<Skill>>,
+    project_source: Option<Arc<ProjectSource>>,
 }
+
+type ProjectSource = dyn Fn(&Path, &Path) -> Option<PathBuf> + Send + Sync;
 
 impl SkillStore {
     pub fn new(project_dir: PathBuf, user_dir: Option<PathBuf>) -> Self {
@@ -219,6 +232,22 @@ impl SkillStore {
             user_dir,
             judge: None,
             plugin_skills: std::sync::RwLock::new(Vec::new()),
+            project_source: None,
+        }
+    }
+
+    pub fn with_project_source(mut self, source: Arc<ProjectSource>) -> Self {
+        self.project_source = Some(source);
+        self
+    }
+
+    pub fn rebase(&self, project_dir: PathBuf) -> Self {
+        Self {
+            project_dir,
+            user_dir: self.user_dir.clone(),
+            judge: self.judge.clone(),
+            plugin_skills: std::sync::RwLock::new(self.plugin_skill_list()),
+            project_source: self.project_source.clone(),
         }
     }
 
@@ -299,10 +328,53 @@ impl SkillStore {
         ];
         for (dir, scope) in dirs {
             let Some(dir) = dir else { continue };
-            for (path, parsed) in scan_dir(dir) {
+            for (path, parsed) in scan_dir(dir, scope != SkillScope::Project) {
+                if scope == SkillScope::Project {
+                    out.project_present = true;
+                }
+                let package = if scope == SkillScope::Project {
+                    let Some(workspace) = self.project_dir.parent().and_then(Path::parent) else {
+                        continue;
+                    };
+                    let Some(package_dir) = path.parent() else {
+                        continue;
+                    };
+                    let Some(cache) = self
+                        .project_source
+                        .as_ref()
+                        .and_then(|source| source(workspace, package_dir))
+                    else {
+                        continue;
+                    };
+                    let allowed = |dir: &Path| {
+                        self.project_source
+                            .as_ref()
+                            .and_then(|source| source(workspace, dir))
+                            .is_some()
+                    };
+                    match crate::project_skill_scan::scan(package_dir, &cache, &allowed) {
+                        Ok(package) => Some(Arc::new(package)),
+                        Err(reason) => {
+                            out.errors.push((path, reason));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let parsed = match &package {
+                    Some(package) => package
+                        .files
+                        .get("SKILL.md")
+                        .ok_or_else(|| "missing SKILL.md".into())
+                        .and_then(|bytes| std::str::from_utf8(bytes).map_err(|e| e.to_string()))
+                        .and_then(parse_skill_md),
+                    None => parsed,
+                };
                 match parsed {
                     Ok(fm_body) => {
-                        let skill = build_skill(fm_body, scope, path);
+                        let mut skill = build_skill(fm_body, scope, path);
+                        skill.package = package;
                         let shadowed = !seen.insert(skill.name.clone());
                         let missing_tools = skill
                             .required_tools
@@ -374,7 +446,21 @@ impl SkillStore {
         // the procedure mentions by relative path. Surface the skill's dir and
         // its files so those references are resolvable, not dead ends.
         let dir = s.path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let files = bundled_files(&dir);
+        let files = s.package.as_ref().map_or_else(
+            || bundled_files(&dir),
+            |package| {
+                package
+                    .files
+                    .keys()
+                    .filter(|file| {
+                        file.as_str() != "SKILL.md"
+                            && !file.split('/').any(|part| part.starts_with('.'))
+                    })
+                    .take(100)
+                    .cloned()
+                    .collect()
+            },
+        );
         let mut out = json!({
             "name": s.name,
             "description": s.description,
@@ -383,6 +469,12 @@ impl SkillStore {
             "dir": dir.display().to_string(),
             "procedure": s.body,
         });
+        if let Some(package) = &s.package {
+            out[crate::RELAYED_TRUST] = json!(kernel::TrustLabel::Skill);
+            if !package.findings.is_empty() {
+                out["warnings"] = json!(package.findings);
+            }
+        }
         let migrations: Vec<Value> = s
             .required_tools
             .iter()
@@ -483,8 +575,20 @@ impl SkillStore {
                 relative.display()
             ));
         }
-        let content = read_text_limited(&target, MAX_BUNDLED_TEXT_BYTES)
-            .map_err(|e| format!("reading bundled file: {e}"))?;
+        let content = match &listing.skill.package {
+            Some(package) => {
+                let bytes = package
+                    .files
+                    .get(&crate::portable_rel(relative))
+                    .ok_or("bundled file was not in the scanned package")?;
+                if bytes.len() > MAX_BUNDLED_TEXT_BYTES {
+                    return Err("bundled file exceeds the text limit".into());
+                }
+                String::from_utf8(bytes.clone()).map_err(|e| e.to_string())?
+            }
+            None => read_text_limited(&target, MAX_BUNDLED_TEXT_BYTES)
+                .map_err(|e| format!("reading bundled file: {e}"))?,
+        };
         let total_lines = content.lines().count();
         let start = line_start.max(1);
         let limit = line_limit.clamp(1, MAX_BUNDLED_LINES_PER_READ);
@@ -498,7 +602,7 @@ impl SkillStore {
         } else {
             start + page.len() - 1
         };
-        Ok(json!({
+        let mut value = json!({
             "name": name,
             "file": crate::portable_rel(relative),
             "content": page.join("\n"),
@@ -506,16 +610,29 @@ impl SkillStore {
             "line_end": end,
             "total_lines": total_lines,
             "has_more": end < total_lines,
-        }))
+        });
+        if listing.skill.scope == SkillScope::Project {
+            value[crate::RELAYED_TRUST] = json!(kernel::TrustLabel::Skill);
+        }
+        Ok(value)
     }
 
     /// Large catalogs retain prompt matches and an omitted count.
     pub fn manifest(&self, known_tools: &HashSet<String>, prompt: Option<&str>) -> String {
+        let discovery = self.discover(known_tools);
+        self.manifest_from(&discovery, known_tools, prompt)
+    }
+
+    pub fn manifest_from(
+        &self,
+        disc: &Discovery,
+        known_tools: &HashSet<String>,
+        prompt: Option<&str>,
+    ) -> String {
         if !known_tools.contains("skill") {
             return String::new();
         }
         const TRIM_ABOVE: usize = 30;
-        let disc = self.discover(known_tools);
         let all: Vec<&SkillListing> = disc.effective().collect();
         if all.is_empty() {
             return String::new();
@@ -541,8 +658,7 @@ impl SkillStore {
         };
 
         let mut lines = String::from(
-            "## Skills available — CHECK THIS BEFORE STARTING A TASK. If any description below \
-             matches the request, call skill with its name and follow it before doing the task your own way.\n",
+            "## Skills available. Load a relevant procedure when it helps the task; user instructions and Medha's safety rules take precedence.\n",
         );
         for (i, l) in shown.iter().enumerate() {
             let s = &l.skill;
@@ -833,7 +949,7 @@ impl SkillStore {
         // scanned at install exactly as a command is scanned at exec. A
         // dangerous verdict aborts (nothing is written); caution installs but
         // its findings ride back in the report so the surface can warn.
-        let scan = match scan_staged(&stage) {
+        let scan = match crate::project_skill_scan::scan_package(&stage) {
             Ok(scan) => scan,
             Err(error) => {
                 std::fs::remove_dir_all(&stage).ok();
@@ -978,40 +1094,6 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Screen every staged file with the Skills Guard before committing. `SKILL.md`
-/// is added back explicitly since `collect_files` lists only bundled extras. A
-/// read failure must never drop a file from the scan.
-fn scan_staged(stage: &Path) -> Result<policy::guard::ScanReport, String> {
-    let mut rels = Vec::new();
-    collect_files(stage, stage, &mut rels);
-    rels.push("SKILL.md".to_string());
-    rels.sort();
-    rels.dedup();
-    let mut files = Vec::with_capacity(rels.len());
-    for rel in rels {
-        let path = stage.join(&rel);
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("cannot security-scan staged file '{rel}': {error}"))?;
-        files.push((rel, bytes, is_executable_file(&path)?));
-    }
-    Ok(policy::guard::scan_package_with_modes(files.iter().map(
-        |(path, bytes, executable)| (path.as_str(), bytes.as_slice(), *executable),
-    )))
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> Result<bool, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("reading staged file mode '{}': {error}", path.display()))?;
-    Ok(metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(_path: &Path) -> Result<bool, String> {
-    Ok(false)
-}
-
 /// Installed skill assets are data until a reviewed interpreter invocation
 /// consumes them. Removing execute bits prevents a bundled launcher from being
 /// run directly after installation; directories retain traversal permissions.
@@ -1096,7 +1178,7 @@ fn gather_flagged_content(stage: &Path, scan: &policy::guard::ScanReport) -> Str
 
 /// Render guard findings as `"file:line — reason"` (or `"file — reason"` for a
 /// whole-file finding) for the install report and any surface that shows them.
-fn format_findings(findings: &[policy::guard::Finding]) -> Vec<String> {
+pub(crate) fn format_findings(findings: &[policy::guard::Finding]) -> Vec<String> {
     const MAX_SHOWN: usize = 12;
     let mut ordered: Vec<_> = findings.iter().collect();
     ordered.sort_by(|a, b| {
@@ -1585,7 +1667,7 @@ fn validate_manifest_list(field: &str, values: &[String]) -> Result<(), String> 
 /// Scan a `<dir>/*/SKILL.md` layout, returning each file's parse result. A
 /// missing directory yields nothing (the common case — most workspaces have no
 /// skills). Sorted by directory name for deterministic ordering.
-fn scan_dir(dir: &Path) -> Vec<(PathBuf, Result<ParsedMd, String>)> {
+fn scan_dir(dir: &Path, read_content: bool) -> Vec<(PathBuf, Result<ParsedMd, String>)> {
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| {
@@ -1604,9 +1686,13 @@ fn scan_dir(dir: &Path) -> Vec<(PathBuf, Result<ParsedMd, String>)> {
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
         if is_plain_file {
-            let parsed = std::fs::read_to_string(&md)
-                .map_err(|e| e.to_string())
-                .and_then(|text| parse_skill_md(&text));
+            let parsed = if read_content {
+                read_text_limited(&md, MAX_SKILL_MD_BYTES)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| parse_skill_md(&text))
+            } else {
+                Err("project skill requires trust".into())
+            };
             out.push((md, parsed));
         }
     }
@@ -1677,6 +1763,7 @@ fn build_skill(fm_body: ParsedMd, scope: SkillScope, path: PathBuf) -> Skill {
         body,
         scope,
         path,
+        package: None,
     }
 }
 
@@ -2063,6 +2150,14 @@ impl Tool for SkillSave {
 mod tests {
     use super::*;
 
+    fn trusted_store(project: PathBuf, user: Option<PathBuf>) -> SkillStore {
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let cache = project.parent().unwrap_or(&project).join("scan-cache");
+        SkillStore::new(project, user)
+            .with_project_source(Arc::new(move |_, _| Some(cache.clone())))
+    }
+
     fn tools(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
@@ -2097,7 +2192,7 @@ mod tests {
     fn disabled_skills_are_listed_but_cannot_enter_context_or_be_loaded() {
         let root = tmp();
         write_skill(&root, "deploy-fly", DEPLOY);
-        let store = SkillStore::new(root.to_path_buf(), None);
+        let store = trusted_store(root.to_path_buf(), None);
         let known = tools(&["shell.exec", "skill"]);
         assert!(store.manifest(&known, None).contains("deploy-fly"));
         store.set_enabled("deploy-fly", false).unwrap();
@@ -2142,7 +2237,7 @@ mod tests {
     fn plugin_skills_are_namespaced_read_only_and_served_as_approved() {
         let root = tmp();
         write_skill(&root, "pkg", DEPLOY);
-        let store = SkillStore::new(root.join("project"), Some(root.join("user")));
+        let store = trusted_store(root.join("project"), Some(root.join("user")));
         let source = ("dev.me.kit".to_string(), root.join("pkg"));
         let problems = store.set_plugin_skills(&[source.clone(), source.clone()]);
         assert_eq!(
@@ -2250,7 +2345,7 @@ mod tests {
             "rust-review",
             "---\nname = \"rust-review\"\ndescription = \"Review Rust\"\n---\nbody",
         );
-        let store = SkillStore::new(proj, Some(user));
+        let store = trusted_store(proj, Some(user));
         let disc = store.discover(&tools(&["shell.exec"]));
         assert_eq!(disc.effective().count(), 2); // deploy-fly (project) + rust-review (user)
         let shadowed: Vec<_> = disc.listings.iter().filter(|l| l.shadowed).collect();
@@ -2265,7 +2360,7 @@ mod tests {
         let proj = root.join("proj");
         write_skill(&proj, "good", DEPLOY);
         write_skill(&proj, "bad", "no frontmatter at all");
-        let store = SkillStore::new(proj, Some(root.join("user")));
+        let store = trusted_store(proj, Some(root.join("user")));
         let disc = store.discover(&tools(&["shell.exec"]));
         assert_eq!(disc.effective().count(), 1);
         assert_eq!(disc.errors.len(), 1);
@@ -2278,7 +2373,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         write_skill(&proj, "deploy-fly", DEPLOY);
-        let store = SkillStore::new(proj, Some(root.join("user")));
+        let store = trusted_store(proj, Some(root.join("user")));
         let known = tools(&["read", "skill"]); // shell.exec missing
         let disc = store.discover(&known);
         let l = disc.effective().next().unwrap();
@@ -2301,7 +2396,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         write_skill(&proj, "deploy-fly", DEPLOY);
-        let store = SkillStore::new(proj, Some(root.join("user")));
+        let store = trusted_store(proj, Some(root.join("user")));
         let known = tools(&["shell.exec"]);
         let v = store.load("deploy-fly", &known).unwrap();
         assert!(v["procedure"].as_str().unwrap().contains("flyctl launch"));
@@ -2315,7 +2410,7 @@ mod tests {
         let root = tmp();
         let user = root.join("user");
         std::fs::create_dir_all(&user).unwrap();
-        let store = SkillStore::new(root.join("proj"), Some(user.clone()));
+        let store = trusted_store(root.join("proj"), Some(user.clone()));
 
         // A package whose procedure hides a destructive command is refused
         // outright — and nothing lands in the skills dir.
@@ -2395,7 +2490,7 @@ mod tests {
             let root = tmp();
             let user = root.join("user");
             std::fs::create_dir_all(&user).unwrap();
-            let mut store = SkillStore::new(root.join("proj"), Some(user));
+            let mut store = trusted_store(root.join("proj"), Some(user));
             if let Some(j) = judge {
                 store = store.with_judge(j);
             }
@@ -2470,7 +2565,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&payload, permissions).unwrap();
 
-        let store = SkillStore::new(root.join("project"), Some(user.clone()))
+        let store = trusted_store(root.join("project"), Some(user.clone()))
             .with_judge(Arc::new(AlwaysSafe));
         let report =
             futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
@@ -2509,7 +2604,7 @@ mod tests {
             b"\x7fELF\x02\x01\x01\0renamed executable",
         )
         .unwrap();
-        let store = SkillStore::new(root.join("project"), Some(user.clone()));
+        let store = trusted_store(root.join("project"), Some(user.clone()));
         let error =
             futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap_err();
         assert!(error.contains("executable binary payload"), "{error}");
@@ -2529,7 +2624,7 @@ mod tests {
         .unwrap();
         std::fs::write(src.join("bundle/payload.dat"), "print('hello')").unwrap();
         std::fs::write(src.join("bundle/nested.txt"), b"PK\x03\x04archive").unwrap();
-        let store = SkillStore::new(root.join("project"), Some(root.join("user")));
+        let store = trusted_store(root.join("project"), Some(root.join("user")));
         let report =
             futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
         assert_eq!(report.scan_verdict, "caution");
@@ -2553,7 +2648,7 @@ mod tests {
         let root = tmp();
         let user = root.join("user");
         std::fs::create_dir_all(&user).unwrap();
-        let store = SkillStore::new(root.join("proj"), Some(user.clone()));
+        let store = trusted_store(root.join("proj"), Some(user.clone()));
 
         let src = root.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -2596,7 +2691,7 @@ mod tests {
     #[test]
     fn manifest_is_empty_with_no_skills() {
         let root = tmp();
-        let store = SkillStore::new(root.join("proj"), Some(root.join("user")));
+        let store = trusted_store(root.join("proj"), Some(root.join("user")));
         assert_eq!(store.manifest(&tools(&["shell.exec"]), None), "");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2610,7 +2705,7 @@ mod tests {
             "legacy",
             "---\nname: legacy\ndescription: old procedure\nrequired_tools: [fs.read, memory.write, agent.transcript, word_count]\n---\nUse the original procedure.\n",
         );
-        let store = SkillStore::new(proj, None);
+        let store = trusted_store(proj, None);
         let available = tools(&["read", "memory", "agent", "skill"]);
         let loaded = store.load("legacy", &available).unwrap();
         let migrations = loaded["tool_migrations"].as_array().unwrap();
@@ -2639,7 +2734,7 @@ mod tests {
             );
             write_skill(&proj, &format!("skill-{i}"), &body);
         }
-        let store = SkillStore::new(proj, Some(root.join("user")));
+        let store = trusted_store(proj, Some(root.join("user")));
         let m = store.manifest(&tools(&["skill"]), Some("please do kw7 now"));
         assert!(m.contains("skill-7"));
         assert!(m.contains("and 34 more — call skill without a name"));
@@ -2651,7 +2746,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         write_skill(&proj, "deploy-fly", DEPLOY);
-        let store = SkillStore::new(proj, Some(root.join("user")));
+        let store = trusted_store(proj, Some(root.join("user")));
         let index = store.list(&tools(&["shell.exec"]));
         assert_eq!(index["skills"].as_array().unwrap().len(), 1);
         assert_eq!(index["skills"][0]["name"], "deploy-fly");
@@ -2665,7 +2760,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
-        let store = SkillStore::new(proj.clone(), Some(root.join("user")));
+        let store = trusted_store(proj.clone(), Some(root.join("user")));
         let spec = SaveSpec {
             name: "my-skill".into(),
             description: "Does a thing".into(),
@@ -2691,7 +2786,7 @@ mod tests {
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         let tool = SkillSave {
-            store: Arc::new(SkillStore::new(proj.clone(), Some(root.join("user")))),
+            store: Arc::new(trusted_store(proj.clone(), Some(root.join("user")))),
             catalog: fixed_catalog(&["shell.exec", "web.search"]),
         };
 
@@ -2717,7 +2812,7 @@ mod tests {
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         let tool = SkillSave {
-            store: Arc::new(SkillStore::new(proj.clone(), Some(root.join("user")))),
+            store: Arc::new(trusted_store(proj.clone(), Some(root.join("user")))),
             catalog: fixed_catalog(&["web.search"]),
         };
 
@@ -2759,7 +2854,7 @@ mod tests {
             "first\nsecond\nthird\n",
         )
         .unwrap();
-        let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
+        let store = Arc::new(trusted_store(proj, Some(root.join("user"))));
         let tool = SkillLoad {
             store,
             catalog: fixed_catalog(&["shell.exec"]),
@@ -2810,7 +2905,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         write_skill(&proj, "deploy-fly", DEPLOY);
-        let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
+        let store = Arc::new(trusted_store(proj, Some(root.join("user"))));
         let tool = SkillList {
             store,
             catalog: fixed_catalog(&["shell.exec"]),
@@ -2825,7 +2920,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         write_skill(&proj, "deploy-fly", DEPLOY);
-        let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
+        let store = Arc::new(trusted_store(proj, Some(root.join("user"))));
         store.set_enabled("deploy-fly", false).unwrap();
         let tool = SkillList {
             store: Arc::clone(&store),
@@ -2846,7 +2941,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         write_skill(&proj, "mcp-echo", MCP_SKILL);
-        let store = Arc::new(SkillStore::new(proj.clone(), Some(root.join("user"))));
+        let store = Arc::new(trusted_store(proj.clone(), Some(root.join("user"))));
         let live = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let live_tools = {
             let live = live.clone();
@@ -2905,7 +3000,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
-        let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
+        let store = Arc::new(trusted_store(proj, Some(root.join("user"))));
         let known = Arc::new(tools(&["read"]));
         let tool = SkillSave {
             store: store.clone(),
@@ -2945,7 +3040,7 @@ mod tests {
         let root = tmp();
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
-        let store = SkillStore::new(proj, Some(root.join("user")));
+        let store = trusted_store(proj, Some(root.join("user")));
         let known = tools(&["read"]);
         let base = SaveSpec {
             name: "ok-name".into(),
@@ -3020,7 +3115,7 @@ mod tests {
         .unwrap();
         std::fs::write(src.join("references").join("notes.md"), "extra").unwrap();
 
-        let store = SkillStore::new(root.join("proj"), Some(root.join("user")));
+        let store = trusted_store(root.join("proj"), Some(root.join("user")));
         let report = futures::executor::block_on(store.install_from(src.to_str().unwrap()))
             .expect("install succeeds");
         assert_eq!(report.name, "installed-skill");
@@ -3072,7 +3167,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(src.join("stale.txt"), "old").unwrap();
-        let store = SkillStore::new(root.join("project"), Some(root.join("user")));
+        let store = trusted_store(root.join("project"), Some(root.join("user")));
         let first = futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
         assert!(!first.replaced);
 
@@ -3134,7 +3229,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("outside.txt"), "secret").unwrap();
         symlink(root.join("outside.txt"), src.join("reference.txt")).unwrap();
-        let store = SkillStore::new(root.join("project"), Some(root.join("user")));
+        let store = trusted_store(root.join("project"), Some(root.join("user")));
         let error =
             futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap_err();
         assert!(error.contains("symlink"), "{error}");

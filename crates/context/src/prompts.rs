@@ -1,6 +1,6 @@
 //! Embedded prompt registry with deployment overrides, resolved in order:
 //!   1. `$MEDHA_PROMPTS_DIR/<id>.md`         (explicit override dir)
-//!   2. `./.medha/prompts/<id>.md`           (project scope)
+//!   2. `$MEDHA_HOME/prompts/<id>.md`       (personal scope)
 //!   3. embedded default                      (shipped in the binary)
 
 use std::path::PathBuf;
@@ -84,7 +84,11 @@ fn override_dirs() -> Vec<PathBuf> {
     {
         dirs.push(PathBuf::from(d));
     }
-    dirs.push(PathBuf::from(".medha/prompts"));
+    if let Some(home) = std::env::var_os("MEDHA_HOME").filter(|home| !home.is_empty()) {
+        dirs.push(PathBuf::from(home).join("prompts"));
+    } else if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".medha/prompts"));
+    }
     dirs
 }
 

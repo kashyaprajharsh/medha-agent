@@ -88,6 +88,17 @@ fn captured_request(preset: &str) -> serde_json::Value {
     for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("MEDHA_")) {
         command.env_remove(key);
     }
+    let accepted = Command::new(env!("CARGO_BIN_EXE_medha"))
+        .args(["trust", "--yes"])
+        .current_dir(&workspace)
+        .env("MEDHA_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
     let output = command
         .arg("hii")
         .current_dir(&workspace)

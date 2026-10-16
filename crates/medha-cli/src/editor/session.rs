@@ -228,6 +228,31 @@ pub(super) async fn emit(writer: &Writer, session: &str, event: protocol::TurnEv
             )
             .await
         }
+        E::ProjectTrust { review } => {
+            let state = if review.trusted {
+                "Changed project settings were ignored"
+            } else {
+                "Project skills, prompts and language servers are disabled"
+            };
+            let settings = review
+                .settings
+                .iter()
+                .map(|setting| {
+                    format!(
+                        "{} = {}{}",
+                        setting.key,
+                        serde_json::to_string(&setting.value).expect("text serializes"),
+                        if review.ignored.contains(&setting.key) {
+                            " (ignored until accepted)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            text(writer, session, "agent_message_chunk", &format!("\n{state} for {}.\n{settings}\nRun medha trust --yes to trust it and accept these exact settings.\n", serde_json::to_string(&review.root).expect("path serializes"))).await;
+        }
         E::Error { message } => {
             text(
                 writer,
@@ -387,6 +412,7 @@ pub(super) async fn presentation(
             .await
         }
         I::Notice { text: content } => emit(writer, session, E::Notice { text: content }).await,
+        I::ProjectTrust { review } => emit(writer, session, E::ProjectTrust { review }).await,
         I::Verify { ok, summary } => emit(writer, session, E::Verify { ok, summary }).await,
         I::Compaction {
             summary: Some(summary),

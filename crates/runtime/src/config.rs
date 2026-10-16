@@ -593,8 +593,15 @@ pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
 
 /// A workspace's state only if it already has one bound to it; reading never mints an empty store.
 pub fn existing_state_dir(workspace: &std::path::Path) -> Option<PathBuf> {
+    existing_state_dir_in(&medha_home().ok()?, workspace)
+}
+
+pub(crate) fn existing_state_dir_in(
+    home: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Option<PathBuf> {
     let workspace = workspace.canonicalize().ok()?;
-    let candidate = state_dir_in(&medha_home().ok()?, &workspace);
+    let candidate = state_dir_in(home, &workspace);
     let stored = std::fs::read_to_string(candidate.join(WORKSPACE_ID_MARKER)).ok()?;
     (stored == workspace_path_identity(&workspace)).then_some(candidate)
 }
@@ -605,7 +612,10 @@ fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf 
 
 const WORKSPACE_ID_MARKER: &str = ".medha-workspace-id-v2";
 
-fn select_state_dir(home: &std::path::Path, workspace: &std::path::Path) -> Result<PathBuf> {
+pub(crate) fn select_state_dir(
+    home: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<PathBuf> {
     let projects = home.join("projects");
     std::fs::create_dir_all(&projects)
         .with_context(|| format!("creating {}", projects.display()))?;

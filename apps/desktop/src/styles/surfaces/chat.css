@@ -20,6 +20,21 @@
   color: var(--faint);
   font-size: var(--text-sm);
 }
+.project-trust {
+  margin: var(--s-4) 0;
+  padding: var(--s-4);
+  border-radius: var(--r-md);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.project-trust p { margin: var(--s-2) 0; }
+.project-trust .project-trust-title { color: var(--text); font-size: var(--text-md); font-weight: 500; margin-top: 0; }
+.project-trust-folder { display: block; color: var(--dim); overflow-wrap: anywhere; }
+.project-trust-settings { list-style: none; padding: 0; margin: var(--s-3) 0; display: grid; gap: var(--s-2); }
+.project-trust-settings li { display: grid; gap: var(--s-1); }
+.project-trust code { font-size: var(--text-xs); overflow-wrap: anywhere; }
+.project-trust-settings code { color: var(--code); white-space: pre-wrap; }
+.project-trust-actions { display: flex; flex-wrap: wrap; gap: var(--s-2); margin-top: var(--s-3); color: var(--text); }
 .more {
   display: block;
   margin: var(--s-6) auto;

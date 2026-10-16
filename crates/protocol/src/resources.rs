@@ -325,6 +325,7 @@ pub struct SessionSummary {
     deny_unknown_fields
 )]
 pub enum ReadResource {
+    ProjectTrust,
     Models,
     Pulse,
     Sessions,
@@ -343,6 +344,7 @@ pub enum ReadResource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "resource", content = "data", rename_all = "snake_case")]
 pub enum ResourceResult {
+    ProjectTrust(Option<ProjectTrustReview>),
     Models(ModelCatalogue),
     Pulse(ResourceNotice),
     Sessions(Vec<SessionSummary>),
@@ -403,6 +405,12 @@ impl Command for ChatResource {
     deny_unknown_fields
 )]
 pub enum ChangeResource {
+    TrustProject {
+        root: std::path::PathBuf,
+        folder: std::path::PathBuf,
+        fingerprint: String,
+    },
+    RevokeProjectTrust,
     SaveModel(ModelDraft),
     SetDefaultModel {
         name: String,
@@ -499,6 +507,24 @@ pub enum ChangeResource {
         event: String,
         file: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectTrustReview {
+    pub root: PathBuf,
+    pub folder: PathBuf,
+    pub trusted: bool,
+    pub fingerprint: String,
+    pub settings: Vec<ProjectTrustSetting>,
+    #[serde(default)]
+    pub ignored: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectTrustSetting {
+    pub key: String,
+    pub value: String,
+    pub effect: String,
 }
 
 impl Command for ChangeResource {

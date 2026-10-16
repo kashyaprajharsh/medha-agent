@@ -13,6 +13,8 @@ pub mod notices;
 pub mod options;
 pub mod plugin_session;
 pub mod plugin_store;
+pub mod project_session;
+pub mod project_trust;
 pub mod reasoning;
 pub mod session;
 pub mod session_mcp;

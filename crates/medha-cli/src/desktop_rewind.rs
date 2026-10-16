@@ -103,6 +103,7 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
             .first()
             .cloned()
             .unwrap_or_else(|| Message::system(""));
+        let mut updated_memory = None;
         if let Some(memory) = &resources.memory {
             let fork_events = kernel
                 .log
@@ -123,12 +124,17 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
                 resources.memory_stale_days,
             )
             .map_err(|e| e.to_string())?;
-            system.content = memory::recall::replace_k3(&system.content, &block);
+            updated_memory = Some(block);
         }
         if agents.is_some_and(|control| !control.adopt(id)) {
             return Err(
                 "The rewind branch was saved, but an agent prevented switching to it".into(),
             );
+        }
+        if let Some(block) = updated_memory {
+            system.content = kernel
+                .refresh_memory(&block)
+                .unwrap_or_else(|| memory::recall::replace_k3(&system.content, &block));
         }
         transcript.clear();
         transcript.push(system);

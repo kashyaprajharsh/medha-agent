@@ -46,7 +46,8 @@ fn check(folder: &Path) {
 fn every_editor_module_uses_the_backend_for_application_work() {
     let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
     check(&cli.join("src/editor"));
-    let main = std::fs::read_to_string(cli.join("src/main.rs")).unwrap();
+    let source = std::fs::read_to_string(cli.join("src/main.rs")).unwrap();
+    let main = &source[source.find("async fn main()").unwrap()..];
     let client = main.find("return editor::run").unwrap();
     let native = main
         .find("let lock = runtime::workspace::load_lock")
@@ -63,7 +64,8 @@ fn every_editor_module_uses_the_backend_for_application_work() {
 fn every_terminal_module_uses_the_backend_for_application_work() {
     let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
     check(&cli.join("src/tui_tea"));
-    let main = std::fs::read_to_string(cli.join("src/main.rs")).unwrap();
+    let source = std::fs::read_to_string(cli.join("src/main.rs")).unwrap();
+    let main = &source[source.find("async fn main()").unwrap()..];
     let client = main.find("return tui_tea::backend_ui::run").unwrap();
     let native = main
         .find("let workspace_home = runtime::Workspace::open")

@@ -350,7 +350,7 @@ impl Chats for ServeChats {
             options.mcp_host = Some(host);
             let workspace = opened(&folders, &folder, noted.as_ref())?;
             let lock = runtime::workspace::load_lock(&folder, noted.as_ref()).map_err(failed)?;
-            let choices = Choices::of(&lock, &options).map_err(failed)?;
+            let choices = Choices::of(&lock, &options, &workspace.root).map_err(failed)?;
             Ok((folder, options, workspace, lock, choices))
         })
         .await?;

@@ -68,7 +68,7 @@ impl MedhaLock {
         if !dropped.is_empty() {
             note(
                 "policy.approve",
-                format!("drops {dropped:?}"),
+                format!("{:?}", self.policy.approve),
                 "stops these tools asking before they run",
             );
         }
@@ -115,7 +115,7 @@ impl MedhaLock {
                 "selects the remote directory in which commands run",
             ),
         ] {
-            if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
                 note(key, value.to_string(), effect);
             }
         }
@@ -123,8 +123,7 @@ impl MedhaLock {
             .verify
             .command
             .as_deref()
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
+            .filter(|command| !command.trim().is_empty())
         {
             note(
                 "verify.command",
@@ -132,7 +131,74 @@ impl MedhaLock {
                 "runs this shell command after local-effect turns",
             );
         }
+        if self.memory.write_approval == "none" {
+            note(
+                "memory.write_approval",
+                self.memory.write_approval.clone(),
+                "allows personal memory writes without approval",
+            );
+        }
+        if self.lsp.allow_network {
+            note(
+                "lsp.allow_network",
+                "true".into(),
+                "allows language servers to reach the network",
+            );
+        }
+        if !self.lsp.servers.is_empty() {
+            note(
+                "lsp.servers",
+                toml::Value::try_from(&self.lsp.servers)
+                    .expect("LSP servers serialize")
+                    .to_string(),
+                "provides language-server commands or executable project settings",
+            );
+        }
+        for (key, value) in [
+            ("pricing.input_per_mtok", self.pricing.input_per_mtok),
+            ("pricing.output_per_mtok", self.pricing.output_per_mtok),
+            (
+                "pricing.cached_input_per_mtok",
+                self.pricing.cached_input_per_mtok,
+            ),
+            (
+                "pricing.cache_write_per_mtok",
+                self.pricing.cache_write_per_mtok,
+            ),
+        ] {
+            if let Some(value) = value {
+                note(key, value.to_string(), "changes the cost meter's rates");
+            }
+        }
         found
+    }
+
+    pub fn legacy_risky_settings(&self) -> Vec<RiskySetting> {
+        self.risky_settings()
+            .into_iter()
+            .filter_map(|mut setting| {
+                if setting.key.starts_with("pricing.")
+                    || setting.key.starts_with("lsp.")
+                    || setting.key == "memory.write_approval"
+                {
+                    return None;
+                }
+                if setting.key == "policy.approve" {
+                    setting.value = format!("drops {:?}", dropped_approvals(&self.policy.approve));
+                }
+                if matches!(
+                    setting.key.as_str(),
+                    "sandbox.image"
+                        | "sandbox.runtime"
+                        | "sandbox.host"
+                        | "sandbox.remote_dir"
+                        | "verify.command"
+                ) {
+                    setting.value = setting.value.trim().to_owned();
+                }
+                Some(setting)
+            })
+            .collect()
     }
 
     /// A copy with every privilege-relaxing setting returned to its default.
@@ -157,6 +223,59 @@ impl MedhaLock {
         safe.sandbox.host = None;
         safe.sandbox.remote_dir = None;
         safe.verify.command = None;
+        if safe.memory.write_approval == "none" {
+            safe.memory.write_approval = crate::MemoryConfig::default().write_approval;
+        }
+        safe.lsp.allow_network = false;
+        safe.lsp.servers.clear();
+        safe.pricing = crate::PricingConfig::default();
+        safe
+    }
+
+    pub fn with_accepted_settings(&self, accepted: &[RiskySetting]) -> Self {
+        let mut safe = self.without_risky_settings();
+        for setting in self
+            .risky_settings()
+            .iter()
+            .filter(|setting| accepted.contains(setting))
+        {
+            match setting.key.as_str() {
+                "policy.autonomy" => safe.policy.autonomy.clone_from(&self.policy.autonomy),
+                "policy.approve" => safe.policy.approve.clone_from(&self.policy.approve),
+                "sandbox.backend" => safe.sandbox.backend.clone_from(&self.sandbox.backend),
+                "sandbox.network" => safe.sandbox.network.clone_from(&self.sandbox.network),
+                "sandbox.extra_writable" => safe
+                    .sandbox
+                    .extra_writable
+                    .clone_from(&self.sandbox.extra_writable),
+                "sandbox.image" => safe.sandbox.image.clone_from(&self.sandbox.image),
+                "sandbox.runtime" => safe.sandbox.runtime.clone_from(&self.sandbox.runtime),
+                "sandbox.host" => safe.sandbox.host.clone_from(&self.sandbox.host),
+                "sandbox.remote_dir" => {
+                    safe.sandbox.remote_dir.clone_from(&self.sandbox.remote_dir)
+                }
+                "verify.command" => safe.verify.command.clone_from(&self.verify.command),
+                "memory.write_approval" => safe
+                    .memory
+                    .write_approval
+                    .clone_from(&self.memory.write_approval),
+                "lsp.allow_network" => safe.lsp.allow_network = self.lsp.allow_network,
+                "lsp.servers" => safe.lsp.servers.clone_from(&self.lsp.servers),
+                "pricing.input_per_mtok" => {
+                    safe.pricing.input_per_mtok = self.pricing.input_per_mtok
+                }
+                "pricing.output_per_mtok" => {
+                    safe.pricing.output_per_mtok = self.pricing.output_per_mtok
+                }
+                "pricing.cached_input_per_mtok" => {
+                    safe.pricing.cached_input_per_mtok = self.pricing.cached_input_per_mtok
+                }
+                "pricing.cache_write_per_mtok" => {
+                    safe.pricing.cache_write_per_mtok = self.pricing.cache_write_per_mtok
+                }
+                _ => {}
+            }
+        }
         safe
     }
 }

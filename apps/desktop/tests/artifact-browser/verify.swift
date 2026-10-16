@@ -9,8 +9,11 @@ final class Probe: NSObject, WKNavigationDelegate {
     var evaluating = false
     var timer: Timer?
     let started = Date()
+    var trustFixture = false
+    var darkBackground: String?
 
     func start(_ url: URL) {
+        trustFixture = url.lastPathComponent == "trust.html"
         web.navigationDelegate = self
         web.load(URLRequest(url: url))
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [self] _ in
@@ -18,6 +21,10 @@ final class Probe: NSObject, WKNavigationDelegate {
             evaluating = true
             web.evaluateJavaScript("JSON.stringify(window.fixtureReport?.())") { [self] value, error in
                 evaluating = false
+                if trustFixture {
+                    checkTrust(value, error)
+                    return
+                }
                 if let text = value as? String, let data = text.data(using: .utf8),
                    let report = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                    let checks = report["checks"] as? [[String: Any]], checks.count == 8,
@@ -77,11 +84,59 @@ final class Probe: NSObject, WKNavigationDelegate {
             }
         }
     }
+    func checkTrust(_ value: Any?, _ error: Error?) {
+        guard let text = value as? String, let data = text.data(using: .utf8), error == nil,
+              let report = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              report["fontsLoaded"] as? Bool == true,
+              let cards = report["cards"] as? [[String: Any]], cards.count == 2 else {
+            if Date().timeIntervalSince(started) > 60 { print("Trust fixture timeout: \(value ?? "none")"); exit(8) }
+            return
+        }
+        guard report["dialogs"] as? Int == 0, cards.allSatisfy({ card in
+            (card["width"] as? Double ?? 0) >= 650 && (card["width"] as? Double ?? 0) <= 704 &&
+            (card["height"] as? Double ?? 0) > 100 && card["font"] as? String == "15px" &&
+            card["buttons"] as? Int == 2 && card["overflow"] as? Bool == false
+        }) else { print("Invalid trust notice: " + text); exit(9) }
+        let theme = report["theme"] as? String ?? "dark"
+        let background = cards[0]["background"] as? String ?? ""
+        if let previous = darkBackground, previous == background { print("Trust theme did not change"); exit(10) }
+        evaluating = true
+        let finish = { [self] in
+            print("WebKit \(theme): two production trust notices at 704 CSS pixels, 15px title, no overflow or dialogs.")
+            if darkBackground == nil {
+                darkBackground = background
+                web.evaluateJavaScript("document.documentElement.dataset.theme = 'light'") { _, _ in self.evaluating = false }
+            } else { timer?.invalidate(); exit(0) }
+        }
+        guard CommandLine.arguments.count == 3 else { finish(); return }
+        let directory = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+        do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        catch { print("Cannot create screenshot directory: \(error)"); exit(11) }
+        saveTrustCard(cards, index: 0, theme: theme, directory: directory, finish: finish)
+    }
+
+    func saveTrustCard(_ cards: [[String: Any]], index: Int, theme: String, directory: URL, finish: @escaping () -> Void) {
+        guard index < cards.count else { finish(); return }
+        let card = cards[index]
+        let config = WKSnapshotConfiguration()
+        config.rect = CGRect(x: card["x"] as? Double ?? 0, y: card["y"] as? Double ?? 0,
+                             width: card["width"] as? Double ?? 0, height: card["height"] as? Double ?? 0)
+        config.snapshotWidth = NSNumber(value: (card["width"] as? Double ?? 0) / (NSScreen.main?.backingScaleFactor ?? 1))
+        web.takeSnapshot(with: config) { [self] image, error in
+            guard error == nil, let tiff = image?.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
+                  let bytes = bitmap.representation(using: .png, properties: [:]), let state = card["state"] as? String else {
+                print("Cannot capture trust notice: \(String(describing: error))"); exit(12)
+            }
+            do { try bytes.write(to: directory.appendingPathComponent("\(theme)-\(state).png")) }
+            catch { print("Cannot save trust notice: \(error)"); exit(13) }
+            saveTrustCard(cards, index: index + 1, theme: theme, directory: directory, finish: finish)
+        }
+    }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         print("Artifact fixture navigation failed: \(error)"); exit(4)
     }
 }
-guard CommandLine.arguments.count == 2, let url = URL(string: CommandLine.arguments[1]) else { exit(5) }
+guard (2...3).contains(CommandLine.arguments.count), let url = URL(string: CommandLine.arguments[1]) else { exit(5) }
 NSApplication.shared.setActivationPolicy(.prohibited)
 let probe = Probe()
 probe.start(url)

@@ -8,6 +8,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PresentationItem {
+    ProjectTrust {
+        review: super::ProjectTrustReview,
+    },
     User {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

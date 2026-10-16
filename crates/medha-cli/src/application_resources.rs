@@ -140,7 +140,8 @@ fn skill_store(workspace: &Path) -> Result<tools::SkillStore, String> {
     Ok(tools::SkillStore::new(
         workspace.join(".medha/skills"),
         Some(config::user_skills_dir().map_err(|error| error.to_string())?),
-    ))
+    )
+    .with_project_source(runtime::project_trust::skill_source()))
 }
 
 pub(crate) fn skills(
@@ -362,6 +363,20 @@ pub(crate) async fn read<L: EventLog>(
     known: &HashSet<String>,
 ) -> Result<Reply, String> {
     Ok(match request {
+        Read::ProjectTrust => {
+            let review = runtime::project_trust::ProjectTrust::for_folder(workspace)
+                .map_err(|error| error.to_string())?
+                .map(|trust| trust.review(workspace))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            Reply::ProjectTrust(
+                review
+                    .map(|review| {
+                        decoded(serde_json::to_value(review).expect("trust review serializes"))
+                    })
+                    .transpose()?,
+            )
+        }
         Read::Models => Reply::Models(models()?),
         Read::Pulse => {
             let cfg = config::load().map_err(|e| e.to_string())?;
@@ -491,6 +506,29 @@ pub(crate) async fn read<L: EventLog>(
 
 pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, String> {
     let (method, params) = match action {
+        Change::TrustProject {
+            root,
+            folder,
+            fingerprint,
+        } => {
+            let trust = runtime::project_trust::ProjectTrust::for_folder(workspace)
+                .map_err(|error| error.to_string())?
+                .ok_or("The home folder is not a project.")?;
+            trust
+                .accept_for(workspace, &root, &folder, fingerprint)
+                .map_err(|error| error.to_string())?;
+            return Ok(Reply::Changed(protocol::ResourceNotice {
+                messages: vec![
+                    "Project trusted. Its approved settings apply from the next message.".into(),
+                ],
+            }));
+        }
+        Change::RevokeProjectTrust => {
+            runtime::project_trust::revoke_live(workspace)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(Reply::Changed(protocol::ResourceNotice { messages: vec!["Project trust revoked. Local language servers stopped; other processes stop theirs at next use. Open chats follow the change from their next message.".into()] }));
+        }
         Change::SaveModel(draft) => {
             let profile = draft_profile(&draft)?;
             config::deployment_credential(&profile, draft.key.as_ref().map(|key| key.0.as_str()))

@@ -1,4 +1,5 @@
 import type { ArtifactRevision, LiveFrame, MessageImage, SessionSettings, ToolScreen } from "./api";
+import type { ProjectTrustReview } from "./ProjectTrustNotice";
 
 /** What may be answered to an approval, as the backend names each answer. */
 export type ApprovalChoice =
@@ -117,6 +118,7 @@ export type LiveState = {
   /** `tool`: the model has named a tool and is still writing its call, which can take minutes for a large file. */
   activity?: { kind: "compacting" | "model" | "tool"; started: number; tool?: string; target?: string };
   notice?: string;
+  projectTrust?: ProjectTrustReview;
   error?: string;
   settled: number;
   // Messages a stopped or failed turn never read, waiting for the composer.
@@ -410,6 +412,8 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
     }
     case "notice":
       return { ...state, notice: str(params.text) };
+    case "project.trust":
+      return { ...state, projectTrust: params.review as ProjectTrustReview };
     case "model.text": {
       const delta = str(params.delta) ?? "";
       const html = str(params.html);

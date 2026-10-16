@@ -359,6 +359,17 @@ impl ContextEngine for PipelineEngine {
         Some(Arc::new(self.forked()))
     }
 
+    fn fork_with_summary_prompt(
+        &self,
+        prompt: Arc<kernel::context::SummaryPrompt>,
+    ) -> Option<Arc<dyn ContextEngine>> {
+        let mut fork = self.forked();
+        if let Some(summarizer) = self.summarizer.with_prompt(prompt) {
+            fork.summarizer = summarizer;
+        }
+        Some(Arc::new(fork))
+    }
+
     fn update_usage(&self, prompt_tokens: u32, _total_tokens: u32) {
         // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens

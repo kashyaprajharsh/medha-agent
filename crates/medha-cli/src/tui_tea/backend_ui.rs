@@ -45,6 +45,35 @@ pub(super) struct Peer {
     questions: VecDeque<protocol::QuestionPrompt>,
 }
 
+pub(super) fn trust_notice(review: &protocol::ProjectTrustReview) -> String {
+    let settings = review
+        .settings
+        .iter()
+        .map(|setting| {
+            format!(
+                "{} = {}{}",
+                setting.key,
+                serde_json::to_string(&setting.value).expect("text serializes"),
+                if review.ignored.contains(&setting.key) {
+                    " (ignored until accepted)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state = if review.trusted {
+        "Changed project settings were ignored"
+    } else {
+        "Project skills, prompts and language servers are disabled"
+    };
+    format!(
+        "{state} for {}.\n{settings}\n/trust accepts this checkout and these exact settings; /trust --revoke removes them.",
+        serde_json::to_string(&review.root).expect("path serializes")
+    )
+}
+
 struct Pending {
     effect: Effect,
     form: Option<u64>,
@@ -53,6 +82,7 @@ struct Pending {
 
 #[derive(Clone)]
 pub(super) enum After {
+    Trust,
     Startup,
     Notice,
     Models,
@@ -902,6 +932,7 @@ pub(super) fn item(item: protocol::PresentationItem) -> Item {
         P::Assistant { text, .. } => Item::Assistant(text),
         P::Reasoning { text } => Item::Thinking(text),
         P::Notice { text } => Item::Notice(text),
+        P::ProjectTrust { review } => Item::Notice(trust_notice(&review)),
         P::ToolCall { id, tool, args } => Item::ToolCall { id, tool, args },
         P::ToolResult {
             id,
@@ -1378,6 +1409,7 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
         }
         E::Reasoning { delta } => model.push_thinking_delta(&delta),
         E::Notice { text } => model.push_main_notice(text),
+        E::ProjectTrust { review } => model.push_main_notice(trust_notice(&review)),
         E::ToolStarted { tool, target } => model.current_tool = Some((tool, target)),
         E::ToolCall { id, tool, args } => model.push_main_item(Item::ToolCall { id, tool, args }),
         E::ToolResult {

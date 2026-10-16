@@ -89,6 +89,12 @@ pub enum SummarizeError {
 /// model; `ExtractiveSummarizer` is the deterministic offline fallback.
 #[async_trait]
 pub trait Summarizer: Send + Sync {
+    fn with_prompt(
+        &self,
+        _: std::sync::Arc<kernel::context::SummaryPrompt>,
+    ) -> Option<std::sync::Arc<dyn Summarizer>> {
+        None
+    }
     fn time_limit(&self) -> std::time::Duration {
         std::time::Duration::from_secs(60)
     }
@@ -299,6 +305,7 @@ pub struct LlmSummarizer<P: kernel::Provider> {
     provider: std::sync::Arc<P>,
     replay: bool,
     output_limit: Option<u64>,
+    prompt: Option<std::sync::Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 const MAX_SUMMARY_INPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -321,6 +328,7 @@ impl<P: kernel::Provider> LlmSummarizer<P> {
             provider,
             replay: true,
             output_limit: None,
+            prompt: None,
         }
     }
 
@@ -328,6 +336,17 @@ impl<P: kernel::Provider> LlmSummarizer<P> {
     pub fn with_replay(mut self, replay: bool) -> Self {
         self.replay = replay;
         self
+    }
+
+    pub fn with_prompt(mut self, prompt: std::sync::Arc<dyn Fn() -> String + Send + Sync>) -> Self {
+        self.prompt = Some(prompt);
+        self
+    }
+
+    fn prompt(&self) -> String {
+        self.prompt
+            .as_ref()
+            .map_or_else(crate::prompts::compaction_summary, |prompt| prompt())
     }
 }
 
@@ -347,8 +366,13 @@ fn length_target(output_cap: u64) -> String {
 /// The trailing instruction appended after a replayed prefix. `anchor` opens the
 /// last message to summarize; without one the whole replay is in scope, which
 /// re-covers the verbatim tail rather than risking a short summary.
-fn replay_instruction(previous: Option<&str>, anchor: Option<&str>, output_cap: u64) -> String {
-    let base = crate::prompts::compaction_summary() + &length_target(output_cap);
+fn replay_instruction(
+    previous: Option<&str>,
+    anchor: Option<&str>,
+    output_cap: u64,
+    prompt: &str,
+) -> String {
+    let base = prompt.to_owned() + &length_target(output_cap);
     let prev = previous.map_or_else(String::new, |prev| {
         let prev = kernel::provenance::boundary(prev, kernel::TrustLabel::Tool);
         format!("\n\n=== previous summary (update it) ===\n{prev}")
@@ -639,6 +663,17 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
 
 #[async_trait]
 impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
+    fn with_prompt(
+        &self,
+        prompt: std::sync::Arc<kernel::context::SummaryPrompt>,
+    ) -> Option<std::sync::Arc<dyn Summarizer>> {
+        Some(std::sync::Arc::new(Self {
+            provider: self.provider.clone(),
+            replay: self.replay,
+            output_limit: self.output_limit,
+            prompt: Some(prompt),
+        }))
+    }
     fn time_limit(&self) -> std::time::Duration {
         std::time::Duration::from_secs(300)
     }
@@ -658,6 +693,7 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             provider: self.provider.clone(),
             replay: self.replay,
             output_limit: Some(u64::from(output_tokens)),
+            prompt: self.prompt.clone(),
         };
         match sent {
             Some(sent) => {
@@ -680,7 +716,7 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
         let ctx = CompiledContext {
             model: String::new(),
             messages: vec![
-                Message::system(crate::prompts::compaction_summary() + &length_target(output_cap)),
+                Message::system(self.prompt() + &length_target(output_cap)),
                 Message::user(Self::blob(previous, items)?),
             ],
             ordered: None,
@@ -722,7 +758,12 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             ));
         }
         let output_cap = self.output_cap(previous, items);
-        let instruction = kernel::Message::user(replay_instruction(previous, anchor, output_cap));
+        let instruction = kernel::Message::user(replay_instruction(
+            previous,
+            anchor,
+            output_cap,
+            &self.prompt(),
+        ));
         let mut ctx = sent.clone();
         if let Some(ordered) = ctx.ordered.as_mut() {
             ordered.push(instruction.ordered());

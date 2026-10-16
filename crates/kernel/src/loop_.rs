@@ -187,6 +187,14 @@ fn attach_discovered_context(
     }
 }
 
+fn relayed_source(base: TrustLabel, source: TrustLabel) -> TrustLabel {
+    if base == TrustLabel::Tool && source == TrustLabel::Skill {
+        source
+    } else {
+        base.min(source)
+    }
+}
+
 fn successful_observed_path(observation: &Observation) -> Option<&std::path::Path> {
     if !matches!(observation.status, crate::types::ObsStatus::Ok) {
         return None;
@@ -512,8 +520,9 @@ pub struct Kernel<P: Provider, L: EventLog> {
     /// The longest image side, in pixels, this server is known to take.
     image_side: std::sync::atomic::AtomicU32,
     /// Stored results that came from outside; reading one back is outside text too.
-    outside_stored: std::sync::Mutex<std::collections::HashSet<String>>,
+    outside_stored: std::sync::Mutex<std::collections::HashMap<String, TrustLabel>>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
+    request_context: Option<Arc<dyn crate::context::RequestContext>>,
     max_parallel_tools: usize,
     /// Times a turn waits for a server that is away, after all else is used up.
     server_waits: u32,
@@ -742,6 +751,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
             progressive_context: None,
+            request_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             server_waits: crate::recovery::WAITS,
             result_limits: (None, None),
@@ -783,6 +793,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
             progressive_context: self.progressive_context.clone(),
+            request_context: self.request_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
             server_waits: self.server_waits,
             result_limits: self.result_limits,
@@ -837,7 +848,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     fn price(&self) -> Option<crate::types::Pricing> {
         let own_model = self.priced_model.as_deref() == Some(&*self.provider.context_identity());
         let own = self.pricing.filter(|_| own_model);
-        own.or_else(|| self.provider.list_price())
+        let default = own.or_else(|| self.provider.list_price());
+        if own_model {
+            self.request_context
+                .as_ref()
+                .map_or(default, |context| context.pricing(default))
+        } else {
+            default
+        }
     }
 
     /// Set the operator's own rate, so the governor meters real dollars. It is
@@ -845,6 +863,44 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
         self.priced_model = pricing.map(|_| self.provider.context_identity());
         self.pricing = pricing;
+        self
+    }
+
+    pub fn with_request_context(
+        mut self,
+        context: Arc<dyn crate::context::RequestContext>,
+    ) -> Self {
+        self.priced_model = Some(self.provider.context_identity());
+        self.request_context = Some(context);
+        self
+    }
+
+    pub fn refresh_memory(&self, memory: &str) -> Option<String> {
+        self.request_context.as_ref()?.refresh_memory(memory)
+    }
+
+    pub fn with_child_context(mut self, workspace: Option<&std::path::Path>) -> Self {
+        if let Some(context) = self.request_context.as_ref().and_then(|context| {
+            context.fork(
+                workspace,
+                self.executor
+                    .specs()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect(),
+            )
+        }) {
+            if let Some(policy) = context.policy() {
+                self.policy = policy;
+            }
+            let summary = context.clone();
+            if let Some(engine) = self.context.fork_with_summary_prompt(Arc::new(move || {
+                summary.summary_prompt().unwrap_or_default()
+            })) {
+                self.context = engine;
+            }
+            self.request_context = Some(context);
+        }
         self
     }
 
@@ -1304,11 +1360,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         };
         let mut trust = obs
             .relayed_trust
-            .map_or(trust, |relayed| trust.min(relayed));
+            .map_or(trust, |relayed| relayed_source(trust, relayed));
         // A result naming a stored output that came from outside is that text again.
         let read_back = obs.payload.get("hash").and_then(serde_json::Value::as_str);
-        if read_back.is_some_and(|hash| self.outside_stored.lock().unwrap().contains(hash)) {
-            trust = TrustLabel::Web;
+        if let Some(relayed) =
+            read_back.and_then(|hash| self.outside_stored.lock().unwrap().get(hash).copied())
+        {
+            trust = relayed_source(trust, relayed);
         }
         // The model reads its result, so it also reads what Medha changed in
         // the call, and can send the right types itself next time.
@@ -1349,8 +1407,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut event = Event::observed_tool(session, &obs, trust, &tool);
         if let Some(hash) = &stored {
             event.payload["stored"] = serde_json::json!(hash);
-            if trust.rank() < TrustLabel::Tool.rank() {
-                self.outside_stored.lock().unwrap().insert(hash.clone());
+            if trust == TrustLabel::Skill || trust.rank() < TrustLabel::Tool.rank() {
+                self.outside_stored
+                    .lock()
+                    .unwrap()
+                    .entry(hash.clone())
+                    .and_modify(|label| *label = label.min(trust))
+                    .or_insert(trust);
             }
         }
         let event = self.log.append(event).await?;
@@ -1481,6 +1544,25 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             self.log.append(event).await?;
         }
         outcome
+    }
+
+    async fn begin_context_message(
+        &self,
+        session: &Session,
+        events: &mut Vec<Event>,
+        sink: &dyn StreamSink,
+    ) -> Result<(), KernelError> {
+        if let Some(context) = &self.request_context {
+            for (key, review) in context.begin_message(events, sink) {
+                let event = self
+                    .log
+                    .append(Event::project_trust_notice(session, key, review))
+                    .await?;
+                sink.project_trust(&event.payload["review"]);
+                events.push(event);
+            }
+        }
+        Ok(())
     }
 
     async fn run_session_inner(
@@ -1661,12 +1743,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
         let mut logged_events = self.log.checked_events(session.id).await?;
-        self.outside_stored.lock().unwrap().extend(
-            logged_events
-                .iter()
-                .filter(|event| event.trust.rank() < TrustLabel::Tool.rank())
-                .filter_map(|event| event.payload["stored"].as_str().map(str::to_owned)),
-        );
+        self.begin_context_message(session, &mut logged_events, sink)
+            .await?;
+        {
+            let mut stored = self.outside_stored.lock().unwrap();
+            for event in logged_events.iter().filter(|event| {
+                event.trust == TrustLabel::Skill || event.trust.rank() < TrustLabel::Tool.rank()
+            }) {
+                if let Some(hash) = event.payload["stored"].as_str() {
+                    stored
+                        .entry(hash.to_owned())
+                        .and_modify(|label| *label = label.min(event.trust))
+                        .or_insert(event.trust);
+                }
+            }
+        }
         tracing::info!(
             elapsed_ms = history_started.elapsed().as_millis() as u64,
             "session history prepared"
@@ -1739,12 +1830,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 if q.cancel_requested() {
                     return self.finish_interrupted(session, messages, q, sink).await;
                 }
+                let mut person_steered = false;
                 for (s, trust) in q.drain_steers() {
                     let e = self
                         .log
                         .append(Event::user_input(session, &s, trust))
                         .await?;
                     if trust == TrustLabel::User {
+                        person_steered = true;
                         window_events.clear();
                         window_taint = trust;
                     } else {
@@ -1769,6 +1862,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     ordered_messages.push(message.ordered());
                     messages.push(message);
+                }
+                if person_steered {
+                    self.begin_context_message(session, &mut logged_events, sink)
+                        .await?;
                 }
             }
 
@@ -1799,6 +1896,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let mut tool_call_corrections = 0;
             let mut compaction_passes = 0u32;
             let (turn, request_tools) = 'model_call: loop {
+                if let Some(refresh) = &self.request_context
+                    && let Some(index) = messages
+                        .iter()
+                        .position(|message| message.role == Role::System)
+                {
+                    let system = &mut messages[index];
+                    system.content = refresh.refresh(&system.content, sink);
+                    ordered_messages[index] = system.ordered();
+                }
                 let (prepared, prepared_input_tokens, reserved_output_tokens) = loop {
                     let limits = self.provider.model_limits();
                     let input_limit = limits

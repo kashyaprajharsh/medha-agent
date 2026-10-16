@@ -375,6 +375,7 @@ struct ReaderState {
 }
 
 struct ClientEntry {
+    configuration: String,
     cell: ClientCell,
     created_at: Instant,
     last_used: Instant,
@@ -507,6 +508,8 @@ impl Default for Config {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("project language servers are disabled until the checkout is trusted")]
+    ProjectUntrusted,
     #[error("LSP is disabled")]
     Disabled,
     #[error("path is outside the workspace: {0}")]
@@ -757,12 +760,73 @@ pub struct LspManager {
 }
 
 struct ManagerInner {
+    lifecycle: tokio::sync::RwLock<()>,
+    starting: StdMutex<CancellationToken>,
     workspace: PathBuf,
     config: Config,
     clients: Mutex<HashMap<ClientKey, ClientEntry>>,
     approved_servers: Mutex<HashSet<ClientKey>>,
     reaper_started: AtomicBool,
     cancel: CancellationToken,
+    project_config: Option<Arc<ProjectConfig>>,
+}
+
+type ProjectConfig = dyn Fn(&Path) -> Option<Config> + Send + Sync;
+
+#[cfg(test)]
+#[path = "project_trust_tests.rs"]
+mod project_trust_tests;
+
+pub fn would_start_in(folder: &Path, config: &Config) -> bool {
+    if !config.enabled {
+        return false;
+    }
+    let manager = LspManager::new(folder.to_path_buf(), config.clone());
+    let extensions = manager
+        .inventory()
+        .into_iter()
+        .filter(|server| server.installed)
+        .flat_map(|server| server.extensions)
+        .collect::<HashSet<_>>();
+    if extensions.is_empty() {
+        return false;
+    }
+    let mut pending = vec![(folder.to_path_buf(), 0)];
+    let mut remaining = 4096usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if remaining == 0 {
+                return false;
+            }
+            remaining -= 1;
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extensions.contains(extension))
+            {
+                return true;
+            }
+            if kind.is_dir()
+                && depth < 16
+                && !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | ".medha" | "target" | "node_modules" | "dist")
+                )
+                && std::fs::symlink_metadata(path.join(".git")).is_err()
+            {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    false
 }
 
 impl Drop for ManagerInner {
@@ -780,18 +844,47 @@ impl LspManager {
     pub fn new(workspace: PathBuf, config: Config) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
+                lifecycle: tokio::sync::RwLock::new(()),
+                starting: StdMutex::new(CancellationToken::new()),
                 workspace: normalize_path(&workspace),
                 config,
                 clients: Mutex::new(HashMap::new()),
                 approved_servers: Mutex::new(HashSet::new()),
                 reaper_started: AtomicBool::new(false),
                 cancel: CancellationToken::new(),
+                project_config: None,
             }),
         }
     }
 
+    pub fn with_project_config(mut self, config: Arc<ProjectConfig>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configure LSP before sharing it")
+            .project_config = Some(config);
+        self
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.inner.workspace
+    }
+
+    fn current_config(&self, folder: &Path) -> Result<Config, Error> {
+        match &self.inner.project_config {
+            Some(config) => config(folder).ok_or(Error::ProjectUntrusted),
+            None => Ok(self.inner.config.clone()),
+        }
+    }
+
+    async fn enforce_project_trust(&self) -> Result<(), Error> {
+        if let Err(error) = self.current_config(&self.inner.workspace) {
+            self.stop_all().await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn supports(&self, path: impl AsRef<Path>) -> bool {
-        self.supports_path(path.as_ref())
+        self.supports_path(&normalize_path_from(&self.inner.workspace, path.as_ref()))
     }
 
     pub fn start_preview(&self, path: impl AsRef<Path>) -> Result<ServerStartPreview, Error> {
@@ -822,6 +915,7 @@ impl LspManager {
         path: impl AsRef<Path>,
         server_id: Option<&str>,
     ) -> Result<ServerStatus, Error> {
+        self.enforce_project_trust().await?;
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
         let (adapter, root, key) = self.resolve_start_server(&path, server_id)?;
         self.inner.approved_servers.lock().await.insert(key.clone());
@@ -862,6 +956,12 @@ impl LspManager {
     /// Return diagnostics produced after synchronizing the current file text.
     pub async fn diagnostics(&self, path: impl AsRef<Path>) -> DiagnosticReport {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
+        if let Err(error) = self.enforce_project_trust().await {
+            return DiagnosticReport::Unavailable {
+                path,
+                reason: error.to_string(),
+            };
+        }
         if !self.inner.config.enabled {
             return DiagnosticReport::Unavailable {
                 path,
@@ -909,6 +1009,7 @@ impl LspManager {
         text: String,
     ) -> Option<DiagnosticBaseline> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
+        self.enforce_project_trust().await.ok()?;
         if !self.inner.config.enabled || !self.supports_path(&path) {
             return None;
         }
@@ -937,6 +1038,12 @@ impl LspManager {
         baseline: Option<DiagnosticBaseline>,
     ) -> DiagnosticReport {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
+        if let Err(error) = self.enforce_project_trust().await {
+            return DiagnosticReport::Unavailable {
+                path,
+                reason: error.to_string(),
+            };
+        }
         if !self.inner.config.enabled {
             return DiagnosticReport::Unavailable {
                 path,
@@ -1000,7 +1107,7 @@ impl LspManager {
         position: Position,
     ) -> QueryReport<Location> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
-        if let Some(report) = self.unsupported_or_disabled(&path) {
+        if let Some(report) = self.unsupported_or_disabled(&path).await {
             return report;
         }
         let results = self
@@ -1024,7 +1131,7 @@ impl LspManager {
         include_declaration: bool,
     ) -> QueryReport<Location> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
-        if let Some(report) = self.unsupported_or_disabled(&path) {
+        if let Some(report) = self.unsupported_or_disabled(&path).await {
             return report;
         }
         let results = self
@@ -1047,7 +1154,7 @@ impl LspManager {
 
     pub async fn hover(&self, path: impl AsRef<Path>, position: Position) -> QueryReport<Hover> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
-        if let Some(report) = self.unsupported_or_disabled(&path) {
+        if let Some(report) = self.unsupported_or_disabled(&path).await {
             return report;
         }
         let results = self
@@ -1070,6 +1177,9 @@ impl LspManager {
         query: &str,
     ) -> QueryReport<Symbol> {
         let path = normalize_path_from(&self.inner.workspace, context_path.as_ref());
+        if let Err(error) = self.enforce_project_trust().await {
+            return unavailable_query(error);
+        }
         if !self.inner.config.enabled {
             return unavailable_query(Error::Disabled);
         }
@@ -1096,7 +1206,7 @@ impl LspManager {
         position: Position,
     ) -> QueryReport<Location> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
-        if let Some(report) = self.unsupported_or_disabled(&path) {
+        if let Some(report) = self.unsupported_or_disabled(&path).await {
             return report;
         }
         let results = self
@@ -1115,7 +1225,7 @@ impl LspManager {
 
     pub async fn document_symbols(&self, path: impl AsRef<Path>) -> QueryReport<Symbol> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
-        if let Some(report) = self.unsupported_or_disabled(&path) {
+        if let Some(report) = self.unsupported_or_disabled(&path).await {
             return report;
         }
         let results = self
@@ -1138,7 +1248,7 @@ impl LspManager {
         outgoing: bool,
     ) -> QueryReport<Symbol> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
-        if let Some(report) = self.unsupported_or_disabled(&path) {
+        if let Some(report) = self.unsupported_or_disabled(&path).await {
             return report;
         }
         let results = self
@@ -1184,8 +1294,15 @@ impl LspManager {
         reports
     }
 
-    fn unsupported_or_disabled<T>(&self, path: &Path) -> Option<QueryReport<T>> {
-        if !self.inner.config.enabled {
+    async fn unsupported_or_disabled<T>(&self, path: &Path) -> Option<QueryReport<T>> {
+        if let Err(error) = self.enforce_project_trust().await {
+            return Some(unavailable_query(error));
+        }
+        let config = match self.current_config(path.parent().unwrap_or(path)) {
+            Ok(config) => config,
+            Err(error) => return Some(unavailable_query(error)),
+        };
+        if !config.enabled {
             return Some(unavailable_query(Error::Disabled));
         }
         (!self.supports_path(path)).then(|| QueryReport::Unsupported {
@@ -1194,11 +1311,13 @@ impl LspManager {
     }
 
     fn supports_path(&self, path: &Path) -> bool {
-        self.inner
-            .config
-            .servers
-            .iter()
-            .any(|adapter| adapter_language_id(adapter, path).is_some())
+        self.current_config(path.parent().unwrap_or(path))
+            .is_ok_and(|config| {
+                config
+                    .servers
+                    .iter()
+                    .any(|adapter| adapter_language_id(adapter, path).is_some())
+            })
     }
 
     /// Every configured adapter and whether its binary resolves here. Servers
@@ -1225,6 +1344,9 @@ impl LspManager {
     }
 
     pub async fn status(&self) -> Vec<ServerStatus> {
+        if self.enforce_project_trust().await.is_err() {
+            return Vec::new();
+        }
         self.ensure_reaper();
         self.reap_idle().await;
         let now = Instant::now();
@@ -1277,6 +1399,17 @@ impl LspManager {
     }
 
     pub async fn shutdown_all(&self) {
+        self.shutdown_servers(false).await;
+    }
+
+    pub async fn stop_all(&self) {
+        self.shutdown_servers(true).await;
+    }
+
+    async fn shutdown_servers(&self, force: bool) {
+        lock_unpoisoned(&self.inner.starting).cancel();
+        let _lifecycle = self.inner.lifecycle.write().await;
+        self.inner.approved_servers.lock().await.clear();
         let entries = {
             let mut clients = self.inner.clients.lock().await;
             clients.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
@@ -1288,8 +1421,13 @@ impl LspManager {
             .cloned()
             .collect::<Vec<_>>();
         for client in clients {
-            client.shutdown().await;
+            if force {
+                client.kill_and_wait().await;
+            } else {
+                client.shutdown().await;
+            }
         }
+        *lock_unpoisoned(&self.inner.starting) = CancellationToken::new();
     }
 
     async fn clients_for(&self, path: &Path) -> Vec<Result<ClientLease, Error>> {
@@ -1313,6 +1451,15 @@ impl LspManager {
         root: PathBuf,
         key: ClientKey,
     ) -> Result<ClientLease, Error> {
+        let _lifecycle = self.inner.lifecycle.read().await;
+        let starting = lock_unpoisoned(&self.inner.starting).clone();
+        let current_config = self.current_config(&root)?;
+        let configuration = json!([
+            adapter.command,
+            adapter.settings,
+            current_config.allow_network
+        ])
+        .to_string();
         if adapter.requires_approval && !self.inner.approved_servers.lock().await.contains(&key) {
             return Err(Error::ApprovalRequired {
                 server: adapter.id,
@@ -1337,9 +1484,10 @@ impl LspManager {
                     .restart_backoff
                     .saturating_mul(1u32 << entry.failures.min(6))
                     .min(MAX_RESTART_BACKOFF);
-                broken
-                    && entry.failures < config.max_restart_attempts
-                    && now.saturating_duration_since(entry.created_at) >= backoff
+                entry.configuration != configuration
+                    || broken
+                        && entry.failures < config.max_restart_attempts
+                        && now.saturating_duration_since(entry.created_at) >= backoff
             });
             let retired = should_replace.then(|| clients.remove(&key)).flatten();
             let next_failures = retired
@@ -1365,6 +1513,7 @@ impl LspManager {
                 }
             }
             let entry = clients.entry(key).or_insert_with(|| ClientEntry {
+                configuration,
                 cell: Arc::new(OnceCell::new()),
                 created_at: now,
                 last_used: now,
@@ -1384,20 +1533,26 @@ impl LspManager {
                 client.shutdown().await;
             }
         }
-        let config = self.inner.config.clone();
+        let config = current_config;
         let result = cell
             .get_or_init(|| async {
-                LspClient::start(root, adapter, config)
+                LspClient::start(root.clone(), adapter, config, &starting)
                     .await
                     .map(Arc::new)
                     .map_err(|error| Arc::<str>::from(error.to_string()))
             })
             .await;
         match result {
-            Ok(client) => Ok(ClientLease {
-                client: Arc::clone(client),
-                _active: active_lease,
-            }),
+            Ok(client) => {
+                if let Err(error) = self.current_config(&root) {
+                    client.kill_and_wait().await;
+                    return Err(error);
+                }
+                Ok(ClientLease {
+                    client: Arc::clone(client),
+                    _active: active_lease,
+                })
+            }
             Err(error) => Err(Error::Protocol(error.to_string())),
         }
     }
@@ -1447,15 +1602,14 @@ impl LspManager {
         &self,
         path: &Path,
     ) -> Result<Vec<(ServerAdapter, PathBuf, ClientKey)>, Error> {
-        if !self.inner.config.enabled {
+        let config = self.current_config(path.parent().unwrap_or(path))?;
+        if !config.enabled {
             return Err(Error::Disabled);
         }
         if !path.starts_with(&self.inner.workspace) {
             return Err(Error::OutsideWorkspace(path.to_path_buf()));
         }
-        let adapters = self
-            .inner
-            .config
+        let adapters = config
             .servers
             .iter()
             .filter(|adapter| adapter_language_id(adapter, path).is_some())
@@ -1939,7 +2093,15 @@ struct LspClient {
 }
 
 impl LspClient {
-    async fn start(root: PathBuf, adapter: ServerAdapter, config: Config) -> Result<Self, Error> {
+    async fn start(
+        root: PathBuf,
+        adapter: ServerAdapter,
+        config: Config,
+        starting: &CancellationToken,
+    ) -> Result<Self, Error> {
+        if starting.is_cancelled() {
+            return Err(Error::ProjectUntrusted);
+        }
         let (program, arguments) = adapter.command.split_first().ok_or(Error::EmptyCommand)?;
         let resolved_program = {
             let candidate = Path::new(program);
@@ -2058,7 +2220,11 @@ impl LspClient {
             let cancel = client.cancel.clone();
             client.stderr_task = Some(tokio::spawn(drain_server_stderr(stderr, cancel)));
         }
-        client.initialize().await?;
+        tokio::select! {
+            biased;
+            _ = starting.cancelled() => { client.kill_and_wait().await; return Err(Error::ProjectUntrusted); }
+            result = client.initialize() => result?,
+        }
         Ok(client)
     }
 
@@ -2798,6 +2964,21 @@ impl LspClient {
                     "timed out writing to the language server; the connection was dropped".into(),
                 ))
             }
+        }
+    }
+
+    async fn kill_and_wait(&self) {
+        self.alive.store(false, Ordering::Release);
+        self.cancel.cancel();
+        kill_process_group(self.process_group.swap(0, Ordering::AcqRel));
+        self.reader_task.abort();
+        if let Some(task) = &self.stderr_task {
+            task.abort();
+        }
+        let mut child = self.child.lock().await;
+        if let Some(child) = child.as_mut() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 
@@ -4882,6 +5063,7 @@ mod tests {
                 root: directory.path().to_path_buf(),
             },
             ClientEntry {
+                configuration: String::new(),
                 cell,
                 created_at: Instant::now(),
                 last_used: Instant::now(),
@@ -4918,6 +5100,7 @@ mod tests {
         manager.inner.clients.lock().await.insert(
             occupied_key.clone(),
             ClientEntry {
+                configuration: String::new(),
                 cell,
                 created_at: Instant::now(),
                 last_used: Instant::now() - Duration::from_secs(60),

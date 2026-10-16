@@ -49,7 +49,7 @@ impl TrustLabel {
         match self {
             TrustLabel::System => 5,
             TrustLabel::User => 4,
-            TrustLabel::Skill => 3,
+            TrustLabel::Skill => 2,
             TrustLabel::Workspace => 3,
             TrustLabel::Memory => 2,
             TrustLabel::Tool => 2,

@@ -113,6 +113,7 @@ pub enum EventKind {
     MemoryWrite,
     ContextFileLoaded,
     ContextFileBlocked,
+    ProjectTrustNotice,
     /// A sub-agent lifecycle event on the parent's chain.
     AgentSpawned,
     AgentCompleted,
@@ -148,6 +149,7 @@ impl EventKind {
             EventKind::MemoryWrite => "memory.write",
             EventKind::ContextFileLoaded => "context.file_loaded",
             EventKind::ContextFileBlocked => "context.file_blocked",
+            EventKind::ProjectTrustNotice => "project.trust_notice",
             EventKind::AgentSpawned => "agent.spawned",
             EventKind::AgentCompleted => "agent.completed",
             EventKind::AgentFailed => "agent.failed",
@@ -178,6 +180,7 @@ impl EventKind {
             "memory.write" => EventKind::MemoryWrite,
             "context.file_loaded" => EventKind::ContextFileLoaded,
             "context.file_blocked" => EventKind::ContextFileBlocked,
+            "project.trust_notice" => EventKind::ProjectTrustNotice,
             "agent.spawned" => EventKind::AgentSpawned,
             "agent.completed" => EventKind::AgentCompleted,
             "agent.failed" => EventKind::AgentFailed,
@@ -523,6 +526,15 @@ impl Event {
             },
             json!({ "path": path, "content": content }),
             trust,
+        )
+    }
+
+    pub fn project_trust_notice(s: &Session, key: String, review: Value) -> Self {
+        Self::new(
+            s,
+            EventKind::ProjectTrustNotice,
+            json!({"key":key,"review":review}),
+            TrustLabel::System,
         )
     }
 

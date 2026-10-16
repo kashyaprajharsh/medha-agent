@@ -19,6 +19,7 @@ import { PlanCard, Reasoning, StepGroup } from "./Steps";
 import { clock } from "./timeline";
 import { TurnHead } from "./Transcript";
 import { UserText } from "./UserText";
+import { ProjectTrustNotice } from "./ProjectTrustNotice";
 
 // A live reply is newer than anything saved, so its outputs sort last.
 const LIVE = 1e12;
@@ -203,6 +204,7 @@ export const LiveTail = memo(function LiveTail({
         </div>
       )}
       {state.notice && <p className="quiet">{state.notice}</p>}
+      {state.projectTrust && <ProjectTrustNotice key={`${state.sessionId}:${state.projectTrust.root}:${state.projectTrust.fingerprint}`} review={state.projectTrust} session={state.sessionId} />}
       {state.error && (
         <div className="error inline" role="alert">
           <b>

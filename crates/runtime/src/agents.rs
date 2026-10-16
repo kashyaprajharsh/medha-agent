@@ -1088,7 +1088,8 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             // orchestrator verifies this writer's extracted patch in its own
             // worktree, so inheriting that verifier both checks the wrong tree
             // and runs the build twice.
-            .with_verifier(Arc::new(kernel::NoVerify));
+            .with_verifier(Arc::new(kernel::NoVerify))
+            .with_child_context(run.workspace.as_deref());
 
         if let Some(state) = &self.lease_directory {
             let lease = crate::lease::SessionLease::acquire(state, run.session)

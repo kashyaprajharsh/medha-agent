@@ -275,7 +275,10 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                             *model = resolved.provider.model;
                             *active = resolved.name;
                         }
-                        Change::Mode(mode) => session.autonomy = mode,
+                        Change::Mode(mode) => {
+                            kernel.policy.operator_autonomy(mode);
+                            session.autonomy = mode;
+                        }
                         Change::Reasoning(reasoning) => kernel
                             .provider
                             .set_reasoning(reasoning)

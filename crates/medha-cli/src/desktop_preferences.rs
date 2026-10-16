@@ -533,7 +533,8 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             let skills = tools::SkillStore::new(
                 workspace.join(".medha/skills"),
                 Some(config::user_skills_dir()?),
-            );
+            )
+            .with_project_source(runtime::project_trust::skill_source());
             let mut discovered = crate::plugin_session::SessionPlugins::discover(store);
             discovered.add_skills(&skills);
             let mut catalog = skills.list(&std::collections::HashSet::new());
@@ -550,7 +551,8 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             let skills = tools::SkillStore::new(
                 workspace.join(".medha/skills"),
                 Some(config::user_skills_dir()?),
-            );
+            )
+            .with_project_source(runtime::project_trust::skill_source());
             skills
                 .set_enabled(
                     text(params, "name")?,
@@ -672,6 +674,7 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
                 workspace.join(".medha/skills"),
                 Some(config::user_skills_dir()?),
             )
+            .with_project_source(runtime::project_trust::skill_source())
             .remove_user(text(params, "name")?)
             .map_err(anyhow::Error::msg)?;
             Ok(json!({"removed": true}))
@@ -742,7 +745,8 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             let skills = tools::SkillStore::new(
                 workspace.join(".medha/skills"),
                 Some(config::user_skills_dir()?),
-            );
+            )
+            .with_project_source(runtime::project_trust::skill_source());
             let source = text(params, "source")?;
             let source = if let Some(rest) = source.strip_prefix("~/") {
                 config::medha_home()?

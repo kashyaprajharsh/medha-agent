@@ -9,6 +9,23 @@ pub trait StreamSink: Send + Sync {
     /// How the turn is being run, when that differs from what was asked —
     /// an image described instead of sent, for instance. Not model output.
     fn notice(&self, _text: &str) {}
+    fn project_trust(&self, review: &Value) {
+        let state = if review["trusted"] == true {
+            "Changed project settings were ignored"
+        } else {
+            "Project skills, prompts and language servers are disabled"
+        };
+        let mut text = format!(
+            "{state} for {}. Run /trust or medha trust --yes to trust the checkout and accept these exact settings.",
+            review["root"]
+        );
+        if let Some(settings) = review["settings"].as_array() {
+            for setting in settings {
+                text.push_str(&format!("\n{} = {}", setting["key"], setting["value"]));
+            }
+        }
+        self.notice(&text);
+    }
     /// A fragment of model text as it streams in.
     fn text(&self, _delta: &str) {}
     /// The completed text segment is durable. Consumers use its exact event

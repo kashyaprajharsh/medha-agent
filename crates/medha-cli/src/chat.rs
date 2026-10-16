@@ -1017,6 +1017,12 @@ impl kernel::StreamSink for Sink {
             text: text.to_owned(),
         });
     }
+    fn project_trust(&self, review: &Value) {
+        if let Ok(review) = serde_json::from_value(review.clone()) {
+            self.writer
+                .turn_event(protocol::TurnEvent::ProjectTrust { review });
+        }
+    }
     fn text(&self, delta: &str) {
         self.writer.turn_event(protocol::TurnEvent::Text {
             delta: delta.to_owned(),
@@ -1843,7 +1849,7 @@ where
                         // everybody's runtime. The router retires its viewer
                         // after this answer; the last-viewer policy owns exit.
                         if idle {
-                            let resumable = !kernel.log.events(session.id).await.is_empty();
+                            let resumable = kernel.log.events(session.id).await.iter().any(|event| matches!(event.kind, kernel::EventKind::UserMessage | kernel::EventKind::ModelText | kernel::EventKind::ModelMessage | kernel::EventKind::ModelIntent | kernel::EventKind::ToolObs));
                             let settings = crate::desktop_controls::handle("session.settings", &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, &extensions.model_env, running, agents.as_ref()).await.and_then(Result::ok);
                             Some(Ok(json!({ "slept": true, "session": resumable.then(|| session.id.to_string()), "settings": settings })))
                         } else {

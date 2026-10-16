@@ -297,6 +297,10 @@ pub fn replace_k3(system: &str, block: &str) -> String {
         .find(MEMORY_MARKER)
         .map(|idx| system[..idx].trim_end())
         .unwrap_or_else(|| system.trim_end());
+    append_k3(head, block)
+}
+
+pub fn append_k3(head: &str, block: &str) -> String {
     if block.is_empty() {
         return head.to_string();
     }

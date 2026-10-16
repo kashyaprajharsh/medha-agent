@@ -1012,6 +1012,13 @@ pub(super) fn after_reload(model: &mut Model, after: After) {
 }
 pub(super) fn resource_reply(model: &mut Model, resource: Resource, after: After) {
     match resource {
+        Resource::ProjectTrust(Some(review)) => {
+            model.push_notice(super::backend_ui::trust_notice(&review));
+            if matches!(after, After::Trust) {
+                request(model, Effect::Change(Change::TrustProject { root: review.root, folder: review.folder, fingerprint: review.fingerprint }, After::Notice));
+            }
+        },
+        Resource::ProjectTrust(None) => model.push_notice("The home folder is not a project."),
         Resource::Changed(notice) => {
             for message in notice.messages { model.push_notice(message); }
             match after {
@@ -1426,6 +1433,9 @@ fn local_command(model: &mut Model, command: &str) {
         .unwrap_or((command, ""));
     let args = args.trim();
     match name {
+        "trust" if args == "--revoke" => { request(model, Effect::Change(Change::RevokeProjectTrust, After::Notice)); },
+        "trust" if args.is_empty() => { request(model, Effect::Read(Read::ProjectTrust, After::Trust)); },
+        "trust" => model.push_notice("usage: /trust [--revoke]"),
         "reconnect" => { if boundary_allowed(model) && request(model, Effect::Reconnect) { model.session_op = Some(SessionOp::Opening); } },
         "exit" | "quit" => model.should_quit = true,
         "help" => model.push_notice(format!("{}\n\n/reconnect  Rejoin the conversation after a backend connection ends\nEsc interrupts · Ctrl-D quits · Tab switches agents · ↑/↓ scroll or recall input · mouse selects and copies",

@@ -616,6 +616,8 @@ pub enum CountQuality {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum TurnEvent {
+    #[serde(rename = "project.trust")]
+    ProjectTrust { review: ProjectTrustReview },
     #[serde(rename = "turn.started")]
     Started { turn: u64 },
     /// Completion of exactly one kernel run, after its final stream events.

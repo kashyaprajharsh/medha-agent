@@ -23,6 +23,9 @@ pub struct Store {
 /// Loads `medha.lock` beside `given`, without what a repository may not grant itself.
 pub fn load_lock(given: &Path, notices: &dyn Notices) -> Result<lockfile::MedhaLock> {
     let lock = lockfile::MedhaLock::load(given.join("medha.lock"))?.unwrap_or_default();
+    if let Some(trust) = crate::project_trust::ProjectTrust::for_folder(given)? {
+        return Ok(trust.filter(given, &lock));
+    }
     let state = crate::config::state_dir(given)?;
     Ok(apply_lock_trust(
         lock,
@@ -44,22 +47,44 @@ pub fn apply_lock_trust(
     if risky.is_empty() {
         return lock;
     }
-    let key = workspace.display().to_string();
-    let accepted = lockfile::AcceptedLocks::load(&state.join("lock_trust.toml"));
-    if accepted.allows(&key, &risky) {
-        return lock;
+    let granted = legacy_settings(&lock, workspace, state);
+    let safe = lock.with_accepted_settings(&granted);
+    let applied = safe.risky_settings();
+    let ignored = risky
+        .iter()
+        .filter(|setting| !applied.contains(setting))
+        .collect::<Vec<_>>();
+    if ignored.is_empty() {
+        return safe;
     }
     notices.say(&format!(
         "warning: ignoring {} privilege-relaxing setting(s) in {} — this file ships \
          inside the repository and cannot grant itself authority:",
-        risky.len(),
+        ignored.len(),
         lock_path.display()
     ));
-    for setting in &risky {
+    for setting in ignored {
         notices.say(&format!("  · {setting}"));
     }
-    notices.say("  run `medha trust` in this directory to accept them.");
-    lock.without_risky_settings()
+    notices
+        .say("  checkout trust applies only to project folders; the home folder is not a project.");
+    safe
+}
+
+pub(crate) fn legacy_settings(
+    lock: &lockfile::MedhaLock,
+    workspace: &Path,
+    state: &Path,
+) -> Vec<lockfile::RiskySetting> {
+    let accepted = lockfile::AcceptedLocks::load(&state.join("lock_trust.toml"));
+    let legacy = lock.legacy_risky_settings();
+    if !accepted.allows(&workspace.display().to_string(), &legacy) {
+        return Vec::new();
+    }
+    lock.risky_settings()
+        .into_iter()
+        .filter(|setting| legacy.iter().any(|old| old.key == setting.key))
+        .collect()
 }
 
 pub fn warn_legacy_state(cwd: &Path, state: &Path, notices: &dyn Notices) {

@@ -1441,7 +1441,7 @@ All tools return structured observations:
 
 ### What It Does
 
-MEDHA embeds a **native Language Server Protocol client** so the agent understands code the way a compiler does — real diagnostics, definitions, and references — instead of guessing from text. It is **automatic and opt-out**: the agent does not pick a language, and nothing starts until a supported file is touched.
+MEDHA embeds a **native Language Server Protocol client** so the agent understands code the way a compiler does — real diagnostics, definitions, and references — instead of guessing from text. In a trusted checkout it starts lazily when a supported file is touched. An untrusted folder starts no language servers. A quiet notice appears only when project content, risky settings or an installed language server are actually disabled here; a plain notes folder gets none. It offers checkout trust together with acceptance of exact shown settings and never opens a dialog. Revocation stops the current process's servers immediately. Other processes check trust before LSP use and stop their own servers at next use, without sockets or control records.
 
 The headline win is **automatic post-edit diagnostics**: every successful `edit` returns a compact "errors this edit introduced/resolved" delta, so the agent catches its own mistakes on the same turn instead of shipping a broken build.
 
@@ -1457,7 +1457,7 @@ The headline win is **automatic post-edit diagnostics**: every successful `edit`
 
 Servers are **not bundled** — MEDHA only ships the thin JSON-RPC client and uses whatever servers are installed. A missing server produces an actionable status and falls back to the text-based `code` and `diagnostics` tools. The fallback is **not silent**: those tools return a `backend` field naming the language server that answered, or the string `"text"` when the heuristic did, so a caller always knows which it got. `lsp` with `op: "status"` reports both live sessions and the inventory of what is installed, because an empty session list otherwise cannot distinguish "nothing asked yet" from "nothing installed".
 
-`lsp.start` can also **fetch a missing server binary** when MEDHA knows how, installing it into MEDHA's own directory — the approval card shows the exact command and destination first. Project-defined servers are approval-gated. Extra languages are added via `[[lsp.servers]]` in `medha.lock`.
+`lsp.start` can also **fetch a missing server binary** when MEDHA knows how, installing it into MEDHA's own directory. Its existing tool approval shows the exact command and destination first. Project-defined commands and executable settings must be accepted at their exact values through the checkout trust action; accepted servers then start lazily without a second trust dialog. Extra languages are added via `[[lsp.servers]]` in `medha.lock`.
 
 ### Tools
 
@@ -2446,8 +2446,22 @@ fine and are simply not carried, so skills written for other agent harnesses dro
 unchanged. Legacy TOML frontmatter still parses as a fallback. Fields left empty are
 skipped on write, so a skill MEDHA saves stays portable back out.
 
-**Scope.** Project skills (committed to the workspace) **shadow** personal ones of the
-same name, so a repo can override a user's version of a procedure.
+**Scope.** Trusted project skills **shadow** personal ones of the same name. Untrusted
+project skills are excluded. Trust uses the nearest Git checkout's real root, or the
+exact folder outside Git; nested checkouts never inherit it. The home folder itself
+is never a project. This separate machine-local record does not widen or migrate
+legacy acceptance of an exact folder's exact `medha.lock`. `/trust` or `medha trust
+--yes` trusts the checkout and accepts the risky values shown in one action;
+`medha trust --revoke` from any subfolder removes both grants.
+
+Trusted project prompts append scanned guidance to the built-in system and summary
+prompts. Personal prompts under the user's home still fully replace those defaults.
+Each chat reads project prompts from its own workspace. Changed risky settings are
+ignored individually until accepted again; unchanged accepted values still apply.
+Project context and its sandbox backend refresh once per message from the person;
+model continuations reuse that snapshot. The prompt builder owns the project and
+memory slots, so headings inside personal instructions are never delimiters. Notice
+state belongs to the chat's event history and does not grow the checkout trust record.
 
 The model-facing `skill` and `skill.save` calls use a live catalogue:
 each combines the session's frozen built-in/static tools with the MCP tools available
@@ -2462,8 +2476,14 @@ connection.
 
 ### Lifecycle
 
-The guard runs **once, at install time** — not on every discovery or load. What is on
-disk has already been screened.
+Fetched skills are screened at install. Project skills are also screened before
+discovery and every load, using a bounded snapshot of the entire package. Memory
+and disk verdict caches are keyed by package content and scanner version, including
+executable bits. Changed bytes always require a new scan. Mild findings load with a
+warning; dangerous packages and unreadable snapshots are blocked. Project skill
+results carry their own `Skill` source label at the same rank as local tool output.
+Installs use the same bounded package reader. Explicit skill loads always check
+current content, including changes made during a message. These checks add no model calls.
 
 ```
 0. Install (once, for a fetched skill)

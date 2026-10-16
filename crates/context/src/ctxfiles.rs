@@ -177,14 +177,25 @@ impl ContextFileLoader {
     /// Load one priority-matched file per directory from cwd through git root,
     /// plus the user-global MEDHA.md.
     pub async fn discover_startup(&self, cwd: &Path, medha_home: &Path) -> Vec<CtxFile> {
-        let root = git_root(cwd);
+        let home = dirs::home_dir().unwrap_or_else(|| medha_home.to_path_buf());
+        self.discover_startup_in(cwd, medha_home, &home).await
+    }
+
+    pub(crate) async fn discover_startup_in(
+        &self,
+        cwd: &Path,
+        medha_home: &Path,
+        home: &Path,
+    ) -> Vec<CtxFile> {
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let root = crate::workspace::project_root(&cwd, home).ok().flatten();
         let mut files = Vec::new();
-        let mut current = Some(cwd);
+        let mut current = root.as_ref().map(|_| cwd.as_path());
         while let Some(dir) = current {
             if let Some(path) = first_context_file(dir) {
                 files.push(self.read_guarded(path, self.startup_max_chars, false).await);
             }
-            if dir == root {
+            if root.as_deref() == Some(dir) {
                 break;
             }
             current = dir.parent();
@@ -339,23 +350,23 @@ fn first_context_file(dir: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn git_root(cwd: &Path) -> PathBuf {
-    cwd.ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .unwrap_or(cwd)
-        .to_path_buf()
-}
-
 fn progressive_candidates(seen: &mut HashSet<PathBuf>, touched_path: &Path) -> Vec<PathBuf> {
     let mut dir = if touched_path.is_dir() {
         touched_path.to_path_buf()
     } else {
         touched_path.parent().unwrap_or(touched_path).to_path_buf()
     };
+    let home = dirs::home_dir().unwrap_or_default();
+    let Some(root) = crate::workspace::project_root(&dir, &home).ok().flatten() else {
+        return Vec::new();
+    };
     let mut candidates = Vec::new();
     for _ in 0..5 {
         if seen.insert(dir.clone()) {
             candidates.push(dir.clone());
+        }
+        if dir == root {
+            break;
         }
         let Some(parent) = dir.parent() else {
             break;
@@ -445,12 +456,13 @@ impl kernel::ProgressiveContextPathAuthorizer for WorkspaceContextAuthorizer {
 impl ProgressiveContextFiles {
     pub fn new(loader: ContextFileLoader, cwd: PathBuf) -> Self {
         let cwd = cwd.canonicalize().unwrap_or(cwd);
-        let root = git_root(&cwd);
+        let home = dirs::home_dir().unwrap_or_default();
+        let root = crate::workspace::project_root(&cwd, &home).ok().flatten();
         let mut seen = HashSet::new();
-        let mut current = Some(cwd.as_path());
+        let mut current = root.as_ref().map(|_| cwd.as_path());
         while let Some(dir) = current {
             seen.insert(dir.to_path_buf());
-            if dir == root {
+            if root.as_deref() == Some(dir) {
                 break;
             }
             current = dir.parent();
@@ -547,8 +559,8 @@ mod tests {
 
         let files = ContextFileLoader::new().discover_startup(&cwd, &home).await;
         assert_eq!(files.len(), 3);
-        assert_eq!(files[0].path, cwd.join("AGENTS.md"));
-        assert_eq!(files[1].path, root.join("MEDHA.md"));
+        assert_eq!(files[0].path, cwd.join("AGENTS.md").canonicalize().unwrap());
+        assert_eq!(files[1].path, root.join("MEDHA.md").canonicalize().unwrap());
         assert_eq!(files[2].path, home.join("MEDHA.md"));
         let rendered = render_startup(&files);
         assert!(rendered.starts_with("## Project context"));

@@ -17,14 +17,23 @@ impl Notices for Quiet {
 
 /// Replies `echo: <last user message>` so a chat that got another chat's turn is caught.
 pub async fn endpoint() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+    let (address, asked, _) = endpoint_with_requests().await;
+    (address, asked)
+}
+
+pub type RequestLog = Arc<Mutex<Vec<serde_json::Value>>>;
+pub async fn endpoint_with_requests() -> (String, Arc<Mutex<Vec<(String, String)>>>, RequestLog) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}/v1", listener.local_addr().unwrap());
     let asked = Arc::new(Mutex::new(Vec::new()));
     let seen = asked.clone();
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let received = requests.clone();
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
             let seen = seen.clone();
+            let received = received.clone();
             tokio::spawn(async move {
                 let mut bytes = Vec::new();
                 let mut chunk = [0; 4096];
@@ -49,6 +58,7 @@ pub async fn endpoint() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
                 }
                 let request: serde_json::Value =
                     serde_json::from_slice(&bytes[head..head + len]).unwrap_or_default();
+                received.lock().unwrap().push(request.clone());
                 let last = request["messages"]
                     .as_array()
                     .and_then(|all| all.iter().rev().find(|m| m["role"] == "user"))
@@ -72,7 +82,7 @@ pub async fn endpoint() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
             });
         }
     });
-    (address, asked)
+    (address, asked, requests)
 }
 
 pub fn open(folder: &Path) -> Workspace {

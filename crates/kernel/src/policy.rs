@@ -3,6 +3,7 @@
 use crate::types::{AutonomyLevel, BlastRadius, Decision, ToolIntent};
 
 pub trait Policy: Send + Sync {
+    fn operator_autonomy(&self, _: AutonomyLevel) {}
     /// Authorize an intent. `None` radius is unregistered; autonomy never
     /// weakens a base `Human` or `Deny` decision.
     fn authorize(

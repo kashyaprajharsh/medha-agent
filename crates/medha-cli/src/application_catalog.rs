@@ -4,6 +4,10 @@
 pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     (
+        "/trust",
+        "trust this checkout and shown settings; /trust --revoke removes them",
+    ),
+    (
         "/attach",
         "images: /attach PATH · /attach paste · /attach remove [number|all]",
     ),

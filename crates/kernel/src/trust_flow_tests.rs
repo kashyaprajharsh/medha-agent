@@ -2,6 +2,28 @@ use super::{escalate_for_trust_flow, follows_web};
 use crate::types::{BlastRadius, Containment, Decision};
 
 #[test]
+fn a_declared_skill_source_never_promotes_web_content() {
+    use crate::TrustLabel;
+    assert_eq!(TrustLabel::Skill.rank(), TrustLabel::Tool.rank());
+    assert_eq!(
+        super::relayed_source(TrustLabel::Tool, TrustLabel::Skill),
+        TrustLabel::Skill
+    );
+    assert_eq!(
+        super::relayed_source(TrustLabel::Web, TrustLabel::Skill),
+        TrustLabel::Web
+    );
+    assert_eq!(
+        super::relayed_source(TrustLabel::Skill, TrustLabel::Web),
+        TrustLabel::Web
+    );
+    assert_eq!(
+        super::relayed_source(TrustLabel::Tool, TrustLabel::User),
+        TrustLabel::Tool
+    );
+}
+
+#[test]
 fn escalates_web_tainted_consequential_action_in_a_leaky_box() {
     // Irreversible action, web-tainted, FS jail but network reachable → gate.
     let d = escalate_for_trust_flow(

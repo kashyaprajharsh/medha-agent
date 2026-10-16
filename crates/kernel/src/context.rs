@@ -6,7 +6,40 @@ use crate::types::{CompiledContext, Message, ToolSpec, TrustLabel};
 use async_trait::async_trait;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+pub trait RequestContext: Send + Sync {
+    fn begin_message(
+        &self,
+        _: &[crate::Event],
+        _: &dyn crate::StreamSink,
+    ) -> Vec<(String, serde_json::Value)> {
+        Vec::new()
+    }
+    fn refresh(&self, system: &str, sink: &dyn crate::StreamSink) -> String;
+    fn pricing(&self, default: Option<crate::Pricing>) -> Option<crate::Pricing> {
+        default
+    }
+    fn fork(
+        &self,
+        _: Option<&Path>,
+        _: std::collections::HashSet<String>,
+    ) -> Option<Arc<dyn RequestContext>> {
+        None
+    }
+    fn policy(&self) -> Option<Arc<dyn crate::Policy>> {
+        None
+    }
+    fn summary_prompt(&self) -> Option<String> {
+        None
+    }
+    fn refresh_memory(&self, _: &str) -> Option<String> {
+        None
+    }
+}
+
+pub type SummaryPrompt = dyn Fn() -> String + Send + Sync;
 
 /// The same input budget used by the compiler and every output surface.
 /// Unknown limits remain unknown; estimated counts are explicitly labelled.
@@ -145,6 +178,9 @@ pub struct CompileResult {
 
 #[async_trait]
 pub trait ContextEngine: Send + Sync {
+    fn fork_with_summary_prompt(&self, _: Arc<SummaryPrompt>) -> Option<Arc<dyn ContextEngine>> {
+        self.fork()
+    }
     /// Reset usage calibration when the session, deployment, model or limits
     /// change. This does not discard the conversation or its checkpoints.
     fn begin_request(&self, _scope: &str) {}

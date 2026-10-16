@@ -223,6 +223,25 @@ fn a_shared_current_turn_keeps_its_user_image_references() {
 }
 
 #[test]
+fn an_idle_snapshot_keeps_the_quiet_trust_action_without_opening_a_dialog() {
+    let review = json!({"root":"/checkout","folder":"/checkout/src","trusted":false,"fingerprint":"values","settings":[],"ignored":[]});
+    let snapshot = json!({"revision":1,"conversation":"conversation","running":false,"turn":2,
+        "pending_steers":[],"force_aborting":false,"settings":null,
+        "items":[{"type":"project_trust","review":review}, {"type":"assistant","text":"completed"}],"current_turn_from":null,"omitted_items":0,
+        "approvals":[],"questions":[],"metrics":protocol::PresentationMetrics::default(),"agents":[],"omitted_agent_views":0,"cursor":null});
+    let rendered = render_snapshot(
+        json!({"method":"session.presentation","params":snapshot}),
+        &mut Steps::default(),
+        &mut String::new(),
+    );
+    assert_eq!(rendered["params"]["running"], false);
+    assert_eq!(rendered["params"]["frames"][0]["params"]["review"], review);
+    assert_eq!(rendered["params"]["approvals"], json!([]));
+    assert_eq!(rendered["params"]["questions"], json!([]));
+    assert!(!rendered.to_string().contains("completed"));
+}
+
+#[test]
 fn saved_source_metadata_survives_stream_coalescing_without_replacing_markdown() {
     let now = Instant::now();
     let mut stream = StreamFrames::default();

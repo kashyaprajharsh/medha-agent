@@ -1,9 +1,8 @@
 //! Builds one chat on an opened workspace: its sandbox, tools, agents, context and kernel.
 
-use crate::approvals::{approve_list_from, unknown_approvals};
+use crate::approvals::unknown_approvals;
 use crate::lease::{Ownership, SessionLease};
 use crate::model::Model;
-use crate::verify::CommandVerifier;
 use crate::{
     Notices, Resume, SessionOptions, Surface, Workspace, agents, attachments, config,
     plugin_session, skill_judge, vision,
@@ -37,7 +36,7 @@ pub struct Choices {
 }
 
 impl Choices {
-    pub fn of(lock: &lockfile::MedhaLock, options: &SessionOptions) -> Result<Self> {
+    pub fn of(lock: &lockfile::MedhaLock, options: &SessionOptions, folder: &Path) -> Result<Self> {
         let autonomy = match options.autonomy {
             Some(mode) => mode,
             None => {
@@ -50,9 +49,12 @@ impl Choices {
             .or_else(|| lock.verify.command.clone());
         let verify_required = options.require_verify || lock.verify.required;
         if verify_required && verify_command.is_none() {
-            anyhow::bail!(
-                "required verification needs [verify].command in medha.lock or MEDHA_VERIFY"
-            );
+            let raw = lockfile::MedhaLock::load(folder.join("medha.lock"))?.unwrap_or_default();
+            if options.require_verify || raw.verify.command.is_none() {
+                anyhow::bail!(
+                    "required verification needs [verify].command in medha.lock or MEDHA_VERIFY"
+                );
+            }
         }
         let verify_timeout = std::time::Duration::from_secs(
             lock.verify
@@ -254,12 +256,6 @@ pub async fn start(
         }
         _ => {}
     }
-    let jail = match sbx_cfg.backend {
-        sandbox::BackendKind::Container => policy::Jail::Active,
-        sandbox::BackendKind::Native if sandbox::native_backend_available() => policy::Jail::Active,
-        sandbox::BackendKind::Native => policy::Jail::Missing,
-        sandbox::BackendKind::Host | sandbox::BackendKind::Ssh => policy::Jail::Off,
-    };
     if sbx_cfg.backend == sandbox::BackendKind::Native && !sandbox::native_backend_available() {
         if sandbox::native_sandbox_supported() {
             notices.say(
@@ -280,13 +276,17 @@ pub async fn start(
     // Shared network grant: the exec backend enforces it, the permission manager
     // flips and persists it. One handle so a session/persistent grant reaches both.
     let net_grant = sandbox::NetworkGrant::default();
-    let extra_writable = lock.sandbox.extra_writable_paths();
-    let exec_backend = sandbox::select_backend(
-        &sbx_cfg,
-        extra_writable,
+    let scratch = sandbox::Scratch::create().ok();
+    let live_settings = crate::project_session::LiveSettings::new(
+        cwd.clone(),
+        options.clone(),
+        lock.clone(),
+        sbx_cfg.home.clone(),
         approved.clone(),
         net_grant.clone(),
+        scratch.as_ref().map(|scratch| scratch.path().to_path_buf()),
     );
+    let exec_backend = live_settings.exec();
     let verifier_exec = Arc::clone(&exec_backend);
 
     // Writers re-root this template in their isolated worktrees.
@@ -314,7 +314,6 @@ pub async fn start(
     .with_readable_roots(&[config::user_skills_dir()?])
     .with_snapshots_dir(state.join("snapshots"));
     // Held to the end of the run; a temp directory that refuses it just means no scratch.
-    let scratch = sandbox::Scratch::create().ok();
     if let Some(scratch) = &scratch {
         workspace = workspace.with_scratch(scratch.path());
     }
@@ -354,12 +353,13 @@ pub async fn start(
             workspace.root().join(".medha").join("skills"),
             Some(config::user_skills_dir()?),
         )
+        .with_project_source(crate::project_trust::skill_source())
         .with_judge(security_judge);
         session_plugins.add_skills(&skills);
         Arc::new(skills)
     };
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
-    let lsp_manager = if lock.lsp.enabled {
+    let lsp_manager = {
         let mut lsp_config = lsp::Config {
             enabled: true,
             startup_timeout: std::time::Duration::from_millis(lock.lsp.startup_timeout_ms),
@@ -380,50 +380,18 @@ pub async fn start(
             home: sbx_cfg.home.clone(),
             ..lsp::Config::default()
         };
-        for configured in &lock.lsp.servers {
-            let id = configured.id.trim();
-            if id.is_empty() || configured.trust != "workspace" {
-                notices.say(&format!(
-                    "note: ignored invalid LSP server '{}' (id and trust = \"workspace\" are required)",
-                    configured.id
-                ));
-                continue;
-            }
-            let settings = toml_table_to_json(&configured.settings);
-            // A commandless entry only tunes a built-in server of the same id.
-            if configured.command.is_empty() && configured.languages.is_empty() {
-                match lsp_config.servers.iter_mut().find(|server| server.id == id) {
-                    Some(server) => server.settings = settings,
-                    None => notices.say(&format!(
-                        "note: ignored LSP settings for unknown server '{id}' (add a command to define it)"
-                    )),
-                }
-                continue;
-            }
-            if configured.command.is_empty() || configured.languages.is_empty() {
-                notices.say(&format!(
-                    "note: ignored invalid LSP server '{id}' (command and languages are required to define one)"
-                ));
-                continue;
-            }
-            let adapter = lsp::ServerAdapter {
-                id: id.to_string(),
-                command: configured.command.clone(),
-                languages: lsp::language_mappings(&configured.languages),
-                root_markers: configured.root_markers.clone(),
-                requires_approval: true,
-                settings,
-            };
-            lsp_config
-                .servers
-                .retain(|existing| existing.id != adapter.id);
-            lsp_config.servers.push(adapter);
-        }
-        let manager = Arc::new(lsp::LspManager::new(cwd.clone(), lsp_config));
+        lsp_config.allow_network = false;
+        let source_folder = cwd.clone();
+        let manager = Arc::new(
+            lsp::LspManager::new(cwd.clone(), lsp_config.clone()).with_project_config(Arc::new(
+                move |folder| {
+                    crate::project_session::lsp_config(&source_folder, folder, &lsp_config)
+                },
+            )),
+        );
+        crate::project_trust::register_lsp(&manager);
         registry.register_lsp(manager.clone());
         Some(manager)
-    } else {
-        None
     };
     // MCP definitions are portable; credentials remain in the user store.
     let mut mcp_servers: Vec<mcp::ServerConfig> = model_profiles
@@ -655,6 +623,20 @@ pub async fn start(
     };
     let known_tools: std::collections::HashSet<String> =
         executor.specs().into_iter().map(|spec| spec.name).collect();
+    let fallback = catalogue_pricing.map(|(input, output, cached, written)| kernel::Pricing {
+        input_per_mtok: input,
+        output_per_mtok: output,
+        cached_input_per_mtok: cached,
+        cache_write_per_mtok: written,
+        indicative: true,
+    });
+    let live_context = crate::project_session::LiveContext::new(
+        live_settings.clone(),
+        skill_store.clone(),
+        known_tools.clone(),
+        has_task.then(|| prompt.clone()),
+        fallback,
+    );
 
     let configured_compressor = {
         let configured = model_profiles.lock().unwrap().clone();
@@ -688,10 +670,16 @@ pub async fn start(
     };
     let recall_store = memory_store.clone();
     let memory_enabled = lock.memory.enabled;
+    let recall_context = live_context.clone();
     let context_engine = Arc::new(
         context::PipelineEngine::new(lock.context.to_policy())
             .with_summarizer(Arc::new(
-                context::LlmSummarizer::new(summary_provider).with_replay(replay_summary),
+                context::LlmSummarizer::new(summary_provider)
+                    .with_replay(replay_summary)
+                    .with_prompt(Arc::new({
+                        let live = live_context.clone();
+                        move || live.summary_prompt()
+                    })),
             ))
             .with_artifacts(artifacts.clone())
             .with_trusted_compaction_refresh(Arc::new(move |system| {
@@ -709,7 +697,7 @@ pub async fn start(
                     stale_after_days,
                 ) {
                     Ok(snapshot) => (
-                        memory::recall::replace_k3(system, &snapshot.text),
+                        recall_context.replace_memory(&snapshot.text),
                         Some(snapshot.trust),
                     ),
                     Err(_) => (system.to_string(), None),
@@ -726,31 +714,12 @@ pub async fn start(
             stale.join(", ")
         ));
     }
-    let policy = Arc::new(
-        policy::DefaultPolicy::requiring_approval(approve_list_from(
-            lock.policy.approve.clone(),
-            options.approve.as_deref().unwrap_or_default(),
-        ))
-        .with_workspace(workspace.root())
-        .with_scratch(
-            scratch
-                .as_ref()
-                .map_or(std::path::Path::new(""), |s| s.path()),
-        )
-        .with_memory_write_approval(&lock.memory.write_approval)
-        .with_jail(jail),
-    );
-
-    let verifier: Arc<dyn kernel::Verifier> = match verify_cmd.clone() {
-        Some(cmd) => Arc::new(CommandVerifier {
-            command: cmd,
-            dir: cwd.clone(),
-            limit: verify_timeout,
-            required: verify_required,
-            exec: Arc::clone(&verifier_exec),
-        }),
-        None => Arc::new(kernel::NoVerify),
-    };
+    let policy: Arc<dyn kernel::Policy> = live_settings.clone();
+    let verifier: Arc<dyn kernel::Verifier> = Arc::new(crate::project_session::LiveVerifier::new(
+        live_settings.clone(),
+        verifier_exec,
+        verify_timeout,
+    ));
 
     // Children inherit this already-resolved budget.
     let base_budget = options.budget.apply(lock.budget.to_budget());
@@ -823,6 +792,7 @@ pub async fn start(
     // Only the operator's own rate is fixed for the chat; a list price is asked
     // of the model in use at each call, so it follows a change of model.
     .with_pricing(pricing.filter(|price| !price.indicative))
+    .with_request_context(live_context.clone())
     .with_secrets(kernel::redact::Secrets::new(
         credential
             .into_iter()
@@ -885,18 +855,7 @@ pub async fn start(
         system.push_str("\n\n");
         system.push_str(&project_context);
     }
-    let skills_manifest = skill_store.manifest(
-        &known_tools,
-        if has_task {
-            Some(prompt.as_str())
-        } else {
-            None
-        },
-    );
-    if !skills_manifest.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&skills_manifest);
-    }
+    live_context.bind_project_slot(context::identity::ProjectSlot::after(&system));
     if let Ok(mut slot) = agent_session.lock() {
         *slot = Some(session.id);
     }
@@ -946,7 +905,7 @@ pub async fn start(
             now,
             stale_after_days,
         )?;
-        system = memory::recall::replace_k3(&system, &k3.text);
+        system = live_context.replace_memory(&k3.text);
         if !k3.text.is_empty() {
             log.append(kernel::Event::context_file(
                 &session,
@@ -1086,11 +1045,3 @@ impl std::fmt::Display for LeaseFailure {
 }
 
 impl std::error::Error for LeaseFailure {}
-
-fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
-    if table.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::to_value(table).unwrap_or(serde_json::Value::Null)
-    }
-}

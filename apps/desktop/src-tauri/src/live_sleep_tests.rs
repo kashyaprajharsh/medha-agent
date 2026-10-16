@@ -24,6 +24,7 @@ fn answer(stream: std::net::TcpStream, record: &Mutex<Vec<usize>>) {
 struct HeldReply {
     arrived: std::sync::mpsc::Sender<()>,
     released: Mutex<std::sync::mpsc::Receiver<()>>,
+    held: AtomicBool,
 }
 
 fn held_model() -> (
@@ -38,6 +39,7 @@ fn held_model() -> (
     let held = Arc::new(HeldReply {
         arrived,
         released: Mutex::new(released),
+        held: AtomicBool::new(false),
     });
     std::thread::spawn(move || {
         let record = Arc::new(Mutex::new(Vec::new()));
@@ -96,6 +98,7 @@ fn answer_held(
         .find(|message| message["role"] == "user");
     if last_user.is_some_and(|message| message["content"].to_string().contains("HOLD"))
         && let Some(held) = held
+        && !held.held.swap(true, Ordering::Relaxed)
     {
         let _ = held.arrived.send(());
         let _ = held

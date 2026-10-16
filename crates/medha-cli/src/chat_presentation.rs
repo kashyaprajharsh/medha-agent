@@ -785,6 +785,7 @@ impl Presentation {
                 });
             }
             TurnEvent::Notice { text } => self.rows.push(Item::Notice { text }),
+            TurnEvent::ProjectTrust { review } => self.rows.push(Item::ProjectTrust { review }),
             TurnEvent::Compaction {
                 before,
                 after,

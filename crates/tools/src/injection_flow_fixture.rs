@@ -94,7 +94,7 @@ pub struct FixtureExecutor {
 impl Executor for FixtureExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
         let named = ["page", "write", "external", "browser_result", "memory"];
-        let stored = ["long_page", "long_local", "read_back"];
+        let stored = ["long_page", "long_local", "long_skill", "read_back"];
         named
             .into_iter()
             .chain(stored)
@@ -111,7 +111,7 @@ impl Executor for FixtureExecutor {
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
         Some(match tool {
             "page" | "browser_result" | "memory" => BlastRadius::Read,
-            "long_page" | "long_local" | "read_back" => BlastRadius::Read,
+            "long_page" | "long_local" | "long_skill" | "read_back" => BlastRadius::Read,
             "write" => BlastRadius::ReversibleLocal,
             "external" => BlastRadius::External,
             _ => return None,
@@ -138,7 +138,12 @@ impl Executor for FixtureExecutor {
         // Long enough that the kernel stores it and shows only its ends.
         if intent.tool.starts_with("long_") {
             let line = "a line of the long result\n";
-            return Observation::ok(&intent.id, json!({"content": line.repeat(4_000)}));
+            let observation = Observation::ok(&intent.id, json!({"content": line.repeat(4_000)}));
+            return if intent.tool == "long_skill" {
+                observation.relaying(TrustLabel::Skill)
+            } else {
+                observation
+            };
         }
         if intent.tool == "read_back" {
             let page = json!({"hash": intent.args["hash"], "content": "the middle of it"});

@@ -18,7 +18,8 @@ fn store(workspace: &Path) -> Result<tools::SkillStore> {
     Ok(tools::SkillStore::new(
         workspace.join(".medha/skills"),
         Some(config::user_skills_dir()?),
-    ))
+    )
+    .with_project_source(runtime::project_trust::skill_source()))
 }
 
 fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str> {

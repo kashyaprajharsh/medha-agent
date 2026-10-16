@@ -10,6 +10,7 @@ pub mod policy;
 pub mod prompts;
 mod prune_batch;
 pub mod tokens;
+pub mod workspace;
 
 pub use budget::ContextBudget;
 pub use compactor::{

@@ -1243,6 +1243,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-safety"
+version = "0.1.10"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "glib"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2071,6 +2078,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "getrandom 0.3.4",
+ "git-safety",
  "libc",
  "medha-client",
  "medha-protocol",

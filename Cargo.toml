@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/git-safety",
     "crates/kernel",
     "crates/medha-client",
     "crates/protocol",

@@ -674,3 +674,5 @@ async fn a_screen_works_the_same_through_the_shared_host() {
             .is_err()
     );
 }
+#[path = "hub/outbound_tests.rs"]
+mod outbound_tests;

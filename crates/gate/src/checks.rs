@@ -783,6 +783,9 @@ async fn execute_command(
         #[cfg(test)]
         PreparedCommandBackend::Direct(backend) => {
             let request = check_request(&check_env, backend.label(), workspace, cmd);
+            let _git_protection = backend
+                .protect(&request)
+                .map_err(|error| error.to_string())?;
             let command = backend
                 .build_command(&request)
                 .map_err(|error| error.to_string())?;

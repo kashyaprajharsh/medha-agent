@@ -244,11 +244,7 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                                 config::resolve_model_as(
                                     &cfg,
                                     &name,
-                                    if stored_key {
-                                        None
-                                    } else {
-                                        model_env.api_key.as_deref()
-                                    },
+                                    if stored_key { None } else { Some(model_env) },
                                 )
                                 .map_err(|error| error.to_string())?
                             };

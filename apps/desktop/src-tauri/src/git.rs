@@ -3,7 +3,11 @@ use std::path::Path;
 
 /// The checked-out branch for `dir`, or a short commit id when HEAD is detached.
 pub fn branch(dir: &Path) -> Option<String> {
-    let root = dir.ancestors().find(|path| path.join(".git").exists())?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let root = git_safety::project_root(dir, &home).ok()??;
     let dot_git = root.join(".git");
     let git_dir = if dot_git.is_file() {
         let pointer = fs::read_to_string(&dot_git).ok()?;
@@ -30,51 +34,16 @@ use std::{
 };
 const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 
-/// Overrides for every key in the repository's own config that would run a program.
-fn config_overrides(dir: &Path) -> Vec<String> {
-    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let mut overrides = vec![
-        "core.fsmonitor=false".to_owned(),
-        format!("core.hooksPath={null}"),
-    ];
-    let Ok(listed) = Command::new("git")
-        .args(["config", "--list", "--show-scope", "--name-only", "-z"])
-        .current_dir(dir)
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return overrides;
-    };
-    let mut fields = listed.stdout.split(|byte| *byte == 0);
-    while let (Some(scope), Some(key)) = (fields.next(), fields.next()) {
-        // The user's own global and system filters, such as large-file storage, stay on.
-        if !matches!(scope, b"local" | b"worktree") {
-            continue;
-        }
-        let driver = std::str::from_utf8(key)
-            .ok()
-            .and_then(|key| key.strip_prefix("filter."))
-            .and_then(|rest| rest.rsplit_once('.'));
-        if let Some((driver, _)) = driver {
-            overrides.extend(
-                ["clean=", "smudge=", "process=", "required=false"]
-                    .map(|setting| format!("filter.{driver}.{setting}")),
-            );
-        }
-    }
-    overrides.sort();
-    overrides.dedup();
-    overrides
-}
-
 fn run(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
-    let overrides = config_overrides(dir);
+    let args = git_safety::arguments(
+        dir,
+        &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+    )?;
     let mut child = Command::new("git")
-        .arg("--no-pager")
-        .args(overrides.iter().flat_map(|setting| ["-c", setting]))
         .args(args)
         .current_dir(dir)
-        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_clear()
+        .envs(git_safety::environment())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

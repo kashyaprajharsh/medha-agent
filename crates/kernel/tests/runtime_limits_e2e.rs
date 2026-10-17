@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "runtime_limits/outbound_tests.rs"]
+mod outbound_tests;
+
 enum Turn {
     Blocks(Vec<Block>),
     Failed(Vec<Block>, ProviderError),

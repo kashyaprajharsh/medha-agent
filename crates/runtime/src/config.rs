@@ -934,12 +934,8 @@ fn resolve_inner(
     let model_source = model_source.unwrap_or(Source::Config);
 
     // Avoid a macOS keychain prompt when the environment already supplies a key.
-    let env_key = env.api_key.clone();
-    let file_key = if env_key.is_none() {
-        file_load_key(&base_url)
-    } else {
-        None
-    };
+    let env_key = env.key_for(&base_url)?.map(str::to_owned);
+    let file_key = file_load_key(&base_url);
     let credential_source = if env_key.is_some() {
         CredSource::Env
     } else if file_key.is_some() {
@@ -1022,6 +1018,7 @@ fn resolve_inner(
         .or_else(|| configured.map(|profile| profile.image_input))
         .unwrap_or_default();
 
+    let transport = configured.filter(|profile| profile.base_url == base_url);
     let provider = providers::ProviderProfile {
         provider_id: configured
             .and_then(|p| p.provider_id.clone())
@@ -1044,7 +1041,8 @@ fn resolve_inner(
         prompt_cache: configured.and_then(|p| p.prompt_cache),
         cache_ttl: configured.map(|p| p.cache_ttl).unwrap_or_default(),
         reasoning_echo: configured.and_then(|p| p.reasoning_echo),
-        ca_cert_file: configured.and_then(|p| p.ca_cert_file.clone()),
+        ca_cert_file: transport.and_then(|p| p.ca_cert_file.clone()),
+        proxy: transport.and_then(|p| p.proxy.clone()),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
     if provider.auth.requires_credential() && api_key.is_empty() {
@@ -1219,7 +1217,7 @@ fn diagnose_checks(
                     title: "Credential missing".into(),
                     detail: format!(
                         "'{}' uses {} auth but no key was found (env MEDHA_API_KEY or credentials file). \
-                         Add one via /model, or export MEDHA_API_KEY.",
+                         Add one via /model, or pair MEDHA_API_KEY with MEDHA_BASE_URL.",
                         r.provider.model,
                         r.provider.auth.as_str()
                     ),
@@ -1595,15 +1593,18 @@ fn parse_image_input(value: &str) -> Result<kernel::ImageInputMode> {
 }
 
 pub fn resolve_model(cfg: &Config, name: &str) -> Result<Resolved> {
-    resolve_model_as(cfg, name, first_env(&["MEDHA_API_KEY"]).as_deref())
+    resolve_model_as(cfg, name, Some(&ModelEnv::from_process()))
 }
 
-/// `resolve_model`, with the environment's key handed in instead of read from the process.
-pub fn resolve_model_as(cfg: &Config, name: &str, env_key: Option<&str>) -> Result<Resolved> {
+/// Resolve a saved model with an optional deployment-bound environment override.
+pub fn resolve_model_as(cfg: &Config, name: &str, env: Option<&ModelEnv>) -> Result<Resolved> {
     let provider = cfg
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
-    // Prefer MEDHA_API_KEY to avoid an unnecessary macOS keychain prompt.
+    let env_key = env
+        .map(|env| env.key_for(provider.credential_target()))
+        .transpose()?
+        .flatten();
     let api_key = deployment_credential(provider, env_key)?;
     resolve_keyed(cfg, name, &api_key, env_key.is_some())
 }
@@ -1631,7 +1632,7 @@ pub fn deployment_credential(
 }
 
 pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
-    resolve_keyed(cfg, name, api_key, first_env(&["MEDHA_API_KEY"]).is_some())
+    resolve_keyed(cfg, name, api_key, false)
 }
 
 fn resolve_keyed(cfg: &Config, name: &str, api_key: &str, key_from_env: bool) -> Result<Resolved> {
@@ -1703,10 +1704,18 @@ fn read_credentials_file(path: &std::path::Path) -> CredentialsFile {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| toml::from_str(&text).ok())
+        .inspect(|creds: &CredentialsFile| {
+            for key in creds.keys.values() {
+                kernel::redact::remember_stored(key);
+            }
+        })
         .unwrap_or_default()
 }
 
 fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Result<()> {
+    for value in creds.keys.values() {
+        kernel::redact::remember_stored(value);
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -1860,6 +1869,7 @@ fn keychain_load_key(base_url: &str) -> Option<String> {
 /// Secrets are stored outside `config.toml`.
 pub fn store_key(base_url: &str, key: &str) -> Result<()> {
     let key = normalize_api_key(key);
+    kernel::redact::remember(&key);
     if key.is_empty() {
         anyhow::bail!("API key cannot be empty");
     }
@@ -1873,7 +1883,7 @@ pub fn store_key(base_url: &str, key: &str) -> Result<()> {
                     write_key_file_locked(base_url, &key).map_err(|file_err| {
                         anyhow::anyhow!(
                             "could not store the key in the OS keychain ({keychain_err}) or \
-                             ~/.medha/credentials.toml ({file_err}); set MEDHA_API_KEY instead"
+                             ~/.medha/credentials.toml ({file_err}); pair MEDHA_API_KEY with MEDHA_BASE_URL instead"
                         )
                     })
                 })
@@ -2007,6 +2017,12 @@ pub fn read_mcp_server(id: &str, server: &McpServer) -> Result<mcp::ServerConfig
 }
 
 fn mcp_server_with(id: &str, server: &McpServer, key: Option<String>) -> mcp::ServerConfig {
+    if let Some(key) = &key {
+        kernel::redact::remember(key);
+    }
+    for (name, value) in &server.env {
+        kernel::redact::remember_named(name, value);
+    }
     // Resolve `${key}` at spawn time so previews and argv never contain the secret.
     let transport = if server.url.is_empty() {
         mcp::Transport::Stdio {
@@ -2082,11 +2098,14 @@ pub(crate) fn read_key(id: &str) -> Result<Option<String>> {
     with_credentials_lock(|| {
         let path = credentials_path()?;
         let filed = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str::<CredentialsFile>(&text)
-                .with_context(|| format!("reading {}", path.display()))?
-                .keys
-                .remove(id)
-                .filter(|key| !key.is_empty()),
+            Ok(text) => {
+                let mut credentials = toml::from_str::<CredentialsFile>(&text)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                for value in credentials.keys.values() {
+                    kernel::redact::remember_stored(value);
+                }
+                credentials.keys.remove(id).filter(|key| !key.is_empty())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
@@ -2101,6 +2120,9 @@ pub(crate) fn read_key(id: &str) -> Result<Option<String>> {
         }
     })
 }
+
+#[path = "env_key.rs"]
+mod env_key;
 
 #[cfg(test)]
 mod tests {
@@ -2324,6 +2346,7 @@ mod tests {
             cache_ttl: Default::default(),
             reasoning_echo: None,
             ca_cert_file: None,
+            proxy: None,
         }
     }
 

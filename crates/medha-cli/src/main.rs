@@ -1859,6 +1859,22 @@ where
                 if let Some(cmd) = line.strip_prefix('/') {
                     let cmd = cmd.trim();
                     let (name, rest) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                    if name == "outbound" {
+                        if let Some(id) = rest.trim().strip_prefix("allow ") {
+                            match kernel.egress.approve(id.trim()) {
+                                Ok(()) => println!(
+                                    "Approved this exact payload for one send. Retry the blocked request to use it."
+                                ),
+                                Err(error) => eprintln!("{error}"),
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&kernel.egress.reviews())?
+                            );
+                        }
+                        continue;
+                    }
                     if name == "trust" {
                         let argument = match rest.trim() {
                             "" => "--yes",

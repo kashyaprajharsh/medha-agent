@@ -107,15 +107,28 @@ fn builder() -> reqwest::ClientBuilder {
 /// The connection for one server: the usual one, also trusting the
 /// certificates its model was saved with.
 pub(crate) fn client_for(profile: &ProviderProfile) -> Result<reqwest::Client, ProviderError> {
-    let Some(file) = profile.ca_cert_file.as_deref() else {
-        return Ok(client());
-    };
-    let unusable = |why: String| ProviderError::Certificate(why);
-    trusting(builder(), file)?.build().map_err(|error| {
-        unusable(format!(
-            "The certificate file {file} could not be used: {error}"
-        ))
-    })
+    configured(builder(), profile)?
+        .build()
+        .map_err(|_| ProviderError::Transport("could not configure model HTTP client".into()))
+}
+
+pub(crate) fn configured(
+    mut builder: reqwest::ClientBuilder,
+    profile: &ProviderProfile,
+) -> Result<reqwest::ClientBuilder, ProviderError> {
+    profile.validate().map_err(ProviderError::Decode)?;
+    builder = builder
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy) = &profile.proxy {
+        let proxy = reqwest::Proxy::all(proxy)
+            .map_err(|_| ProviderError::Decode("invalid model proxy URL".into()))?;
+        builder = builder.proxy(proxy);
+    }
+    if let Some(file) = &profile.ca_cert_file {
+        builder = trusting(builder, file)?;
+    }
+    Ok(builder)
 }
 
 /// Trust the certificates in `file` as well as the public ones. A file that
@@ -279,7 +292,9 @@ pub(crate) fn with_profile(
     profile: &ProviderProfile,
     credential: &str,
 ) -> Result<reqwest::RequestBuilder, ProviderError> {
+    kernel::redact::remember(credential);
     for (name, value) in &profile.headers {
+        kernel::redact::remember_named(name, value);
         let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
             .map_err(|error| ProviderError::Decode(format!("invalid header '{name}': {error}")))?;
         let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {

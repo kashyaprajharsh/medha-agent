@@ -11,7 +11,13 @@ use kernel::HumanGate;
 use permissions::PermissionManager;
 use sha2::{Digest, Sha256};
 
+pub mod command_resources;
 pub mod exec;
+mod git_controls;
+#[cfg(target_os = "linux")]
+mod git_namespace;
+#[cfg(any(windows, target_os = "linux", test))]
+mod git_snapshot;
 /// Kernel-level network-denial detection. Linux only: it is built on seccomp's
 /// user-notification mechanism, which has no counterpart elsewhere.
 #[cfg(target_os = "linux")]

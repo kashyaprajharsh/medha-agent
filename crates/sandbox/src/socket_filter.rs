@@ -29,6 +29,37 @@ pub(crate) fn program(net: NetPolicy) -> Vec<libc::sock_filter> {
         deny,
         stmt(load, 0),
     ];
+    for syscall in [
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_open_tree,
+        libc::SYS_move_mount,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
+    ] {
+        filter.extend([jeq(syscall as u32, 0, 1), deny]);
+    }
+    filter.extend([
+        jeq(libc::SYS_clone3 as u32, 0, 1),
+        stmt(ret, SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+        jeq(libc::SYS_clone as u32, 0, 4),
+        stmt(load, 16),
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: (libc::CLONE_NEWUSER | libc::CLONE_NEWNS) as u32,
+        },
+        deny,
+        stmt(load, 0),
+    ]);
     #[cfg(target_arch = "x86_64")]
     filter.extend([
         libc::sock_filter {

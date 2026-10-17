@@ -2063,6 +2063,7 @@ struct DiagnosticSnapshot {
 }
 
 struct LspClient {
+    git_protection: Option<sandbox::command_resources::CommandResources>,
     server: String,
     root: PathBuf,
     language_ids: HashMap<String, String>,
@@ -2156,6 +2157,9 @@ impl LspClient {
             read_roots: Vec::new(),
             write_roots: Vec::new(),
         };
+        let git_protection = backend
+            .protect(&request)
+            .map_err(|error| Error::Sandbox(error.to_string()))?;
         let mut command = backend
             .build_command(&request)
             .map_err(|error| Error::Sandbox(error.to_string()))?;
@@ -2216,6 +2220,7 @@ impl LspClient {
             },
             configuration,
         );
+        client.git_protection = Some(git_protection);
         if let Some(stderr) = stderr {
             let cancel = client.cancel.clone();
             client.stderr_task = Some(tokio::spawn(drain_server_stderr(stderr, cancel)));
@@ -2272,6 +2277,7 @@ impl LspClient {
             },
         ));
         Self {
+            git_protection: None,
             server,
             root,
             language_ids,

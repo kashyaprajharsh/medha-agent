@@ -394,6 +394,10 @@ impl BrowserScreenshot {
     /// `read` with `render: true`: a screenshot of `path`, a workspace page or URL.
     pub(crate) async fn render(&self, args: &Value) -> Result<Value, ToolError> {
         let requested = arg_str(args, "path")?;
+        if requested.starts_with("http://") || requested.starts_with("https://") {
+            kernel::egress::check("browser.navigate", &serde_json::json!({"url":requested}))
+                .map_err(ToolError::Security)?;
+        }
         let size = (
             dimension(args, "width", 1280, 320..=3840)?,
             dimension(args, "height", 800, 240..=4000)?,

@@ -134,14 +134,6 @@ impl LiveSettings {
         if let Some(backend) = options.sandbox {
             config.backend = backend;
         }
-        match config.backend {
-            sandbox::BackendKind::Ssh
-                if config.host.is_none() || !sandbox::program_on_path("ssh") =>
-            {
-                config.backend = sandbox::BackendKind::Native
-            }
-            _ => {}
-        }
         let backend = sandbox::select_backend(
             &config,
             lock.sandbox.extra_writable_paths(),
@@ -270,6 +262,12 @@ impl LiveExec {
 }
 #[async_trait::async_trait]
 impl ExecBackend for LiveExec {
+    fn protect(
+        &self,
+        request: &ExecRequest,
+    ) -> Result<sandbox::command_resources::CommandResources, ExecError> {
+        self.backend().protect(request)
+    }
     fn build_command(&self, request: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         self.backend().build_command(request)
     }
@@ -402,6 +400,9 @@ impl LiveContext {
 }
 
 impl kernel::context::RequestContext for LiveContext {
+    fn owns_memory_slot(&self) -> bool {
+        true
+    }
     fn fork(
         &self,
         workspace: Option<&Path>,

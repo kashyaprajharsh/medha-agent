@@ -1,5 +1,6 @@
 //! Swappable host, native, container, and SSH command-execution backends.
 
+use crate::command_resources::CommandResources;
 use async_trait::async_trait;
 use permissions::{ApprovedRoots, NetworkGrant};
 use std::collections::VecDeque;
@@ -198,6 +199,12 @@ impl Default for SandboxConfig {
 
 #[async_trait]
 pub trait ExecBackend: Send + Sync {
+    fn protect(&self, _req: &ExecRequest) -> Result<CommandResources, ExecError> {
+        Ok(CommandResources::default())
+    }
+    fn command_resources(&self, req: &ExecRequest) -> Result<CommandResources, ExecError> {
+        self.protect(req)
+    }
     /// Build the fully jail-configured command without spawning it, so isolation
     /// is applied in one place for both foreground and background runs.
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError>;
@@ -210,17 +217,18 @@ pub trait ExecBackend: Send + Sync {
         working_dir: Option<&Path>,
         limits: CaptureLimits,
     ) -> Result<BgProc, ExecError> {
+        let resources = self.command_resources(req)?;
         let mut command = self.build_command(req)?;
         if let Some(dir) = working_dir {
             command.current_dir(dir);
         }
-        spawn_background_with_limits(
+        spawn_background_captured(
             command,
-            limits.stdout,
-            limits.stderr,
-            limits.aggregate,
+            limits,
             self.denies_network(req),
             None,
+            None,
+            Some(resources),
         )
     }
 
@@ -1464,23 +1472,25 @@ fn spawn_background_with_limits(
 ) -> Result<BgProc, ExecError> {
     spawn_background_captured(
         cmd,
-        stdout_cap,
-        stderr_cap,
-        aggregate_cap,
+        CaptureLimits {
+            stdout: stdout_cap,
+            stderr: stderr_cap,
+            aggregate: aggregate_cap,
+        },
         watch_network,
         input,
+        None,
         None,
     )
 }
 
 fn spawn_background_captured(
     mut cmd: tokio::process::Command,
-    stdout_cap: usize,
-    stderr_cap: usize,
-    aggregate_cap: usize,
+    limits: CaptureLimits,
     watch_network: bool,
     input: Option<Vec<u8>>,
     shared_capture: Option<SharedCapture>,
+    resources: Option<CommandResources>,
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
     configure_for_spawn(&mut cmd, false, input.is_some());
@@ -1497,10 +1507,18 @@ fn spawn_background_captured(
     let net_flag: Option<Arc<AtomicBool>> = None;
     // std Child, not tokio: the leader must stay unreaped (PID reserved) until
     // its group helpers are killed, or a later group kill races PID reuse.
-    let mut child = cmd
-        .as_std_mut()
-        .spawn()
-        .map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let mut child = cmd.as_std_mut().spawn().map_err(|e| {
+        ExecError::Spawn(
+            if resources
+                .as_ref()
+                .is_some_and(|resources| !resources._protected.is_empty())
+            {
+                format!("native Git confinement could not be established; command was not run: {e}")
+            } else {
+                e.to_string()
+            },
+        )
+    })?;
     let finished = Arc::new(AtomicBool::new(false));
     #[cfg(target_os = "linux")]
     if let Some(pending) = pending {
@@ -1512,9 +1530,9 @@ fn spawn_background_captured(
     let err_pipe = child.stderr.take();
     let capture: SharedCapture = shared_capture.unwrap_or_else(|| {
         Arc::new(Mutex::new(CapturePair::new(
-            stdout_cap,
-            stderr_cap,
-            aggregate_cap,
+            limits.stdout,
+            limits.stderr,
+            limits.aggregate,
             watch_network,
         )))
     });
@@ -1577,6 +1595,7 @@ fn spawn_background_captured(
     // starved runtime worker lets an orphaned helper work on after the leader dies.
     let child_slot = Arc::new(Mutex::new(Some(child)));
     let supervisor_child = child_slot.clone();
+    let resource_capture = capture.clone();
     let supervisor = std::thread::Builder::new()
         .name(format!("medha-proc-{pid}"))
         .stack_size(128 * 1024)
@@ -1612,6 +1631,14 @@ fn spawn_background_captured(
                 None => child.wait().ok(),
             };
             reaper.disarm();
+            if let Some(notice) = resources.and_then(CommandResources::finish)
+                && let Ok(mut capture) = resource_capture.lock()
+            {
+                capture.push(
+                    CapturedStream::Stderr,
+                    format!("\nMedha: {notice}\n").as_bytes(),
+                );
+            }
             let _ = status_tx.send(status.and_then(|status| status.code()));
         });
     if let Err(error) = supervisor {
@@ -1696,6 +1723,12 @@ pub struct HostBackend;
 
 #[async_trait]
 impl ExecBackend for HostBackend {
+    #[cfg(windows)]
+    fn command_resources(&self, req: &ExecRequest) -> Result<CommandResources, ExecError> {
+        let mut roots = vec![req.cwd.clone()];
+        roots.extend(req.write_roots.iter().cloned());
+        CommandResources::snapshot(&roots)
+    }
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         Ok(base_command(&req.program, &req.args, req))
     }
@@ -2628,6 +2661,16 @@ pub struct LandlockBackend {
 
 #[cfg(target_os = "linux")]
 impl LandlockBackend {
+    fn control_roots(&self, req: &ExecRequest) -> Vec<PathBuf> {
+        if self.plugin.is_some() {
+            return vec![];
+        }
+        let owned = self.approved.owned_roots();
+        self.writable_paths(req)
+            .into_iter()
+            .filter(|root| *root != self.home.path && !owned.contains(root) && root.is_dir())
+            .collect()
+    }
     pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>, approved: ApprovedRoots) -> Self {
         Self {
             net,
@@ -2700,10 +2743,7 @@ impl LandlockBackend {
             PathBuf::from("/etc/ca-certificates"),
             // Toolchains locate themselves through procfs (rustc reads
             // /proc/self/exe); /sys carries the cgroup limits runtimes size to.
-            //
-            // CAVEAT: procfs is process-wide, so a child can read other same-UID
-            // processes' environ, including this agent's keys. Landlock cannot
-            // express a narrower grant; closing it needs PR_SET_DUMPABLE or a PID ns.
+            // Landlock's ptrace restriction denies other domains' environ files.
             PathBuf::from("/proc"),
             PathBuf::from("/sys"),
         ];
@@ -2862,6 +2902,13 @@ fn build_landlock_ruleset(
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl ExecBackend for LandlockBackend {
+    fn protect(&self, req: &ExecRequest) -> Result<CommandResources, ExecError> {
+        // Where the system refuses the private view, Git's controls are put back after each command.
+        match crate::git_namespace::available() {
+            true => CommandResources::git(&self.control_roots(req)),
+            false => CommandResources::snapshot(&self.control_roots(req)),
+        }
+    }
     fn build_plugin_command(
         &self,
         req: &ExecRequest,
@@ -2894,6 +2941,13 @@ impl ExecBackend for LandlockBackend {
             self.effective_net(req),
         )?;
         let sockets = crate::socket_filter::program(self.effective_net(req));
+        let mounts = match crate::git_namespace::available() {
+            true => {
+                let protected = crate::git_controls::held(&self.control_roots(req))?;
+                Some(crate::git_namespace::Mounts::new(&protected)?)
+            }
+            false => None,
+        };
 
         let mut cmd = std::process::Command::new(&req.program);
         cmd.args(&req.args).current_dir(&req.cwd);
@@ -2902,11 +2956,13 @@ impl ExecBackend for LandlockBackend {
         }
         cmd.envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-        // Apply Landlock in the child (post-fork, pre-exec): only restrict_self
-        // runs here — no allocation, so it's safe under the threaded runtime.
+        // Install the namespace, Landlock and seccomp in the child without allocating.
         let mut slot = Some(ruleset);
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(mounts) = &mounts {
+                    mounts.install()?;
+                }
                 if let Some(r) = slot.take() {
                     let status = r
                         .restrict_self()
@@ -3121,6 +3177,18 @@ impl ContainerBackend {
             "--security-opt".into(),
             "no-new-privileges".into(),
         ];
+        let git = ws.join(".git");
+        if git.is_dir() {
+            a.extend(["-v".into(), format!("{}:/workspace/.git", git.display())]);
+            for name in ["config", "commondir", "hooks"] {
+                a.extend([
+                    "-v".into(),
+                    format!("{}:/workspace/.git/{name}:ro", git.join(name).display()),
+                ]);
+            }
+        } else if git.is_file() {
+            a.extend(["-v".into(), format!("{}:/workspace/.git:ro", git.display())]);
+        }
         if self.effective_net(req) == NetPolicy::Deny {
             a.push("--network".into());
             a.push("none".into());
@@ -3344,8 +3412,7 @@ impl ExecBackend for SshBackend {
 }
 
 /// Pick an execution backend from config. `Native` degrades to `Host` where no
-/// native sandbox exists (Windows), as do misconfigured `Container`/`Ssh`.
-/// Callers validate and warn, so isolation is never silently assumed.
+/// native sandbox exists (Windows). Misconfigured remote execution fails closed.
 pub fn select_backend(
     cfg: &SandboxConfig,
     _extra_writable: Vec<PathBuf>,
@@ -3359,7 +3426,7 @@ pub fn select_backend(
         ));
     }
     match cfg.backend {
-        BackendKind::Host => Arc::new(HostBackend),
+        BackendKind::Host => platform_host(_extra_writable, _approved),
         BackendKind::Native => {
             #[cfg(target_os = "macos")]
             {
@@ -3384,13 +3451,15 @@ pub fn select_backend(
                             .with_state_access(&cfg.state),
                     )
                 } else {
-                    Arc::new(HostBackend)
+                    Arc::new(UnavailableBackend(
+                        "native Linux confinement is unavailable; command execution will not fall back to host",
+                    ))
                 }
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = net_grant;
-                Arc::new(HostBackend)
+                platform_host(_extra_writable, _approved)
             }
         }
         BackendKind::Container => match cfg.image.as_deref() {
@@ -3407,15 +3476,34 @@ pub fn select_backend(
             _ => Arc::new(UnavailableBackend("container execution requires an image")),
         },
         BackendKind::Ssh => match cfg.host.as_deref() {
-            Some(host) if !host.is_empty() => {
+            Some(host) if !host.trim().is_empty() && program_on_path("ssh") => {
                 Arc::new(SshBackend::new(host.to_string(), cfg.remote_dir.clone()))
             }
-            _ => Arc::new(HostBackend),
+            _ => Arc::new(UnavailableBackend(
+                "SSH execution needs a nonempty host and an installed ssh program; commands are unavailable until configured",
+            )),
         },
     }
 }
 
 struct UnavailableBackend(&'static str);
+
+fn platform_host(
+    _extra: Vec<PathBuf>,
+    _approved: ApprovedRoots,
+) -> std::sync::Arc<dyn ExecBackend> {
+    #[cfg(windows)]
+    {
+        std::sync::Arc::new(crate::git_snapshot::Backend {
+            extra: _extra,
+            approved: _approved,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        std::sync::Arc::new(HostBackend)
+    }
+}
 
 #[async_trait]
 impl ExecBackend for UnavailableBackend {
@@ -3513,6 +3601,18 @@ fn landlock_supported() -> bool {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "home_scope_tests.rs"]
 mod home_scope_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "proc_boundary_tests.rs"]
+mod proc_boundary_tests;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "git_boundary_tests.rs"]
+mod git_boundary_tests;
+
+#[cfg(test)]
+#[path = "ssh_selection_tests.rs"]
+mod ssh_selection_tests;
 
 #[cfg(test)]
 mod tests {

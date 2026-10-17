@@ -468,6 +468,7 @@ function ModelForm({
     String(model?.profile.max_output_tokens || ""),
   );
   const [certificate, setCertificate] = useState(String(model?.profile.ca_cert_file || ""));
+  const [proxy, setProxy] = useState(String(model?.profile.proxy || ""));
   const [reasoning, setReasoning] = useState(
     String(model?.profile.reasoning || "unknown"),
   );
@@ -563,6 +564,7 @@ function ModelForm({
       max_ctx: context ? Number(context) : null,
       max_output_tokens: output ? Number(output) : null,
       ca_cert_file: certificate.trim() || null,
+      proxy: proxy.trim() || null,
       reasoning,
       reasoning_efforts: efforts.length ? efforts : null,
       image_input: images,
@@ -860,6 +862,12 @@ function ModelForm({
               The full path of a .pem file with the certificate this server is signed by. Medha then trusts it for
               this server, as well as the usual public ones.
             </p>
+            <label>
+              Model proxy
+              <input value={proxy} spellCheck={false} placeholder="Off, or https://proxy.example:8443"
+                onChange={(event) => { setProxy(event.target.value); resetDiscovery(); }} />
+            </label>
+            <p className="quiet">This saved model sends its requests through this proxy, including authenticated traffic. A TLS-inspecting proxy also needs its certificate above. Web tools and servers use their own connections.</p>
             <label>
               Authentication
               <Select

@@ -336,40 +336,8 @@ fn kill_git_process_tree(pid: u32) {
     }
 }
 
-/// Environment entries that let a caller hand `git` an arbitrary program to run.
-const GIT_EXECUTABLE_ENV: &[&str] = &[
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_DIFF_OPTS",
-    "GIT_PAGER",
-    "GIT_EDITOR",
-    "GIT_SEQUENCE_EDITOR",
-    "GIT_ASKPASS",
-    "GIT_PROXY_COMMAND",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_TEMPLATE_DIR",
-    "GIT_NAMESPACE",
-];
-
 fn configure_git_process(command: &mut tokio::process::Command) {
-    // These worktree calls run outside the sandbox against the user's real repo,
-    // so a hook-shaped environment entry must not reach them.
-    for name in GIT_EXECUTABLE_ENV {
-        command.env_remove(name);
-    }
-    for (name, _) in std::env::vars_os() {
-        let text = name.to_string_lossy();
-        if text.starts_with("GIT_CONFIG_KEY_") || text.starts_with("GIT_CONFIG_VALUE_") {
-            drop(text);
-            command.env_remove(&name);
-        }
-    }
-    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env_clear().envs(git_safety::environment());
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
@@ -438,6 +406,7 @@ async fn run_git_program_observed(
     let command_name = args.join(" ");
     let mut command = tokio::process::Command::new(program);
     command.args(&args).current_dir(dir);
+    configure_git_process(&mut command);
     if let Some((key, value)) = env {
         command.env(key, value);
     }
@@ -446,7 +415,6 @@ async fn run_git_program_observed(
     } else {
         command.stdin(Stdio::null());
     }
-    configure_git_process(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
@@ -595,10 +563,16 @@ async fn run_git(
     env: Option<(OsString, OsString)>,
     stdout_limit: usize,
 ) -> Result<GitOutput, WorktreeError> {
+    let probe_dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let args = tokio::task::spawn_blocking(move || git_safety::arguments(&probe_dir, &args))
+        .await
+        .map_err(|error| WorktreeError::Spawn(error.to_string()))?
+        .map_err(WorktreeError::Spawn)?;
     run_git_program(
         PathBuf::from("git"),
         dir.to_path_buf(),
-        args.iter().map(|arg| (*arg).to_string()).collect(),
+        args,
         stdin,
         env,
         stdout_limit,

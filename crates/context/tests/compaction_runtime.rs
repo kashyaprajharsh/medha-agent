@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 #[path = "compaction_runtime/prune_batches.rs"]
 mod prune_batches;
 
+#[path = "compaction_runtime/budget_runtime_tests.rs"]
+mod budget_runtime_tests;
+
 struct Endpoint {
     caps: ProviderCaps,
     limit: AtomicU32,

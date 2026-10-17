@@ -37,6 +37,9 @@ pub trait RequestContext: Send + Sync {
     fn refresh_memory(&self, _: &str) -> Option<String> {
         None
     }
+    fn owns_memory_slot(&self) -> bool {
+        false
+    }
 }
 
 pub type SummaryPrompt = dyn Fn() -> String + Send + Sync;
@@ -178,6 +181,9 @@ pub struct CompileResult {
 
 #[async_trait]
 pub trait ContextEngine: Send + Sync {
+    fn estimate_prepared(&self, _: &crate::PreparedModelRequest) -> Option<InputTokenCount> {
+        None
+    }
     fn fork_with_summary_prompt(&self, _: Arc<SummaryPrompt>) -> Option<Arc<dyn ContextEngine>> {
         self.fork()
     }
@@ -199,6 +205,9 @@ pub trait ContextEngine: Send + Sync {
 
     /// Restore provider usage only after the kernel has matched the priced request prefix.
     fn restore_usage(&self, _ctx: &CompiledContext, _prompt_tokens: u32) {}
+    fn restore_prepared_usage(&self, request: &crate::PreparedModelRequest, prompt_tokens: u32) {
+        self.restore_usage(&request.context, prompt_tokens);
+    }
 
     /// Version of the retention policy used for full compaction checkpoints.
     fn compaction_policy_version(&self) -> Option<u64> {

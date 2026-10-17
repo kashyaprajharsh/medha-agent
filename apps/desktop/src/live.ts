@@ -119,6 +119,7 @@ export type LiveState = {
   activity?: { kind: "compacting" | "model" | "tool"; started: number; tool?: string; target?: string };
   notice?: string;
   projectTrust?: ProjectTrustReview;
+  outbound?: { id: string };
   error?: string;
   settled: number;
   // Messages a stopped or failed turn never read, waiting for the composer.
@@ -530,7 +531,9 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       // A call that failed has no screen coming; one that worked keeps what was
       // written until its screen arrives, so the drawing is never taken down between.
       const writing = params.ok === true ? state.writing : state.writing?.filter((call) => call.id !== id);
-      return { ...state, items, writing };
+      const outbound = params.outbound as LiveState["outbound"];
+      const notice = outbound && state.notice?.startsWith("Outbound request blocked:") && state.notice.includes(outbound.id) ? undefined : state.notice;
+      return { ...state, items, writing, notice, outbound: outbound ?? state.outbound };
     }
     case "tool.input": {
       const [id, tool, delta] = [str(params.id), str(params.tool), str(params.delta)];

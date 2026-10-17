@@ -158,6 +158,12 @@ impl kernel::Executor for Rebound {
     fn containment(&self) -> kernel::Containment {
         self.inner.containment()
     }
+    async fn call_containment(&self, intent: &kernel::ToolIntent) -> kernel::Containment {
+        self.inner.call_containment(intent).await
+    }
+    async fn check_outbound(&self, intent: &kernel::ToolIntent) -> Result<(), String> {
+        self.inner.check_outbound(intent).await
+    }
 
     fn missing_access(
         &self,

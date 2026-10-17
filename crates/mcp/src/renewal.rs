@@ -126,7 +126,12 @@ impl Persisted {
             .blocking(|store, server, url| store.load(server, url))
             .await
             .ok()??;
-        serde_json::from_str(&blob).ok()
+        let tokens: StoredTokens = serde_json::from_str(&blob).ok()?;
+        kernel::redact::remember(tokens.token.access_token().secret());
+        if let Some(refresh) = tokens.token.refresh_token() {
+            kernel::redact::remember(refresh.secret());
+        }
+        Some(tokens)
     }
 }
 
@@ -140,6 +145,10 @@ impl CredentialStore for Persisted {
         let Some(token) = credentials.token_response else {
             return Ok(());
         };
+        kernel::redact::remember(token.access_token().secret());
+        if let Some(refresh) = token.refresh_token() {
+            kernel::redact::remember(refresh.secret());
+        }
         let stored = StoredTokens {
             client_id: credentials.client_id,
             token,

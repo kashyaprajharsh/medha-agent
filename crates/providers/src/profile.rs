@@ -126,6 +126,9 @@ pub struct ProviderProfile {
     /// are trusted for this server as well as the public ones, never instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_file: Option<String>,
+    /// Explicit model-traffic proxy; setting it authorizes this profile's authenticated traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 /// Bounds on a configured stream wait: long enough for a model to think,
@@ -163,6 +166,7 @@ impl ProviderProfile {
             cache_ttl: Default::default(),
             reasoning_echo: None,
             ca_cert_file: None,
+            proxy: None,
         }
     }
 
@@ -243,6 +247,19 @@ impl ProviderProfile {
         }
         if self.token_counter == TokenCounter::Vllm && self.protocol != Protocol::OpenAiChat {
             return Err("the vLLM counter is only valid with the open-ai-chat protocol".into());
+        }
+        if let Some(proxy) = &self.proxy {
+            let url = reqwest::Url::parse(proxy)
+                .map_err(|_| "model proxy must be an HTTP or HTTPS URL")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(
+                    "model proxy must be an HTTP or HTTPS URL without embedded credentials".into(),
+                );
+            }
         }
         for (name, value) in &self.headers {
             let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
@@ -333,6 +350,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             reasoning_echo: Option<bool>,
             #[serde(default)]
             ca_cert_file: Option<String>,
+            #[serde(default)]
+            proxy: Option<String>,
         }
 
         let raw = RawProfile::deserialize(deserializer)?;
@@ -361,6 +380,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             cache_ttl: raw.cache_ttl,
             reasoning_echo: raw.reasoning_echo,
             ca_cert_file: raw.ca_cert_file.filter(|file| !file.trim().is_empty()),
+            proxy: raw.proxy.filter(|value| !value.trim().is_empty()),
         })
     }
 }

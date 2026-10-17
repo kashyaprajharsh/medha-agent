@@ -1,7 +1,10 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::process::Command;
 use std::time::Duration;
+
+#[path = "headless_exit/http.rs"]
+mod http;
 
 fn configured_medha(workspace: &std::path::Path, home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_medha"));
@@ -54,8 +57,12 @@ fn a_headless_provider_failure_exits_nonzero() {
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut request = [0u8; 8192];
-                    let _ = stream.read(&mut request);
+                    let request = http::request(&mut stream);
+                    assert!(
+                        std::str::from_utf8(&request)
+                            .unwrap()
+                            .starts_with("POST /v1/chat/completions ")
+                    );
                     let body = br#"{"error":{"message":"deliberate provider rejection"}}"#;
                     write!(
                         stream,
@@ -80,6 +87,8 @@ fn a_headless_provider_failure_exits_nonzero() {
 
     let output = configured_medha(&workspace, &home)
         .env("MEDHA_BASE_URL", format!("http://{address}/v1"))
+        .env("MEDHA_MAX_CTX", "32000")
+        .env("MEDHA_MAX_WALL", "5")
         .output()
         .unwrap();
     server.join().unwrap();
@@ -95,6 +104,7 @@ fn a_headless_provider_failure_exits_nonzero() {
         "failure was not propagated clearly: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deliberate provider rejection"));
 }
 
 #[test]
@@ -213,29 +223,7 @@ fn required_completion_failure_exits_nonzero_but_plan_does_not_run_checks() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-                    let length = headers
-                        .lines()
-                        .find_map(|l| {
-                            l.strip_prefix("content-length:")
-                                .and_then(|n| n.trim().parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= end + 4 + length {
-                        break;
-                    }
-                }
-                assert!(request.len() < 2_000_000);
-            }
+            let request = http::request(&mut stream);
             let is_chat =
                 String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions");
             let (content_type, body) = if is_chat {

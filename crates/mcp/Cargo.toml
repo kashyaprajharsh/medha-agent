@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kernel.workspace = true
 dirs = "5"
 sandbox = { path = "../sandbox" }
 serde.workspace = true

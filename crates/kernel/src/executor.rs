@@ -62,8 +62,16 @@ pub trait Executor: Send + Sync {
         Containment::None
     }
 
+    async fn call_containment(&self, _intent: &ToolIntent) -> Containment {
+        self.containment()
+    }
+
     /// Execute one validated intent and return its observation.
     async fn execute(&self, intent: &ToolIntent) -> Observation;
+
+    async fn check_outbound(&self, _intent: &ToolIntent) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Validate requested capabilities and return the subset not already granted.
     fn missing_access(&self, _intent: &ToolIntent) -> Result<crate::ExecutionAccess, String> {

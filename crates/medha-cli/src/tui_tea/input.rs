@@ -1571,6 +1571,7 @@ pub(super) fn set_theme(model: &mut Model, id: &str) {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SlashAction {
+    Outbound(String),
     Resume,
     Rewind,
     Clear,
@@ -1646,6 +1647,12 @@ pub(super) enum SlashAction {
 /// single source of truth for routing; both Enter paths go through it.
 pub(super) fn classify_slash(cmd: &str) -> SlashAction {
     match cmd {
+        c if c.strip_prefix("outbound").is_some_and(is_cmd_boundary) => SlashAction::Outbound(
+            c.strip_prefix("outbound")
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        ),
         "resume" => SlashAction::Resume,
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,

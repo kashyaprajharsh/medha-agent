@@ -8,7 +8,7 @@ use crate::tokens::{BpeCounter, TokenCounter};
 use async_trait::async_trait;
 use kernel::{CompileResult, ContextEngine, InputTokenCount, Message, Role, TokenCountQuality};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 type SystemRefresh = dyn Fn(&str) -> (String, Option<kernel::TrustLabel>) + Send + Sync;
 
@@ -23,6 +23,9 @@ pub struct PipelineEngine {
     /// Real prompt tokens from the provider's last response (0 = unknown). The
     /// authoritative basis for the compaction decision — not an estimate.
     last_prompt_tokens: AtomicU32,
+    prepared_estimate: AtomicU64,
+    prepared_anchor: AtomicU64,
+    prepared_usage: AtomicU64,
     /// Count for the exact request candidate currently being compiled. Cleared
     /// before every prepare/count cycle so it can never leak across a changed
     /// request body.
@@ -97,6 +100,9 @@ impl PipelineEngine {
             summary_failed: AtomicBool::new(false),
             summary_failure: std::sync::Mutex::new(None),
             pending_estimate: AtomicU32::new(0),
+            prepared_estimate: AtomicU64::new(0),
+            prepared_anchor: AtomicU64::new(0),
+            prepared_usage: AtomicU64::new(0),
             estimate_at_last_usage: AtomicU32::new(0),
             thinking_unseen: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
@@ -215,6 +221,24 @@ const PER_TOOL_SCAFFOLD_TOKENS: u32 = 18;
 
 #[async_trait]
 impl ContextEngine for PipelineEngine {
+    fn estimate_prepared(&self, request: &kernel::PreparedModelRequest) -> Option<InputTokenCount> {
+        let raw = crate::request_estimate::count(request, self.counter.as_ref());
+        self.prepared_estimate.store(raw, Ordering::Relaxed);
+        let anchor = self.prepared_anchor.load(Ordering::Relaxed);
+        let usage = self.prepared_usage.load(Ordering::Relaxed);
+        let calibrated = if anchor > 0 {
+            raw.saturating_mul(usage).div_ceil(anchor).max(raw)
+        } else {
+            raw
+        };
+        Some(InputTokenCount {
+            tokens: calibrated
+                .saturating_add(calibrated.div_ceil(10))
+                .saturating_add(256),
+            quality: TokenCountQuality::LocalEstimate,
+            request_fingerprint: request.request_fingerprint.clone(),
+        })
+    }
     fn begin_request(&self, scope: &str) {
         let mut current = self.request_scope.lock().unwrap();
         if *current != scope {
@@ -222,6 +246,9 @@ impl ContextEngine for PipelineEngine {
             self.last_prompt_tokens.store(0, Ordering::Relaxed);
             self.estimate_at_last_usage.store(0, Ordering::Relaxed);
             self.pending_estimate.store(0, Ordering::Relaxed);
+            self.prepared_estimate.store(0, Ordering::Relaxed);
+            self.prepared_anchor.store(0, Ordering::Relaxed);
+            self.prepared_usage.store(0, Ordering::Relaxed);
             self.thinking_unseen.store(0, Ordering::Relaxed);
             self.pending_usage_verification
                 .store(false, Ordering::Relaxed);
@@ -263,6 +290,10 @@ impl ContextEngine for PipelineEngine {
     }
 
     fn restore_usage(&self, ctx: &kernel::CompiledContext, prompt_tokens: u32) {
+        if prompt_tokens == 0 {
+            self.prepared_anchor.store(0, Ordering::Relaxed);
+            self.prepared_usage.store(0, Ordering::Relaxed);
+        }
         self.last_prompt_tokens
             .store(prompt_tokens, Ordering::Relaxed);
         self.estimate_at_last_usage.store(
@@ -274,6 +305,16 @@ impl ContextEngine for PipelineEngine {
             },
             Ordering::Relaxed,
         );
+    }
+
+    fn restore_prepared_usage(&self, request: &kernel::PreparedModelRequest, prompt_tokens: u32) {
+        self.restore_usage(&request.context, prompt_tokens);
+        self.prepared_anchor.store(
+            crate::request_estimate::count(request, self.counter.as_ref()),
+            Ordering::Relaxed,
+        );
+        self.prepared_usage
+            .store(u64::from(prompt_tokens), Ordering::Relaxed);
     }
 
     fn compaction_policy_version(&self) -> Option<u64> {
@@ -371,6 +412,12 @@ impl ContextEngine for PipelineEngine {
     }
 
     fn update_usage(&self, prompt_tokens: u32, _total_tokens: u32) {
+        self.prepared_anchor.store(
+            self.prepared_estimate.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.prepared_usage
+            .store(u64::from(prompt_tokens), Ordering::Relaxed);
         // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens
             .store(prompt_tokens, Ordering::Relaxed);
@@ -397,6 +444,7 @@ impl ContextEngine for PipelineEngine {
     }
 
     fn clear_preflight(&self) {
+        self.prepared_estimate.store(0, Ordering::Relaxed);
         self.preflight_tokens.store(0, Ordering::Release);
         self.preflight_quality.store(
             quality_code(TokenCountQuality::LocalEstimate),

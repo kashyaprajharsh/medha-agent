@@ -36,6 +36,9 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
     if !["conversation", "code", "both"].contains(&scope) {
         return Err("Unknown rewind scope".into());
     }
+    if scope != "code" && resources.memory.is_some() && !kernel.owns_memory_slot() {
+        return Err("The prompt builder has no owned memory slot; rewind was not applied".into());
+    }
     let _lease = kernel
         .log
         .acquire_mutation_lease("state:*")
@@ -132,9 +135,9 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
             );
         }
         if let Some(block) = updated_memory {
-            system.content = kernel
-                .refresh_memory(&block)
-                .unwrap_or_else(|| memory::recall::replace_k3(&system.content, &block));
+            system.content = kernel.refresh_memory(&block).ok_or(
+                "The rewind branch was saved, but its prompt builder has no owned memory slot",
+            )?;
         }
         transcript.clear();
         transcript.push(system);

@@ -14,6 +14,18 @@ pub const DEFAULT_MAX_TURNS: u32 = 200;
 /// ceiling is no ceiling at all.
 pub type Allowance = Arc<Mutex<Pooled>>;
 
+/// A capped request's output allowance: what both the model and the budget allow,
+/// but never less than one ordinary reply. When the budget cannot pay for that,
+/// the request is refused and the task ends with its wrap-up instead.
+pub(crate) fn capped_output(model: Option<u64>, room: Option<u64>) -> u64 {
+    // A model whose own limit is unknown is not asked for more than this.
+    const UNKNOWN_MODEL: u64 = 32_768;
+    const ONE_REPLY: u64 = 4_096;
+    let model = model.unwrap_or(UNKNOWN_MODEL);
+    let floor = ONE_REPLY.min(model);
+    room.map_or(model, |room| room.min(model)).max(floor)
+}
+
 /// Shared slot holding the budget a session was started with, so anything that
 /// spawns work on its behalf can derive ceilings from the same source.
 pub type BudgetHandle = Arc<Mutex<Option<Budget>>>;
@@ -25,6 +37,7 @@ pub struct Pooled {
     reserved_tokens: u64,
     reserved_cost_usd: f64,
     started: Option<Instant>,
+    finish_claimed: bool,
 }
 
 impl Pooled {
@@ -127,6 +140,8 @@ pub struct Governor {
     allowance: Allowance,
     local: Arc<Mutex<LocalSpend>>,
     turns: u32,
+    finish_reserve: bool,
+    finishing: bool,
 }
 
 #[derive(Debug, Default)]
@@ -161,7 +176,97 @@ impl Governor {
             allowance,
             local: Arc::new(Mutex::new(LocalSpend::default())),
             turns: 0,
+            finish_reserve: false,
+            finishing: false,
         }
+    }
+
+    pub fn reserve_for_finish(mut self) -> Self {
+        self.finish_reserve = true;
+        self
+    }
+
+    pub fn capped_requests(&self) -> bool {
+        self.budget.max_cost_usd.is_some() || self.budget.max_tokens.is_some()
+    }
+
+    pub fn requires_pricing(&self) -> bool {
+        self.budget.max_cost_usd.is_some()
+    }
+
+    /// The share of the caps working requests may use; the rest funds the finish.
+    fn working_share(&self, spent: &Pooled) -> f64 {
+        let started = spent.tokens > 0
+            || spent.reserved_tokens > 0
+            || spent.cost_usd > 0.0
+            || spent.reserved_cost_usd > 0.0;
+        match self.finish_reserve && !self.finishing && started {
+            true => 0.95,
+            false => 1.0,
+        }
+    }
+
+    /// Output tokens the caps can still pay for after `prompt`; `None` when no cap limits it.
+    pub fn output_room(&self, prompt: u64, price: Option<Pricing>) -> Option<u64> {
+        let spent = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let share = self.working_share(&spent);
+        let tokens = self.budget.max_tokens.map(|max| {
+            let used = spent.tokens + spent.reserved_tokens + prompt;
+            ((max as f64 * share).floor() as u64).saturating_sub(used)
+        });
+        let paid = self
+            .budget
+            .max_cost_usd
+            .zip(price)
+            .and_then(|(max, price)| {
+                let input = prompt as f64 * price.input_per_mtok / 1_000_000.0;
+                let left = max * share - spent.cost_usd - spent.reserved_cost_usd - input;
+                (price.output_per_mtok > 0.0)
+                    .then(|| (left.max(0.0) * 1_000_000.0 / price.output_per_mtok).floor() as u64)
+            });
+        match (tokens, paid) {
+            (Some(tokens), Some(paid)) => Some(tokens.min(paid)),
+            (room, None) | (None, room) => room,
+        }
+    }
+
+    pub fn begin_wrap_up(&mut self, prompt: u64, price: Option<Pricing>) -> Option<u64> {
+        let mut allowance = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if allowance.finish_claimed || !self.capped_requests() {
+            return None;
+        }
+        let mut cap = 512;
+        if let Some(max) = self.budget.max_tokens {
+            cap = cap.min(
+                max.saturating_sub(allowance.tokens.saturating_add(allowance.reserved_tokens))
+                    .saturating_sub(prompt),
+            );
+        }
+        if let Some(max) = self.budget.max_cost_usd {
+            let price = price?;
+            let remaining = max
+                - allowance.cost_usd
+                - allowance.reserved_cost_usd
+                - prompt as f64 * price.input_per_mtok / 1_000_000.0;
+            if !remaining.is_finite() || remaining < 0.0 {
+                return None;
+            }
+            if price.output_per_mtok > 0.0 {
+                cap = cap.min((remaining * 1_000_000.0 / price.output_per_mtok).floor() as u64);
+            }
+        }
+        if cap == 0 {
+            return None;
+        }
+        allowance.finish_claimed = true;
+        self.finishing = true;
+        Some(cap)
     }
 
     /// `Some(reason)` if any ceiling is reached — stop before the turn. Turns are
@@ -225,8 +330,8 @@ impl Governor {
 
     /// Atomically reserve the maximum charge of one provider request.
     ///
-    /// A hard token/cost ceiling requires exact prepared-input accounting and a
-    /// finite output cap. Otherwise there is no safe upper bound to admit.
+    /// Admission uses prepared-input accounting and a finite output cap.
+    /// Local estimates are reconciled against the provider's actual usage.
     pub fn reserve_model(
         &mut self,
         prompt_tokens: Option<u64>,
@@ -267,6 +372,7 @@ impl Governor {
             .allowance
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let working_share = self.working_share(&allowance);
         if matches!(
             self.budget.max_tokens,
             Some(max)
@@ -274,7 +380,7 @@ impl Governor {
                     .tokens
                     .saturating_add(allowance.reserved_tokens)
                     .saturating_add(tokens)
-                    > max
+                    > (max as f64 * working_share).floor() as u64
         ) {
             return Err(BudgetStop::Tokens);
         }
@@ -282,7 +388,7 @@ impl Governor {
             self.budget.max_cost_usd,
             Some(max)
                 if allowance.cost_usd + allowance.reserved_cost_usd + cost_usd
-                    > max
+                    > max * working_share
         ) {
             return Err(BudgetStop::Cost);
         }
@@ -407,6 +513,43 @@ impl Drop for ModelReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capped request may write as much as the model allows while money
+    /// remains, and never more than the rest of the budget can pay for.
+    #[test]
+    fn a_capped_reply_is_as_long_as_the_budget_can_pay_for() {
+        let price = Pricing {
+            input_per_mtok: 1.0,
+            output_per_mtok: 10.0,
+            cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
+            indicative: false,
+        };
+        let governor = Governor::new(Budget {
+            max_cost_usd: Some(5.0),
+            ..Budget::default()
+        });
+        // $5 less $0.01 of prompt pays for 499,000 output tokens: the model's limit decides.
+        let room = governor.output_room(10_000, Some(price));
+        assert_eq!(room, Some(499_000));
+        assert_eq!(capped_output(Some(64_000), room), 64_000);
+        assert_eq!(capped_output(None, room), 32_768);
+        // Nearly spent: no tiny working reply is asked for. A full one is, which the
+        // budget refuses, so the task ends with its wrap-up instead.
+        let nearly = Governor::new(Budget {
+            max_cost_usd: Some(0.02),
+            ..Budget::default()
+        });
+        let room = nearly.output_room(10_000, Some(price));
+        assert_eq!(room, Some(1_000));
+        assert_eq!(capped_output(Some(64_000), room), 4_096);
+        assert_eq!(capped_output(Some(2_000), room), 2_000);
+        let tokens = Governor::new(Budget {
+            max_tokens: Some(20_000),
+            ..Budget::default()
+        });
+        assert_eq!(tokens.output_room(15_000, None), Some(5_000));
+    }
 
     #[test]
     fn invalid_cost_limits_never_admit_spend() {

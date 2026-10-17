@@ -130,6 +130,18 @@ impl Executor for NarrowedExecutor {
     fn containment(&self) -> Containment {
         self.inner.containment()
     }
+    async fn call_containment(&self, intent: &ToolIntent) -> Containment {
+        self.inner.call_containment(intent).await
+    }
+    async fn check_outbound(&self, intent: &ToolIntent) -> Result<(), String> {
+        if !self.allows_intent(intent) {
+            return Err(format!(
+                "'{}' is outside this agent's capabilities",
+                intent.tool
+            ));
+        }
+        self.inner.check_outbound(intent).await
+    }
 
     fn missing_access(&self, intent: &ToolIntent) -> Result<kernel::ExecutionAccess, String> {
         if !self.allows_intent(intent) {

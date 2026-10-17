@@ -9,6 +9,8 @@ pub(crate) struct Registration {
     fingerprint: String,
     permitted: bool,
     filter: ToolFilter,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub(crate) outbound: Option<(String, String)>,
 }
 
 impl Registration {
@@ -17,6 +19,7 @@ impl Registration {
             fingerprint: crate::cache::fingerprint(config),
             permitted: !config.disabled,
             filter: config.tools.clone(),
+            outbound: crate::outbound::target(config),
         }
     }
 }

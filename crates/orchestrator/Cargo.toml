@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+git-safety = { path = "../git-safety" }
 kernel = { path = "../kernel" }
 async-trait.workspace = true
 futures.workspace = true

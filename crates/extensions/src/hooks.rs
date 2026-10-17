@@ -290,6 +290,15 @@ impl ProcessHookRunner {
             }
         }
         let input = self.encode(hook, request, limit)?;
+        let _git_protection = if self.require_isolation {
+            None
+        } else {
+            Some(
+                backend
+                    .protect(&exec_request)
+                    .map_err(|error| HookRunFailure::failed(error.to_string()))?,
+            )
+        };
         let command = if self.require_isolation {
             backend.build_plugin_command(
                 &exec_request,

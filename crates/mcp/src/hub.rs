@@ -343,6 +343,16 @@ impl Link {
         self.mirror.read().expect("hub mirror lock").clone()
     }
 
+    pub(crate) fn outbound(&self, server: &str) -> Result<Option<(String, String)>, Error> {
+        self.mirror
+            .read()
+            .expect("hub mirror lock")
+            .registrations
+            .get(server)
+            .map(|registration| registration.outbound.clone())
+            .ok_or_else(|| Error::UnknownServer(server.into()))
+    }
+
     pub fn tool_specs(&self) -> Vec<McpToolSpec> {
         self.mirror
             .read()

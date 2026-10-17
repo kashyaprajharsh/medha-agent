@@ -6,6 +6,7 @@ pub mod budgets;
 pub mod clarify;
 pub mod context;
 mod cut_off;
+pub mod egress;
 mod empty_reply;
 pub mod errors;
 mod event_trust;

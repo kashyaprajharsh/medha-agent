@@ -291,15 +291,6 @@ pub fn compile_k3_configured(
     )
 }
 
-/// Replace the trailing recall section while preserving the stable system-prefix.
-pub fn replace_k3(system: &str, block: &str) -> String {
-    let head = system
-        .find(MEMORY_MARKER)
-        .map(|idx| system[..idx].trim_end())
-        .unwrap_or_else(|| system.trim_end());
-    append_k3(head, block)
-}
-
 pub fn append_k3(head: &str, block: &str) -> String {
     if block.is_empty() {
         return head.to_string();
@@ -403,7 +394,7 @@ mod tests {
             })
             .unwrap();
         let frozen = compile_k3(&store, 1_200, now).unwrap();
-        let system = replace_k3("persona", &frozen);
+        let system = append_k3("persona", &frozen);
 
         store
             .apply(&MemoryOp::Write {
@@ -416,10 +407,10 @@ mod tests {
                 ),
             })
             .unwrap();
-        assert_eq!(system, replace_k3("persona", &frozen));
+        assert_eq!(system, append_k3("persona", &frozen));
         assert!(!system.contains("mid-session"));
 
-        let refreshed = replace_k3(&system, &compile_k3(&store, 1_200, now).unwrap());
+        let refreshed = append_k3("persona", &compile_k3(&store, 1_200, now).unwrap());
         assert!(refreshed.contains("session-a"));
         assert!(refreshed.contains("mid-session"));
         assert_eq!(refreshed.matches(MEMORY_MARKER).count(), 1);
@@ -451,11 +442,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_replaced_blocks_are_well_formed() {
-        assert_eq!(replace_k3("persona", ""), "persona");
-        let once = replace_k3("persona", "one");
-        let twice = replace_k3(&once, "two");
-        assert_eq!(twice, "persona\n\n## Memory\n\ntwo");
+    fn empty_and_appended_blocks_are_well_formed() {
+        assert_eq!(append_k3("persona", ""), "persona");
+        assert_eq!(append_k3("persona", "two"), "persona\n\n## Memory\n\ntwo");
     }
 
     #[test]

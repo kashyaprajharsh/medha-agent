@@ -46,6 +46,7 @@ mod cache;
 pub mod hub;
 mod lapse;
 mod oauth;
+mod outbound;
 mod renewal;
 pub mod session_tools;
 
@@ -515,6 +516,7 @@ fn screen_identity(server: &str, definition: &ServerConfig) -> String {
 
 /// A live connection taken out of its slot, awaiting shutdown and process reap.
 struct Retiree {
+    _git_protection: Option<sandbox::command_resources::CommandResources>,
     client: Option<Client>,
     pid: Option<u32>,
 }
@@ -537,6 +539,7 @@ impl Retiree {
 }
 
 struct Slot {
+    git_protection: Option<sandbox::command_resources::CommandResources>,
     config: ServerConfig,
     state: ServerState,
     client: Option<Client>,
@@ -580,6 +583,7 @@ impl Slot {
         };
         Self {
             config,
+            git_protection: None,
             state,
             client: None,
             peer: None,
@@ -602,6 +606,7 @@ impl Slot {
         self.proven = false;
         self.generation = next_generation();
         Retiree {
+            _git_protection: self.git_protection.take(),
             client: self.client.take(),
             pid: self.pid.take(),
         }
@@ -641,6 +646,7 @@ impl ClientHandler for Handler {
 
 /// A freshly established connection, before it is installed into its slot.
 struct Connected {
+    git_protection: Option<sandbox::command_resources::CommandResources>,
     client: Client,
     peer: Peer<RoleClient>,
     pid: Option<u32>,
@@ -1325,6 +1331,13 @@ impl McpManager {
             return Err(Error::Disabled);
         }
         let (server, tool) = parse_qualified(qualified)?;
+        let outbound = self.outbound_target(&server).await?;
+        if let Some((url, _)) = &outbound {
+            kernel::egress::check_tool(url, &serde_json::json!({"tool":tool,"arguments":args}))
+                .map_err(Error::Protocol)?;
+        }
+        let identity =
+            identity.or_else(|| outbound.as_ref().map(|(_, identity)| identity.as_str()));
         if let Some(link) = self.hub_for(&server) {
             return link.call(qualified, args, screen, identity).await;
         }
@@ -1715,12 +1728,14 @@ impl McpManager {
                         // may be a different server wearing the same id.
                         Some(slot) if slot.generation != generation || slot.config.disabled => {
                             Some(Retiree {
+                                _git_protection: connected.git_protection,
                                 client: Some(connected.client),
                                 pid: connected.pid,
                             })
                         }
                         Some(slot) => {
                             slot.client = Some(connected.client);
+                            slot.git_protection = connected.git_protection;
                             slot.peer = Some(connected.peer);
                             slot.pid = connected.pid;
                             slot.lapse = connected.lapse;
@@ -1740,6 +1755,7 @@ impl McpManager {
                         }
                         // Removed mid-connect: retire the new client, don't leak it.
                         None => Some(Retiree {
+                            _git_protection: connected.git_protection,
                             client: Some(connected.client),
                             pid: connected.pid,
                         }),
@@ -1914,12 +1930,13 @@ impl McpManager {
                 hint: "install the configured MCP server executable".into(),
             });
         }
-        let command = self.build_command(program, args, env, server)?;
+        let (command, git_protection) = self.build_command(program, args, env, server)?;
         let transport = TokioChildProcess::new(command).map_err(|e| Error::Spawn(e.to_string()))?;
         let pid = transport.id();
         match self.handshake(server, transport).await {
             Ok(mut connected) => {
                 connected.pid = pid;
+                connected.git_protection = Some(git_protection);
                 Ok(connected)
             }
             // The transport is already dropped; reap the tree it may have spawned.
@@ -2045,6 +2062,7 @@ impl McpManager {
         };
         match timeout(deadline, connect).await {
             Ok(Ok((client, tools))) => Ok(Connected {
+                git_protection: None,
                 peer: client.peer().clone(),
                 client,
                 pid: None,
@@ -2062,7 +2080,7 @@ impl McpManager {
         args: &[String],
         env: &[(String, String)],
         server: &ServerConfig,
-    ) -> Result<Command, Error> {
+    ) -> Result<(Command, sandbox::command_resources::CommandResources), Error> {
         let allow_network = server
             .allow_network
             .unwrap_or(self.inner.config.allow_network);
@@ -2127,13 +2145,16 @@ impl McpManager {
             read_roots: server.read_roots.clone(),
             write_roots: Vec::new(),
         };
+        let resources = backend
+            .protect(&request)
+            .map_err(|error| Error::Sandbox(error.to_string()))?;
         let mut command = backend
             .build_command(&request)
             .map_err(|e| Error::Sandbox(e.to_string()))?;
         command.kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        Ok(command)
+        Ok((command, resources))
     }
 
     async fn server_config(&self, server_id: &str) -> Result<ServerConfig, Error> {
@@ -2595,6 +2616,10 @@ pub fn id_from_url(url: &str) -> Option<String> {
 fn normalize(path: &std::path::Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
+
+#[cfg(test)]
+#[path = "outbound_tests.rs"]
+mod outbound_tests;
 
 #[cfg(test)]
 mod tests {

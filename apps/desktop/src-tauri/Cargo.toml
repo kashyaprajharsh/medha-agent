@@ -20,6 +20,7 @@ opt-level = 3
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+git-safety = { path = "../../../crates/git-safety" }
 sha2 = "0.10"
 tauri = { version = "2", features = ["macos-private-api"] }
 serde_json = "1"

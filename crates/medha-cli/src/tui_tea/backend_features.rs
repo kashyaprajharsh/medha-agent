@@ -385,6 +385,25 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
                 model.push_notice(notice);
             }
         }
+        A::Outbound(args) => {
+            if let Some(id) = args
+                .strip_prefix("allow ")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                request(
+                    model,
+                    Effect::SessionChange(
+                        protocol::SessionChange::AllowOutbound { id: id.into() },
+                        After::Notice,
+                    ),
+                );
+            } else if args.is_empty() {
+                request(model, Effect::Inspect(Inspect::Outbound, After::Notice));
+            } else {
+                model.push_notice("usage: /outbound [allow <payload id>]");
+            }
+        }
         A::Lsp => {
             request(model, Effect::Inspect(Inspect::Lsp, After::Notice));
         }

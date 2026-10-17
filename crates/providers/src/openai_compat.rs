@@ -266,15 +266,20 @@ impl ProviderClient {
     /// The connection to use for a server: the shared one, or one that also
     /// trusts the certificate file its model was saved with. Built once per file.
     fn http_for(&self, profile: &ProviderProfile) -> Result<reqwest::Client, ProviderError> {
-        let Some(file) = profile.ca_cert_file.as_ref() else {
+        if profile.ca_cert_file.is_none() && profile.proxy.is_none() {
             return Ok(self.http.clone());
-        };
+        }
+        let key = serde_json::to_string(&(&profile.ca_cert_file, &profile.proxy))
+            .expect("transport settings");
         let mut trusting = self.trusting.lock().unwrap();
-        if let Some(known) = trusting.get(file) {
+        if let Some(known) = trusting.get(&key) {
             return Ok(known.clone());
         }
         let built = http::client_for(profile)?;
-        trusting.insert(file.clone(), built.clone());
+        if trusting.len() >= 16 {
+            trusting.clear();
+        }
+        trusting.insert(key, built.clone());
         Ok(built)
     }
 
@@ -355,6 +360,7 @@ impl ProviderClient {
             )));
         }
         let credential = credential.into();
+        kernel::redact::remember(&credential);
         if profile.auth.requires_credential() && credential.trim().is_empty() {
             return Err(ProviderError::Decode(format!(
                 "{} authentication requires a credential",
@@ -780,11 +786,7 @@ pub async fn list_models_for_profile(
         // Model discovery carries the credential too — see transport::http::client.
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
-    // A server behind a private certificate must be reachable to be listed at all.
-    let client = match profile.ca_cert_file.as_deref() {
-        Some(file) => http::trusting(client, file)?,
-        None => client,
-    };
+    let client = http::configured(client, profile)?;
     let client = client
         .build()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -1393,7 +1395,15 @@ impl Provider for ProviderClient {
                     serde_json::json!(max_output_tokens),
                 );
             }
-            Protocol::OpenAiResponses | Protocol::AnthropicMessages => return Ok(None),
+            Protocol::OpenAiResponses => {
+                object.insert(
+                    "max_output_tokens".into(),
+                    serde_json::json!(max_output_tokens),
+                );
+            }
+            Protocol::AnthropicMessages => {
+                object.insert("max_tokens".into(), serde_json::json!(max_output_tokens));
+            }
         }
         Ok(Some(request.with_body(body)))
     }

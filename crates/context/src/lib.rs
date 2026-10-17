@@ -9,6 +9,7 @@ pub mod identity;
 pub mod policy;
 pub mod prompts;
 mod prune_batch;
+mod request_estimate;
 pub mod tokens;
 pub mod workspace;
 

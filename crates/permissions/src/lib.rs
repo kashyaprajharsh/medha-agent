@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+mod audit;
 mod protected;
 pub use protected::{
     CREDENTIAL_RELATIVE, is_protected, named_state_dir, protected_paths, state_secrets,
@@ -1127,17 +1128,15 @@ impl PermissionManager {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let log_entry = format!("{timestamp} | {capability} | decision={decision}\n");
-        if let Some(parent) = self.audit_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| PermissionError::Io(e.to_string()))?;
-        }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.audit_path)
-            .map_err(|e| PermissionError::Io(e.to_string()))?
-            .write_all(log_entry.as_bytes())
-            .map_err(|e| PermissionError::Io(e.to_string()))
+        audit::append(
+            &self.audit_path,
+            &format!(
+                "{timestamp} | {} | decision={}\n",
+                audit::field(capability),
+                audit::field(decision)
+            ),
+        )
+        .map_err(|e| PermissionError::Io(e.to_string()))
     }
 
     fn audit_log(
@@ -1154,23 +1153,12 @@ impl PermissionManager {
 
         let log_entry = format!(
             "{timestamp} | {permission:?} | requested={} | resolved={} | decision={}\n",
-            requested_path.display(),
-            resolved_path.display(),
-            decision
+            audit::field(&requested_path.to_string_lossy()),
+            audit::field(&resolved_path.to_string_lossy()),
+            audit::field(decision)
         );
 
-        // The log's directory may not exist yet (fresh state dir); a missing
-        // parent must not turn an approved access into a failure.
-        if let Some(parent) = self.audit_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| PermissionError::Io(e.to_string()))?;
-        }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.audit_path)
-            .map_err(|e| PermissionError::Io(e.to_string()))?
-            .write_all(log_entry.as_bytes())
-            .map_err(|e| PermissionError::Io(e.to_string()))
+        audit::append(&self.audit_path, &log_entry).map_err(|e| PermissionError::Io(e.to_string()))
     }
 
     /// Resolve only workspace or pre-approved paths without prompting. Intended

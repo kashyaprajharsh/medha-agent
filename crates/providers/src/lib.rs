@@ -13,6 +13,8 @@ pub mod openai_compat;
 pub mod profile;
 pub mod prompt_cache;
 pub(crate) mod protocol;
+#[cfg(test)]
+mod proxy_tests;
 mod reasoning_echo;
 mod schema_rules;
 #[cfg(test)]

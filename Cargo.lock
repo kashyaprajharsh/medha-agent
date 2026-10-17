@@ -558,6 +558,7 @@ dependencies = [
  "async-trait",
  "dirs 5.0.1",
  "futures",
+ "git-safety",
  "kernel",
  "policy",
  "serde",
@@ -1428,6 +1429,14 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "git-safety"
+version = "0.1.10"
+dependencies = [
+ "libc",
+ "test-support",
 ]
 
 [[package]]
@@ -2304,6 +2313,7 @@ dependencies = [
  "async-trait",
  "dirs 5.0.1",
  "futures",
+ "kernel",
  "libc",
  "oauth2",
  "reqwest 0.13.4",
@@ -2754,6 +2764,7 @@ dependencies = [
  "async-trait",
  "fd-lock",
  "futures",
+ "git-safety",
  "kernel",
  "libc",
  "serde",
@@ -2854,6 +2865,7 @@ dependencies = [
  "dirs 5.0.1",
  "fd-lock",
  "kernel",
+ "libc",
  "serde",
  "serde_json",
  "test-support",
@@ -3910,6 +3922,7 @@ name = "sandbox"
 version = "0.1.10"
 dependencies = [
  "async-trait",
+ "git-safety",
  "kernel",
  "landlock",
  "libc",
@@ -4825,6 +4838,7 @@ dependencies = [
  "async-trait",
  "fd-lock",
  "futures",
+ "git-safety",
  "glob",
  "htmd",
  "ignore",

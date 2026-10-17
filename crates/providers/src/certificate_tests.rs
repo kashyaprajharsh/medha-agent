@@ -124,3 +124,51 @@ async fn a_self_signed_server_is_trusted_by_its_own_certificate() {
     };
     ask(trusting).await.unwrap();
 }
+
+#[tokio::test]
+async fn an_explicit_connect_proxy_keeps_certificate_checks_and_uses_only_the_saved_ca() {
+    let server = serve(SIGNED).await;
+    let authority = server
+        .strip_prefix("https://")
+        .unwrap()
+        .strip_suffix("/v1")
+        .unwrap()
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let tunnels = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                client.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+                assert!(header.len() <= 8192);
+            }
+            assert!(
+                String::from_utf8(header)
+                    .unwrap()
+                    .starts_with(&format!("CONNECT {authority} HTTP/1.1"))
+            );
+            let mut upstream = tokio::net::TcpStream::connect(&authority).await.unwrap();
+            client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    let mut profile = ProviderProfile::openai_chat(server, "m", AuthKind::None);
+    profile.proxy = Some(proxy_url);
+    assert!(matches!(
+        ask(profile.clone()).await.unwrap_err(),
+        ProviderError::Certificate(_)
+    ));
+    let (_kept, ca) = saved(AUTHORITY);
+    profile.ca_cert_file = Some(ca);
+    ask(profile).await.unwrap();
+    tunnels.await.unwrap();
+}

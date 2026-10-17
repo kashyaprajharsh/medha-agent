@@ -98,10 +98,18 @@ pub(super) fn spawn(
     working_dir: Option<&Path>,
     limits: CaptureLimits,
 ) -> Result<BgProc, ExecError> {
+    let resources = CommandResources::git(std::slice::from_ref(&request.cwd))?;
     let root = request
         .cwd
         .canonicalize()
         .map_err(|e| ExecError::Spawn(e.to_string()))?;
+    if resources
+        ._protected
+        .iter()
+        .any(|control| !control._entry.starts_with(&root))
+    {
+        return Err(ExecError::Unavailable("container workspace is inside a Git checkout; select the checkout root so its Git controls can be mounted safely".into()));
+    }
     let dir = working_dir
         .unwrap_or(&request.cwd)
         .canonicalize()
@@ -184,12 +192,11 @@ pub(super) fn spawn(
                     start.args(["start", "-a", &lease.name]);
                     let process = spawn_background_captured(
                         start,
-                        limits.stdout,
-                        limits.stderr,
-                        limits.aggregate,
+                        limits,
                         false,
                         None,
                         Some(held_capture.clone()),
+                        None,
                     )
                     .map_err(|error| error.to_string())?;
                     tokio::select! {
@@ -220,6 +227,7 @@ pub(super) fn spawn(
                 if let Ok(mut target) = held_code.lock() {
                     *target = result;
                 }
+                drop(resources);
                 // Completion includes confirmed cleanup; failure is explicitly nonzero.
                 let _ = done_tx.send(true);
             });

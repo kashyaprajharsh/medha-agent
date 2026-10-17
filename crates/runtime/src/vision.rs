@@ -107,9 +107,9 @@ impl kernel::VisionDescriber for AuxiliaryVision {
 pub fn connect(
     config: &crate::config::Config,
     name: &str,
-    env_key: Option<&str>,
+    env: Option<&crate::config::ModelEnv>,
 ) -> Result<providers::OpenAiCompat> {
-    let resolved = crate::config::resolve_model_as(config, name, env_key)?;
+    let resolved = crate::config::resolve_model_as(config, name, env)?;
     Ok(providers::OpenAiCompat::from_profile(
         resolved.provider,
         resolved.credential,

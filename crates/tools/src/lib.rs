@@ -12,6 +12,7 @@ mod browser;
 mod edit_match;
 mod lanes;
 mod model_view;
+mod outbound;
 pub mod outputs;
 mod shell_hints;
 mod shown;
@@ -95,6 +96,9 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the parameters (what the model is told it can pass).
     fn schema(&self) -> Value;
     async fn execute(&self, args: &Value) -> Result<Value, ToolError>;
+    fn check_outbound(&self, _args: &Value) -> Result<(), ToolError> {
+        Ok(())
+    }
 
     /// Presentation category surfaces map to a glyph/verb. Defaults from
     /// the blast radius; tools override for a finer class (Search/Web/Vcs/…).
@@ -1190,6 +1194,21 @@ impl Executor for ToolRegistry {
         }
     }
 
+    async fn call_containment(&self, intent: &ToolIntent) -> kernel::Containment {
+        let outside = self.category(&intent.tool) == Some(ToolCategory::Web)
+            || browser::needs_network(&intent.args)
+            || (mcp::McpManager::is_mcp_tool(&intent.tool)
+                && match &self.mcp {
+                    Some(manager) => manager.remote_call(&intent.tool).await.unwrap_or(true),
+                    None => true,
+                });
+        if outside {
+            kernel::Containment::None
+        } else {
+            self.containment()
+        }
+    }
+
     fn missing_access(&self, intent: &ToolIntent) -> Result<kernel::ExecutionAccess, String> {
         if intent.tool == "read" {
             let sbx = self
@@ -1230,6 +1249,22 @@ impl Executor for ToolRegistry {
 
     fn allows_network_retry(&self, intent: &ToolIntent) -> bool {
         intent.tool != "shell.exec"
+    }
+
+    async fn check_outbound(&self, intent: &ToolIntent) -> Result<(), String> {
+        if mcp::McpManager::is_mcp_tool(&intent.tool) {
+            return self
+                .mcp
+                .as_ref()
+                .ok_or("MCP is unavailable")?
+                .check_outbound(&intent.tool, &intent.args)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        self.tools
+            .get(&intent.tool)
+            .map_or(Ok(()), |tool| tool.check_outbound(&intent.args))
+            .map_err(|error| error.to_string())
     }
 
     async fn execute(&self, intent: &ToolIntent) -> Observation {
@@ -1340,6 +1375,13 @@ impl Read {
 
 #[async_trait]
 impl Tool for Read {
+    fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
+        if browser::needs_network(args) {
+            kernel::egress::peek("browser.navigate", &json!({"url":arg_str(args,"path")?}))
+                .map_err(ToolError::Security)?;
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         "read"
     }
@@ -1625,6 +1667,7 @@ impl Tool for FsRead {
                 range.total_lines.unwrap_or(0)
             )
         });
+        kernel::egress::file_read(&range.content);
         Ok(json!({
             "path": path,
             "content": range.content,
@@ -3300,6 +3343,7 @@ fn http_client() -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
         .user_agent(BROWSER_UA)
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ToolError::Failed(e.to_string()))
 }
@@ -3623,14 +3667,18 @@ impl SearchSettings {
     }
 
     fn secret(&self, value: Option<&str>, env: &str) -> Option<String> {
-        if self.captured {
+        let found = if self.captured {
             value
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned)
         } else {
             resolve_secret(value, env)
+        };
+        if let Some(value) = &found {
+            kernel::redact::remember_named(env, value);
         }
+        found
     }
 }
 
@@ -3659,6 +3707,17 @@ struct WebSearch {
 }
 #[async_trait]
 impl Tool for WebSearch {
+    fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
+        let selected = outbound::selected(&read_search(&self.search))
+            .ok()
+            .flatten();
+        let destination = selected.as_ref().map_or_else(
+            || "https://lite.duckduckgo.com/lite/".into(),
+            outbound::Selected::destination,
+        );
+        kernel::egress::peek(&destination, &json!({"query":arg_str(args,"query")?}))
+            .map_err(ToolError::Security)
+    }
     fn name(&self) -> &str {
         "web"
     }
@@ -3695,39 +3754,23 @@ impl Tool for WebSearch {
         // one misconfigured backend never leaves search dead. DuckDuckGo itself
         // needs no key and is the default when nothing is configured.
         let mut errors = Vec::new();
-        let chosen: Option<(&'static str, Result<Value, ToolError>)> = match cfg.provider {
-            SearchProvider::DuckDuckGo => None,
-            SearchProvider::Tavily => match cfg.tavily_key() {
-                Some(key) => Some(("tavily", tavily_search(&client, &query, max, &key).await)),
-                None => {
-                    errors.push("tavily: no API key configured".to_string());
-                    None
-                }
-            },
-            SearchProvider::Brave => match cfg.brave_key() {
-                Some(key) => Some(("brave", brave_search(&client, &query, max, &key).await)),
-                None => {
-                    errors.push("brave: no API key configured".to_string());
-                    None
-                }
-            },
-            SearchProvider::Searxng => match cfg.searxng_url() {
-                Some(url) => Some(("searxng", searxng_search(&client, &query, max, &url).await)),
-                None => {
-                    errors.push("searxng: no instance URL configured".to_string());
-                    None
-                }
-            },
-        };
-        if let Some((name, result)) = chosen {
+        let chosen = outbound::selected(&cfg).unwrap_or_else(|error| {
+            errors.push(error);
+            None
+        });
+        if let Some(selected) = chosen {
+            let name = selected.name();
+            let result = selected.run(&client, &query, max).await;
             match result {
                 Ok(v) => return Ok(v),
+                Err(e @ ToolError::Security(_)) => return Err(e),
                 Err(e) => errors.push(format!("{name}: {e}")),
             }
         }
 
         match duckduckgo_search(&client, &query, max).await {
             Ok(v) => Ok(v),
+            Err(e @ ToolError::Security(_)) => Err(e),
             Err(e) => {
                 errors.push(format!("duckduckgo: {e}"));
                 // Chosen backend (if any) AND the DuckDuckGo fallback both
@@ -3754,6 +3797,7 @@ async fn duckduckgo_search(
     ];
     let mut last_err = String::from("no results parsed (DuckDuckGo may be anti-botting)");
     for (url, parse) in endpoints {
+        kernel::egress::check(url, &json!({"query":query})).map_err(ToolError::Security)?;
         let resp = client
             .post(url)
             .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
@@ -3795,6 +3839,8 @@ async fn tavily_search(
     max: usize,
     key: &str,
 ) -> Result<Value, ToolError> {
+    kernel::egress::check("https://api.tavily.com/search", &json!({"query":query}))
+        .map_err(ToolError::Security)?;
     let body = json!({
         "query": query,
         "search_depth": "basic",
@@ -3842,6 +3888,8 @@ async fn tavily_extract(
     url: &str,
     key: &str,
 ) -> Result<Value, ToolError> {
+    kernel::egress::check("https://api.tavily.com/extract", &json!({"url":url}))
+        .map_err(ToolError::Security)?;
     let body = json!({ "urls": url, "extract_depth": "basic", "format": "markdown" });
     let resp = client
         .post("https://api.tavily.com/extract")
@@ -3893,6 +3941,11 @@ async fn tavily_crawl(
     limit: u64,
     key: &str,
 ) -> Result<Value, ToolError> {
+    kernel::egress::check(
+        "https://api.tavily.com/crawl",
+        &json!({"url":url,"instructions":instructions}),
+    )
+    .map_err(ToolError::Security)?;
     let mut body = json!({
         "url": url,
         "max_depth": max_depth.clamp(1, 5),
@@ -3966,6 +4019,11 @@ async fn brave_search(
     max: usize,
     key: &str,
 ) -> Result<Value, ToolError> {
+    kernel::egress::check(
+        "https://api.search.brave.com/res/v1/web/search",
+        &json!({"query":query}),
+    )
+    .map_err(ToolError::Security)?;
     let count = max.to_string();
     let resp = client
         .get("https://api.search.brave.com/res/v1/web/search")
@@ -4007,6 +4065,7 @@ async fn searxng_search(
     base: &str,
 ) -> Result<Value, ToolError> {
     let url = format!("{}/search", base.trim_end_matches('/'));
+    kernel::egress::check(&url, &json!({"query":query})).map_err(ToolError::Security)?;
     let resp = client
         .get(&url)
         .query(&[("q", query), ("format", "json")])
@@ -4144,6 +4203,10 @@ struct WebFetch {
 }
 #[async_trait]
 impl Tool for WebFetch {
+    fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
+        kernel::egress::peek("web.fetch", &json!({"url":arg_str(args,"url")?}))
+            .map_err(ToolError::Security)
+    }
     fn name(&self) -> &str {
         "web"
     }
@@ -4192,6 +4255,7 @@ impl Tool for WebFetch {
 /// Free plain HTTP fetch → Markdown. Returns Err on network failure or a non-2xx
 /// status (so the caller can fall back to Tavily Extract on blocked/erroring pages).
 async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
+    kernel::egress::check("web.fetch", &json!({"url":url})).map_err(ToolError::Security)?;
     let parsed =
         reqwest::Url::parse(url).map_err(|e| ToolError::Failed(format!("invalid URL: {e}")))?;
 
@@ -4223,6 +4287,8 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
         let next = current
             .join(loc)
             .map_err(|e| ToolError::Failed(format!("bad redirect target: {e}")))?;
+        kernel::egress::check("web.fetch", &json!({"url":next.as_str()}))
+            .map_err(ToolError::Security)?;
         target = resolve_public_url_async(&next)
             .await
             .map_err(|error| match error {
@@ -4302,6 +4368,9 @@ struct WebCrawl {
 }
 #[async_trait]
 impl Tool for WebCrawl {
+    fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
+        kernel::egress::peek("https://api.tavily.com/crawl", &json!({"url":arg_str(args,"url")?,"instructions":args.get("instructions").and_then(Value::as_str)})).map_err(ToolError::Security)
+    }
     fn name(&self) -> &str {
         "web"
     }
@@ -4397,6 +4466,9 @@ impl Web {
 
 #[async_trait]
 impl Tool for Web {
+    fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
+        self.op(args)?.check_outbound(args)
+    }
     fn name(&self) -> &str {
         "web"
     }
@@ -5450,6 +5522,13 @@ impl Drop for RegisteredTask {
 
 #[async_trait]
 impl Tool for ShellExec {
+    fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
+        if !self.sbx.denies_network() || args["outside_sandbox"] == true || args["network"] == true
+        {
+            kernel::egress::peek("shell.network", args).map_err(ToolError::Security)?;
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         "shell.exec"
     }
@@ -5530,6 +5609,9 @@ impl Tool for ShellExec {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let plan = ShellPlan::parse(args, &self.sbx)?;
+        if !self.sbx.denies_network() || plan.access.outside_sandbox || plan.access.network {
+            kernel::egress::check("shell.network", args).map_err(ToolError::Security)?;
+        }
         let missing = self
             .sbx
             .missing_execution_access(&plan.access)
@@ -6182,15 +6264,23 @@ impl Tool for Git {
             ga.push("--".into());
             ga.push(safe_git_arg(path.unwrap_or("."))?.into());
         }
-        // Fixed git subcommand, run through the sandbox backend (inherits env —
-        // git needs $HOME/$PATH; it's not an arbitrary-command surface).
-        let env = match self.reads(args) {
-            true => vec![lanes::git_read_env()],
-            false => vec![],
-        };
+        let root = self.sbx.root().to_path_buf();
+        ga = tokio::task::spawn_blocking(move || git_safety::arguments(&root, &ga))
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?
+            .map_err(ToolError::Failed)?;
+        let env = git_safety::environment()
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
         let output = self
             .sbx
-            .exec("git", &ga, env, false)
+            .exec("git", &ga, env, true)
             .await
             .map_err(|e| ToolError::Failed(format!("failed to run git: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout);

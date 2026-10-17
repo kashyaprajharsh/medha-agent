@@ -229,6 +229,10 @@ async fn inspect<P: Provider, L: EventLog>(
 ) -> Result<protocol::SessionResult, String> {
     use protocol::{SessionRead as Read, SessionResult as Reply};
     Ok(match query {
+        Read::Outbound => Reply::Text(
+            serde_json::to_string_pretty(&kernel.egress.reviews())
+                .map_err(|error| error.to_string())?,
+        ),
         Read::Bootstrap => Reply::Bootstrap(protocol::Bootstrap {
             tools: kernel
                 .executor
@@ -503,6 +507,17 @@ async fn change_session<P: Provider, L: EventLog>(
                     ""
                 }
             )))
+        }
+        Change::DismissOutbound { id } => {
+            kernel.egress.dismiss(&id)?;
+            Ok(Reply::Changed)
+        }
+        Change::AllowOutbound { id } => {
+            kernel.egress.approve(&id)?;
+            Ok(Reply::Text(
+                "Approved this exact payload for one send. Retry the blocked request to use it."
+                    .into(),
+            ))
         }
         Change::StopAgents => {
             if let Some(control) = agents {

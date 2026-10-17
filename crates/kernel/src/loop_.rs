@@ -17,6 +17,9 @@ use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "budget_finish.rs"]
+mod budget_finish;
+
 fn context_has_media(context: &CompiledContext) -> bool {
     context.ordered_messages().iter().any(|message| {
         message
@@ -531,6 +534,7 @@ pub struct Kernel<P: Provider, L: EventLog> {
     result_limits: (Option<usize>, Option<usize>),
     /// Removed from every tool result before the model reads it.
     secrets: Arc<crate::redact::Secrets>,
+    pub egress: Arc<crate::egress::Guard>,
     pricing: Option<crate::types::Pricing>,
     /// The model `pricing` was set for; any other is priced from its list price.
     priced_model: Option<String>,
@@ -756,6 +760,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             server_waits: crate::recovery::WAITS,
             result_limits: (None, None),
             secrets: Arc::default(),
+            egress: Arc::default(),
             pricing: None,
             priced_model: None,
             gate_serial: Arc::new(futures::lock::Mutex::new(())),
@@ -798,6 +803,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             server_waits: self.server_waits,
             result_limits: self.result_limits,
             secrets: Arc::clone(&self.secrets),
+            egress: Arc::clone(&self.egress),
             pricing: self.pricing,
             priced_model: self.priced_model.clone(),
             // Shared, not rebuilt: see the field's own note. A fresh lane here
@@ -877,6 +883,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
     pub fn refresh_memory(&self, memory: &str) -> Option<String> {
         self.request_context.as_ref()?.refresh_memory(memory)
+    }
+    pub fn owns_memory_slot(&self) -> bool {
+        self.request_context
+            .as_ref()
+            .is_some_and(|context| context.owns_memory_slot())
     }
 
     pub fn with_child_context(mut self, workspace: Option<&std::path::Path>) -> Self {
@@ -1087,6 +1098,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             text = clean;
             viewed = true;
         }
+        if let std::borrow::Cow::Owned(clean) = self.egress.redact(&text) {
+            text = clean;
+            viewed = true;
+        }
         let per_result = self.result_limits().0;
         // A result no bigger than a preview would only grow by being stored.
         let small = text.len() <= SPILL_PREVIEW * 3 / 2;
@@ -1133,6 +1148,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             if let std::borrow::Cow::Owned(clean) = self.secrets.redact(&message.content) {
                 message.content = clean;
             }
+            if let std::borrow::Cow::Owned(clean) = self.egress.redact(&message.content) {
+                message.content = clean;
+            }
             if message.content.len() > limit {
                 message.content = self.maybe_spill(std::mem::take(&mut message.content)).await;
             }
@@ -1144,6 +1162,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             for part in &mut message.parts {
                 if let ContentPart::ToolResult(result) = part
                     && let std::borrow::Cow::Owned(clean) = self.secrets.redact(&result.content)
+                {
+                    result.content = clean;
+                }
+                if let ContentPart::ToolResult(result) = part
+                    && let std::borrow::Cow::Owned(clean) = self.egress.redact(&result.content)
                 {
                     result.content = clean;
                 }
@@ -1216,10 +1239,22 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             } else {
                 TrustLabel::Tool
             };
-            let fut = crate::provenance::execution_trust_scope(
-                trust,
-                self.dispatch_one(session, &intent, web_tainted, &cancel, lane, sink),
-            );
+            let fut = async {
+                let (mut obs, review) = crate::egress::scope(
+                    self.egress.clone(),
+                    web_tainted,
+                    crate::provenance::execution_trust_scope(
+                        trust,
+                        self.dispatch_one(session, &intent, web_tainted, &cancel, lane, sink),
+                    ),
+                )
+                .await;
+                if let Some(review) = review {
+                    sink.notice(&format!("Outbound request blocked: {}. Use /outbound allow {} to approve this exact payload.", review["reason"].as_str().unwrap_or("private content"), review["id"].as_str().unwrap_or_default()));
+                    obs.payload["outbound"] = serde_json::json!({"id":review["id"]});
+                }
+                obs
+            };
             tokio::pin!(fut);
             tokio::select! {
                 biased;
@@ -1479,6 +1514,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
         };
+        let fallback = || self.context.estimate_prepared(prepared);
         match counted {
             Ok(Some(count)) if count.request_fingerprint != prepared.request_fingerprint => {
                 if strict {
@@ -1486,7 +1522,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         "strict token accounting rejected a stale request fingerprint".into(),
                     ))
                 } else {
-                    Ok(None)
+                    Ok(fallback())
                 }
             }
             Ok(Some(count))
@@ -1502,9 +1538,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 "strict token accounting requires an authoritative preflight counter for this profile"
                     .into(),
             )),
-            Ok(None) => Ok(None),
+            Ok(None) => Ok(fallback()),
             Err(error) if strict => Err(KernelError::Provider(error.to_string())),
-            Err(_) => Ok(None),
+            Err(_) => Ok(fallback()),
         }
     }
 
@@ -1617,7 +1653,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         self.executor.images_reach_model(
             self.vision.is_some() || self.route_reads_images().unwrap_or(false),
         );
-        let mut gov = crate::budgets::Governor::new(budget);
+        let mut gov = crate::budgets::Governor::new(budget).reserve_for_finish();
         // Every trailing user message is new, not just the last: a surface can
         // append a typed prompt and then an agent report in one turn.
         // Memory taint window: event ids since the last real user message and the
@@ -1813,6 +1849,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         });
         // Spill after hydration — checkpoint replay would silently undo an earlier
         // spill. Both views are rewritten independently.
+        self.egress.restore(&logged_events);
         self.spill_hydrated_tool_results(&mut messages, &mut ordered_messages)
             .await;
         // Compaction changes the visible window, never the session's exposure.
@@ -1871,6 +1908,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
             // Budget gate: stop gracefully before a turn if any ceiling is hit (I4).
             if let Some(stop) = gov.check() {
+                if matches!(
+                    stop,
+                    crate::budgets::BudgetStop::Cost | crate::budgets::BudgetStop::Tokens
+                ) {
+                    self.finish_budget(session, &mut messages, &mut gov, sink, &cancel)
+                        .await?;
+                }
                 if let Some(q) = interrupts.as_mut() {
                     Self::return_unapplied_steers(q, sink);
                 }
@@ -1978,10 +2022,27 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         }
                     }
                     let model_candidate = crate::provenance::for_model(&candidate);
-                    let prepared = self
+                    let mut prepared = self
                         .provider
                         .prepare_request_in(&model_candidate, &request_owner)
                         .map_err(|error| KernelError::Provider(error.to_string()))?;
+                    if gov.capped_requests() && self.provider.requested_output_tokens().is_none() {
+                        // As long as the model allows and the budget can still pay for.
+                        let prompt = self.context.estimate_prepared(&prepared);
+                        let prompt = prompt.map_or(0, |count| count.tokens);
+                        let room = gov.output_room(prompt, self.price());
+                        let cap = crate::budgets::capped_output(limits.max_output_tokens, room);
+                        prepared = self
+                            .provider
+                            .with_output_limit(&prepared, cap)
+                            .map_err(|error| KernelError::Provider(error.to_string()))?
+                            .ok_or_else(|| {
+                                KernelError::Provider(
+                                    "A capped task needs a provider that can bound its output"
+                                        .into(),
+                                )
+                            })?;
+                    }
 
                     let request_scope = format!(
                         "{}:{}:{}:{limits:?}",
@@ -2004,7 +2065,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 &request_owner,
                             )
                         {
-                            self.context.restore_usage(&prefix, anchor.prompt_tokens);
+                            let priced = self
+                                .provider
+                                .prepare_request_in(
+                                    &crate::provenance::for_model(&prefix),
+                                    &request_owner,
+                                )
+                                .map_err(|error| KernelError::Provider(error.to_string()))?;
+                            self.context
+                                .restore_prepared_usage(&priced, anchor.prompt_tokens);
                         }
                     }
 
@@ -2142,6 +2211,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         let output_tokens = self
                             .provider
                             .requested_output_tokens()
+                            .or_else(|| {
+                                let room = gov.output_room(input_tokens.unwrap_or(0), self.price());
+                                gov.capped_requests().then(|| {
+                                    crate::budgets::capped_output(limits.max_output_tokens, room)
+                                })
+                            })
                             .or(limits.max_output_tokens)
                             .or_else(|| {
                                 limits
@@ -2491,6 +2566,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         return Ok((messages, StopReason::Interrupted));
                     }
                     Err(KernelError::Budget(stop)) => {
+                        if matches!(
+                            stop,
+                            crate::budgets::BudgetStop::Cost | crate::budgets::BudgetStop::Tokens
+                        ) {
+                            self.finish_budget(session, &mut messages, &mut gov, sink, &cancel)
+                                .await?;
+                        }
                         if let Some(q) = interrupts.as_mut() {
                             Self::return_unapplied_steers(q, sink);
                         }
@@ -3121,6 +3203,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut request = prepared.clone();
         // The model does not change inside one call, so neither does its price.
         let price = self.price();
+        if governor.requires_pricing() && price.is_none() {
+            return Err(KernelError::Provider("max_cost_usd requires input and output prices for the selected model; configure its pricing before running a cost-capped task".into()));
+        }
         let (text, reasoning, intents, canonical, usage, interrupted) = loop {
             let reservation = governor
                 .reserve_model(prepared_input_tokens, reserved_output_tokens, price)
@@ -4102,6 +4187,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         lane: Option<&Lane>,
         sink: &dyn StreamSink,
     ) -> Observation {
+        if let Some(blocked) = self.check_outbound_intent(session, intent).await {
+            return blocked;
+        }
         let radius = self.executor.call_radius(intent);
         // Enforce before policy/human approval so custom AllowAll policies and
         // remembered approvals cannot turn Plan into an editing session.
@@ -4116,7 +4204,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         };
         // Trust-flow escalations must never be auto-approved. That holds for a
         // call policy already sends to a human: its card is marked all the same.
-        let containment = self.executor.containment();
+        let containment = self.executor.call_containment(intent).await;
         let mut decision = escalate_for_trust_flow(raw, radius, web_tainted, containment);
         let trust_escalated = follows_web(radius, web_tainted, containment)
             && matches!(decision, crate::types::Decision::Human);

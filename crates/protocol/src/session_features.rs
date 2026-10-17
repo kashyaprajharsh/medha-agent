@@ -91,6 +91,7 @@ pub struct MemoryEvidence {
     deny_unknown_fields
 )]
 pub enum SessionRead {
+    Outbound,
     Bootstrap,
     Live,
     Lsp,
@@ -164,6 +165,12 @@ pub struct Bootstrap {
     deny_unknown_fields
 )]
 pub enum SessionChange {
+    AllowOutbound {
+        id: String,
+    },
+    DismissOutbound {
+        id: String,
+    },
     PinMemory {
         scope: ResourceScope,
         name: String,

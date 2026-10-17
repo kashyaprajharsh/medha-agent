@@ -1211,6 +1211,7 @@ async fn gemini_reasoning_choices_and_model_switches_are_shared_between_viewers(
         ("HOME", os_home),
         ("USERPROFILE", os_home),
         ("MEDHA_BASE_URL", ""),
+        ("MEDHA_API_KEY", ""),
         ("MEDHA_MODEL", ""),
         ("MEDHA_PROTOCOL", ""),
     ]);
@@ -1363,7 +1364,7 @@ async fn typed_application_resources_preserve_credentials_and_reject_stale_grant
         matches!(saved, ResourceResult::ModelSaved { catalogue, .. } if catalogue.profiles.iter().any(|profile| profile.name == "saved" && profile.key_present && profile.requires_key))
     );
 
-    let startup = protocol::StartupOptions {
+    let mut startup = protocol::StartupOptions {
         model: Some("saved".into()),
         model_env: protocol::ModelOverrides {
             api_key: Some("sk-zz-client".into()),
@@ -1371,6 +1372,21 @@ async fn typed_application_resources_preserve_credentials_and_reject_stale_grant
         },
         ..Default::default()
     };
+    let refused = client
+        .ask(
+            "session.create",
+            None,
+            json!({"folder":folder,"startup":startup}),
+        )
+        .await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MEDHA_BASE_URL")
+    );
+    assert!(!refused.to_string().contains("sk-zz-client"));
+    startup.model_env.base_url = Some(world.provider.url.clone());
     let made = client
         .ask(
             "session.create",

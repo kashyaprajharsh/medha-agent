@@ -412,8 +412,28 @@ With the default `native` backend, the sandbox blocks:
 - Network access (the default is `network = "deny"`; opt in explicitly)
 - Local Unix sockets outside the workspace, such as a container daemon's, even
   once network is granted (Linux closes every Unix socket)
-- On macOS, writes to the workspace repository's `.git/config` and `.git/hooks`,
-  which Git would later run outside the jail
+- On macOS and Linux, changes to the `.git` entry itself, `.git/config`,
+  `.git/commondir` and `.git/hooks`. Index, objects and refs remain writable,
+  so shell `git add` and `git commit` still work.
+
+Linux combines Landlock with a private user/mount namespace and read-only binds
+for those Git controls. Commands cannot undo the mounts or enter another mount
+namespace. If setup fails, commands fail with a clear error; native execution
+never falls back to the host. Missing control entries get harmless placeholders
+while commands use the folder, removed when their last holder finishes. This can
+leave empty metadata after a process crash; it does not grant permission to run a
+hook. Containers bind the same controls read-only while keeping Git data writable.
+Open the checkout root for container execution: an inner folder cannot safely
+mount its parent checkout's Git metadata without widening workspace access.
+
+Windows keeps host execution without requiring Docker. Before each command Medha
+snapshots those four Git items, then restores changes after the process tree has
+stopped and reports any restoration. Commands for one folder are serialized so
+one snapshot cannot preserve another command's planted hook. Snapshots are bounded
+to 16 MiB and 4096 entries per folder, with at most 128 active folder guards;
+an unsafe or oversized snapshot stops the command.
+This prevents a planted hook from persisting. It does **not** stop what the command
+itself does while it runs, and cannot recover deleted Git objects or other files.
 
 Keys and tokens (`~/.ssh`, `~/.aws`, `~/.gitconfig` and the rest of one shared
 list) are refused to file tools and commands alike, with or without approval. A
@@ -427,6 +447,9 @@ The command danger scanner is a separate policy check, not an OS sandbox rule.
 The `host` and `ssh` backends do not make those filesystem guarantees. They
 remain subject to the command scanner, policy, and human gate, and should be
 selected only when their larger trust boundary is intentional.
+
+Selecting SSH with a missing host or unavailable `ssh` leaves chat usable but
+command execution unavailable. An SSH failure never runs the command locally.
 
 ### How It Works
 
@@ -468,12 +491,17 @@ local filesystem sandbox.
 ### OS-Native Isolation
 
 - **macOS:** Uses Seatbelt sandboxing profiles
-- **Linux:** Uses Landlock LSM (Linux Security Module) for files and a seccomp
-  filter for sockets; without both, Medha falls back to no sandbox and says so
+- **Linux:** Uses Landlock LSM for files, a seccomp socket filter and a private
+  user/mount namespace for Git controls. Missing enforcement stops commands.
 - **Windows:** No OS sandbox yet. Commands run with the user's own rights behind
-  the scanner and the approval gate, and `yolo` still asks before builds and tests
+  the scanner and approval gate, with Git control snapshots as described above
 - **No Docker required** for default isolation
 - **Zero additional dependencies**
+
+Under enforced Landlock, `/proc` remains available for toolchain self-inspection,
+but Landlock's ptrace-domain restriction denies reads of the agent's or unrelated
+same-UID processes' environments. A Linux attacker regression verifies an unjailed
+canary is readable before testing that both jailed reads return no bytes.
 
 ---
 
@@ -888,8 +916,8 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 | 🔴 **External** | `mcp__*` (every MCP tool), `lsp.start`, `mcp.start` | No + affects outside | Ask Human |
 
 > **The `web` tool is `Read`, not `External`.** Fetching a page changes nothing, so
-> it is not gated on blast radius. What protects you there is a different mechanism:
-> the SSRF guard on the request itself, and **trust-flow escalation** — once
+> it is not gated on blast radius. Protection includes the SSRF guard, the
+> outbound payload check below, and **trust-flow escalation**: once
 > web-labelled content enters a turn, later consequential actions derived from it are
 > escalated to the human gate. See [Trust Flow](#trust-flow--web-tainted-actions).
 >
@@ -900,6 +928,58 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 > There is no `git.push`. The `git` tool covers `status`, `diff`, `log`, `blame`,
 > `show`, `add` and `commit` only — branches, pushes and rebases are deliberately out
 > of scope and left to `shell.exec`, where the scanner and gate apply.
+
+Before a chat has read web-labelled text, outbound web requests run as before.
+After that durable web latch is set, model-authored search queries, fetch URLs
+(including each redirect), crawl instructions, browser navigation URLs and remote
+MCP arguments are checked before sending. A known real secret value blocks the
+payload on every route. On web routes, at least **256 consecutive UTF-8 bytes**
+from file content read in this chat block it too; a remote MCP server the person
+set up may receive file text, such as a snippet for an issue, without asking.
+Network-enabled shell command arguments receive the web check; the
+existing sandbox and consequential-action approvals still apply to shell, LSP
+and MCP execution. Trusted language servers use their separately granted network
+policy; their arbitrary internal traffic is not inspected by this text check.
+
+Blocking produces one quiet notice for that exact payload, never an automatic
+approval dialog. The notice offers **Allow this exact payload once** on desktop;
+terminal chat has `/outbound` to review and `/outbound allow <id>` to approve.
+Both use the owning chat's `session.change` action `allow_outbound`. Approval
+permits one retry with the same destination and payload hash, not a hostname-wide
+grant. Retry the blocked request after approval. Secret values are masked in its
+preview. Changed payloads and changed destinations require their own approval.
+Normal pure research and coding sessions with web lookups get **zero additional
+prompts**. A page requesting `https://x/?k=<known-key>` causes zero dialogs and one
+blocking notice; sending it requires one deliberate exact-payload approval.
+
+This stops realistic literal leaks, **not every encoding or fragmentation**.
+It is not a general data-flow proof. Model-provider requests carry the chat by
+design and use the person's configured deployment and credential separately.
+Search services do not follow automatic HTTP redirects. Direct fetches retain
+their bounded, SSRF-checked redirect loop. Remote MCP and web traffic never claim
+the local command sandbox's containment level.
+Shared MCP calls are checked before forwarding and bound to the server's current
+configuration. Restart an older shared host after updating; missing destination
+metadata is refused rather than forwarding unchecked.
+
+File-content retention is bounded to 8 MiB per chat tree, restored from durable
+file-read events after resume. Inspection is limited to 1 MiB per payload and
+64 review records per chat tree. Known credentials use at most 4096 values and
+1 MiB of value bytes per process, including credentials read after startup.
+Secrets recognized by the redactor in files read by this chat have their own
+4096-value, 1 MiB limit and are also removed from numbered file results.
+Hitting a tracking bound blocks further exposed outbound payloads rather than
+silently forgetting protected content. No scan runs on each model continuation;
+content is recorded at file reads and checked only on outbound tool requests.
+
+Unattended Git calls share a minimal environment without ambient credentials or
+Git injection variables. Hooks and fsmonitor are disabled; diff/show/log/blame
+also disable external diff and textconv. Repository-defined executable filters
+are disabled. Read-only commands can inspect the unfiltered working bytes;
+commands that write use `required=true`, so staging refuses them rather than
+recording unfiltered bytes. User-owned global filters outside the checkout remain enabled,
+including when the command uses an isolated HOME. Configuration inspection is
+bounded to 1 MiB, 256 filter drivers and three seconds; failure refuses the call.
 
 ### Detailed Breakdown
 
@@ -967,7 +1047,15 @@ Blast radius enables **proportional security**:
 
 ### What It Does
 
-Budgets enforce **hard per-task ceilings** to prevent runaway agents that consume excessive resources.
+Budgets stop admission of new chat-model requests against per-task allowances.
+With authoritative counts and configured prices, reservations use those counts.
+Adaptive profiles without a server counter use the embedded o200k BPE estimate,
+calibrated upward from reported usage, plus **10% and 256 tokens** for uncertainty.
+This is labelled an estimate and cannot guarantee exact billed dollars for every
+model. Actual usage reconciles the reservation after the request. Strict profiles
+still require authoritative counting. Missing pricing remains a configuration error.
+Auxiliary vision and compaction calls retain their existing separate accounting;
+these chat-request allowances are not a guarantee over every auxiliary API bill.
 
 ### Four Dimensions
 
@@ -1019,6 +1107,20 @@ When a budget is exhausted:
 2. Session stops with clear message
 3. User can resume with increased budget if desired
 4. All work is preserved in event log
+
+Capped chat tasks hold back 5% after their first working request for one tool-free
+handover of at most 512 output tokens across the agent tree. It uses the same
+pool and is shortened to what remains affordable, with no retry or overspend
+allowance. If its input cannot be funded, Medha shows a saved-work notice instead.
+A first request that needs the full allowance can still run; an unaffordable
+handover then uses that saved-work notice rather than starving the task at start.
+Working requests without a configured output cap may write as much as the model
+allows and the remaining budget can still pay for (32,768 tokens when the model's
+own limit is unknown), so cost reservation works without a token endpoint and a
+long answer is not cut short while money remains. Once the budget cannot pay for
+one ordinary reply (4,096 tokens), no further working request is sent and the
+task ends with its wrap-up.
+Estimates add local CPU work, not another paid token-count request.
 
 ### Configuration
 
@@ -1949,6 +2051,22 @@ explicit non-secret values; catalogue refresh cannot redirect a saved key or
 rewrite a saved endpoint. Provider HTTP requests do not follow redirects.
 Discovery is bounded by time, response bytes, pages and model count.
 
+Each saved model can set an explicit HTTP/HTTPS `proxy` URL in its advanced
+settings or profile data. It is off by default. Generation, token counting and
+discovery use that same proxy. Configuring it authorizes this profile's
+authenticated model traffic through it, including TLS inspection when its CA file
+is explicitly supplied. Certificate verification stays on. Ambient `HTTP_PROXY`,
+`HTTPS_PROXY` and `ALL_PROXY` remain ignored for model traffic. Proxy URLs cannot
+embed credentials. Web, shell and MCP traffic keep their own connection policies.
+Clients are reused with at most 16 explicit proxy/certificate combinations per
+provider client; a profile's transport is never confused with another's.
+
+`MEDHA_API_KEY` must be paired with `MEDHA_BASE_URL` for the exact deployment it
+belongs to. A conflicting endpoint flag, model switch or auxiliary profile never
+receives that environment key. Another deployment resolves its own stored key.
+An unpaired environment key gives a configuration error. Keys entered explicitly
+for one selected endpoint remain explicit endpoint-scoped inputs.
+
 The optional setup test sends only synthetic messages, with at most four requests
 and a 45-second total deadline. It reports text, streaming completion and a
 fabricated function-call/result round trip separately, without running tools or
@@ -2462,6 +2580,10 @@ Project context and its sandbox backend refresh once per message from the person
 model continuations reuse that snapshot. The prompt builder owns the project and
 memory slots, so headings inside personal instructions are never delimiters. Notice
 state belongs to the chat's event history and does not grow the checkout trust record.
+
+Recall refresh, including desktop rewind/fork, uses that owned memory slot.
+There is no search for `## Memory` in personal text; a missing prompt builder
+refuses the refresh instead of cutting or appending to an unknown prompt.
 
 The model-facing `skill` and `skill.save` calls use a live catalogue:
 each combines the session's frozen built-in/static tools with the MCP tools available
@@ -3092,9 +3214,16 @@ granted_at = 1721318400
 
 Every out-of-workspace access attempt is logged:
 ```
-1721318400 | Read | requested=~/.medha/config.toml | decision=allowed (trusted)
-1721318500 | Write | requested=/tmp/output.txt | decision=denied
+1721318400 | Read | requested="~/.medha/config.toml" | decision="allowed (trusted)"
+1721318500 | Write | requested="/tmp/output.txt" | decision="denied"
 ```
+
+The log is machine-local. A checkout's `medha_audit.log` is never adopted or
+moved. Appending opens the destination without following a symlink/reparse point,
+checks its descriptor is a regular file with one link, and locks the append.
+Path and decision fields use JSON string escaping, so embedded newlines and
+terminal escapes cannot forge another record. An unsafe audit target fails closed
+with a repair message and leaves the target unchanged.
 
 ---
 

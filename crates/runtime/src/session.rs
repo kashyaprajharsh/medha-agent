@@ -151,7 +151,7 @@ pub async fn start(
             .map(|name| (name, configured))
     };
     let auxiliary_vision = configured_vision.and_then(|(name, configured)| {
-        match vision::connect(&configured, &name, options.model_env.api_key.as_deref()) {
+        match vision::connect(&configured, &name, Some(&options.model_env)) {
             Ok(provider) => {
                 notices.say(&format!(
                     "auxiliary vision: '{name}' reads images this model cannot"
@@ -214,10 +214,6 @@ pub async fn start(
         ));
     }
     let audit_path = logs_dir.join("audit.log");
-    let legacy_audit = cwd.join("medha_audit.log");
-    if legacy_audit.exists() && !audit_path.exists() {
-        std::fs::rename(&legacy_audit, &audit_path).ok();
-    }
     let mut sbx_cfg = lock.sandbox.to_config();
     // One per chat: its commands, language servers, local MCP servers and hooks.
     sbx_cfg.home = sandbox::HomeScope::private();
@@ -246,18 +242,18 @@ pub async fn start(
         sandbox::BackendKind::Ssh => {
             if sbx_cfg.host.as_deref().unwrap_or("").is_empty() {
                 notices.say(
-                    "warning: [sandbox] backend=ssh needs a `host` — falling back to the native jail.",
+                    "SSH needs a host. Chat is available; commands are unavailable until SSH is configured.",
                 );
-                sbx_cfg.backend = sandbox::BackendKind::Native;
             } else if !sandbox::program_on_path("ssh") {
-                notices.say("warning: `ssh` not found on PATH — falling back to the native jail.");
-                sbx_cfg.backend = sandbox::BackendKind::Native;
+                notices.say("SSH is not installed. Chat is available; commands are unavailable until SSH is installed.");
             }
         }
         _ => {}
     }
     if sbx_cfg.backend == sandbox::BackendKind::Native && !sandbox::native_backend_available() {
-        if sandbox::native_sandbox_supported() {
+        if cfg!(target_os = "linux") {
+            notices.say("Linux native confinement is unavailable. Chat is available; commands fail closed until the native boundary can be set up.");
+        } else if sandbox::native_sandbox_supported() {
             notices.say(
                 "warning: the OS sandbox works on this machine but Medha's own profile failed \
                  to apply — this is a Medha bug, please report it. Shell commands run on the \
@@ -649,15 +645,11 @@ pub async fn start(
     };
     let (summary_provider, replay_summary) = match configured_compressor {
         Some((name, configured)) => {
-            let auxiliary =
-                config::resolve_model_as(&configured, &name, options.model_env.api_key.as_deref())
-                    .and_then(|resolved| {
-                        providers::OpenAiCompat::from_profile(
-                            resolved.provider,
-                            resolved.credential,
-                        )
+            let auxiliary = config::resolve_model_as(&configured, &name, Some(&options.model_env))
+                .and_then(|resolved| {
+                    providers::OpenAiCompat::from_profile(resolved.provider, resolved.credential)
                         .map_err(anyhow::Error::from)
-                    });
+                });
             match auxiliary {
                 Ok(auxiliary) => (Arc::new(auxiliary), false),
                 Err(error) => {

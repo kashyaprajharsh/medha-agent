@@ -259,7 +259,9 @@ fn remove(path: &Path) -> std::io::Result<()> {
     };
     if meta.permissions().readonly() && !linked(&meta) {
         let mut permissions = meta.permissions();
+        // Windows only clears the read-only attribute; the Unix path sets just the owner bit.
         #[cfg(windows)]
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         #[cfg(unix)]
         {

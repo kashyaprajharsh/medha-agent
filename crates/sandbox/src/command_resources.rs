@@ -36,17 +36,18 @@ impl CommandResources {
         })
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn finish(self) -> Option<String> {
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            let notices: Vec<_> = self
-                .snapshot
-                .into_iter()
-                .filter_map(crate::git_snapshot::Snapshot::restore)
-                .collect();
-            return (!notices.is_empty()).then(|| notices.join("\n"));
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
+        let notices: Vec<_> = self
+            .snapshot
+            .into_iter()
+            .filter_map(crate::git_snapshot::Snapshot::restore)
+            .collect();
+        (!notices.is_empty()).then(|| notices.join("\n"))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    pub(crate) fn finish(self) -> Option<String> {
         None
     }
 }

@@ -99,10 +99,11 @@ fn open_under_cursor(model: &mut Model, point: TextPoint) {
             os_open(&url);
             model.push_notice(format!("opening {url}"));
         }
-        Some(OpenTarget::Path(path)) => {
-            os_open(&path.to_string_lossy());
-            model.push_notice(format!("opening {}", path.display()));
-        }
+        Some(OpenTarget::Path(path)) => match file_ops::opening::open_file(&path) {
+            Ok(Some(notice)) => model.push_notice(notice),
+            Ok(None) => model.push_notice(format!("opening {}", path.display())),
+            Err(error) => model.push_notice(error),
+        },
         None => model
             .push_notice("nothing to open there — ctrl/alt-click a URL or a file path that exists"),
     }
@@ -188,22 +189,7 @@ fn strip_locator(token: &str) -> &str {
 /// Hand the target to the OS opener — the user's browser or GUI editor, never a
 /// terminal editor that would fight the TUI for the screen.
 fn os_open(target: &str) {
-    #[cfg(target_os = "macos")]
-    let (program, args) = ("open", vec![target]);
-    #[cfg(target_os = "linux")]
-    let (program, args) = ("xdg-open", vec![target]);
-    #[cfg(target_os = "windows")]
-    let (program, args) = ("cmd", vec!["/C", "start", "", target]);
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let (program, args): (&str, Vec<&str>) = ("", Vec::new());
-
-    if !program.is_empty() {
-        let _ = std::process::Command::new(program)
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    let _ = file_ops::opening::open_path(std::path::Path::new(target));
 }
 
 /// Removes exact bracketed-paste guards without trimming legitimate content.
@@ -634,6 +620,7 @@ pub(super) fn set_theme(model: &mut Model, id: &str) {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SlashAction {
     Outbound(String),
+    Protected(String),
     Resume,
     Rewind,
     Clear,
@@ -709,6 +696,12 @@ pub(super) enum SlashAction {
 /// single source of truth for routing; both Enter paths go through it.
 pub(super) fn classify_slash(cmd: &str) -> SlashAction {
     match cmd {
+        c if c.strip_prefix("protected").is_some_and(is_cmd_boundary) => SlashAction::Protected(
+            c.strip_prefix("protected")
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        ),
         c if c.strip_prefix("outbound").is_some_and(is_cmd_boundary) => SlashAction::Outbound(
             c.strip_prefix("outbound")
                 .unwrap_or_default()

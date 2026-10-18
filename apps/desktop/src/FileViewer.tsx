@@ -35,12 +35,14 @@ export function FileViewer({
   const api = useWorkspaceApi();
   const [file, setFile] = useState<FilePreview>();
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [source, setSource] = useState(false);
   const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     let active = true;
     setFile(undefined);
     setError("");
+    setNotice("");
     setSource(false);
     void api
       .preview(path)
@@ -87,12 +89,13 @@ export function FileViewer({
         <button
           className="btn-line"
           onClick={() =>
-            void api.openFile(path).catch((cause) => setError(String(cause)))
+            void api.openFile(path).then((notice) => setNotice(notice || "")).catch((cause) => setError(String(cause)))
           }
         >
           Open in app
         </button>
       </div>
+      {notice && <p className="quiet" role="status">{notice}</p>}
       {error && (
         <p className="surface-error" role="alert">
           {error}

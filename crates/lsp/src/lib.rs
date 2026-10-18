@@ -3789,28 +3789,34 @@ pub fn install_command(server: &str) -> Option<(String, Vec<String>)> {
     let recipe = install_recipe(server)?;
     let into = server_install_dir()?;
     let own = into.to_string_lossy().into_owned();
-    Some(match recipe[0] {
+    Some(match recipe[0].as_str() {
         // `--prefix` keeps this out of the global npm root: an agent installing a
         // package should not alter the machine outside a directory the user can
         // delete in one command.
         "npm" => (
             "npm".into(),
-            ["install", "--prefix", &own]
-                .into_iter()
-                .map(str::to_string)
-                .chain(recipe[1..].iter().map(|part| (*part).to_string()))
-                .collect(),
+            [
+                "install",
+                "--prefix",
+                &own,
+                "--save-exact",
+                "--package-lock=true",
+                "--engine-strict",
+                "--no-audit",
+                "--no-fund",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .chain(recipe[1..].iter().cloned())
+            .collect(),
         ),
         "go" => (
             "go".into(),
             std::iter::once("install".to_string())
-                .chain(recipe[1..].iter().map(|part| (*part).to_string()))
+                .chain(recipe[1..].iter().cloned())
                 .collect(),
         ),
-        program => (
-            program.into(),
-            recipe[1..].iter().map(|part| (*part).to_string()).collect(),
-        ),
+        program => (program.into(), recipe[1..].to_vec()),
     })
 }
 
@@ -3850,19 +3856,34 @@ pub async fn install_server(server: &str, timeout: Duration) -> Result<String, E
         Error::Protocol(detail)
     })?;
 
-    let mut command = tokio::process::Command::new(&program);
-    command.args(&arguments);
-    // An installer runs arbitrary package scripts. It gets the same allowlist a
-    // language server does rather than the session's whole environment, which
-    // carries API keys and cloud credentials.
-    command.env_clear();
-    for (key, value) in language_server_environment() {
-        command.env(key, value);
+    let backend = installer_backend(&into)?;
+    let mut env = language_server_environment();
+    for (key, path) in [
+        ("GOBIN", into.join("bin")),
+        ("NPM_CONFIG_CACHE", into.join("cache/npm")),
+        ("GOCACHE", into.join("cache/go-build")),
+        ("GOMODCACHE", into.join("cache/go-mod")),
+    ] {
+        env.push((key.into(), path.to_string_lossy().into_owned()));
     }
-    command.env("GOBIN", into.join("bin"));
-    let output = sandbox::run_command_bounded(command, timeout, INSTALL_MAX_OUTPUT_BYTES, None)
-        .await
-        .map_err(|error| Error::Protocol(error.to_string()))?;
+    let request = ExecRequest {
+        program: program.clone(),
+        args: arguments,
+        cwd: into.clone(),
+        env,
+        clear_env: true,
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
+    };
+    let output = sandbox::exec::run_request_bounded(
+        backend.as_ref(),
+        &request,
+        timeout,
+        INSTALL_MAX_OUTPUT_BYTES,
+        None,
+    )
+    .await
+    .map_err(|error| Error::Protocol(error.to_string()))?;
     if !output.passed() {
         let tail = output
             .output
@@ -3874,6 +3895,7 @@ pub async fn install_server(server: &str, timeout: Duration) -> Result<String, E
             .rev()
             .collect::<Vec<_>>()
             .join("\n");
+        let tail = sandbox::environment::redact(&tail);
         return Err(Error::Protocol(format!(
             "{program} failed: {}",
             if tail.is_empty() { "no output" } else { &tail }
@@ -3881,6 +3903,32 @@ pub async fn install_server(server: &str, timeout: Duration) -> Result<String, E
     }
     Ok(format!("{server} installed into {}", into.display()))
 }
+
+fn installer_backend(into: &Path) -> Result<Arc<dyn sandbox::ExecBackend>, Error> {
+    let config = SandboxConfig {
+        backend: BackendKind::Native,
+        net: NetPolicy::Allow,
+        home: sandbox::HomeScope::private(),
+        state: sandbox::StateAccess {
+            read: Vec::new(),
+            write: vec![into.into()],
+        },
+        ..SandboxConfig::default()
+    };
+    let backend = select_backend(
+        &config,
+        Vec::new(),
+        sandbox::ApprovedRoots::default(),
+        sandbox::NetworkGrant::default(),
+    );
+    if backend.label() != "native" {
+        return Err(Error::Sandbox("Managed language-server installation needs the native installer jail on this platform. Install the displayed package manually; no host installer was run.".into()));
+    }
+    Ok(backend)
+}
+
+#[cfg(test)]
+mod install_tests;
 
 /// Language servers need local toolchain discovery, but they should not inherit
 /// API keys, cloud credentials, or arbitrary session secrets from Medha.
@@ -3998,20 +4046,10 @@ fn server_install_hint(server: &str) -> String {
 /// Packages Medha can fetch for a server, as `(fetcher, args…)`. Only servers with
 /// one unambiguous recipe; anything needing a language toolchain is left to it.
 /// Metadata only — servers download at run time, nothing is bundled.
-pub fn install_recipe(server: &str) -> Option<&'static [&'static str]> {
-    Some(match server {
-        "typescript-language-server" => {
-            // The server resolves the TypeScript SDK from its own tree, so both
-            // have to land together or it starts and reports nothing.
-            &["npm", "typescript-language-server", "typescript"]
-        }
-        "pyright" => &["npm", "pyright"],
-        "bash-language-server" => &["npm", "bash-language-server"],
-        "yaml-language-server" => &["npm", "yaml-language-server"],
-        "intelephense" => &["npm", "intelephense"],
-        "gopls" => &["go", "golang.org/x/tools/gopls@latest"],
-        _ => return None,
-    })
+pub fn install_recipe(server: &str) -> Option<Vec<String>> {
+    let packages: HashMap<String, Vec<String>> =
+        serde_json::from_str(include_str!("install_packages.json")).ok()?;
+    packages.get(server).cloned()
 }
 
 fn detect_root(path: &Path, workspace: &Path, markers: &[String]) -> PathBuf {

@@ -38,6 +38,8 @@ pub struct Pooled {
     reserved_cost_usd: f64,
     started: Option<Instant>,
     finish_claimed: bool,
+    startup_pending: bool,
+    indicative: bool,
 }
 
 impl Pooled {
@@ -97,6 +99,27 @@ impl Budget {
     pub fn with_fresh_pool(mut self) -> Self {
         self.pooled = Some(Pooled::new());
         self
+    }
+
+    pub fn for_startup(self) -> Self {
+        let budget = self.with_fresh_pool();
+        if let Some(pool) = &budget.pooled {
+            pool.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .startup_pending = true;
+        }
+        budget
+    }
+
+    pub fn claim_startup(&self) -> Option<Self> {
+        let pool = self.pooled.as_ref()?;
+        let mut state = pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !std::mem::take(&mut state.startup_pending) {
+            return None;
+        }
+        Some(self.clone())
     }
 
     /// A turn-only budget. Handy where a caller has no ceilings to inherit.
@@ -160,6 +183,7 @@ pub struct ModelReservation {
     cost_usd: f64,
     enforce_tokens: bool,
     enforce_cost: bool,
+    indicative: bool,
     settled: bool,
 }
 
@@ -403,6 +427,7 @@ impl Governor {
             cost_usd,
             enforce_tokens: self.budget.max_tokens.is_some(),
             enforce_cost: self.budget.max_cost_usd.is_some(),
+            indicative: pricing.is_some_and(|price| price.indicative),
             settled: false,
         })
     }
@@ -428,6 +453,18 @@ impl Governor {
     pub fn turns(&self) -> u32 {
         self.turns
     }
+    pub fn task_tokens(&self) -> u64 {
+        self.spent().0
+    }
+    pub fn task_cost_usd(&self) -> f64 {
+        self.spent().1
+    }
+    pub fn task_cost_indicative(&self) -> bool {
+        self.allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .indicative
+    }
     pub fn tokens(&self) -> u64 {
         self.local
             .lock()
@@ -443,6 +480,23 @@ impl Governor {
 }
 
 impl ModelReservation {
+    pub fn reconcile_attempt(
+        mut self,
+        usage: Option<Usage>,
+        pricing: Option<Pricing>,
+        error: Option<&crate::ProviderError>,
+    ) -> Result<(), BudgetStop> {
+        let measured = usage.is_some_and(|usage| {
+            usage.prompt_tokens != 0 || usage.completion_tokens != 0 || usage.total_tokens != 0
+        });
+        if !measured && error.is_some_and(crate::ProviderError::billing_rejected) {
+            self.settle(0, 0.0);
+            Ok(())
+        } else {
+            self.reconcile(usage, pricing)
+        }
+    }
+
     /// Reconcile with authoritative usage. Missing or all-zero usage charges
     /// the reserved worst-case amount (the provider call may have run even if
     /// metering was absent, broken, or the transport failed).
@@ -490,6 +544,7 @@ impl ModelReservation {
         allowance.reserved_cost_usd = (allowance.reserved_cost_usd - self.cost_usd).max(0.0);
         allowance.tokens = allowance.tokens.saturating_add(tokens);
         allowance.cost_usd += cost_usd;
+        allowance.indicative |= self.indicative && cost_usd > 0.0;
         drop(allowance);
 
         let mut local = self
@@ -509,6 +564,10 @@ impl Drop for ModelReservation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "budget_attempt_tests.rs"]
+mod attempt_tests;
 
 #[cfg(test)]
 mod tests {

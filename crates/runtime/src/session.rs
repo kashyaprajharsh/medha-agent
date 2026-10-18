@@ -120,6 +120,8 @@ pub async fn start(
     let cwd = workspace_home.root.clone();
     let state = workspace_home.state.clone();
     let medha_home = workspace_home.home.clone();
+    let base_budget = options.budget.apply(lock.budget.to_budget()).for_startup();
+    let pricing = pricing::resolve(lock, &model_name, catalogue_pricing, &base_budget, notices);
     let crate::workspace::Store { log, artifacts } = workspace_home.open_store()?;
 
     let (mut session, resumed, lease) =
@@ -149,13 +151,26 @@ pub async fn start(
         sbx_cfg,
         scratch,
     } = sandbox_setup::build(&setup, &surface)?;
+    // An idle start reviews instructions in its own capped pool, so flagged
+    // files are still judged rather than blocked for the whole session.
+    let startup_budget = if has_task {
+        base_budget.clone()
+    } else {
+        base_budget.clone().with_fresh_pool()
+    };
     let instructions::Discovered {
         startup_context,
         persona_file,
         progressive_context,
         mut session_plugins,
         skill_store,
-    } = instructions::discover(&setup, &provider, &workspace).await?;
+    } = kernel::auxiliary::scope(
+        startup_budget,
+        kernel::Provider::context_identity(provider.as_ref()),
+        pricing,
+        instructions::discover(&setup, &provider, &workspace),
+    )
+    .await?;
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
     let lsp_manager = services::language_servers(&setup, &sbx_cfg, &mut registry);
     let services::Mcp {
@@ -273,10 +288,7 @@ pub async fn start(
     ));
 
     // Children inherit this already-resolved budget.
-    let base_budget = options.budget.apply(lock.budget.to_budget());
     let ui_config = lock.ui.clone();
-
-    let pricing = pricing::resolve(lock, &model_name, catalogue_pricing, &base_budget, notices);
 
     let max_parallel_tools = options
         .max_parallel_tools
@@ -320,6 +332,17 @@ pub async fn start(
     .with_hooks(Arc::new(hook_runner))
     .with_image_shrinker(Arc::new(vision::Shrinker))
     .with_session_owner(Arc::new(Ownership::new(state.clone(), lease)));
+    kernel
+        .egress
+        .mutations
+        .configure(
+            model_profiles
+                .lock()
+                .map_err(|_| anyhow::anyhow!("model configuration lock failed"))?
+                .security
+                .clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
     if let Some(auxiliary) = auxiliary_vision {
         kernel = kernel.with_vision(auxiliary);
     }

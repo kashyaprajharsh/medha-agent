@@ -216,7 +216,7 @@ Resolution order is **CLI flag > `MEDHA_*` env > `~/.medha/config.toml` > first-
 
 </details>
 
-> MEDHA reads **only** its own `MEDHA_*` namespace: never a project's `.env`, never generic `OPENAI_*` / `GOOGLE_*` names. A harness that roams into repos it doesn't own must not let one project's environment swap out its model or credentials. Run `medha pulse` to see what resolved and from where.
+> Model configuration reads MEDHA's own `MEDHA_*` namespace: never a project's `.env`, never generic `OPENAI_*` / `GOOGLE_*` names. Search uses `MEDHA_TAVILY_API_KEY` and `MEDHA_BRAVE_API_KEY`; the old `TAVILY_API_KEY` / `BRAVE_API_KEY` spellings remain aliases for one release, with one notice and both values redacted. Authorized local/container commands honor standard proxy and CA environment settings independently of model traffic. Run `medha pulse` to see what resolved and from where.
 
 ## What you get
 

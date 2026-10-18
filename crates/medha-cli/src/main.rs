@@ -54,7 +54,9 @@ use std::sync::Arc;
 
 /// Apply environment overrides to one task's shared budget pool.
 pub(crate) fn task_budget(base: &kernel::Budget, slot: &kernel::BudgetHandle) -> kernel::Budget {
-    let budget = base.clone().with_fresh_pool();
+    let budget = base
+        .claim_startup()
+        .unwrap_or_else(|| base.clone().with_fresh_pool());
     if let Ok(mut published) = slot.lock() {
         *published = Some(budget.clone());
     }
@@ -670,6 +672,15 @@ async fn recent_writes(log: &store::SqliteLog, limit: usize) -> Vec<WriteEvent> 
             let Some(result) = e.payload.get("payload").and_then(|p| p.as_object()) else {
                 continue;
             };
+            if let Some(id) = result.get("checkpoint").and_then(serde_json::Value::as_str) {
+                out.push(WriteEvent {
+                    id: e.id,
+                    session: meta.id,
+                    path: format!("command checkpoint {id}"),
+                    ts: e.ts,
+                });
+                continue;
+            }
             if !result.contains_key("snapshot") {
                 continue;
             }
@@ -768,7 +779,8 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
         sandbox::ApprovedRoots::default(),
         medha_home.clone(),
     )?
-    .with_snapshots_dir(state.join("snapshots"));
+    .with_snapshots_dir(state.join("snapshots"))
+    .with_command_snapshots_dir(config::command_snapshots_dir(&cwd)?);
 
     println!(
         "Restoring {} file(s) to their state at event {target}:",
@@ -782,8 +794,8 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
                 f.path
             ),
         }
-        sandbox.restore(&f.path, f.snapshot.as_deref()).await?;
     }
+    sandbox.restore_plan(&plan).await?;
     Ok(())
 }
 
@@ -1859,6 +1871,24 @@ where
                 if let Some(cmd) = line.strip_prefix('/') {
                     let cmd = cmd.trim();
                     let (name, rest) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                    if name == "protected" {
+                        if let Some(id) = rest.trim().strip_prefix("allow ") {
+                            match kernel.egress.mutations.allow(id.trim()).await {
+                                Ok(_) => println!("Applied this exact protected change once."),
+                                Err(error) => eprintln!("{error}"),
+                            }
+                        } else if let Some(id) = rest.trim().strip_prefix("dismiss ") {
+                            if let Err(error) = kernel.egress.mutations.dismiss(id.trim()) {
+                                eprintln!("{error}");
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&kernel.egress.mutations.reviews())?
+                            );
+                        }
+                        continue;
+                    }
                     if name == "outbound" {
                         if let Some(id) = rest.trim().strip_prefix("allow ") {
                             match kernel.egress.approve(id.trim()) {

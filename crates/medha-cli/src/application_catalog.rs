@@ -38,7 +38,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/search",
-        "choose the web-search provider (Tavily/Brave/SearXNG) & key; DuckDuckGo fallback",
+        "choose a web-search provider and key; keyless DuckDuckGo is the default",
     ),
     (
         "/mode",

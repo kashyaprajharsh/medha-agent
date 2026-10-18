@@ -21,6 +21,18 @@ const event = (kind, params = {}) => ({
   params: { kind, ...params },
 });
 
+test("separate protected changes retain their own quiet notices and duplicate deliveries do not multiply them", () => {
+  let state = startingLive();
+  for (const id of ["first", "second", "first"]) state = reduceLive(state, event("tool.observation", { id, tool: "write", ok: false, mutation: { id } }));
+  assert.deepEqual(state.mutations, [{ id: "first" }, { id: "second" }]);
+  state = reduceLive(state, event("tool.observation", { id: "parallel", tool: "agent.spawn", ok: true,
+    mutations: [{ id: "third" }, { id: "fourth" }, { id: "first" }] }));
+  assert.deepEqual(state.mutations.map(review => review.id), ["first", "second", "third", "fourth"]);
+  for (let index = 0; index < 100; index++) state = reduceLive(state, event("tool.observation", { id: `call-${index}`, tool: "write", ok: false, mutation: { id: `review-${index}` } }));
+  assert.equal(state.mutations.length, 64);
+  assert.equal(state.mutations.at(-1).id, "review-99");
+});
+
 test("pushed outputs are kept until they may be incomplete, then listed afresh", () => {
   const record = (id) => ({ artifact_id: `file:${id}`, revision_id: `${id}:file`, predecessor: null, source_event: id, source_index: 0, ts: 1, kind: "page", name: id });
   let state = reduceLive(startingLive(), event("outputs", { revisions: [record("a")] }));

@@ -289,6 +289,8 @@ pub struct InvalidToolCall {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    #[error("connection failed before request submission: {0}")]
+    NotSent(String),
     #[error("transport error: {0}")]
     Transport(String),
     /// The request may already be executing upstream. Replaying the same large
@@ -366,6 +368,17 @@ pub enum ProviderFailure {
 }
 
 impl ProviderError {
+    /// Only typed connection failures and explicit request rejections are free.
+    pub fn billing_rejected(&self) -> bool {
+        match self {
+            Self::NotSent(_) | Self::Certificate(_) => true,
+            Self::Status(status, _) | Self::Throttled { status, .. } => {
+                matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 | 429)
+            }
+            _ => false,
+        }
+    }
+
     pub fn invalid_tool_call(tool: &str, call_id: &str, reason: impl Into<String>) -> Self {
         Self::InvalidToolCall(InvalidToolCall {
             tool: tool.into(),
@@ -410,7 +423,8 @@ impl ProviderError {
     pub fn classify(&self) -> ProviderFailure {
         match self {
             ProviderError::InvalidToolCall(_) => ProviderFailure::InvalidToolCall,
-            ProviderError::Transport(_)
+            ProviderError::NotSent(_)
+            | ProviderError::Transport(_)
             | ProviderError::Stream(_)
             | ProviderError::Garbled(_)
             | ProviderError::StreamStalled { .. } => ProviderFailure::Transient,

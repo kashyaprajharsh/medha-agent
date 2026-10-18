@@ -288,7 +288,7 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
     artifacts: (sessionId: string, cursor = 0) => invoke<ArtifactPage>("artifact_list", { workspaceId, sessionId, cursor }),
     artifactPreview: (sessionId: string, revisionId: string) => invoke<FilePreview>("artifact_preview", { workspaceId, sessionId, revisionId }).then(decodedPreview),
     artifactRelease: (bundle: string) => invoke<void>("artifact_release", { bundle }),
-    openFile: (path: string) => invoke<void>("file_open", { ...scope(), path }),
+    openFile: (path: string) => invoke<string | null>("file_open", { ...scope(), path }),
     revealFile: (path: string) => invoke<void>("file_reveal", { ...scope(), path }),
     mediaLink: (path: string) =>
       invoke<{ url: string; size: number }>("media_link", { ...scope(), path }),

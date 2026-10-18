@@ -120,6 +120,7 @@ export type LiveState = {
   notice?: string;
   projectTrust?: ProjectTrustReview;
   outbound?: { id: string };
+  mutations?: { id: string }[];
   error?: string;
   settled: number;
   // Messages a stopped or failed turn never read, waiting for the composer.
@@ -532,8 +533,16 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       // written until its screen arrives, so the drawing is never taken down between.
       const writing = params.ok === true ? state.writing : state.writing?.filter((call) => call.id !== id);
       const outbound = params.outbound as LiveState["outbound"];
-      const notice = outbound && state.notice?.startsWith("Outbound request blocked:") && state.notice.includes(outbound.id) ? undefined : state.notice;
-      return { ...state, items, writing, notice, outbound: outbound ?? state.outbound };
+      const mutation = params.mutation as { id: string } | undefined;
+      const candidates = Array.isArray(params.mutations) ? params.mutations : mutation ? [mutation] : [];
+      const incoming = candidates.filter((review): review is { id: string } =>
+        review && typeof review === "object" && typeof review.id === "string");
+      const mutations = incoming.length ? [...new Map([...(state.mutations ?? []), ...incoming]
+        .map(review => [review.id, review])).values()].slice(-64) : state.mutations;
+      const heldNotice = (outbound && state.notice?.startsWith("Outbound request blocked:") && state.notice.includes(outbound.id))
+        || (state.notice?.startsWith("Protected change held:") && incoming.some(review => state.notice?.includes(review.id)));
+      const notice = heldNotice ? undefined : state.notice;
+      return { ...state, items, writing, notice, outbound: outbound ?? state.outbound, mutations };
     }
     case "tool.input": {
       const [id, tool, delta] = [str(params.id), str(params.tool), str(params.delta)];

@@ -140,18 +140,11 @@ pub fn preview_bytes(path: &Path, bytes: Vec<u8>) -> Result<Value, String> {
         json!({"kind": kind, "extension": extension, "size": size, "html": (kind == "markdown").then(|| transcript_view::to_html(&text)), "text": text}),
     )
 }
-pub fn open_default(root: &Path, requested: &str) -> Result<(), String> {
-    open_path(&resolve(root, requested)?)
+pub fn open_default(root: &Path, requested: &str) -> Result<Option<String>, String> {
+    file_ops::opening::open_file(&resolve(root, requested)?)
 }
 pub fn open_path(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = std::process::Command::new("xdg-open");
-    command.arg(path).spawn().map_err(|e| e.to_string())?;
-    Ok(())
+    file_ops::opening::open_path(path)
 }
 #[cfg(test)]
 mod tests {

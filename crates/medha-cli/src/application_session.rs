@@ -229,6 +229,10 @@ async fn inspect<P: Provider, L: EventLog>(
 ) -> Result<protocol::SessionResult, String> {
     use protocol::{SessionRead as Read, SessionResult as Reply};
     Ok(match query {
+        Read::Protected => Reply::Text(
+            serde_json::to_string_pretty(&kernel.egress.mutations.reviews())
+                .map_err(|error| error.to_string())?,
+        ),
         Read::Outbound => Reply::Text(
             serde_json::to_string_pretty(&kernel.egress.reviews())
                 .map_err(|error| error.to_string())?,
@@ -507,6 +511,37 @@ async fn change_session<P: Provider, L: EventLog>(
                     ""
                 }
             )))
+        }
+        Change::AllowProtected { id } => {
+            if running || agents.is_some_and(|control| !control.active().is_empty()) {
+                return Err(
+                    "Finish active work before applying this exact protected change".into(),
+                );
+            }
+            let _lease = kernel
+                .log
+                .acquire_mutation_lease("state:*")
+                .await
+                .map_err(|error| error.to_string())?;
+            let result = kernel.egress.mutations.allow(&id).await?;
+            kernel
+                .log
+                .append(kernel::Event::protected_applied(
+                    session,
+                    &id,
+                    result.clone(),
+                ))
+                .await
+                .map_err(|error| {
+                    format!("The exact change was applied, but recording it failed: {error}")
+                })?;
+            Ok(Reply::Text(format!(
+                "Applied the exact protected change once: {result}"
+            )))
+        }
+        Change::DismissProtected { id } => {
+            kernel.egress.mutations.dismiss(&id)?;
+            Ok(Reply::Changed)
         }
         Change::DismissOutbound { id } => {
             kernel.egress.dismiss(&id)?;

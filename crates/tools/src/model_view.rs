@@ -202,7 +202,17 @@ pub(crate) fn file_change(payload: &Value) -> Option<String> {
         }
     }
     if let Some(report) = payload.get("lsp").filter(|report| !report.is_null()) {
-        view.push_str(&format!("\nDiagnostics after the change: {report}"));
+        if let Some(introduced) = report.get("introduced").filter(|value| value.is_array()) {
+            view.push_str(&format!(
+                "\nNew LSP diagnostics: {introduced}; resolved: {}",
+                report["resolved"]
+            ));
+        } else {
+            view.push_str("\nLSP delta unknown: no fresh comparable baseline. Current diagnostics remain in the full result.");
+        }
+    }
+    if let Some(report) = payload.get("syntax") {
+        view.push_str(&format!("\nSyntax check: {report}"));
     }
     Some(view)
 }

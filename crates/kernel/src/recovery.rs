@@ -118,9 +118,10 @@ impl ProviderError {
             (_, ProviderError::StreamStalled { .. }) => {
                 (First::Reconnect, Some("it stopped sending"))
             }
-            (_, ProviderError::Transport(_) | ProviderError::Stream(_)) => {
-                (First::Retry, Some("its server could not be reached"))
-            }
+            (
+                _,
+                ProviderError::NotSent(_) | ProviderError::Transport(_) | ProviderError::Stream(_),
+            ) => (First::Retry, Some("its server could not be reached")),
             (_, ProviderError::Garbled(_)) => (First::Retry, Some("its reply could not be read")),
             (_, ProviderError::ResponseTimeout { .. } | ProviderError::ProgressTimeout { .. }) => {
                 (First::Nothing, Some("it did not answer in time"))
@@ -160,7 +161,11 @@ impl ProviderError {
         };
         let hand_over_after = match (status, self) {
             (429, _) => Some(0),
-            (503 | 529, _) | (_, ProviderError::Transport(_) | ProviderError::Stream(_)) => Some(2),
+            (503 | 529, _)
+            | (
+                _,
+                ProviderError::NotSent(_) | ProviderError::Transport(_) | ProviderError::Stream(_),
+            ) => Some(2),
             _ => None,
         };
         // A reply that arrives unreadable is not a server that is away.

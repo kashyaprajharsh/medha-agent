@@ -95,6 +95,11 @@ impl MedhaLock {
         }
         for (key, value, effect) in [
             (
+                "sandbox.user",
+                self.sandbox.user.as_deref(),
+                "selects the identity used by container commands",
+            ),
+            (
                 "sandbox.image",
                 self.sandbox.image.as_deref(),
                 "selects repository-provided code used by the container executor",
@@ -220,6 +225,7 @@ impl MedhaLock {
         safe.sandbox.extra_writable = Vec::new();
         safe.sandbox.image = None;
         safe.sandbox.runtime = None;
+        safe.sandbox.user = None;
         safe.sandbox.host = None;
         safe.sandbox.remote_dir = None;
         safe.verify.command = None;
@@ -250,6 +256,7 @@ impl MedhaLock {
                     .clone_from(&self.sandbox.extra_writable),
                 "sandbox.image" => safe.sandbox.image.clone_from(&self.sandbox.image),
                 "sandbox.runtime" => safe.sandbox.runtime.clone_from(&self.sandbox.runtime),
+                "sandbox.user" => safe.sandbox.user.clone_from(&self.sandbox.user),
                 "sandbox.host" => safe.sandbox.host.clone_from(&self.sandbox.host),
                 "sandbox.remote_dir" => {
                     safe.sandbox.remote_dir.clone_from(&self.sandbox.remote_dir)

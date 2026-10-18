@@ -385,6 +385,37 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
                 model.push_notice(notice);
             }
         }
+        A::Protected(args) => {
+            if let Some(id) = args
+                .strip_prefix("allow ")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                request(
+                    model,
+                    Effect::SessionChange(
+                        protocol::SessionChange::AllowProtected { id: id.into() },
+                        After::Notice,
+                    ),
+                );
+            } else if let Some(id) = args
+                .strip_prefix("dismiss ")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                request(
+                    model,
+                    Effect::SessionChange(
+                        protocol::SessionChange::DismissProtected { id: id.into() },
+                        After::Notice,
+                    ),
+                );
+            } else if args.is_empty() {
+                request(model, Effect::Inspect(Inspect::Protected, After::Notice));
+            } else {
+                model.push_notice("usage: /protected [allow|dismiss <change id>]");
+            }
+        }
         A::Outbound(args) => {
             if let Some(id) = args
                 .strip_prefix("allow ")

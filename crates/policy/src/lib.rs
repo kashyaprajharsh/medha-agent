@@ -274,6 +274,88 @@ pub fn plain_commands(command: &str) -> Option<Vec<Vec<String>>> {
     (!hidden).then(|| syntax.commands.into_iter().map(|c| c.words).collect())
 }
 
+/// Recognized destructive shell operations. This is deliberately a heuristic,
+/// using the same parser as command authorization rather than a second lexer.
+/// An empty target list means the entire checkout needs a checkpoint.
+pub fn checkpoint_targets(command: &str) -> Result<Option<Vec<String>>, &'static str> {
+    let Ok(syntax) = parse_shell_syntax(command) else {
+        return Ok(None);
+    };
+    let mut targets = Vec::new();
+    let mut whole = false;
+    let mut changed_directory = false;
+    for command in &syntax.commands {
+        for target in &command.outputs {
+            let Some(path) = command.words.get(*target) else {
+                return Err("Cannot identify a shell output target for its required checkpoint");
+            };
+            if path != "/dev/null" && !path.eq_ignore_ascii_case("NUL") {
+                targets.push(path.clone());
+            }
+        }
+        let Some((at, program)) = effective_program(&command.words) else {
+            continue;
+        };
+        let args = &command.words[at + 1..];
+        match program {
+            "cd" => changed_directory = true,
+            "rm" => {
+                let mut operands = false;
+                for arg in args {
+                    if arg == "--" && !operands {
+                        operands = true;
+                    } else if operands || !arg.starts_with('-') {
+                        targets.push(arg.clone());
+                    }
+                }
+            }
+            "mv" | "truncate" => {
+                targets.extend(args.iter().filter(|arg| !arg.starts_with('-')).cloned());
+                if program == "mv" {
+                    targets.extend(args.iter().filter_map(|arg| {
+                        arg.strip_prefix("--target-directory=")
+                            .or_else(|| {
+                                arg.strip_prefix('-')
+                                    .filter(|flags| !flags.starts_with('-'))
+                                    .and_then(|flags| flags.split_once('t').map(|(_, path)| path))
+                            })
+                            .filter(|path| !path.is_empty())
+                            .map(str::to_owned)
+                    }));
+                }
+            }
+            "git"
+                if args
+                    .iter()
+                    .any(|arg| ["reset", "clean"].contains(&arg.as_str())) =>
+            {
+                if command.words.iter().any(|word| {
+                    is_assignment(word)
+                        || word == "-C"
+                        || word.starts_with("--git-dir")
+                        || word.starts_with("--work-tree")
+                }) {
+                    return Err(
+                        "Checkpointed Git commands must use the current checkout without Git-directory overrides",
+                    );
+                }
+                whole = true;
+            }
+            _ => {}
+        }
+    }
+    if (whole || !targets.is_empty()) && (syntax.dynamic || syntax.grouping || changed_directory) {
+        return Err(
+            "Cannot identify the destructive command's actual checkpoint targets; use workspace-relative paths without changing directories",
+        );
+    }
+    Ok(if whole {
+        Some(Vec::new())
+    } else {
+        (!targets.is_empty()).then_some(targets)
+    })
+}
+
 /// A deliberately small shell AST. Medha does not need to reproduce a shell's
 /// expansion semantics here; it needs to distinguish plain argv-like commands
 /// from syntax whose eventual executable or data flow is not statically known.
@@ -291,6 +373,7 @@ struct ShellSyntax {
 #[derive(Debug, Default)]
 struct SimpleCommand {
     words: Vec<String>,
+    outputs: Vec<usize>,
     /// This command consumes the preceding command's stdout.
     piped_in: bool,
 }
@@ -410,6 +493,9 @@ fn parse_shell_syntax(input: &str) -> Result<ShellSyntax, &'static str> {
                 '<' | '>' => {
                     finish_word(&mut command, &mut word, &mut word_started);
                     syntax.redirection = true;
+                    if ch == '>' && chars.peek() != Some(&'&') {
+                        command.outputs.push(command.words.len());
+                    }
                     // Consume common paired operators. The target remains a
                     // normal following word, but the whole command is gated.
                     if chars.peek() == Some(&ch) {

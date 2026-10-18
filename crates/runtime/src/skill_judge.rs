@@ -66,7 +66,9 @@ impl context::ctxfiles::ContextJudge for LlmJudge {
 }
 
 async fn collect_text(provider: &dyn Provider, ctx: &CompiledContext) -> Result<String, String> {
-    let mut stream = provider.stream(ctx).await.map_err(|e| e.to_string())?;
+    let mut stream = kernel::auxiliary::context(provider, ctx, 1024)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut out = String::new();
     while let Some(block) = stream.next().await {
         if let Block::Text(t) = block.map_err(|e| e.to_string())? {

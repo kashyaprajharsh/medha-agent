@@ -52,7 +52,7 @@ const keyOf = (model: Model) =>
 const EVERYWHERE = ["persona", "global"];
 const fileOf = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
 const PROVIDERS = [
-  { id: "duckduckgo", name: "DuckDuckGo", note: "Works at once. No key needed." },
+  { id: "duckduckgo", name: "DuckDuckGo", note: "Keyless default. No API key needed." },
   { id: "tavily", name: "Tavily", note: "Search made for agents. Needs an API key." },
   { id: "brave", name: "Brave Search", note: "An independent index. Needs an API key." },
   { id: "searxng", name: "SearXNG", note: "Your own search server, at an address you give." },

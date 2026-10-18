@@ -14,6 +14,7 @@ name = "medha"
 path = "src/main.rs"
 
 [dependencies]
+file-ops = { path = "../file-ops" }
 kernel.workspace = true
 providers.workspace = true
 context.workspace = true

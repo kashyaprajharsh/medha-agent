@@ -9,11 +9,17 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 
 mod agents;
 mod browser;
+mod checkpoints;
 mod edit_match;
+mod file_checks;
 mod lanes;
 mod model_view;
 mod outbound;
 pub mod outputs;
+mod protected_patches;
+mod protected_writes;
+mod read_revisions;
+pub mod search_environment;
 mod shell_hints;
 mod shown;
 mod tool_inventory;
@@ -100,6 +106,10 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
+    async fn mutation_preflight(&self, _args: &Value) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     /// Presentation category surfaces map to a glyph/verb. Defaults from
     /// the blast radius; tools override for a finer class (Search/Web/Vcs/…).
     /// Declared here so surfaces read it, never re-deriving from the tool name.
@@ -139,6 +149,27 @@ pub trait Tool: Send + Sync {
     /// for people and for the record. Default: the model reads the payload.
     fn model_view(&self, _payload: &Value) -> Option<String> {
         None
+    }
+
+    /// Called after redaction, result fitting and durable observation storage.
+    fn delivered(&self, _observation: &Observation) {}
+
+    fn changed_files(&self, observation: &Observation) -> bool {
+        if matches!(
+            observation.status,
+            kernel::ObsStatus::Denied
+                | kernel::ObsStatus::Rejected
+                | kernel::ObsStatus::SchemaInvalid
+        ) {
+            return false;
+        }
+        if let Some(changed) = observation.payload["changed"].as_bool() {
+            return changed;
+        }
+        matches!(
+            self.blast_radius(),
+            BlastRadius::ReversibleLocal | BlastRadius::IrreversibleLocal
+        )
     }
 
     /// Hard wall-clock ceiling for one call, default 60s. `None` means the tool
@@ -216,6 +247,11 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
             };
             if net_denied { obs.net_denied() } else { obs }
         }
+        Err(ToolError::Args(error)) => {
+            let mut observation = Observation::error(&intent.id, error);
+            observation.payload["changed"] = json!(false);
+            observation
+        }
         Err(error) => Observation::error(&intent.id, error.to_string()),
     }
 }
@@ -223,6 +259,25 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
 /// Key a tool sets to declare the trust of content it is relaying rather than
 /// producing. Stripped here: it is provenance for the kernel, not for the model.
 pub(crate) const RELAYED_TRUST: &str = "_relayed_trust";
+
+pub(crate) async fn mutation_preflight(
+    tool: &dyn Tool,
+    intent: &ToolIntent,
+) -> Option<Observation> {
+    match tool.mutation_preflight(&intent.args).await {
+        Ok(()) => None,
+        Err(ToolError::Structured(payload)) => {
+            let mut observation = Observation::error(&intent.id, "Protected change held");
+            observation.payload = payload;
+            Some(observation)
+        }
+        Err(error) => {
+            let mut observation = Observation::error(&intent.id, error.to_string());
+            observation.payload["changed"] = json!(false);
+            Some(observation)
+        }
+    }
+}
 
 fn take_relayed_trust(payload: &mut Value) -> Option<kernel::TrustLabel> {
     let taken = payload.as_object_mut()?.remove(RELAYED_TRUST)?;
@@ -758,7 +813,7 @@ pub struct ToolRegistry {
     tasks: Option<Arc<TaskTable>>,
     /// Live web-search configuration shared with the `web.*` tools. The TUI's
     /// `/search` writes it; the tools read it per call, so a provider change
-    /// takes effect mid-session. Defaults to DuckDuckGo (with env fallback).
+    /// takes effect mid-session. Defaults to keyless DuckDuckGo.
     search: SearchHandle,
     /// The surface's question-asker, populated by `main` per surface (TUI vs
     /// headless). `None` inside = no interactive user → `clarify` reports skipped.
@@ -1087,6 +1142,38 @@ impl Default for ToolRegistry {
 
 #[async_trait]
 impl Executor for ToolRegistry {
+    async fn prepare_effect(&self, intent: &ToolIntent) -> Result<Value, Observation> {
+        if intent.tool != "shell.exec" {
+            return Ok(Value::Null);
+        }
+        let Some(sandbox) = &self.sandbox else {
+            return Ok(Value::Null);
+        };
+        checkpoints::prepare(sandbox, &intent.args)
+            .await
+            .map_err(|error| Observation {
+                intent_id: intent.id.clone(),
+                status: kernel::ObsStatus::Error,
+                payload: error,
+                media: vec![],
+                relayed_trust: None,
+                net_denied: false,
+                model_text: None,
+            })
+    }
+    async fn finish_effect(
+        &self,
+        intent: &ToolIntent,
+        preparation: &Value,
+        observation: &mut Observation,
+    ) {
+        if intent.tool == "shell.exec"
+            && preparation["checkpoint"].is_string()
+            && let Some(sandbox) = &self.sandbox
+        {
+            checkpoints::finish(sandbox, observation).await;
+        }
+    }
     async fn tool_inventory(
         &self,
         previous_sources: &std::collections::BTreeMap<String, String>,
@@ -1268,57 +1355,92 @@ impl Executor for ToolRegistry {
     }
 
     async fn execute(&self, intent: &ToolIntent) -> Observation {
-        if mcp::McpManager::is_mcp_tool(&intent.tool) {
-            let Some(mcp) = &self.mcp else {
-                return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
-            };
-            return match mcp.call(&intent.tool, &intent.args).await {
-                Ok(out) => {
-                    // Bound what reaches the model; the full result is preserved
-                    // losslessly in the artifact store rather than discarded.
-                    let cap = mcp.max_text_chars();
-                    let cut = out.text.char_indices().nth(cap).map(|(index, _)| index);
-                    let mut payload = json!({
-                        "server": out.server,
-                        "tool": out.tool,
-                        "content": cut.map_or(out.text.as_str(), |index| &out.text[..index]),
-                        "truncated": cut.is_some(),
-                    });
-                    // The screen draws the whole result; the model reads only the text above.
-                    if let Some(resource) = &out.screen {
-                        payload[kernel::TOOL_SCREEN_FIELD] = json!({
+        let run = async {
+            if mcp::McpManager::is_mcp_tool(&intent.tool) {
+                let Some(mcp) = &self.mcp else {
+                    return Observation::denial(
+                        &intent.id,
+                        format!("unknown tool '{}'", intent.tool),
+                    );
+                };
+                return match mcp.call(&intent.tool, &intent.args).await {
+                    Ok(out) => {
+                        // Bound what reaches the model; the full result is preserved
+                        // losslessly in the artifact store rather than discarded.
+                        let cap = mcp.max_text_chars();
+                        let cut = out.text.char_indices().nth(cap).map(|(index, _)| index);
+                        let mut payload = json!({
                             "server": out.server,
                             "tool": out.tool,
-                            "resource": resource,
-                            "identity": out.identity,
-                            "input": intent.args,
-                            "result": out.result,
+                            "content": cut.map_or(out.text.as_str(), |index| &out.text[..index]),
+                            "truncated": cut.is_some(),
                         });
-                    }
-                    if let (Some(_), Some(store)) = (cut, &self.artifacts) {
-                        attach_artifact(&mut payload, out.text.into_bytes(), store).await;
-                    }
-                    if out.is_error {
-                        Observation {
-                            intent_id: intent.id.clone(),
-                            status: kernel::ObsStatus::Error,
-                            payload,
-                            media: Vec::new(),
-                            relayed_trust: None,
-                            net_denied: false,
-                            model_text: None,
+                        // The screen draws the whole result; the model reads only the text above.
+                        if let Some(resource) = &out.screen {
+                            payload[kernel::TOOL_SCREEN_FIELD] = json!({
+                                "server": out.server,
+                                "tool": out.tool,
+                                "resource": resource,
+                                "identity": out.identity,
+                                "input": intent.args,
+                                "result": out.result,
+                            });
                         }
-                    } else {
-                        Observation::ok(&intent.id, payload)
+                        if let (Some(_), Some(store)) = (cut, &self.artifacts) {
+                            attach_artifact(&mut payload, out.text.into_bytes(), store).await;
+                        }
+                        if out.is_error {
+                            Observation {
+                                intent_id: intent.id.clone(),
+                                status: kernel::ObsStatus::Error,
+                                payload,
+                                media: Vec::new(),
+                                relayed_trust: None,
+                                net_denied: false,
+                                model_text: None,
+                            }
+                        } else {
+                            Observation::ok(&intent.id, payload)
+                        }
                     }
-                }
-                Err(e) => Observation::error(&intent.id, e.to_string()),
+                    Err(e) => Observation::error(&intent.id, e.to_string()),
+                };
+            }
+            let Some(tool) = self.tools.get(&intent.tool) else {
+                return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
             };
-        }
-        let Some(tool) = self.tools.get(&intent.tool) else {
-            return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
+            run_tool(tool.as_ref(), intent).await
         };
-        run_tool(tool.as_ref(), intent).await
+        match &self.sandbox {
+            Some(workspace) => kernel::egress::workspace_scope(workspace.root(), run).await,
+            None => run.await,
+        }
+    }
+
+    async fn mutation_preflight(&self, intent: &ToolIntent) -> Option<Observation> {
+        let tool = self.tools.get(&intent.tool)?;
+        match &self.sandbox {
+            Some(workspace) => {
+                kernel::egress::workspace_scope(
+                    workspace.root(),
+                    mutation_preflight(tool.as_ref(), intent),
+                )
+                .await
+            }
+            None => mutation_preflight(tool.as_ref(), intent).await,
+        }
+    }
+
+    fn observation_delivered(&self, tool: &str, observation: &Observation) {
+        if let Some(tool) = self.tools.get(tool) {
+            tool.delivered(observation);
+        }
+    }
+
+    fn changed_files(&self, tool: &str, observation: &Observation) -> bool {
+        self.tools
+            .get(tool)
+            .is_some_and(|tool| tool.changed_files(observation))
     }
 
     async fn preview(&self, intent: &ToolIntent) -> Option<String> {
@@ -1375,6 +1497,9 @@ impl Read {
 
 #[async_trait]
 impl Tool for Read {
+    fn delivered(&self, observation: &Observation) {
+        self.text.delivered(observation);
+    }
     fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
         if browser::needs_network(args) {
             kernel::egress::peek("browser.navigate", &json!({"url":arg_str(args,"path")?}))
@@ -1576,6 +1701,9 @@ const FS_READ_MAX_RANGE_OUTPUT_BYTES: usize = 2_000_000;
 
 #[async_trait]
 impl Tool for FsRead {
+    fn delivered(&self, observation: &Observation) {
+        self.shown.revisions.delivered(observation);
+    }
     fn name(&self) -> &str {
         "read"
     }
@@ -1670,6 +1798,7 @@ impl Tool for FsRead {
         kernel::egress::file_read(&range.content);
         Ok(json!({
             "path": path,
+            "resolved_path": resolved,
             "content": range.content,
             "start_line": range.start_line,
             "end_line": range.end_line,
@@ -1705,6 +1834,28 @@ struct Edit {
 
 #[async_trait]
 impl Tool for Edit {
+    async fn mutation_preflight(&self, args: &Value) -> Result<(), ToolError> {
+        if self.shape(args).is_none() {
+            return Ok(());
+        }
+        for field in ["old_string", "new_string"] {
+            for text in args.get(field).into_iter().chain(
+                args["edits"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|edit| edit.get(field)),
+            ) {
+                if let Some(reason) = text
+                    .as_str()
+                    .and_then(|text| self.replace.shown.refusal(field, text))
+                {
+                    return Err(ToolError::Args(reason));
+                }
+            }
+        }
+        protected_writes::preflight(&self.replace.sbx, args, None).await
+    }
     fn name(&self) -> &str {
         "edit"
     }
@@ -1828,6 +1979,15 @@ struct FsWrite {
 }
 #[async_trait]
 impl Tool for FsWrite {
+    async fn mutation_preflight(&self, args: &Value) -> Result<(), ToolError> {
+        if let Some(reason) = args["content"]
+            .as_str()
+            .and_then(|text| self.shown.refusal("content", text))
+        {
+            return Err(ToolError::Args(reason));
+        }
+        protected_writes::preflight(&self.sbx, args, Some(&self.shown.revisions)).await
+    }
     fn name(&self) -> &str {
         "write"
     }
@@ -1886,17 +2046,26 @@ impl Tool for FsWrite {
                 Err(_) => (String::new(), true),
             },
         };
+        if old != content
+            && !self
+                .shown
+                .revisions
+                .permits(guard.resolved(), &inspection.state)
+        {
+            return Err(ToolError::Args(format!(
+                "Read all current pages of {path} before replacing the whole file, or use an exact targeted edit. Internal previews do not count as a read, and neither does a page too long to show in full: read those again with a smaller `limit`."
+            )));
+        }
+        protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &content)?;
         let baseline = if unreadable {
             None
         } else {
             pre_edit_lsp(&self.lsp, &self.sbx, &path, &old).await
         };
-        let snapshot = self
-            .sbx
-            .write_guarded_checked(&guard, &content, Some(&inspection.state))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let snapshot = file_checks::commit(&self.sbx, &guard, &content, &inspection.state).await?;
         let mut out = json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content });
+        self.shown.revisions.written(guard.resolved(), &content);
+        file_checks::annotate(&mut out, &path, &old, &content);
         outputs::attach(&mut out, &self.sbx, guard.resolved(), &content).await;
         if unreadable {
             out["note"] = json!(
@@ -2174,12 +2343,9 @@ impl Tool for FsEdit {
         let done = edit_match::replace(&content, &old_s, &new_s, replace_all)
             .map_err(|miss| ToolError::Failed(missed(miss, &path)))?;
         let updated = done.text;
+        protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &updated)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
-        let snapshot = self
-            .sbx
-            .write_guarded_checked(&guard, &updated, Some(&inspection.state))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let snapshot = file_checks::commit(&self.sbx, &guard, &updated, &inspection.state).await?;
         let diff = make_diff(&path, &content, &updated);
         let mut out = json!({
             "path": path,
@@ -2192,6 +2358,7 @@ impl Tool for FsEdit {
             "replacements": done.count,
             "snapshot": snapshot
         });
+        file_checks::annotate(&mut out, &path, &content, &updated);
         outputs::attach(&mut out, &self.sbx, guard.resolved(), &updated).await;
         if done.loose {
             out["note"] = json!(edit_match::LOOSE_NOTE);
@@ -3334,10 +3501,7 @@ impl Tool for ReadArtifact {
     }
 }
 
-/// A realistic desktop-browser User-Agent. Search engines (DuckDuckGo especially)
-/// and many sites return empty/blocked responses to non-browser agents, so a
-/// browser UA is the single biggest reliability win for both search and fetch.
-const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+const BROWSER_UA: &str = "Medha/0.1";
 
 fn http_client() -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
@@ -3593,9 +3757,8 @@ pub(crate) fn validate_connected_peer(
     Ok(())
 }
 
-/// Which backend a web search uses. `DuckDuckGo` needs no key and is always the
-/// fallback; the others need a key (Tavily/Brave) or an instance URL (SearXNG)
-/// supplied via `/search` in the TUI (or the matching env var).
+/// The selected search backend. DuckDuckGo is the keyless default; a selected
+/// provider's failure never sends the query to a different provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchProvider {
     #[default]
@@ -3642,9 +3805,12 @@ impl SearchProvider {
 #[derive(Debug, Clone, Default)]
 pub struct SearchSettings {
     pub provider: SearchProvider,
+    pub configuration_error: Option<String>,
     pub tavily_key: Option<String>,
     pub brave_key: Option<String>,
     pub searxng_url: Option<String>,
+    pub tavily_extract: bool,
+    pub tavily_crawl: bool,
     pub captured: bool,
 }
 
@@ -3653,13 +3819,22 @@ pub struct SearchSettings {
 pub type SearchHandle = Arc<Mutex<SearchSettings>>;
 
 impl SearchSettings {
-    /// Tavily key — explicit value first, else `TAVILY_API_KEY`.
+    /// Explicit key first; process lookup is only for standalone registries.
     fn tavily_key(&self) -> Option<String> {
-        self.secret(self.tavily_key.as_deref(), "TAVILY_API_KEY")
+        search_environment::key(
+            self.tavily_key.as_deref(),
+            self.captured,
+            "MEDHA_TAVILY_API_KEY",
+            "TAVILY_API_KEY",
+        )
     }
-    /// Brave key — explicit value first, else `BRAVE_API_KEY`.
     fn brave_key(&self) -> Option<String> {
-        self.secret(self.brave_key.as_deref(), "BRAVE_API_KEY")
+        search_environment::key(
+            self.brave_key.as_deref(),
+            self.captured,
+            "MEDHA_BRAVE_API_KEY",
+            "BRAVE_API_KEY",
+        )
     }
     /// SearXNG base URL — explicit value first, else `MEDHA_SEARXNG_URL`.
     fn searxng_url(&self) -> Option<String> {
@@ -3708,11 +3883,9 @@ struct WebSearch {
 #[async_trait]
 impl Tool for WebSearch {
     fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
-        let selected = outbound::selected(&read_search(&self.search))
-            .ok()
-            .flatten();
+        let selected = outbound::selected(&read_search(&self.search)).map_err(ToolError::Failed)?;
         let destination = selected.as_ref().map_or_else(
-            || "https://lite.duckduckgo.com/lite/".into(),
+            || "https://html.duckduckgo.com/html/".into(),
             outbound::Selected::destination,
         );
         kernel::egress::peek(&destination, &json!({"query":arg_str(args,"query")?}))
@@ -3726,8 +3899,8 @@ impl Tool for WebSearch {
     }
     fn description(&self) -> &str {
         "Search the web. Returns {title, url, snippet}. Uses the provider the \
-         user configured via /search (Tavily, Brave, or SearXNG), falling back \
-         to DuckDuckGo when none is set or the chosen one fails. Follow up by fetching a result url."
+         user configured via /search. DuckDuckGo is the keyless default. Selected \
+         provider failures are returned without switching providers. Follow up by fetching a result url."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -3748,36 +3921,10 @@ impl Tool for WebSearch {
         let client = http_client()?;
         let cfg = read_search(&self.search);
 
-        // Sticky selection: use ONLY the provider the user chose (via /search),
-        // then DuckDuckGo. A chosen provider that lacks a key/URL or errors —
-        // invalid/expired key, network failure — falls through to DuckDuckGo so
-        // one misconfigured backend never leaves search dead. DuckDuckGo itself
-        // needs no key and is the default when nothing is configured.
-        let mut errors = Vec::new();
-        let chosen = outbound::selected(&cfg).unwrap_or_else(|error| {
-            errors.push(error);
-            None
-        });
-        if let Some(selected) = chosen {
-            let name = selected.name();
-            let result = selected.run(&client, &query, max).await;
-            match result {
-                Ok(v) => return Ok(v),
-                Err(e @ ToolError::Security(_)) => return Err(e),
-                Err(e) => errors.push(format!("{name}: {e}")),
-            }
+        if let Some(selected) = outbound::selected(&cfg).map_err(ToolError::Failed)? {
+            return selected.run(&client, &query, max).await;
         }
-
-        match duckduckgo_search(&client, &query, max).await {
-            Ok(v) => Ok(v),
-            Err(e @ ToolError::Security(_)) => Err(e),
-            Err(e) => {
-                errors.push(format!("duckduckgo: {e}"));
-                // Chosen backend (if any) AND the DuckDuckGo fallback both
-                // failed: surface every attempt so the cause is visible.
-                Err(ToolError::Failed(errors.join("; ")))
-            }
-        }
+        duckduckgo_search(&client, &query, max).await
     }
 }
 
@@ -3789,11 +3936,9 @@ async fn duckduckgo_search(
     query: &str,
     max: usize,
 ) -> Result<Value, ToolError> {
-    // Try the scraper-friendly `lite` endpoint first, then the heavier `html` one.
-    // `lite` returns simple table markup and is far less aggressively bot-blocked.
     let endpoints: [(&str, DdgParser); 2] = [
-        ("https://lite.duckduckgo.com/lite/", parse_ddg_lite),
         ("https://html.duckduckgo.com/html/", parse_ddg),
+        ("https://lite.duckduckgo.com/lite/", parse_ddg_lite),
     ];
     let mut last_err = String::from("no results parsed (DuckDuckGo may be anti-botting)");
     for (url, parse) in endpoints {
@@ -4218,8 +4363,8 @@ impl Tool for WebFetch {
     }
     fn description(&self) -> &str {
         "Fetch a web page and return its readable content as Markdown (free plain \
-         fetch; falls back to Tavily Extract if TAVILY_API_KEY is set and the page \
-         blocks scrapers or errors). For crawling a whole site, crawl it."
+         fetch; Tavily extraction is used only when explicitly enabled in saved \
+         search settings). For crawling a whole site, crawl it."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -4237,9 +4382,12 @@ impl Tool for WebFetch {
             Ok(v) => Ok(v),
             Err(error @ ToolError::Security(_)) => Err(error),
             Err(e) => {
-                // Plain fetch failed or the page blocked us — fall back to Tavily's
-                // LLM-optimized extractor when a key is configured (via /search or env).
-                if let Some(key) = read_search(&self.search).tavily_key() {
+                let settings = read_search(&self.search);
+                if let Some(key) = settings
+                    .tavily_extract
+                    .then(|| settings.tavily_key())
+                    .flatten()
+                {
                     return tavily_extract(&http_client()?, &url, &key)
                         .await
                         .map_err(|te| {
@@ -4253,7 +4401,7 @@ impl Tool for WebFetch {
 }
 
 /// Free plain HTTP fetch → Markdown. Returns Err on network failure or a non-2xx
-/// status (so the caller can fall back to Tavily Extract on blocked/erroring pages).
+/// status. A saved extraction setting is required for any third-party rescue.
 async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
     kernel::egress::check("web.fetch", &json!({"url":url})).map_err(ToolError::Security)?;
     let parsed =
@@ -4382,7 +4530,7 @@ impl Tool for WebCrawl {
     }
     fn description(&self) -> &str {
         "Fetch content from MANY pages under ONE site/root in a single call (Tavily; \
-         requires a Tavily key configured via /search or TAVILY_API_KEY). Use this — \
+         requires explicit saved tavily_crawl permission and a Tavily key). Use this — \
          instead of fetching page by page — when the task needs multiple pages of the SAME site, e.g. 'read all \
          the docs under this URL', 'every posting on this careers page', 'summarize \
          this whole section'. Give natural-language `instructions` to focus it (e.g. \
@@ -4413,10 +4561,14 @@ impl Tool for WebCrawl {
         let instructions = args.get("instructions").and_then(Value::as_str);
         let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(1);
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
-        let key = read_search(&self.search).tavily_key().ok_or_else(|| {
+        let settings = read_search(&self.search);
+        if !settings.tavily_crawl {
+            return Err(ToolError::Failed("Tavily crawl is off; explicitly enable search.tavily_crawl in saved settings to send URLs and instructions to Tavily".into()));
+        }
+        let key = settings.tavily_key().ok_or_else(|| {
             ToolError::Failed(
                 "a web crawl needs a Tavily API key — set one with /search (choose Tavily) \
-                 or TAVILY_API_KEY"
+                 or MEDHA_TAVILY_API_KEY"
                     .into(),
             )
         })?;
@@ -4482,12 +4634,12 @@ impl Tool for Web {
         "Reach the open web.\n\
          \n\
          `op: \"search\"` — find pages by `query`. Returns {title, url, snippet}; \
-         uses the provider configured via /search (Tavily, Brave, or SearXNG) and \
-         falls back to DuckDuckGo. Follow up by fetching a result's url.\n\
-         `op: \"fetch\"` — read ONE known `url` as Markdown (plain fetch, falling \
-         back to Tavily Extract when a key is set and the page blocks scrapers).\n\
+         uses the configured provider; DuckDuckGo is the keyless default. No \
+         fallback to another provider. Follow up by fetching a result's url.\n\
+         `op: \"fetch\"` — read ONE known `url` as Markdown. Third-party Tavily \
+         extraction requires an explicit saved setting as well as a key.\n\
          `op: \"crawl\"` — read MANY pages under one root `url` in a single call \
-         (Tavily key required). Use it instead of fetching page by page when the \
+         (explicit saved Tavily crawl setting and key required). Use it instead of fetching page by page when the \
          task spans one site: 'read all the docs under this URL', 'every posting \
          on this careers page'. Narrow it with natural-language `instructions`. \
          Not for a single page, and not for finding pages across different sites."
@@ -5522,6 +5674,22 @@ impl Drop for RegisteredTask {
 
 #[async_trait]
 impl Tool for ShellExec {
+    fn changed_files(&self, observation: &Observation) -> bool {
+        if matches!(
+            observation.status,
+            kernel::ObsStatus::Denied
+                | kernel::ObsStatus::Rejected
+                | kernel::ObsStatus::SchemaInvalid
+        ) || observation.payload["changed"] == false
+        {
+            return false;
+        }
+        !(observation.status == kernel::ObsStatus::Ok
+            && observation.payload["exit_code"] == 0
+            && observation.payload["command"]
+                .as_str()
+                .is_some_and(lanes::shell_only_reads))
+    }
     fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
         if !self.sbx.denies_network() || args["outside_sandbox"] == true || args["network"] == true
         {
@@ -6088,12 +6256,9 @@ impl Tool for MultiEdit {
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         self.pins.check(args, &path, &inspection.state)?;
         let (updated, loose) = apply_edits(&content, edits)?;
+        protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &updated)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
-        let snapshot = self
-            .sbx
-            .write_guarded_checked(&guard, &updated, Some(&inspection.state))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let snapshot = file_checks::commit(&self.sbx, &guard, &updated, &inspection.state).await?;
         let diff = make_diff(&path, &content, &updated);
         let mut out = json!({
             "path": path,
@@ -6103,6 +6268,7 @@ impl Tool for MultiEdit {
             "new": updated,
             "snapshot": snapshot
         });
+        file_checks::annotate(&mut out, &path, &content, &updated);
         outputs::attach(&mut out, &self.sbx, guard.resolved(), &updated).await;
         if loose {
             out["note"] = json!(edit_match::LOOSE_NOTE);

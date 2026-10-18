@@ -229,6 +229,7 @@ const CERTIFICATE: &str = "Medha could not verify the security certificate of th
 pub(crate) fn connection_failed(error: reqwest::Error) -> ProviderError {
     match certificate_fault(&error) {
         Some(why) => ProviderError::Certificate(format!("{CERTIFICATE} Detail: {why}")),
+        None if error.is_connect() => ProviderError::NotSent(error.without_url().to_string()),
         None => ProviderError::Transport(error.without_url().to_string()),
     }
 }

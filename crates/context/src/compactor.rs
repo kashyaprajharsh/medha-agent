@@ -592,11 +592,18 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
             },
             None => (request, output_cap),
         };
-        let mut stream =
-            tokio::time::timeout_at(progress_deadline, self.provider.stream_prepared(&request))
-                .await
-                .map_err(summary_stalled)?
-                .map_err(SummarizeError::Provider)?;
+        let mut stream = tokio::time::timeout_at(
+            progress_deadline,
+            kernel::auxiliary::prepared(
+                self.provider.as_ref(),
+                &request,
+                Some(tokens),
+                Some(output_cap),
+            ),
+        )
+        .await
+        .map_err(summary_stalled)?
+        .map_err(SummarizeError::Provider)?;
         let mut text = String::new();
         let mut blocks = 0usize;
         while let Some(block) = tokio::time::timeout_at(progress_deadline, stream.next())

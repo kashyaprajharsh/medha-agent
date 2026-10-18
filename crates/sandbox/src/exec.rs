@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod container_lifecycle;
 
 /// A command to execute: argv + working directory + environment policy.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecRequest {
     pub program: String,
     pub args: Vec<String>,
@@ -29,6 +29,31 @@ pub struct ExecRequest {
     /// Write roots granted for this invocation only. A write root also implies
     /// read access in native backends, but disappears with this request.
     pub write_roots: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for ExecRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecRequest")
+            .field("program", &self.program)
+            .field(
+                "args",
+                &self
+                    .args
+                    .iter()
+                    .map(|arg| crate::environment::redact(arg))
+                    .collect::<Vec<_>>(),
+            )
+            .field("cwd", &self.cwd)
+            .field(
+                "env_names",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("clear_env", &self.clear_env)
+            .field("read_roots", &self.read_roots)
+            .field("write_roots", &self.write_roots)
+            .finish()
+    }
 }
 
 /// The result of running a command. Mirrors `std::process::Output` but with the
@@ -123,6 +148,7 @@ pub struct SandboxConfig {
     pub image: Option<String>,
     /// Container backend: runtime binary (`docker`/`podman`); auto-detected if None.
     pub runtime: Option<String>,
+    pub user: Option<String>,
     /// Container backend: memory cap (e.g. "2g") and process cap.
     pub memory: Option<String>,
     pub pids: Option<u32>,
@@ -187,6 +213,7 @@ impl Default for SandboxConfig {
             net: NetPolicy::Deny,
             image: None,
             runtime: None,
+            user: None,
             memory: None,
             pids: None,
             host: None,
@@ -217,7 +244,7 @@ pub trait ExecBackend: Send + Sync {
         working_dir: Option<&Path>,
         limits: CaptureLimits,
     ) -> Result<BgProc, ExecError> {
-        let resources = self.command_resources(req)?;
+        let resources = self.command_resources(req)?.with_protected_content(req)?;
         let mut command = self.build_command(req)?;
         if let Some(dir) = working_dir {
             command.current_dir(dir);
@@ -276,11 +303,8 @@ pub trait ExecBackend: Send + Sync {
     fn containment(&self) -> kernel::Containment {
         kernel::Containment::None
     }
-    /// Whether this backend was configured to deny network for `req`. Deliberately
-    /// not `containment()`, which Landlock under-reports by design: this answers
-    /// only "did we ask for deny", which the failure-driven retry needs and which
-    /// is knowable from config without probing enforcement. Defaults to false, so
-    /// unsandboxed backends never offer a grant they cannot honour.
+    /// Whether this request denies network, including scoped grants.
+    /// Unsandboxed backends never offer a grant they cannot honour.
     fn denies_network(&self, _req: &ExecRequest) -> bool {
         false
     }
@@ -645,7 +669,18 @@ pub async fn run_shell_bounded_with(
         read_roots: Vec::new(),
         write_roots: Vec::new(),
     };
-    let process = backend.spawn_owned(&request, None, CaptureLimits::combined(max_output))?;
+    run_request_bounded(backend, &request, limit, max_output, cancel).await
+}
+
+/// Fixed-program counterpart with the same owned lifetime and bounded capture.
+pub async fn run_request_bounded(
+    backend: &dyn ExecBackend,
+    request: &ExecRequest,
+    limit: std::time::Duration,
+    max_output: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ShellOutcome, ExecError> {
+    let process = backend.spawn_owned(request, None, CaptureLimits::combined(max_output))?;
     finish_bounded(process, limit, max_output, cancel).await
 }
 
@@ -896,6 +931,31 @@ pub async fn run_command_bounded_with_input(
         timed_out: matches!(ended, Err(false)),
         cancelled: matches!(ended, Err(true)),
     })
+}
+
+/// Synchronous callers share the owned process supervisor and its cleanup.
+pub fn run_command_bounded_sync(
+    cmd: tokio::process::Command,
+    limit: std::time::Duration,
+    max_stdout: usize,
+    max_stderr: usize,
+) -> Result<BoundedCommandOutput, ExecError> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ExecError::Unavailable(error.to_string()))?
+            .block_on(run_command_bounded_with_input(
+                cmd,
+                Vec::new(),
+                limit,
+                max_stdout,
+                max_stderr,
+                None,
+            ))
+    })
+    .join()
+    .map_err(|_| ExecError::Unavailable("command supervisor failed".into()))?
 }
 
 async fn wait_bounded(
@@ -1730,7 +1790,8 @@ impl ExecBackend for HostBackend {
         CommandResources::snapshot(&roots)
     }
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
-        Ok(base_command(&req.program, &req.args, req))
+        let req = crate::environment::prepare(req, true)?;
+        Ok(base_command(&req.program, &req.args, &req))
     }
     fn label(&self) -> &str {
         "host"
@@ -2606,6 +2667,9 @@ impl ExecBackend for SeatbeltBackend {
     }
 
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+        let network = self.effective_net(req) == NetPolicy::Allow;
+        let prepared = crate::environment::prepare(req, network)?;
+        let req = &prepared;
         if workspace_contains_native_credentials(&req.cwd) {
             return Err(ExecError::Unavailable(
                 "native sandbox workspace contains host credential directories; choose a narrower workspace"
@@ -2620,6 +2684,7 @@ impl ExecBackend for SeatbeltBackend {
         wrapped.push(req.program.clone());
         wrapped.extend(req.args.iter().cloned());
         let mut command = base_command("/usr/bin/sandbox-exec", &wrapped, req);
+        crate::environment::clear_denied(command.as_std_mut(), network);
         apply_isolated_environment(&mut command, &self.home);
         prepend_shims(&mut command, req, &self.home);
         Ok(command)
@@ -2929,6 +2994,10 @@ impl ExecBackend for LandlockBackend {
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         use std::os::unix::process::CommandExt;
 
+        let network = self.effective_net(req) == NetPolicy::Allow;
+        let prepared = crate::environment::prepare(req, network)?;
+        let req = &prepared;
+
         if workspace_contains_native_credentials(&req.cwd) {
             return Err(ExecError::Unavailable(
                 "native sandbox workspace contains host credential directories; choose a narrower workspace"
@@ -2955,6 +3024,7 @@ impl ExecBackend for LandlockBackend {
             cmd.env_clear();
         }
         cmd.envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        crate::environment::clear_denied(&mut cmd, network);
 
         // Install the namespace, Landlock and seccomp in the child without allocating.
         let mut slot = Some(ruleset);
@@ -2984,9 +3054,12 @@ impl ExecBackend for LandlockBackend {
         "native"
     }
     fn containment(&self) -> kernel::Containment {
-        // Net-deny is attempted but never claimed: it needs kernel ≥6.7 and is not
-        // probed here, so trust-flow keeps gating web-tainted actions on Linux.
-        kernel::Containment::OsFsJail
+        // Seccomp denies sockets independently of Landlock's network ABI; installation failure aborts exec.
+        if self.net == NetPolicy::Deny && !self.net_grant.granted() {
+            kernel::Containment::OsFsJailNoNet
+        } else {
+            kernel::Containment::OsFsJail
+        }
     }
     fn denies_network(&self, req: &ExecRequest) -> bool {
         // The socket filter refuses every network family, whatever Landlock's own rule covers.
@@ -3097,6 +3170,8 @@ pub struct ContainerBackend {
     /// Operator-independent name used by Gate to force-remove the daemon-owned
     /// workload if the attached runtime client is timed out or cancelled.
     container_name: Option<String>,
+    user: Option<String>,
+    user_arguments: Option<Vec<String>>,
 }
 
 impl ContainerBackend {
@@ -3116,6 +3191,8 @@ impl ContainerBackend {
             pids,
             hermetic: false,
             container_name: None,
+            user: None,
+            user_arguments: None,
         }
     }
 
@@ -3138,12 +3215,33 @@ impl ContainerBackend {
             pids,
             hermetic: true,
             container_name: Some(container_name),
+            user: None,
+            user_arguments: None,
         }
     }
 
     pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
         self.net_grant = net_grant;
         self
+    }
+
+    pub fn with_user(mut self, user: Option<String>) -> Self {
+        self.user_arguments = user
+            .as_deref()
+            .and_then(|user| crate::container_user::explicit(user).ok());
+        self.user = user;
+        self
+    }
+
+    pub async fn prepare_execution(mut self) -> Result<Self, ExecError> {
+        // Resolve while still in the caller's network-once task scope, before
+        // the owned container supervisor moves execution to its OS thread.
+        if !self.hermetic && (kernel::network_once_active() || self.net_grant.granted()) {
+            self.net = NetPolicy::Allow;
+        }
+        self.user_arguments =
+            Some(crate::container_user::resolve(&self.runtime, self.user.as_deref()).await?);
+        Ok(self)
     }
 
     /// Network policy for this run. A hermetic verification container hard-denies
@@ -3177,6 +3275,17 @@ impl ContainerBackend {
             "--security-opt".into(),
             "no-new-privileges".into(),
         ];
+        a.extend(self.user_arguments.iter().flatten().cloned());
+        a.extend([
+            "--env".into(),
+            "HOME=/tmp/medha-home".into(),
+            "--env".into(),
+            "TMPDIR=/tmp".into(),
+            "--tmpfs".into(),
+            "/tmp:rw,nosuid,nodev,mode=1777".into(),
+            "--tmpfs".into(),
+            "/tmp/medha-home:rw,nosuid,nodev,mode=1777".into(),
+        ]);
         let git = ws.join(".git");
         if git.is_dir() {
             a.extend(["-v".into(), format!("{}:/workspace/.git", git.display())]);
@@ -3193,6 +3302,10 @@ impl ContainerBackend {
             a.push("--network".into());
             a.push("none".into());
         }
+        a.extend(crate::environment::container_arguments(
+            req,
+            self.effective_net(req) == NetPolicy::Allow,
+        ));
         if let Some(m) = &self.memory {
             a.push("--memory".into());
             a.push(m.clone());
@@ -3254,6 +3367,11 @@ impl ContainerBackend {
                 "container create lifecycle is only available in hermetic mode".into(),
             ));
         }
+        if self.user_arguments.is_none() {
+            return Err(ExecError::Unavailable(
+                "resolve container ownership before creating a workload".into(),
+            ));
+        }
         let mut command = tokio::process::Command::new(&self.runtime);
         command.args(self.build_create_argv(req));
         Ok(command)
@@ -3277,8 +3395,22 @@ impl ContainerBackend {
         req: &ExecRequest,
         name: &str,
         directory: &str,
-    ) -> tokio::process::Command {
+    ) -> Result<tokio::process::Command, ExecError> {
+        let prepared =
+            crate::environment::prepare(req, self.effective_net(req) == NetPolicy::Allow)?;
+        if self.user_arguments.is_none() {
+            return Err(ExecError::Unavailable(
+                "resolve container ownership before creating a workload".into(),
+            ));
+        }
+        let req = &prepared;
         let mut command = tokio::process::Command::new(&self.runtime);
+        command.envs(
+            req.env
+                .iter()
+                .filter(|(name, _)| crate::environment::is_transport(name))
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
         command
             .arg("create")
             .args(self.isolation_argv_at(req, directory))
@@ -3293,7 +3425,7 @@ impl ContainerBackend {
                 &self.image,
             ])
             .args(&req.args);
-        command
+        Ok(command)
     }
 }
 
@@ -3471,7 +3603,8 @@ pub fn select_backend(
                     cfg.memory.clone(),
                     cfg.pids,
                 )
-                .with_network_grant(net_grant),
+                .with_network_grant(net_grant)
+                .with_user(cfg.user.clone()),
             ),
             _ => Arc::new(UnavailableBackend("container execution requires an image")),
         },
@@ -4758,7 +4891,10 @@ mod tests {
 
     fn owned_create_argv(backend: &ContainerBackend, request: &ExecRequest) -> Vec<String> {
         backend
+            .clone()
+            .with_user(Some("65534:65534".into()))
             .build_owned_create_command(request, "medha-command-test", "/workspace")
+            .unwrap()
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())

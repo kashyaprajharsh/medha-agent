@@ -346,7 +346,11 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
         .with_network_grant(self.template.net_grant.clone())
         .map_err(|error| error.to_string())?
         .with_readable_roots(&self.template.readable)
-        .with_snapshots_dir(self.template.snapshots.clone());
+        .with_snapshots_dir(self.template.snapshots.clone())
+        .with_command_snapshots_dir(
+            crate::config::command_snapshots_dir(worktree.path())
+                .map_err(|error| error.to_string())?,
+        );
 
         let executor = registry
             .rebase(Arc::new(sandbox))

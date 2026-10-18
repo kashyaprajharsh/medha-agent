@@ -10,6 +10,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+url = "2"
+serde_json.workspace = true
 git-safety = { path = "../git-safety" }
 tokio-util = "0.7"
 thiserror.workspace = true
@@ -27,6 +29,7 @@ landlock = "0.4"
 # Unix: SIGKILL a command's whole process group on timeout/cancel (no orphans).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+errno = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

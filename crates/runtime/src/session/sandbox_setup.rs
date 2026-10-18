@@ -125,7 +125,8 @@ pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
     .with_network_grant(net_grant)?
     // Bundled user-skill files are trusted configuration, not workspace data.
     .with_readable_roots(&[config::user_skills_dir()?])
-    .with_snapshots_dir(state.join("snapshots"));
+    .with_snapshots_dir(state.join("snapshots"))
+    .with_command_snapshots_dir(config::command_snapshots_dir(cwd)?);
     // Held to the end of the run; a temp directory that refuses it just means no scratch.
     if let Some(scratch) = &scratch {
         workspace = workspace.with_scratch(scratch.path());

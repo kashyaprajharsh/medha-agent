@@ -41,3 +41,18 @@ test("an answered or forged id never produces an approval button", async () => {
   assert.equal(document.querySelector("button"), null);
   await act(() => root.unmount());
 });
+
+test("protected changes offer only the exact one-time action without a modal", async () => {
+  const id="c".repeat(64); const actions=[];
+  globalThis.__outboundApi={settings:async(method,payload)=>{
+    if(method==="session.inspect") { assert.equal(payload.query,"protected"); return {data:JSON.stringify([{id,reason:"The write was left unrun",destination:"AGENTS.md",preview:"-old\n+new",allowable:true}])}; }
+    actions.push(payload); return {};
+  }};
+  const root=createRoot(document.getElementById("root"));
+  await act(async()=>root.render(React.createElement(OutboundNotice,{review:{id},kind:"protected"})));
+  assert.equal(document.querySelectorAll('[role="dialog"]').length,0);
+  assert.deepEqual([...document.querySelectorAll("button")].map(button=>button.textContent),["Allow once","Dismiss"]);
+  await act(async()=>document.querySelector("button").click());
+  assert.deepEqual(actions,[{action:"allow_protected",data:{id}}]);
+  await act(()=>root.unmount());
+});

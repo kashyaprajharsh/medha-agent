@@ -20,7 +20,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             self.context.update_usage(u.prompt_tokens, u.total_tokens);
         }
         if let Some(p) = self.price() {
-            cx.sink.cost(state.gov.cost_usd(), p.indicative);
+            let (cost, indicative) = self.reported_cost(&state.gov, p.indicative);
+            cx.sink.cost(cost, indicative);
         }
         // Interrupted mid-stream, or cancelled between the stream ending
         // and dispatch: keep visible content but drop un-admitted calls.

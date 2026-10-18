@@ -12,7 +12,10 @@ use std::{
 const PAGES: usize = 32;
 
 #[derive(Default, Clone)]
-pub(crate) struct ShownPages(Arc<Mutex<VecDeque<Page>>>);
+pub(crate) struct ShownPages {
+    pages: Arc<Mutex<VecDeque<Page>>>,
+    pub revisions: crate::read_revisions::Revisions,
+}
 
 struct Page {
     start: u64,
@@ -22,7 +25,7 @@ struct Page {
 impl ShownPages {
     /// A page as the model saw it: its first line's number, then each line.
     pub(crate) fn remember(&self, start: u64, lines: Vec<String>) {
-        let Ok(mut pages) = self.0.lock() else {
+        let Ok(mut pages) = self.pages.lock() else {
             return;
         };
         pages.push_back(Page { start, lines });
@@ -36,7 +39,7 @@ impl ShownPages {
     pub(crate) fn pasted(&self, text: &str) -> Option<String> {
         let lines: Vec<&str> = text.split_inclusive('\n').collect();
         let numbered: Vec<Option<(u64, &str)>> = lines.iter().map(|line| gutter(line)).collect();
-        let pages = self.0.lock().ok()?;
+        let pages = self.pages.lock().ok()?;
         let shown = |number: u64, rest: &str| {
             pages.iter().any(|page| {
                 number

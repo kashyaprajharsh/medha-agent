@@ -69,6 +69,41 @@ pub trait Executor: Send + Sync {
     /// Execute one validated intent and return its observation.
     async fn execute(&self, intent: &ToolIntent) -> Observation;
 
+    /// A quiet exact proposal can replace an existing approval, never a denial.
+    async fn mutation_preflight(&self, _intent: &ToolIntent) -> Option<Observation> {
+        None
+    }
+
+    /// Prepare an authorized mutation before its durable effect record.
+    async fn prepare_effect(&self, _intent: &ToolIntent) -> Result<serde_json::Value, Observation> {
+        Ok(serde_json::Value::Null)
+    }
+
+    async fn finish_effect(
+        &self,
+        _intent: &ToolIntent,
+        _preparation: &serde_json::Value,
+        _observation: &mut Observation,
+    ) {
+    }
+
+    /// Observe only the final model-facing result after fitting and storage.
+    fn observation_delivered(&self, _tool: &str, _observation: &Observation) {}
+
+    fn changed_files(&self, tool: &str, observation: &Observation) -> bool {
+        !matches!(
+            observation.status,
+            crate::ObsStatus::Denied | crate::ObsStatus::Rejected | crate::ObsStatus::SchemaInvalid
+        ) && matches!(
+            self.blast_radius(tool),
+            Some(BlastRadius::ReversibleLocal | BlastRadius::IrreversibleLocal)
+        ) && observation
+            .payload
+            .get("changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    }
+
     async fn check_outbound(&self, _intent: &ToolIntent) -> Result<(), String> {
         Ok(())
     }

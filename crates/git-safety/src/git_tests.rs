@@ -130,6 +130,31 @@ fn an_owned_global_filter_survives_the_commands_private_home() {
 
 #[cfg(unix)]
 #[test]
+fn a_config_others_can_write_is_never_trusted_and_group_write_needs_a_private_group() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let scratch = test_support::scratch("medha-git-config-mode");
+    let root = scratch.join("repo");
+    let config = scratch.join("home").join(".gitconfig");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    std::fs::write(&config, "[filter \"owned\"]\nclean = cat\n").unwrap();
+    let origin = format!("file:{}", config.display());
+    let trusted = |mode| {
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+        trusted_origin(b"global", origin.as_bytes(), &root)
+    };
+    assert!(trusted(0o644));
+    assert!(!trusted(0o666), "a config any user can write was trusted");
+    let gid = std::fs::metadata(&config).unwrap().gid();
+    assert_eq!(trusted(0o664), private_group(gid));
+    if unsafe { libc::getegid() } != 0 {
+        assert!(!private_group(0), "the root group is shared, never private");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn a_global_include_of_repository_content_is_not_a_trusted_filter() {
     let scratch = test_support::scratch("medha-git-filter-origin");
     let home = scratch.join("home");

@@ -15,6 +15,7 @@ const BLOCKS: usize = 64;
 #[derive(Default)]
 pub struct Guard {
     state: Mutex<State>,
+    pub mutations: Arc<crate::mutations::Guard>,
 }
 
 #[derive(Default)]
@@ -41,6 +42,29 @@ struct Active {
 }
 
 tokio::task_local! { static ACTIVE: Active; }
+tokio::task_local! { static WORKSPACE: std::path::PathBuf; }
+tokio::task_local! { static SESSION: ulid::Ulid; }
+
+pub fn session_id() -> Option<ulid::Ulid> {
+    SESSION.try_with(|id| *id).ok()
+}
+
+pub async fn session_scope<T>(id: ulid::Ulid, future: impl Future<Output = T>) -> T {
+    SESSION.scope(id, future).await
+}
+
+pub fn execution_workspace() -> Option<std::path::PathBuf> {
+    WORKSPACE.try_with(Clone::clone).ok()
+}
+pub async fn workspace_scope<T>(path: &std::path::Path, future: impl Future<Output = T>) -> T {
+    WORKSPACE.scope(path.to_owned(), future).await
+}
+
+pub fn mutation_context() -> Option<(Arc<crate::mutations::Guard>, bool)> {
+    ACTIVE
+        .try_with(|active| (active.guard.mutations.clone(), active.tainted))
+        .ok()
+}
 
 pub async fn scope<T>(
     guard: Arc<Guard>,

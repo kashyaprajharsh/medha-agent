@@ -869,6 +869,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
+    fn reported_cost(&self, governor: &crate::Governor, indicative: bool) -> (f64, bool) {
+        if self.sub_agent {
+            (governor.cost_usd(), indicative)
+        } else {
+            (
+                governor.task_cost_usd(),
+                indicative || governor.task_cost_indicative(),
+            )
+        }
+    }
+
     /// Set the operator's own rate, so the governor meters real dollars. It is
     /// a rate for the model in use now, not for one the chat changes to later.
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
@@ -1279,9 +1290,20 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // A turn always keeps its own reservation, even if a surface switches
         // the idle conversation owner later. Refuse before writing any event.
         let _claim = self.reserve_session(session.id).map_err(KernelError::Log)?;
-        let outcome = self
-            .run_session_inner(session, messages, budget, sink, interrupts)
-            .await;
+        if !self.sub_agent {
+            self.egress.mutations.begin_message();
+        }
+        let budget = budget.pooling();
+        let outcome = crate::egress::session_scope(
+            session.id,
+            crate::auxiliary::scope(
+                budget.clone(),
+                self.provider.context_identity(),
+                self.price(),
+                self.run_session_inner(session, messages, budget, sink, interrupts),
+            ),
+        )
+        .await;
         if let Err(error) = &outcome
             && !matches!(
                 error,
@@ -1330,7 +1352,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
         mut interrupts: Option<crate::interrupts::InterruptQueue>,
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
-        session::run(self, session, messages, budget, sink, &mut interrupts).await
+        // The turn state machine is large; on the heap it cannot overflow a caller's stack.
+        Box::pin(session::run(
+            self,
+            session,
+            messages,
+            budget,
+            sink,
+            &mut interrupts,
+        ))
+        .await
     }
 }
 

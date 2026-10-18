@@ -13,7 +13,7 @@ final class Probe: NSObject, WKNavigationDelegate {
     var darkBackground: String?
 
     func start(_ url: URL) {
-        trustFixture = url.lastPathComponent == "trust.html"
+        trustFixture = ["trust.html", "protected.html"].contains(url.lastPathComponent)
         web.navigationDelegate = self
         web.load(URLRequest(url: url))
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [self] _ in

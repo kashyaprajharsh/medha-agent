@@ -42,21 +42,30 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         {
             return Observation::error(&intent.id, reason);
         }
-        if let Some(mutation_key) = self.executor.mutation_key(intent)
-            && let Err(error) = self
-                .log
-                .append(Event::tool_effect_prepared(session, intent, &mutation_key))
-                .await
-        {
-            return Observation::error(
-                &intent.id,
-                format!(
-                    "state change was not started because its durable execution record \
+        let preparation = match self.executor.prepare_effect(intent).await {
+            Ok(value) => value,
+            Err(observation) => return observation,
+        };
+        if let Some(mutation_key) = self.executor.mutation_key(intent) {
+            let mut event = Event::tool_effect_prepared(session, intent, &mutation_key);
+            if let Some(rows) = preparation.get("_checkpoint_files") {
+                event.payload["_checkpoint_files"] = rows.clone();
+            }
+            if let Err(error) = self.log.append(event).await {
+                return Observation::error(
+                    &intent.id,
+                    format!(
+                        "state change was not started because its durable execution record \
                      could not be written: {error}"
-                ),
-            );
+                    ),
+                );
+            }
         }
-        self.executor.execute(intent).await
+        let mut observation = self.executor.execute(intent).await;
+        self.executor
+            .finish_effect(intent, &preparation, &mut observation)
+            .await;
+        observation
     }
 
     pub(super) async fn invoke_hook(
@@ -285,6 +294,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             );
         }
         if !matches!(decision, crate::types::Decision::Deny { .. }) {
+            if let Some(blocked) = self.executor.mutation_preflight(intent).await {
+                return blocked;
+            }
             let access = match self.executor.missing_access(intent) {
                 Ok(access) => access,
                 Err(error) => return Observation::error(&intent.id, error),

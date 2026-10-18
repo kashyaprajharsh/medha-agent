@@ -690,6 +690,8 @@ fn sanitize(mut frame: Value, steps: &mut Steps) -> Value {
         Some("tool.observation") => {
             let output = params.remove("payload").unwrap_or(Value::Null);
             put(params, "outbound", output.get("outbound").cloned());
+            put(params, "mutation", output.get("mutation").cloned());
+            put(params, "mutations", output.get("mutations").cloned());
             let ok = params.get("ok") == Some(&Value::Bool(true));
             let stored = params
                 .get("stored")

@@ -93,12 +93,16 @@ impl Drop for OwnedContainer {
 }
 
 pub(super) fn spawn(
-    backend: ContainerBackend,
+    mut backend: ContainerBackend,
     request: ExecRequest,
     working_dir: Option<&Path>,
     limits: CaptureLimits,
 ) -> Result<BgProc, ExecError> {
-    let resources = CommandResources::git(std::slice::from_ref(&request.cwd))?;
+    if !backend.hermetic && (kernel::network_once_active() || backend.net_grant.granted()) {
+        backend.net = NetPolicy::Allow;
+    }
+    let resources = CommandResources::git(std::slice::from_ref(&request.cwd))?
+        .with_protected_content(&request)?;
     let root = request
         .cwd
         .canonicalize()
@@ -174,8 +178,13 @@ pub(super) fn spawn(
                         lease.armed = false;
                         return Ok(None);
                     }
-                    let create =
-                        backend.build_owned_create_command(&request, &lease.name, &container_dir);
+                    let backend = backend
+                        .prepare_execution()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let create = backend
+                        .build_owned_create_command(&request, &lease.name, &container_dir)
+                        .map_err(|error| error.to_string())?;
                     // create is inert. Settle registration before observing cancellation
                     // so no late start can race a successful removal.
                     let created = run_command_bounded(create, CREATE_TIMEOUT, 8192, None)
@@ -227,7 +236,11 @@ pub(super) fn spawn(
                 if let Ok(mut target) = held_code.lock() {
                     *target = result;
                 }
-                drop(resources);
+                if let Some(notice) = resources.finish()
+                    && let Ok(mut target) = held_capture.lock()
+                {
+                    target.push(CapturedStream::Stderr, notice.as_bytes());
+                }
                 // Completion includes confirmed cleanup; failure is explicitly nonzero.
                 let _ = done_tx.send(true);
             });

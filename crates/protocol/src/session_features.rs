@@ -92,6 +92,7 @@ pub struct MemoryEvidence {
 )]
 pub enum SessionRead {
     Outbound,
+    Protected,
     Bootstrap,
     Live,
     Lsp,
@@ -165,6 +166,12 @@ pub struct Bootstrap {
     deny_unknown_fields
 )]
 pub enum SessionChange {
+    AllowProtected {
+        id: String,
+    },
+    DismissProtected {
+        id: String,
+    },
     AllowOutbound {
         id: String,
     },

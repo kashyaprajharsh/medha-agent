@@ -122,21 +122,7 @@ pub fn file_reveal(
         session_id.as_deref(),
         &path,
     )?;
-    #[cfg(target_os = "macos")]
-    let shown = std::process::Command::new("open")
-        .arg("-R")
-        .arg(&path)
-        .spawn();
-    #[cfg(target_os = "windows")]
-    let shown = std::process::Command::new("explorer")
-        .arg("/select,")
-        .arg(&path)
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let shown = std::process::Command::new("xdg-open")
-        .arg(path.parent().unwrap_or(&path))
-        .spawn();
-    shown.map(|_| ()).map_err(|error| error.to_string())
+    file_ops::opening::reveal(&path)
 }
 
 #[derive(serde::Deserialize)]

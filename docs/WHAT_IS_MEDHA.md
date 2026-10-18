@@ -407,6 +407,16 @@ delegates isolation to the remote host.
 | `container` | Throwaway Docker/Podman container | Maximum isolation |
 | `ssh` | Remote host execution | Distributed workflows |
 
+Local and container execution that already has network authority honors standard
+`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (including lowercase spellings), and
+`SSL_CERT_FILE`. A CA setting opens only that validated certificate file for
+reading; containers bind it read-only. Proxy values travel in the runtime
+client's environment, with only variable names in container arguments, and are
+registered for redaction. Network denial removes these values. Ambient settings
+are not implicitly forwarded over SSH. Model-provider proxy policy is unchanged.
+
+Container commands automatically select the host UID/GID on Linux rootful Docker, use the host-mapped root identity on rootless Docker, and use keep-id mapping with Podman. An explicit trusted `sandbox.user` overrides selection; its exact value is a risky setting. Unresolved daemon remapping fails clearly without changing host permissions. HOME and TMP are private writable tmpfs directories. Windows retains image-user semantics unless explicitly configured. Capabilities, network policy and Git-control binds stay confined.
+
 ### What's Blocked
 
 With the default `native` backend, the sandbox blocks:
@@ -487,10 +497,9 @@ roots out of the general `~/.medha` deny rule. Hook failure details are surfaced
 plugin health so a missing runtime, denied path or deadline can be diagnosed.
 
 Hooks and snippets fail closed when the required isolation is unavailable. Linux
-Landlock's network enforcement depends on kernel support; Medha does not claim
-proven network denial for that backend, so network-denied plugin execution may be
-unavailable there. Remote MCP tools run on their server and are not confined by the
-local filesystem sandbox.
+denies network sockets with seccomp independently of Landlock's network ABI;
+filter installation failure aborts execution. Remote MCP tools run on their server
+and are not confined by the local filesystem sandbox.
 
 ### OS-Native Isolation
 
@@ -982,7 +991,9 @@ also disable external diff and textconv. Repository-defined executable filters
 are disabled. Read-only commands can inspect the unfiltered working bytes;
 commands that write use `required=true`, so staging refuses them rather than
 recording unfiltered bytes. User-owned global filters outside the checkout remain enabled,
-including when the command uses an isolated HOME. Configuration inspection is
+including when the command uses an isolated HOME. Their config file must not be writable
+by other users; group write counts only for the user's own private group (the Ubuntu
+default), so filters such as Git LFS keep working there. Configuration inspection is
 bounded to 1 MiB, 256 filter drivers and three seconds; failure refuses the call.
 
 ### Detailed Breakdown
@@ -1051,15 +1062,22 @@ Blast radius enables **proportional security**:
 
 ### What It Does
 
-Budgets stop admission of new chat-model requests against per-task allowances.
+Budgets stop admission of new model requests against per-task allowances.
 With authoritative counts and configured prices, reservations use those counts.
 Adaptive profiles without a server counter use the embedded o200k BPE estimate,
 calibrated upward from reported usage, plus **10% and 256 tokens** for uncertainty.
 This is labelled an estimate and cannot guarantee exact billed dollars for every
 model. Actual usage reconciles the reservation after the request. Strict profiles
 still require authoritative counting. Missing pricing remains a configuration error.
-Auxiliary vision and compaction calls retain their existing separate accounting;
-these chat-request allowances are not a guarantee over every auxiliary API bill.
+Chat, compaction, vision and judge calls reserve and settle against the same task
+and child-agent allowance, using the selected route's own price. Cached results
+make no paid request. Startup review spends the initiating message's allowance;
+a chat opened without a message reviews in its own pool under the same caps, so a
+flagged instruction file is still judged. Later messages get fresh pools.
+Unfunded work uses a local summary, an explicit vision-unavailable result or a
+conservative review decision. Proven non-submission/rejection refunds unused
+reservation; actual received usage is charged even after an error, and uncertain
+delivery retains its conservative charge. The final-reply reserve remains.
 
 ### Four Dimensions
 
@@ -1472,6 +1490,48 @@ fact stays visible.
 
 Tools are the **capabilities** the AI can use to interact with the world. Each tool is schema-bearing, blast-radius-tagged, and sandbox-confined.
 
+### File changes
+
+Whole-file replacement requires this chat to have received all current pages.
+Clipped, redacted and internal preview content does not establish that baseline.
+New files need no prior read; exact targeted edits keep their guarded preimage
+check. A completed verified write advances its own baseline. The bounded chat
+ledger forgets old entries on eviction, requiring a reread rather than approval.
+
+The shared writer reads published bytes back before reporting verification.
+If a check fails after publication, the result says the write landed, retains its
+undo snapshot and requires a reread; it does not overwrite concurrent work with
+an automatic rollback. Fresh LSP deltas emphasize introduced diagnostics, while
+a missing baseline is labelled unknown. JSON, TOML and YAML get inexpensive
+in-process syntax comparisons without spawning another tool.
+
+Protected instruction-file and delayed-execution changes use one quiet notice
+with their exact diff and Allow once; this never offers Always. The action is
+owned by the chat, verifies the original content and does not widen folder trust
+or existing credential/Git-control permissions. The desktop and `/protected`
+terminal command call the same backend operation. Denied actions stay denied.
+
+After web text, commands retain the existing G6 policy: a network-denied jail does
+not gain another pre-run approval. Command resources capture protected checkout
+content and its digest, then compare and repair changes after process cleanup.
+An exact restored change can be reapplied once from its notice. Ordinary source
+edits get no new review. Before web, shell policy is unchanged. Repair cannot undo
+execution while content was modified, transient changes undone before comparison,
+or fully detached processes/external daemons outside the cleanup lifetime.
+Folders Git ignores (such as `node_modules/` and `target/`) are listed once before
+the command and not searched, so a `package.json` inside them is not watched. The
+command cannot widen that list by editing ignore rules, ignored files outside those
+folders (such as an ignored `.envrc`) are still watched, and the protected locations
+above are always searched.
+
+The protected set is `AGENTS.md`, `MEDHA.md`, `CLAUDE.md` and `.medha/prompts/**`; after web it also includes `.github/workflows/**`, `.gitlab-ci.yml`, `.envrc`, `.vscode/tasks.json`, `.vscode/launch.json`, and changes to `package.json` scripts. Operator-only `security.protected_paths` adds checkout-relative glob patterns. Repository settings cannot disable this protection. Existing command-policy reviews remain in effect; the restoration layer adds no approval card.
+
+### Destructive command checkpoints
+
+Before the first recognized destructive command per message, Medha backs up tracked files and nonignored untracked files. Git-ignored build output such as `target/` and `node_modules/` is excluded; deleting only ignored output allocates no checkpoint and shows no notice. Commands are left unrun with one quiet notice only when a needed complete backup cannot be made. Recognition covers `rm`, `mv`, `truncate`, Git reset/clean, and shell redirection; it cannot predict destructive side effects hidden in arbitrary scripts. Backup files are copied in parallel. On Linux one `syncfs`, and on macOS per-file data writes plus one full drive flush, make them durable before the checkpoint record is saved; Windows keeps its existing snapshot writer.
+
+Command snapshots reuse metadata-preserving file-tool storage, under the real checkout root's private state. Old per-folder file-tool snapshots stay in their original store. Defaults retain 20 checkpoints and 500 MiB, evicting oldest first; operator-only `security.checkpoint_count` and `security.checkpoint_bytes` change these limits. Backups are recorded before execution in the event log. CLI undo and desktop rewind use the same revision-checked restore and preserve subsequent human edits. Expired backups or unknown post-crash revisions refuse automatic restore. A required external/SSH target backup that cannot be made leaves that destructive command unrun; no host snapshot is presented as a remote backup. Alternate working directories currently refuse covered destructive commands rather than claiming incomplete coverage.
+
 ### Tool Categories
 
 **53 tools** ship in the registry, in these families:
@@ -1565,6 +1625,13 @@ Servers are **not bundled** — MEDHA only ships the thin JSON-RPC client and us
 
 `lsp.start` can also **fetch a missing server binary** when MEDHA knows how, installing it into MEDHA's own directory. Its existing tool approval shows the exact command and destination first. Project-defined commands and executable settings must be accepted at their exact values through the checkout trust action; accepted servers then start lazily without a second trust dialog. Extra languages are added via `[[lsp.servers]]` in `medha.lock`.
 
+Managed language-server installation reuses the native execution jail with a
+private home/cache and writes limited to the install state. It has network for
+the explicitly requested install and never falls back to a host installer. An
+unavailable jail leaves manual setup instructions. Recipes pin exact versions as
+data; npm retains package-lock dependency integrity records and enforces package
+engine requirements. Installation keeps its existing consent, with no new dialog.
+
 ### Tools
 
 Every query is `lsp` with an `op`; only starting a server — which spawns a process —
@@ -1626,6 +1693,13 @@ kernel and differ only in how they render and how they answer the human gate.
 | **Plain REPL** | `medha --plain` | Terminal y/N; fallback for terminals with poor raw-mode support |
 | **Headless** | `medha "task"` | `AutoDeny` — no human, so anything needing approval is refused |
 | **ACP** | `medha --acp` | Approval requests go to the editor over JSON-RPC |
+
+Recognized programs and launchers opened from file previews or terminal chat are
+revealed in their folder, with a quiet explanation. They are not launched by the
+file-open action. Classification checks the real target, executable permissions,
+program signatures, scripts, shortcuts and application bundles; it does not claim
+to recognize every operating-system association. Ordinary documents retain their
+single-click opener, and validated web links retain their browser route.
 
 ### The TUI
 
@@ -2036,6 +2110,20 @@ The Gemini adapter is stateless (`store: false`): MEDHA sends complete ordered
 history and therefore replays every Gemini **thought signature** unchanged, and maps
 thinking levels onto the canonical reasoning controls.
 
+Web search uses the saved provider and returns its failures without sending the
+query to another provider. With no saved choice, the labelled keyless default is
+DuckDuckGo, requested with the honest `Medha/0.1` User-Agent. Direct page fetches
+remain available independently. Tavily extraction and crawling each require
+explicit saved consent (`search.tavily_extract = true` and
+`search.tavily_crawl = true` respectively), as well as a key; a key alone never
+enables either service.
+
+Search credentials use `MEDHA_TAVILY_API_KEY` and `MEDHA_BRAVE_API_KEY`.
+`TAVILY_API_KEY` and `BRAVE_API_KEY` are accepted for one release, with one
+deprecation notice per process. The new spelling wins. Both values are registered
+with redaction, including an overridden legacy value; notices never print keys.
+Shared-backend chats retain the calling client's captured credentials.
+
 ### Model Metadata
 
 The shared provider catalogue retains **models.dev** provider names, endpoints,
@@ -2048,8 +2136,10 @@ Package names are metadata and are never executed as provider adapters.
 
 Saved profiles can qualify metadata with `provider_id`, while retaining their
 existing protocol, endpoint and credential record. Explicit profile overrides
-take precedence. Unknown capabilities remain unknown. Older profiles retain
-their existing metadata lookup behavior. Prices feed the cost meter and are
+take precedence. Prices, context windows and capabilities require an exact
+catalogue identity, including its provider when qualified. Similar names and
+unknown deployments stay unknown; enter explicit prices/window for a custom
+deployment when needed. Prices feed the cost meter and are
 labelled indicative when taken from the public catalogue.
 
 Desktop and TUI select a provider before asking for access and a model. Custom
@@ -3098,6 +3188,11 @@ Runs configured command (e.g., cargo check)
 The trigger comes from the **declared blast radius**, not a hardcoded tool list — any
 `ReversibleLocal` or `IrreversibleLocal` call in the turn arms it. That is why an edit
 made through `shell.exec` running `sed -i` is covered just as an `edit` is.
+
+Verification follows landed effects: rejected/schema-invalid calls, successful
+proven reader commands and known no-op edits do not trigger an optional verifier.
+Unknown or failed potentially mutating commands remain conservative. Required
+verification at final completion still runs.
 
 > **Verifier output is labelled `Tool`, not `User`.** The report is fed back as a
 > message on the user channel, but it carries tool trust — build scripts and test

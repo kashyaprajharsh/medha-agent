@@ -1857,16 +1857,17 @@ mod tests {
         tree.reap().await;
     }
 
+    /// The fake Git runs through `sh`, never exec'd itself: on Linux, exec of a file
+    /// just written fails with ETXTBSY while another test thread is forking.
     #[cfg(unix)]
-    fn executable_script(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn fake_git(dir: &Path, body: &str, args: [&Path; 3]) -> (PathBuf, Vec<String>) {
         let path = dir.join("fake-git");
         std::fs::write(&path, body).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        path
+        let args = std::iter::once(path.as_path())
+            .chain(args)
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        (PathBuf::from("/bin/sh"), args)
     }
 
     #[cfg(unix)]
@@ -1876,21 +1877,17 @@ mod tests {
         let started = temp.path().join("started");
         let release = temp.path().join("release");
         let survived = temp.path().join("survived");
-        let script = executable_script(
+        let (program, args) = fake_git(
             temp.path(),
-            "#!/bin/sh\n\
-             printf started > \"$1\"\n\
+            "printf started > \"$1\"\n\
              (while [ ! -f \"$2\" ]; do sleep 0.05; done; printf survived > \"$3\") &\n\
              sleep 30\n",
+            [&started, &release, &survived],
         );
         let result = run_git_program(
-            script,
+            program,
             temp.path().to_path_buf(),
-            vec![
-                started.to_string_lossy().to_string(),
-                release.to_string_lossy().to_string(),
-                survived.to_string_lossy().to_string(),
-            ],
+            args,
             None,
             None,
             1024,
@@ -1914,22 +1911,18 @@ mod tests {
         let started = temp.path().join("started");
         let release = temp.path().join("release");
         let survived = temp.path().join("survived");
-        let script = executable_script(
+        let (program, args) = fake_git(
             temp.path(),
-            "#!/bin/sh\n\
-             printf started > \"$1\"\n\
+            "printf started > \"$1\"\n\
              (while [ ! -f \"$2\" ]; do sleep 0.05; done; printf survived > \"$3\") &\n\
              sleep 30\n",
+            [&started, &release, &survived],
         );
         let completion = Arc::new(tokio::sync::Semaphore::new(0));
         let run = tokio::spawn(run_git_program_observed(
-            script,
+            program,
             temp.path().to_path_buf(),
-            vec![
-                started.to_string_lossy().to_string(),
-                release.to_string_lossy().to_string(),
-                survived.to_string_lossy().to_string(),
-            ],
+            args,
             None,
             None,
             1024,

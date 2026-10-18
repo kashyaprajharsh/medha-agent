@@ -411,6 +411,7 @@ pub struct SandboxLockConfig {
     pub image: Option<String>,
     /// Container backend: runtime binary (`docker`/`podman`); auto-detected if unset.
     pub runtime: Option<String>,
+    pub user: Option<String>,
     /// Container backend: memory cap (e.g. "2g") and max process count.
     pub memory: Option<String>,
     pub pids: Option<u32>,
@@ -430,6 +431,7 @@ impl Default for SandboxLockConfig {
             extra_writable: Vec::new(),
             image: None,
             runtime: None,
+            user: None,
             memory: None,
             pids: None,
             host: None,
@@ -530,6 +532,7 @@ impl SandboxLockConfig {
             net,
             image: self.image.clone(),
             runtime,
+            user: self.user.clone(),
             memory: self.memory.clone(),
             pids: self.pids,
             host: self.host.clone(),

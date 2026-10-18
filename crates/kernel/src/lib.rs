@@ -2,6 +2,7 @@
 
 pub mod arg_repair;
 pub mod artifacts;
+pub mod auxiliary;
 pub mod budgets;
 pub mod clarify;
 pub mod context;
@@ -16,8 +17,12 @@ pub mod gate;
 pub mod hooks;
 pub mod injection;
 pub mod interrupts;
+pub mod mutations;
+#[cfg(test)]
+mod mutations_tests;
 pub mod policy;
 pub mod progress;
+pub mod protected_paths;
 pub mod provenance;
 pub mod provider;
 pub mod recovery;

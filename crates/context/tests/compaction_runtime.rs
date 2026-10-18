@@ -406,189 +406,207 @@ async fn protected_oversized_head_stops_after_bounded_compaction_and_keeps_check
 
 #[tokio::test]
 async fn summary_generation_is_bounded_and_oversized_summary_input_never_sends() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    let endpoint = Endpoint::new(8_000, vec![]);
-    let summarizer = LlmSummarizer::new(endpoint.clone());
-    let large = vec![HistoryItem::text(Role::User, "x".repeat(100_000))];
-    assert!(summarizer.summarize(None, &large).await.is_err());
-    assert!(endpoint.sent.lock().unwrap().is_empty());
-    let small = vec![HistoryItem::text(Role::User, "keep this task")];
-    assert!(summarizer.summarize(None, &small).await.is_ok());
-    assert_eq!(endpoint.sent.lock().unwrap()[0].body["max_tokens"], 400);
-    assert_eq!(
-        endpoint.sent.lock().unwrap()[0].body["reasoning_effort"],
-        "none"
-    );
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        let endpoint = Endpoint::new(8_000, vec![]);
+        let summarizer = LlmSummarizer::new(endpoint.clone());
+        let large = vec![HistoryItem::text(Role::User, "x".repeat(100_000))];
+        assert!(summarizer.summarize(None, &large).await.is_err());
+        assert!(endpoint.sent.lock().unwrap().is_empty());
+        let small = vec![HistoryItem::text(Role::User, "keep this task")];
+        assert!(summarizer.summarize(None, &small).await.is_ok());
+        assert_eq!(endpoint.sent.lock().unwrap()[0].body["max_tokens"], 400);
+        assert_eq!(
+            endpoint.sent.lock().unwrap()[0].body["reasoning_effort"],
+            "none"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn a_fitting_replay_preserves_the_chat_prefix_and_reserves_summary_output() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    let endpoint = Endpoint::new(8_000, vec![vec![Block::Text("SUMMARY".into())]]);
-    let summarizer = LlmSummarizer::new(endpoint.clone());
-    // Replay the compatible chat prefix when it fits with the summary's
-    // own output reservation; do not flatten a cacheable prefix needlessly.
-    let filler = "word ".repeat(4_800);
-    let sent = CompiledContext {
-        model: String::new(),
-        messages: vec![Message::system("SYSTEM"), Message::user(&filler)],
-        ordered: None,
-        tools: Vec::new(),
-    };
-    let items = vec![HistoryItem::text(Role::User, filler.clone())];
-    let summary = summarizer
-        .summarize_bounded(None, &items, Some(&sent), Some("\"word word word\""), 128)
-        .await;
-    assert_eq!(summary.unwrap(), "SUMMARY");
-    let requests = endpoint.sent.lock().unwrap();
-    assert_eq!(requests[0].body["max_tokens"], 128);
-    assert_eq!(
-        requests.len(),
-        1,
-        "the replay is sent, never re-sent flattened"
-    );
-    assert_eq!(
-        requests[0].context.messages.len(),
-        3,
-        "the replay carries the sent messages plus one trailing instruction"
-    );
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        let endpoint = Endpoint::new(8_000, vec![vec![Block::Text("SUMMARY".into())]]);
+        let summarizer = LlmSummarizer::new(endpoint.clone());
+        // Replay the compatible chat prefix when it fits with the summary's
+        // own output reservation; do not flatten a cacheable prefix needlessly.
+        let filler = "word ".repeat(4_800);
+        let sent = CompiledContext {
+            model: String::new(),
+            messages: vec![Message::system("SYSTEM"), Message::user(&filler)],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        let items = vec![HistoryItem::text(Role::User, filler.clone())];
+        let summary = summarizer
+            .summarize_bounded(None, &items, Some(&sent), Some("\"word word word\""), 128)
+            .await;
+        assert_eq!(summary.unwrap(), "SUMMARY");
+        let requests = endpoint.sent.lock().unwrap();
+        assert_eq!(requests[0].body["max_tokens"], 128);
+        assert_eq!(
+            requests.len(),
+            1,
+            "the replay is sent, never re-sent flattened"
+        );
+        assert_eq!(
+            requests[0].context.messages.len(),
+            3,
+            "the replay carries the sent messages plus one trailing instruction"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn auxiliary_summary_scales_independently_of_the_chat_output_setting() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    for support in [ReasoningSupport::Effort, ReasoningSupport::Unknown] {
-        let mut endpoint = Endpoint::new(128_000, vec![]);
-        Arc::get_mut(&mut endpoint).unwrap().reasoning = support;
-        endpoint.output.store(512, Ordering::SeqCst);
-        let summarizer = LlmSummarizer::new(endpoint.clone());
-        let items = vec![HistoryItem::text(
-            Role::Assistant,
-            "source material ".repeat(25_000),
-        )];
-        summarizer.summarize(None, &items).await.unwrap();
-        let requests = endpoint.sent.lock().unwrap();
-        let cap = requests[0].body["max_tokens"].as_u64().unwrap();
-        if support == ReasoningSupport::Unknown {
-            assert!(requests[0].body.get("reasoning_effort").is_none());
-            assert!(
-                cap > 6_400,
-                "a model that may think gets the room left: {cap}"
-            );
-        } else {
-            assert_eq!(requests[0].body["reasoning_effort"], "none");
-            assert!(cap > 2_048 && cap <= 6_400);
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        for support in [ReasoningSupport::Effort, ReasoningSupport::Unknown] {
+            let mut endpoint = Endpoint::new(128_000, vec![]);
+            Arc::get_mut(&mut endpoint).unwrap().reasoning = support;
+            endpoint.output.store(512, Ordering::SeqCst);
+            let summarizer = LlmSummarizer::new(endpoint.clone());
+            let items = vec![HistoryItem::text(
+                Role::Assistant,
+                "source material ".repeat(25_000),
+            )];
+            summarizer.summarize(None, &items).await.unwrap();
+            let requests = endpoint.sent.lock().unwrap();
+            let cap = requests[0].body["max_tokens"].as_u64().unwrap();
+            if support == ReasoningSupport::Unknown {
+                assert!(requests[0].body.get("reasoning_effort").is_none());
+                assert!(
+                    cap > 6_400,
+                    "a model that may think gets the room left: {cap}"
+                );
+            } else {
+                assert_eq!(requests[0].body["reasoning_effort"], "none");
+                assert!(cap > 2_048 && cap <= 6_400);
+            }
+            assert_eq!(endpoint.requested_output_tokens(), Some(512));
         }
-        assert_eq!(endpoint.requested_output_tokens(), Some(512));
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn auxiliary_profile_summarizes_only_the_middle_without_chat_images_or_tools() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    let endpoint = Endpoint::new(128_000, vec![]);
-    let summarizer = LlmSummarizer::new(endpoint.clone()).with_replay(false);
-    let sent = CompiledContext {
-        model: "chat-model".into(),
-        messages: vec![Message::user("CHAT PREFIX THAT MUST NOT REPLAY")],
-        ordered: None,
-        tools: vec![],
-    };
-    let items = vec![HistoryItem::text(Role::User, "LATEST TASK")];
-    summarizer
-        .summarize_replaying(None, &items, &sent, None)
-        .await
-        .unwrap();
-    let requests = endpoint.sent.lock().unwrap();
-    assert_eq!(requests[0].context.messages.len(), 2);
-    assert!(
-        requests[0].context.messages[1]
-            .content
-            .contains("LATEST TASK")
-    );
-    assert!(!requests[0].body.to_string().contains("CHAT PREFIX"));
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        let endpoint = Endpoint::new(128_000, vec![]);
+        let summarizer = LlmSummarizer::new(endpoint.clone()).with_replay(false);
+        let sent = CompiledContext {
+            model: "chat-model".into(),
+            messages: vec![Message::user("CHAT PREFIX THAT MUST NOT REPLAY")],
+            ordered: None,
+            tools: vec![],
+        };
+        let items = vec![HistoryItem::text(Role::User, "LATEST TASK")];
+        summarizer
+            .summarize_replaying(None, &items, &sent, None)
+            .await
+            .unwrap();
+        let requests = endpoint.sent.lock().unwrap();
+        assert_eq!(requests[0].context.messages.len(), 2);
+        assert!(
+            requests[0].context.messages[1]
+                .content
+                .contains("LATEST TASK")
+        );
+        assert!(!requests[0].body.to_string().contains("CHAT PREFIX"));
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn unusable_summary_output_is_rejected_instead_of_persisting_a_partial_handoff() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    for (blocks, reason) in [
-        (
-            vec![
-                Block::Text("incomplete summary".into()),
-                Block::Usage(Usage {
-                    completion_tokens: 400,
-                    ..Default::default()
-                }),
-            ],
-            "partial handoff",
-        ),
-        (
-            vec![Block::Text("I cannot summarize this conversation.".into())],
-            "declined",
-        ),
-        (vec![], "empty summary"),
-    ] {
-        let summarizer = LlmSummarizer::new(Endpoint::new(8_000, vec![blocks]));
-        let items = vec![HistoryItem::text(Role::User, "TASK")];
-        let error = summarizer.summarize(None, &items).await.unwrap_err();
-        assert!(matches!(error, ::context::SummarizeError::Invalid(_)));
-        assert!(error.to_string().contains(reason), "{error}");
-    }
-    let mut endpoint = Endpoint::new(8_000, vec![vec![Block::Text("incomplete".into())]]);
-    Arc::get_mut(&mut endpoint).unwrap().truncated = true;
-    let error = LlmSummarizer::new(endpoint)
-        .summarize(None, &[HistoryItem::text(Role::User, "TASK")])
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("summary hit its output limit"),
-        "{error}"
-    );
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        for (blocks, reason) in [
+            (
+                vec![
+                    Block::Text("incomplete summary".into()),
+                    Block::Usage(Usage {
+                        completion_tokens: 400,
+                        ..Default::default()
+                    }),
+                ],
+                "partial handoff",
+            ),
+            (
+                vec![Block::Text("I cannot summarize this conversation.".into())],
+                "declined",
+            ),
+            (vec![], "empty summary"),
+        ] {
+            let summarizer = LlmSummarizer::new(Endpoint::new(8_000, vec![blocks]));
+            let items = vec![HistoryItem::text(Role::User, "TASK")];
+            let error = summarizer.summarize(None, &items).await.unwrap_err();
+            assert!(matches!(error, ::context::SummarizeError::Invalid(_)));
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        let mut endpoint = Endpoint::new(8_000, vec![vec![Block::Text("incomplete".into())]]);
+        Arc::get_mut(&mut endpoint).unwrap().truncated = true;
+        let error = LlmSummarizer::new(endpoint)
+            .summarize(None, &[HistoryItem::text(Role::User, "TASK")])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("summary hit its output limit"),
+            "{error}"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn summary_does_not_inherit_a_large_chat_reserve_or_tokenize_image_base64() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    let endpoint = Endpoint::new(128_000, vec![]);
-    endpoint.output.store(64_000, Ordering::SeqCst);
-    let summarizer = LlmSummarizer::new(endpoint.clone());
-    let mut image = Message::user("old screenshot");
-    image.attachments.push(MediaPart {
-        mime_type: "image/png".into(),
-        source: MediaSource::Base64("IMAGE_BYTES".repeat(100_000)),
-        label: Some("diagram.png".into()),
-        width: None,
-        height: None,
-        byte_size: None,
-        provider_state: Vec::new(),
-    });
-    let sent = CompiledContext {
-        model: String::new(),
-        messages: vec![image],
-        ordered: None,
-        tools: vec![],
-    };
-    // Fits the bounded auxiliary request but not the chat's 64k output reserve.
-    let items = vec![HistoryItem::text(
-        Role::Assistant,
-        "source material ".repeat(20_000),
-    )];
-    summarizer
-        .summarize_replaying(None, &items, &sent, None)
-        .await
-        .unwrap();
-    let requests = endpoint.sent.lock().unwrap();
-    assert!(!requests[0].body.to_string().contains("IMAGE_BYTES"));
-    assert!(
-        requests[0]
-            .context
-            .messages
-            .iter()
-            .all(|m| m.attachments.is_empty())
-    );
-    assert!(requests[0].body["max_tokens"].as_u64().unwrap() <= 6400);
-    assert_eq!(endpoint.requested_output_tokens(), Some(64_000));
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        let endpoint = Endpoint::new(128_000, vec![]);
+        endpoint.output.store(64_000, Ordering::SeqCst);
+        let summarizer = LlmSummarizer::new(endpoint.clone());
+        let mut image = Message::user("old screenshot");
+        image.attachments.push(MediaPart {
+            mime_type: "image/png".into(),
+            source: MediaSource::Base64("IMAGE_BYTES".repeat(100_000)),
+            label: Some("diagram.png".into()),
+            width: None,
+            height: None,
+            byte_size: None,
+            provider_state: Vec::new(),
+        });
+        let sent = CompiledContext {
+            model: String::new(),
+            messages: vec![image],
+            ordered: None,
+            tools: vec![],
+        };
+        // Fits the bounded auxiliary request but not the chat's 64k output reserve.
+        let items = vec![HistoryItem::text(
+            Role::Assistant,
+            "source material ".repeat(20_000),
+        )];
+        summarizer
+            .summarize_replaying(None, &items, &sent, None)
+            .await
+            .unwrap();
+        let requests = endpoint.sent.lock().unwrap();
+        assert!(!requests[0].body.to_string().contains("IMAGE_BYTES"));
+        assert!(
+            requests[0]
+                .context
+                .messages
+                .iter()
+                .all(|m| m.attachments.is_empty())
+        );
+        assert!(requests[0].body["max_tokens"].as_u64().unwrap() <= 6400);
+        assert_eq!(endpoint.requested_output_tokens(), Some(64_000));
+    })
+    .await;
 }
 
 #[derive(Default)]
@@ -918,31 +936,35 @@ async fn provider_usage_survives_restart_only_while_the_priced_prefix_matches() 
 
 #[tokio::test(start_paused = true)]
 async fn summary_waits_for_progress_but_bounds_silence_and_total_time() {
-    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
-    for (delay, chunks, succeeds) in [(45, 3, true), (65, 1, false), (45, 8, false)] {
-        let mut endpoint = Endpoint::new(
-            128_000,
-            vec![vec![Block::Text("summary text ".into()); chunks]],
-        );
-        Arc::get_mut(&mut endpoint).unwrap().block_delay = std::time::Duration::from_secs(delay);
-        let summarizer = LlmSummarizer::new(endpoint);
-        let started = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            summarizer.time_limit(),
-            summarizer.summarize(None, &[HistoryItem::text(Role::User, "TASK")]),
-        )
-        .await;
-        assert_eq!(matches!(result, Ok(Ok(_))), succeeds);
-        let elapsed = started.elapsed().as_secs();
-        assert_eq!(
-            elapsed,
-            if succeeds {
-                delay * chunks as u64
-            } else if delay > 60 {
-                60
-            } else {
-                300
-            }
-        );
-    }
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+        for (delay, chunks, succeeds) in [(45, 3, true), (65, 1, false), (45, 8, false)] {
+            let mut endpoint = Endpoint::new(
+                128_000,
+                vec![vec![Block::Text("summary text ".into()); chunks]],
+            );
+            Arc::get_mut(&mut endpoint).unwrap().block_delay =
+                std::time::Duration::from_secs(delay);
+            let summarizer = LlmSummarizer::new(endpoint);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                summarizer.time_limit(),
+                summarizer.summarize(None, &[HistoryItem::text(Role::User, "TASK")]),
+            )
+            .await;
+            assert_eq!(matches!(result, Ok(Ok(_))), succeeds);
+            let elapsed = started.elapsed().as_secs();
+            assert_eq!(
+                elapsed,
+                if succeeds {
+                    delay * chunks as u64
+                } else if delay > 60 {
+                    60
+                } else {
+                    300
+                }
+            );
+        }
+    })
+    .await;
 }

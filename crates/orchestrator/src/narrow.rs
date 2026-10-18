@@ -74,6 +74,57 @@ impl NarrowedExecutor {
 
 #[async_trait]
 impl Executor for NarrowedExecutor {
+    async fn mutation_preflight(&self, intent: &ToolIntent) -> Option<Observation> {
+        if !self.allows_intent(intent) {
+            return Some(Observation::denial(
+                &intent.id,
+                "Outside this agent's capabilities",
+            ));
+        }
+        self.inner.mutation_preflight(intent).await
+    }
+
+    async fn prepare_effect(&self, intent: &ToolIntent) -> Result<serde_json::Value, Observation> {
+        if !self.allows_intent(intent) {
+            return Err(Observation::denial(
+                &intent.id,
+                "Outside this agent's capabilities",
+            ));
+        }
+        self.inner.prepare_effect(intent).await
+    }
+
+    async fn finish_effect(
+        &self,
+        intent: &ToolIntent,
+        preparation: &serde_json::Value,
+        observation: &mut Observation,
+    ) {
+        if self.allows_intent(intent) {
+            self.inner
+                .finish_effect(intent, preparation, observation)
+                .await;
+        }
+    }
+
+    fn observation_delivered(&self, tool: &str, observation: &Observation) {
+        if self.allows(tool) {
+            self.inner.observation_delivered(tool, observation);
+        }
+    }
+
+    fn changed_files(&self, tool: &str, observation: &Observation) -> bool {
+        self.allows(tool) && self.inner.changed_files(tool, observation)
+    }
+
+    fn background_tasks(&self) -> Vec<kernel::BackgroundTask> {
+        if self.read_only {
+            Vec::new()
+        } else {
+            self.inner.background_tasks()
+        }
+    }
+
     async fn tool_inventory(
         &self,
         previous_sources: &std::collections::BTreeMap<String, String>,

@@ -7,6 +7,9 @@ pub(super) enum Selected {
 }
 
 pub(super) fn selected(settings: &SearchSettings) -> Result<Option<Selected>, String> {
+    if let Some(error) = &settings.configuration_error {
+        return Err(error.clone());
+    }
     Ok(Some(match settings.provider {
         SearchProvider::DuckDuckGo => return Ok(None),
         SearchProvider::Tavily => Selected::Tavily(
@@ -26,13 +29,6 @@ pub(super) fn selected(settings: &SearchSettings) -> Result<Option<Selected>, St
 }
 
 impl Selected {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Tavily(_) => "tavily",
-            Self::Brave(_) => "brave",
-            Self::Searxng(_) => "searxng",
-        }
-    }
     pub fn destination(&self) -> String {
         match self {
             Self::Tavily(_) => "https://api.tavily.com/search".into(),

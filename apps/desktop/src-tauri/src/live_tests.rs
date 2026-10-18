@@ -84,6 +84,18 @@ fn other_frames_pass_through_untouched() {
     assert_eq!(clean(frame.clone()), frame);
 }
 
+#[test]
+fn protected_action_ids_survive_the_desktop_stream_boundary() {
+    let reviews = json!([{"id":"a".repeat(64)}, {"id":"b".repeat(64)}]);
+    let sent = clean(json!({"method":"event","params":{
+        "kind":"tool.observation","id":"command","tool":"shell.exec","ok":true,
+        "payload":{"exit_code":0,"mutation":reviews[0],"mutations":reviews}
+    }}));
+    assert_eq!(sent["params"]["mutation"], reviews[0]);
+    assert_eq!(sent["params"]["mutations"], reviews);
+    assert!(sent["params"].get("payload").is_none());
+}
+
 fn text(delta: &str) -> Value {
     json!({ "method": "event", "params": { "kind": "model.text", "delta": delta } })
 }

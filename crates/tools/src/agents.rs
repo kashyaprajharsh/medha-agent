@@ -107,6 +107,44 @@ struct Rebound {
 
 #[async_trait]
 impl kernel::Executor for Rebound {
+    fn background_tasks(&self) -> Vec<kernel::BackgroundTask> {
+        self.inner.background_tasks()
+    }
+
+    async fn prepare_effect(
+        &self,
+        intent: &kernel::ToolIntent,
+    ) -> Result<Value, kernel::Observation> {
+        self.inner.prepare_effect(intent).await
+    }
+    async fn finish_effect(
+        &self,
+        intent: &kernel::ToolIntent,
+        preparation: &Value,
+        observation: &mut kernel::Observation,
+    ) {
+        self.inner
+            .finish_effect(intent, preparation, observation)
+            .await;
+    }
+    async fn mutation_preflight(&self, intent: &kernel::ToolIntent) -> Option<kernel::Observation> {
+        match self.tools.get(&intent.tool) {
+            Some(tool) => crate::mutation_preflight(tool.as_ref(), intent).await,
+            None => self.inner.mutation_preflight(intent).await,
+        }
+    }
+    fn changed_files(&self, tool: &str, observation: &kernel::Observation) -> bool {
+        self.tools.get(tool).map_or_else(
+            || self.inner.changed_files(tool, observation),
+            |tool| tool.changed_files(observation),
+        )
+    }
+    fn observation_delivered(&self, tool: &str, observation: &kernel::Observation) {
+        match self.tools.get(tool) {
+            Some(tool) => tool.delivered(observation),
+            None => self.inner.observation_delivered(tool, observation),
+        }
+    }
     async fn tool_inventory(
         &self,
         previous_sources: &std::collections::BTreeMap<String, String>,
@@ -1263,6 +1301,9 @@ struct AgentApply {
 
 #[async_trait]
 impl Tool for AgentApply {
+    async fn mutation_preflight(&self, args: &Value) -> Result<(), ToolError> {
+        super::protected_patches::check(&self.control, args).await
+    }
     fn name(&self) -> &str {
         "agent.apply"
     }
@@ -1356,6 +1397,7 @@ impl Tool for AgentApply {
                 .collect();
             return Ok(json!({ "unmerged": waiting, "count": waiting.len() }));
         };
+        self.mutation_preflight(args).await?;
         let pending = self.control.pending(id).await.ok_or_else(|| {
             ToolError::Failed(format!(
                 "no patch from '{id}' — it may have changed nothing, or been a read-only agent"

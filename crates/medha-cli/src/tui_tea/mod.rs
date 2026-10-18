@@ -953,7 +953,7 @@ const AUTONOMY_MODES: &[(kernel::AutonomyLevel, &str)] = &[
 const SEARCH_PROVIDERS: &[(tools::SearchProvider, &str)] = &[
     (
         tools::SearchProvider::DuckDuckGo,
-        "DuckDuckGo — free, no key (default fallback)",
+        "DuckDuckGo — keyless default",
     ),
     (
         tools::SearchProvider::Tavily,

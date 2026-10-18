@@ -187,7 +187,7 @@ fn workspace_reveal(
     chat_key: Option<String>,
     session_id: Option<String>,
 ) -> Result<(), String> {
-    files::open_path(
+    file_ops::opening::reveal(
         &state
             .workspaces
             .start(&workspace_id, chat_key.as_deref(), session_id.as_deref())?
@@ -547,7 +547,7 @@ fn file_open(
     chat_key: Option<String>,
     session_id: Option<String>,
     path: String,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     files::open_default(
         &state
             .workspaces

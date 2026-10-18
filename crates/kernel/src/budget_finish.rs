@@ -73,6 +73,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink.notice("The working budget is nearly used. Using its reserved allowance for one short handover.");
         let mut cut = crate::cut_off::CutOff::default();
         let mut join = crate::seam::Join::default();
+        let mut attempt_usage = None;
         match self
             .stream_turn(
                 &request,
@@ -81,6 +82,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 governor.deadline(),
                 &mut cut,
                 &mut join,
+                &mut attempt_usage,
             )
             .await
         {
@@ -97,13 +99,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     sink.notice(FALLBACK);
                 }
                 if let Some(price) = self.price() {
-                    sink.cost(governor.cost_usd(), price.indicative);
+                    let (cost, indicative) = self.reported_cost(governor, price.indicative);
+                    sink.cost(cost, indicative);
                 }
                 accounting.map_err(KernelError::Budget)?;
             }
-            Err(_) => {
+            Err((error, _)) => {
                 reservation
-                    .reconcile(None, self.price())
+                    .reconcile_attempt(attempt_usage, self.price(), Some(&error))
                     .map_err(KernelError::Budget)?;
                 sink.notice(FALLBACK);
             }

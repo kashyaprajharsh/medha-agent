@@ -84,14 +84,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 unavailable.insert(intent.id.clone(), observation);
             }
         }
-        // Blast radius, not tool name, determines whether verification runs.
-        let modified_files = intents.iter().any(|i| {
-            !unavailable.contains_key(&i.id)
-                && matches!(
-                    self.executor.blast_radius(&i.tool),
-                    Some(BlastRadius::ReversibleLocal | BlastRadius::IrreversibleLocal)
-                )
-        });
+        let mut modified_files = false;
 
         // Reads run together; this turn's changes run one by one, in order. If
         // two commit B→A while the log records A→B, replay disagrees with live
@@ -122,6 +115,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         )
                         .await;
                     for (id, tool, obs, discovered) in settled {
+                        modified_files |= self.executor.changed_files(&tool, &obs);
                         self.persist_admitted(
                             cx.session,
                             id,
@@ -160,6 +154,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         cx.sink,
                     )
                     .await;
+                modified_files |= self.executor.changed_files(&tool, &obs);
                 self.persist_admitted(
                     cx.session,
                     id,
@@ -195,6 +190,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 )
                 .await;
             for (id, tool, obs, discovered) in settled {
+                modified_files |= self.executor.changed_files(&tool, &obs);
                 self.persist_admitted(
                     cx.session,
                     id,

@@ -207,6 +207,7 @@ export const LiveTail = memo(function LiveTail({
       {state.notice && <p className="quiet">{state.notice}</p>}
       {state.projectTrust && <ProjectTrustNotice key={`${state.sessionId}:${state.projectTrust.root}:${state.projectTrust.fingerprint}`} review={state.projectTrust} session={state.sessionId} />}
       {state.outbound && <OutboundNotice key={`${state.sessionId}:${state.outbound.id}`} review={state.outbound} />}
+      {state.mutations?.map(review => <OutboundNotice kind="protected" key={`${state.sessionId}:${review.id}`} review={review} />)}
       {state.error && (
         <div className="error inline" role="alert">
           <b>

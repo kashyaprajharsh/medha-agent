@@ -7,7 +7,6 @@
 use crate::{Error, io_error};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSource {
@@ -193,17 +192,19 @@ pub fn fetch(source: &GitSource) -> Result<Checkout, Error> {
     let is_commit = source.git_ref.as_deref().is_some_and(|git_ref| {
         git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
     });
-    let mut clone = vec!["clone", "--quiet"];
+    let mut clone = vec!["clone", "--quiet", "--no-checkout"];
     if !is_commit {
         clone.extend(["--depth", "1"]);
         if let Some(git_ref) = &source.git_ref {
             clone.extend(["--branch", git_ref]);
         }
     }
-    clone.extend([source.url.as_str(), target.as_str()]);
+    clone.extend(["--", source.url.as_str(), target.as_str()]);
     git(None, &clone)?;
     if let Some(commit) = source.git_ref.as_deref().filter(|_| is_commit) {
         git(Some(&dir), &["checkout", "--quiet", commit])?;
+    } else {
+        git(Some(&dir), &["checkout", "--quiet", "HEAD", "--", "."])?;
     }
     checkout.commit = git(Some(&dir), &["rev-parse", "HEAD"])?;
     resolve_links(&dir)?;
@@ -283,26 +284,35 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
 }
 
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, Error> {
-    let mut command = Command::new("git");
-    if let Some(dir) = dir {
-        command.arg("-C").arg(dir);
-    }
-    let output = command
-        .args(["-c", "advice.detachedHead=false"])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|error| {
-            Error::Source(format!(
-                "git is needed to install from a repository and could not run: {error}"
-            ))
-        })?;
-    if !output.status.success() {
+    // Fetch outside the caller's checkout: project config must not select
+    // credentials, helpers, URL rewrites or transport programs.
+    let private = tempfile::tempdir().map_err(|error| Error::Source(error.to_string()))?;
+    let cwd = dir.unwrap_or_else(|| private.path());
+    let args_owned: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let hardened = git_safety::fetch::arguments(cwd, &args_owned).map_err(Error::Source)?;
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(hardened)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_safety::fetch::environment());
+    let output = sandbox::exec::run_command_bounded_sync(
+        command,
+        std::time::Duration::from_secs(120),
+        1024 * 1024,
+        64 * 1024,
+    )
+    .map_err(|error| Error::Source(format!("plugin Git could not run: {error}")))?;
+    if output.status != Some(0)
+        || output.timed_out
+        || output.stdout_truncated
+        || output.stderr_truncated
+    {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::Source(format!(
             "git {} failed: {}",
             args.first().copied().unwrap_or_default(),
-            stderr.trim()
+            sandbox::environment::redact(stderr.trim())
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

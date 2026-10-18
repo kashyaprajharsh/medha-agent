@@ -88,7 +88,8 @@ fn written_content_is_named_not_echoed_and_notes_and_diagnostics_are_kept() {
     }))
     .unwrap();
     assert!(view.contains("Note: matched loosely"));
-    assert!(view.contains(r#"Diagnostics after the change: {"errors":1}"#));
+    assert!(view.contains("LSP delta unknown"));
+    assert!(!view.contains("New LSP diagnostics"));
     assert_eq!(
         file_change(&json!({"path": "a.rs", "old": "same\n", "new": "same\n"})).unwrap(),
         "a.rs is unchanged."

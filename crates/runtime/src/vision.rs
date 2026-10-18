@@ -32,7 +32,6 @@ impl AuxiliaryVision {
 
     async fn ask(&self, mime: &str, bytes: &[u8]) -> Result<String> {
         use base64::Engine;
-        use kernel::Provider;
         let context = CompiledContext {
             model: self.model.clone(),
             messages: Vec::new(),
@@ -59,9 +58,7 @@ impl AuxiliaryVision {
             }]),
             tools: Vec::new(),
         };
-        let mut stream = self
-            .provider
-            .stream(&context)
+        let mut stream = kernel::auxiliary::context(&self.provider, &context, 2048)
             .await
             .context("auxiliary vision request failed")?;
         let mut description = String::new();

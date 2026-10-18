@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+pub mod opening;
+
 #[cfg(not(windows))]
 pub fn replace(source: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(source, target)

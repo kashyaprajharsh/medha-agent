@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 file-ops = { path = "../file-ops" }
+git-safety = { path = "../git-safety" }
 medha-extension-api = { path = "../extension-api" }
 kernel = { path = "../kernel" }
 sandbox = { path = "../sandbox" }
@@ -24,6 +25,4 @@ tokio = { workspace = true, features = ["process", "time"] }
 tokio-util = "0.7"
 toml = "0.8"
 ulid.workspace = true
-
-[dev-dependencies]
 tempfile = "3"

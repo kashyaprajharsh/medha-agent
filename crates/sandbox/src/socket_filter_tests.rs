@@ -3,6 +3,21 @@ use crate::exec::{
 };
 use permissions::{ApprovedRoots, NetworkGrant};
 
+#[tokio::test]
+async fn containment_tracks_persistent_grants_but_keeps_once_scoped() {
+    use crate::exec::{ExecBackend, LandlockBackend};
+    let grant = NetworkGrant::default();
+    let backend = LandlockBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default())
+        .with_network_grant(grant.clone());
+    assert!(backend.containment().confines_network());
+    kernel::network_once_scope(async {
+        assert!(backend.containment().confines_network());
+    })
+    .await;
+    grant.grant();
+    assert!(!backend.containment().confines_network());
+}
+
 /// Re-entered inside the jail: prints which sockets the kernel let it create.
 #[test]
 fn socket_child() {
@@ -45,6 +60,10 @@ async fn sockets_under(net: NetPolicy) -> String {
         NetworkGrant::default(),
     );
     assert_eq!(backend.label(), "native");
+    assert_eq!(
+        backend.containment().confines_network(),
+        net == NetPolicy::Deny
+    );
     let output = backend
         .run(ExecRequest {
             program: exe.to_string_lossy().into_owned(),

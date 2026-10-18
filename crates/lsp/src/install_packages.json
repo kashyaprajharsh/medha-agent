@@ -1,0 +1,8 @@
+{
+  "typescript-language-server": ["npm", "typescript-language-server@6.0.2", "typescript@6.0.3"],
+  "pyright": ["npm", "pyright@1.1.414"],
+  "bash-language-server": ["npm", "bash-language-server@5.8.1"],
+  "yaml-language-server": ["npm", "yaml-language-server@2.0.0"],
+  "intelephense": ["npm", "intelephense@1.18.5"],
+  "gopls": ["go", "golang.org/x/tools/gopls@v0.24.0"]
+}

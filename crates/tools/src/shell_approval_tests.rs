@@ -100,7 +100,7 @@ impl Fixture {
         }
     }
     fn args(&self) -> Value {
-        json!({"command": "printf installed > installed.txt", "network": true, "workdir": self.outside, "write_paths": [self.outside]})
+        json!({"command": "mkdir -p installed", "network": true, "workdir": self.outside, "write_paths": [self.outside]})
     }
 }
 impl Drop for Fixture {
@@ -178,6 +178,15 @@ impl kernel::Policy for Review {
     }
 }
 async fn run(fixture: &Fixture, args: Value, plan: bool) -> Vec<kernel::Event> {
+    run_with_sink(fixture, args, plan, &kernel::NullSink).await
+}
+
+async fn run_with_sink(
+    fixture: &Fixture,
+    args: Value,
+    plan: bool,
+    sink: &dyn kernel::StreamSink,
+) -> Vec<kernel::Event> {
     use kernel::EventLog;
     let log = Arc::new(kernel::InMemoryLog::new());
     let provider = Provider {
@@ -212,7 +221,7 @@ async fn run(fixture: &Fixture, args: Value, plan: bool) -> Vec<kernel::Event> {
             &session,
             vec![kernel::Message::user("install in the requested directory")],
             kernel::Budget::default(),
-            &kernel::NullSink,
+            sink,
             None,
         )
         .await
@@ -221,13 +230,56 @@ async fn run(fixture: &Fixture, args: Value, plan: bool) -> Vec<kernel::Event> {
 }
 
 #[tokio::test]
+async fn an_external_overwrite_without_a_real_backup_is_unrun_with_one_quiet_notice() {
+    let fixture = Fixture::new(vec![kernel::NetworkDecision::Once]);
+    let path = fixture.outside.join("installed.txt");
+    std::fs::write(&path, "original outside work").unwrap();
+    struct Notices(Mutex<Vec<String>>);
+    impl kernel::StreamSink for Notices {
+        fn notice(&self, text: &str) {
+            self.0.lock().unwrap().push(text.into());
+        }
+    }
+    let sink = Notices(Mutex::new(Vec::new()));
+    let mut args = fixture.args();
+    args["command"] = json!("printf changed > installed.txt");
+    let events = run_with_sink(&fixture, args, false, &sink).await;
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "original outside work"
+    );
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(fixture.gate.cards.lock().unwrap().len(), 1);
+    assert_eq!(fixture.gate.standard.load(Ordering::SeqCst), 0);
+    let observation = events
+        .iter()
+        .find(|event| event.kind == kernel::EventKind::ToolObs)
+        .unwrap();
+    assert_eq!(observation.payload["payload"]["changed"], false);
+    assert_eq!(
+        observation.payload["payload"]["mutations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|text| text.starts_with("Protected change held:"))
+            .count(),
+        1
+    );
+    assert!(!fixture.base.join("workspace/.medha/snapshots").exists());
+}
+
+#[tokio::test]
 async fn network_and_folder_are_approved_together_before_the_only_execution() {
     let f = Fixture::new(vec![kernel::NetworkDecision::Once]);
     run(&f, f.args(), false).await;
-    assert_eq!(
-        std::fs::read_to_string(f.outside.join("installed.txt")).unwrap(),
-        "installed"
-    );
+    assert!(f.outside.join("installed").is_dir());
     assert_eq!(f.requests.lock().unwrap().len(), 1);
     assert_eq!(
         f.gate.standard.load(Ordering::SeqCst),
@@ -258,7 +310,7 @@ async fn network_and_folder_are_approved_together_before_the_only_execution() {
 async fn denying_access_and_plan_mode_do_not_start_any_process() {
     let f = Fixture::new(vec![kernel::NetworkDecision::Deny]);
     run(&f, f.args(), false).await;
-    assert!(!f.outside.join("installed.txt").exists());
+    assert!(!f.outside.join("installed").exists());
     assert!(f.requests.lock().unwrap().is_empty());
     assert_eq!(f.gate.cards.lock().unwrap().len(), 1);
     run(&f, f.args(), true).await;
@@ -379,21 +431,18 @@ async fn native_workdir_read_grant_does_not_expand_workspace_write_access() {
         Arc::new(Artifacts),
     ));
     std::fs::write(f.outside.join("readable.txt"), "readable").unwrap();
-    let events = run(&f, json!({"command": "cat readable.txt; printf bad > blocked.txt", "network": false, "workdir": f.outside}), false).await;
+    let events = run(&f, json!({"command": "cat readable.txt; mkdir blocked", "network": false, "workdir": f.outside}), false).await;
     let observation = events
         .iter()
         .find(|event| event.kind == kernel::EventKind::ToolObs)
         .unwrap();
     assert_eq!(observation.payload["payload"]["stdout"], "readable");
     assert!(
-        !f.outside.join("blocked.txt").exists(),
+        !f.outside.join("blocked").exists(),
         "read-only cwd must not become a writable workspace"
     );
-    run(&f, json!({"command": "printf approved > allowed.txt", "network": false, "workdir": f.outside, "write_paths": [f.outside]}), false).await;
-    assert_eq!(
-        std::fs::read_to_string(f.outside.join("allowed.txt")).unwrap(),
-        "approved"
-    );
+    run(&f, json!({"command": "mkdir allowed", "network": false, "workdir": f.outside, "write_paths": [f.outside]}), false).await;
+    assert!(f.outside.join("allowed").is_dir());
     assert!(f.roots.write_roots().is_empty());
     assert_eq!(f.gate.cards.lock().unwrap().len(), 2);
 }
@@ -489,13 +538,9 @@ async fn outside_sandbox_runs_once_on_the_host_and_is_asked_again_every_time() {
         kernel::NetworkDecision::Persistent,
         kernel::NetworkDecision::Once,
     ]);
-    let args =
-        json!({"command": "printf ran > unjailed.txt", "network": false, "outside_sandbox": true});
+    let args = json!({"command": "mkdir -p unjailed", "network": false, "outside_sandbox": true});
     run(&f, args.clone(), false).await;
-    assert_eq!(
-        std::fs::read_to_string(f.base.join("workspace/unjailed.txt")).unwrap(),
-        "ran"
-    );
+    assert!(f.base.join("workspace/unjailed").is_dir());
     assert!(
         f.requests.lock().unwrap().is_empty(),
         "an approved run must not go through the jail backend"
@@ -517,11 +562,11 @@ async fn a_denied_outside_sandbox_run_starts_nothing() {
     let f = Fixture::new(vec![kernel::NetworkDecision::Deny]);
     run(
         &f,
-        json!({"command": "printf ran > unjailed.txt", "network": false, "outside_sandbox": true}),
+        json!({"command": "mkdir -p unjailed", "network": false, "outside_sandbox": true}),
         false,
     )
     .await;
-    assert!(!f.base.join("workspace/unjailed.txt").exists());
+    assert!(!f.base.join("workspace/unjailed").exists());
     assert!(f.requests.lock().unwrap().is_empty());
 }
 

@@ -501,7 +501,7 @@ fn apply_reasoning_efforts(
 /// network failure or if the model genuinely isn't listed — never a guess.
 pub async fn context_window(model_id: &str) -> Option<u32> {
     let data = crate::catalogue::snapshot();
-    lookup(model_id, &data.entries).and_then(|m| m.context)
+    exact_lookup(model_id, &data.entries).and_then(|m| m.context)
 }
 
 /// Look up `model_id`'s list price (USD per MTok input, output). This is the
@@ -511,7 +511,7 @@ pub async fn context_window(model_id: &str) -> Option<u32> {
 /// catalogue publishes one.
 pub async fn pricing(model_id: &str) -> Option<(f64, f64, Option<f64>)> {
     let data = crate::catalogue::snapshot();
-    let meta = lookup(model_id, &data.entries)?;
+    let meta = exact_lookup(model_id, &data.entries)?;
     Some((
         meta.input_per_mtok?,
         meta.output_per_mtok?,
@@ -571,7 +571,7 @@ pub async fn resolve_profile_capabilities(
     }
     let data = crate::catalogue::snapshot();
     let capabilities =
-        profile_meta(profile, &data.entries, false).and_then(|meta| meta.capabilities.clone());
+        profile_meta(profile, &data.entries).and_then(|meta| meta.capabilities.clone());
     CapabilityResolution {
         source: if capabilities.is_some() {
             CapabilitySource::ModelsDev
@@ -590,7 +590,7 @@ pub async fn profile_context_window(profile: &crate::ProviderProfile) -> Option<
         return context_window(&profile.model).await;
     }
     let data = crate::catalogue::snapshot();
-    profile_meta(profile, &data.entries, true).and_then(|meta| meta.context)
+    profile_meta(profile, &data.entries).and_then(|meta| meta.context)
 }
 
 /// The request field this model must be sent its own earlier thinking under,
@@ -599,7 +599,7 @@ pub(crate) fn thinking_field_in(
     profile: &crate::ProviderProfile,
     entries: &BTreeMap<String, ModelMeta>,
 ) -> Option<String> {
-    profile_meta(profile, entries, true)?.thinking_field.clone()
+    profile_meta(profile, entries)?.thinking_field.clone()
 }
 
 /// List price for a profile: input, output, then cache re-read and cache write
@@ -616,7 +616,7 @@ pub fn list_price(
     profile: &crate::ProviderProfile,
 ) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
     let data = crate::catalogue::snapshot();
-    let meta = profile_meta(profile, &data.entries, true)?;
+    let meta = profile_meta(profile, &data.entries)?;
     Some((
         meta.input_per_mtok?,
         meta.output_per_mtok?,
@@ -628,12 +628,9 @@ pub fn list_price(
 fn profile_meta<'a>(
     profile: &crate::ProviderProfile,
     entries: &'a BTreeMap<String, ModelMeta>,
-    legacy_fuzzy: bool,
 ) -> Option<&'a ModelMeta> {
     if profile.provider_id.is_some() {
         entries.get(&profile.catalogue_model_id().to_lowercase())
-    } else if legacy_fuzzy {
-        lookup(&profile.model, entries)
     } else {
         exact_lookup(&profile.model, entries)
     }
@@ -643,32 +640,7 @@ fn exact_lookup<'a>(
     model_id: &str,
     entries: &'a BTreeMap<String, ModelMeta>,
 ) -> Option<&'a ModelMeta> {
-    let needle = model_id.trim().to_lowercase();
-    if let Some(meta) = entries.get(&needle) {
-        return Some(meta);
-    }
-    let tail = needle.rsplit('/').next().unwrap_or(&needle);
-    (tail != needle).then(|| entries.get(tail)).flatten()
-}
-
-fn lookup<'a>(model_id: &str, entries: &'a BTreeMap<String, ModelMeta>) -> Option<&'a ModelMeta> {
-    let needle = model_id.to_lowercase();
-    // Exact match on the full id (as given, and stripped of a provider prefix).
-    if let Some(meta) = entries.get(&needle) {
-        return Some(meta);
-    }
-    let tail = needle.rsplit('/').next().unwrap_or(&needle);
-    if let Some(meta) = entries.get(tail) {
-        return Some(meta);
-    }
-    entries
-        .iter()
-        .filter(|(key, _)| {
-            needle.contains(key.as_str()) || tail.contains(key.as_str()) || key.contains(tail)
-        })
-        // `BTreeMap` order makes equal-length fuzzy matches deterministic.
-        .max_by_key(|(key, _)| key.len())
-        .map(|(_, value)| value)
+    entries.get(&model_id.trim().to_lowercase())
 }
 
 #[cfg(test)]
@@ -689,7 +661,7 @@ mod tests {
         .unwrap();
         let entries = flatten(raw);
         let prices = |model: &str| {
-            let meta = lookup(model, &entries).unwrap();
+            let meta = exact_lookup(model, &entries).unwrap();
             (meta.cached_input_per_mtok, meta.cache_write_per_mtok)
         };
         assert_eq!(prices("caching"), (Some(0.3), Some(3.75)));
@@ -764,7 +736,7 @@ mod tests {
             crate::AuthKind::Bearer,
         );
         profile.provider_id = Some("one".into());
-        let meta = profile_meta(&profile, &entries, true).unwrap();
+        let meta = profile_meta(&profile, &entries).unwrap();
         assert_eq!(meta.context, Some(8000));
         assert_eq!(meta.input_per_mtok, Some(1.0));
         assert_eq!(meta.capabilities.as_ref().unwrap().tool_calls, Some(true));
@@ -775,7 +747,7 @@ mod tests {
         );
         profile.provider_id = Some("unknown".into());
         profile.reasoning_efforts = None;
-        assert!(profile_meta(&profile, &entries, true).is_none());
+        assert!(profile_meta(&profile, &entries).is_none());
         apply_reasoning_efforts(&mut profile, &entries);
         assert!(profile.reasoning_efforts.is_none());
         profile.provider_id = Some("two".into());
@@ -948,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_and_fuzzy_match() {
+    fn exact_identity_keeps_similar_and_unknown_deployments_unknown() {
         let mut m = BTreeMap::new();
         m.insert(
             "qwen3-32b".to_string(),
@@ -978,22 +950,22 @@ mod tests {
         );
 
         assert_eq!(
-            lookup("qwen3-32b", &m).and_then(|x| x.context),
+            exact_lookup("qwen3-32b", &m).and_then(|x| x.context),
             Some(131_072)
         );
         assert_eq!(
-            lookup("nvidia/qwen3-32b-instruct", &m).and_then(|x| x.context),
-            Some(131_072)
+            exact_lookup("nvidia/qwen3-32b-instruct", &m).and_then(|x| x.context),
+            None
         );
-        assert!(lookup("totally-unknown-model", &m).is_none());
+        assert!(exact_lookup("totally-unknown-model", &m).is_none());
         // Pricing present only when models.dev lists both sides.
-        let opus = lookup("claude-opus-4", &m).unwrap();
+        let opus = exact_lookup("claude-opus-4", &m).unwrap();
         assert_eq!(opus.input_per_mtok, Some(15.0));
         assert_eq!(opus.output_per_mtok, Some(75.0));
     }
 
     #[test]
-    fn ambiguous_fuzzy_match_is_deterministic_and_prefers_the_most_specific_id() {
+    fn similar_and_unknown_provider_ids_never_borrow_prices_or_context() {
         let generic = ModelMeta {
             context: Some(8_192),
             input_per_mtok: Some(1.0),
@@ -1020,10 +992,10 @@ mod tests {
         ]);
 
         for _ in 0..32 {
-            let matched = lookup("vendor/qwen3-32b-instruct", &entries).unwrap();
+            assert!(exact_lookup("vendor/qwen3-32b-instruct", &entries).is_none());
+            assert!(exact_lookup("unknown/qwen3-32b", &entries).is_none());
+            let matched = exact_lookup("qwen3-32b", &entries).unwrap();
             assert_eq!(matched.context, specific.context);
-            assert_eq!(matched.input_per_mtok, specific.input_per_mtok);
-            assert_eq!(matched.output_per_mtok, specific.output_per_mtok);
         }
     }
 

@@ -34,6 +34,9 @@ pub struct Config {
     pub auxiliary: AuxiliaryConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    /// Machine-local protection and checkpoint limits; never loaded from a repo.
+    #[serde(default)]
+    pub security: kernel::mutations::Settings,
     /// User-scoped, secret-free MCP definitions.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
@@ -221,11 +224,15 @@ where
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// Provider id; `None` retains legacy environment auto-detection.
+    /// Provider id; `None` uses the keyless DuckDuckGo default.
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
     pub searxng_url: Option<String>,
+    #[serde(default)]
+    pub tavily_extract: bool,
+    #[serde(default)]
+    pub tavily_crawl: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -431,23 +438,20 @@ impl SearchEnv {
     pub fn from_process() -> Self {
         let value = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Self {
-            tavily: value("TAVILY_API_KEY"),
-            brave: value("BRAVE_API_KEY"),
+            tavily: tools::search_environment::key(
+                None,
+                false,
+                "MEDHA_TAVILY_API_KEY",
+                "TAVILY_API_KEY",
+            ),
+            brave: tools::search_environment::key(
+                None,
+                false,
+                "MEDHA_BRAVE_API_KEY",
+                "BRAVE_API_KEY",
+            ),
             searxng: value("MEDHA_SEARXNG_URL"),
         }
-    }
-}
-
-fn auto_detect_search_provider(env: &SearchEnv) -> tools::SearchProvider {
-    use tools::SearchProvider as P;
-    if env.tavily.is_some() {
-        P::Tavily
-    } else if env.brave.is_some() {
-        P::Brave
-    } else if env.searxng.is_some() {
-        P::Searxng
-    } else {
-        P::DuckDuckGo
     }
 }
 
@@ -459,13 +463,26 @@ pub fn resolve_search(cfg: &Config) -> tools::SearchSettings {
 pub fn resolve_search_with(cfg: &Config, env: SearchEnv) -> tools::SearchSettings {
     let provider = match cfg.search.provider.as_deref() {
         Some(p) => tools::SearchProvider::from_id(p),
-        None => auto_detect_search_provider(&env),
+        None => tools::SearchProvider::DuckDuckGo,
     };
     tools::SearchSettings {
         provider,
+        configuration_error: cfg
+            .search
+            .provider
+            .as_deref()
+            .filter(|id| {
+                !["duckduckgo", "tavily", "brave", "searxng"]
+                    .contains(&id.trim().to_ascii_lowercase().as_str())
+            })
+            .map(|_| {
+                "Unknown saved search provider; choose a provider in /search or settings".into()
+            }),
         tavily_key: load_key("search://tavily").or(env.tavily),
         brave_key: load_key("search://brave").or(env.brave),
         searxng_url: cfg.search.searxng_url.clone().or(env.searxng),
+        tavily_extract: cfg.search.tavily_extract,
+        tavily_crawl: cfg.search.tavily_crawl,
         captured: true,
     }
 }
@@ -589,6 +606,16 @@ pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
     }
 
     select_state_dir(&home, &workspace)
+}
+
+pub fn command_snapshots_dir(workspace: &std::path::Path) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let root =
+        context::workspace::project_root(workspace, &home)?.unwrap_or_else(|| workspace.to_owned());
+    Ok(state_dir(&root)?.join("command-snapshots"))
 }
 
 /// A workspace's state only if it already has one bound to it; reading never mints an empty store.

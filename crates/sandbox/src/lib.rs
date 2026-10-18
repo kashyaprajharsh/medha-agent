@@ -12,17 +12,23 @@ use permissions::PermissionManager;
 use sha2::{Digest, Sha256};
 
 pub mod command_resources;
+mod container_user;
+pub mod environment;
 pub mod exec;
 mod git_controls;
 #[cfg(target_os = "linux")]
 mod git_namespace;
-#[cfg(any(windows, target_os = "linux", test))]
 mod git_snapshot;
+#[cfg(unix)]
+mod git_snapshot_unix;
 /// Kernel-level network-denial detection. Linux only: it is built on seccomp's
 /// user-notification mechanism, which has no counterpart elsewhere.
 #[cfg(target_os = "linux")]
 pub(crate) mod netnotify;
+mod protected_commands;
 pub mod scratch;
+#[cfg(not(unix))]
+mod snapshot_paths;
 #[cfg(target_os = "linux")]
 pub(crate) mod socket_filter;
 pub use exec::{
@@ -49,6 +55,11 @@ pub enum SandboxError {
     Permission(#[from] permissions::PermissionError),
     #[error("write target changed after approval: {0}")]
     Conflict(String),
+    #[error("file was published, but post-write verification failed: {message}")]
+    Published {
+        snapshot: Option<String>,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,13 +407,32 @@ fn open_regular_file_at(
 }
 
 fn inspect_open_file(mut file: std::fs::File) -> Result<GuardedInspection, SandboxError> {
+    inspect_open_file_bounded(&mut file, usize::MAX)
+}
+
+fn inspect_open_file_bounded(
+    file: &mut std::fs::File,
+    limit: usize,
+) -> Result<GuardedInspection, SandboxError> {
     use std::io::Read;
     let metadata = file
         .metadata()
         .map_err(|error| SandboxError::Io(error.to_string()))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    if metadata.len() > limit as u64 {
+        return Err(SandboxError::Io(
+            "checkpoint exceeds its byte allowance".into(),
+        ));
+    }
+    (&mut *file)
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|error| SandboxError::Io(error.to_string()))?;
+    if bytes.len() > limit {
+        return Err(SandboxError::Io(
+            "checkpoint source grew past its byte allowance".into(),
+        ));
+    }
     let sha256: [u8; 32] = Sha256::digest(&bytes).into();
     #[cfg(unix)]
     let identity = {
@@ -445,6 +475,14 @@ fn inspect_open_file(mut file: std::fs::File) -> Result<GuardedInspection, Sandb
 
 #[cfg(unix)]
 fn inspect_capability(capability: &UnixWriteCapability) -> Result<GuardedInspection, SandboxError> {
+    inspect_capability_bounded(capability, usize::MAX)
+}
+
+#[cfg(unix)]
+fn inspect_capability_bounded(
+    capability: &UnixWriteCapability,
+    limit: usize,
+) -> Result<GuardedInspection, SandboxError> {
     let Some(parent) = capability.open_parent(false)? else {
         return Ok(GuardedInspection {
             state: GuardedFileState::Missing,
@@ -452,7 +490,7 @@ fn inspect_capability(capability: &UnixWriteCapability) -> Result<GuardedInspect
         });
     };
     match open_regular_file_at(&parent, &capability.leaf)? {
-        Some(file) => inspect_open_file(file),
+        Some(mut file) => inspect_open_file_bounded(&mut file, limit),
         None => Ok(GuardedInspection {
             state: GuardedFileState::Missing,
             bytes: None,
@@ -1000,10 +1038,12 @@ fn copy_required_metadata(
 }
 
 #[cfg(unix)]
+/// `sealed: false` defers the device flush to one `seal_command_snapshots` call.
 fn write_snapshot_capability(
     snapshots: &Path,
     source: &std::fs::File,
     bytes: &[u8],
+    sealed: bool,
 ) -> Result<String, SandboxError> {
     use std::io::Write;
     let directory = open_absolute_dir(snapshots, true)?
@@ -1015,6 +1055,20 @@ fn write_snapshot_capability(
         file.write_all(bytes)
             .map_err(|error| SandboxError::Io(error.to_string()))?;
         copy_required_metadata(source, &file)?;
+        if !sealed {
+            // Off Linux the data reaches the drive here and the seal flushes its cache;
+            // Linux's seal writes the whole filesystem with one syncfs.
+            #[cfg(not(target_os = "linux"))]
+            {
+                use std::os::fd::AsRawFd;
+                if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+                    return Err(SandboxError::Io(
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
         file.sync_all()
             .map_err(|error| SandboxError::Io(error.to_string()))?;
         directory
@@ -1069,7 +1123,9 @@ fn write_through_capability(
     }
 
     let snapshot_id = match (&initial.bytes, &original_file) {
-        (Some(bytes), Some(source)) => Some(write_snapshot_capability(snapshots, source, bytes)?),
+        (Some(bytes), Some(source)) => {
+            Some(write_snapshot_capability(snapshots, source, bytes, true)?)
+        }
         _ => None,
     };
     let mut temporary = capability.leaf.clone();
@@ -1134,10 +1190,32 @@ fn write_through_capability(
         }
         return Err(error);
     }
-    parent
-        .sync_all()
-        .map_err(|error| SandboxError::Io(error.to_string()))?;
-    Ok(snapshot_id)
+    let published = (|| {
+        parent
+            .sync_all()
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        let file = open_regular_file_at(&parent, &capability.leaf)?
+            .ok_or_else(|| SandboxError::Io("published file disappeared".into()))?;
+        inspect_open_file(file)
+    })();
+    verify_publication(published, contents, snapshot_id)
+}
+
+fn verify_publication(
+    inspection: Result<GuardedInspection, SandboxError>,
+    intended: &[u8],
+    snapshot: Option<String>,
+) -> Result<Option<String>, SandboxError> {
+    match inspection {
+        Ok(actual) if actual.bytes.as_deref() == Some(intended) => Ok(snapshot),
+        result => Err(SandboxError::Published {
+            snapshot,
+            message: match result {
+                Ok(_) => "published content differs from the intended bytes; no automatic rollback was attempted".into(),
+                Err(error) => error.to_string(),
+            },
+        }),
+    }
 }
 
 #[cfg(unix)]
@@ -1315,6 +1393,7 @@ fn read_line_range_bounded<R: std::io::Read>(
 pub struct WorkspaceSandbox {
     root: PathBuf,
     snapshots: PathBuf,
+    command_snapshots: Option<PathBuf>,
     permission_manager: Arc<PermissionManager>,
     /// Backend that runs shell/build/VCS commands (host or OS-native jail).
     exec: Arc<dyn ExecBackend>,
@@ -1872,6 +1951,7 @@ impl WorkspaceSandbox {
         Ok(Self {
             root,
             snapshots,
+            command_snapshots: None,
             permission_manager: Arc::new(permission_manager),
             exec: Arc::new(HostBackend),
             write_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1892,6 +1972,7 @@ impl WorkspaceSandbox {
         Ok(Self {
             root,
             snapshots,
+            command_snapshots: None,
             permission_manager: Arc::new(permission_manager),
             exec: Arc::new(HostBackend),
             write_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1903,6 +1984,10 @@ impl WorkspaceSandbox {
     /// selection because `x`, `./x`, an absolute path and a symlink are one file.
     pub async fn path_guard(&self, path: &str) -> Result<WritePathGuard, SandboxError> {
         let resolved = self.resolve_for_write(path).await?;
+        self.guard_resolved(resolved).await
+    }
+
+    async fn guard_resolved(&self, resolved: PathBuf) -> Result<WritePathGuard, SandboxError> {
         let lock = self.path_lock(&resolved);
         let guard = lock.mutex.clone().lock_owned().await;
         #[cfg(unix)]
@@ -2107,6 +2192,171 @@ impl WorkspaceSandbox {
     pub fn with_snapshots_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.snapshots = dir.into();
         self
+    }
+
+    pub fn snapshots_dir(&self) -> &Path {
+        &self.snapshots
+    }
+
+    pub fn with_command_snapshots_dir(mut self, directory: PathBuf) -> Self {
+        self.command_snapshots = Some(directory);
+        self
+    }
+    pub fn command_snapshots_dir(&self) -> &Path {
+        self.command_snapshots.as_deref().unwrap_or(&self.snapshots)
+    }
+    /// One device flush for every checkpoint file written since the last seal.
+    pub fn seal_command_snapshots(&self) -> Result<(), SandboxError> {
+        #[cfg(unix)]
+        {
+            let directory = std::fs::File::open(self.command_snapshots_dir())
+                .map_err(|e| SandboxError::Io(e.to_string()))?;
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                if unsafe { libc::syncfs(directory.as_raw_fd()) } != 0 {
+                    return Err(SandboxError::Io(
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                }
+            }
+            directory
+                .sync_all()
+                .map_err(|e| SandboxError::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+    pub fn discard_snapshot(&self, id: &str) -> Result<(), SandboxError> {
+        match std::fs::remove_file(self.snapshot_path(id)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SandboxError::Io(error.to_string())),
+        }
+    }
+
+    /// Reuse the file writer's metadata-preserving snapshot without publishing
+    /// a write. The held capability and revision comparison pin the backup.
+    pub async fn checkpoint_file(
+        &self,
+        path: &str,
+        remaining: usize,
+    ) -> Result<(String, String, usize), SandboxError> {
+        let path = Path::new(path);
+        if path.strip_prefix(&self.root).map_or(true, |relative| {
+            relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        }) {
+            return Err(SandboxError::Escape(
+                "checkpoint path is outside its workspace".into(),
+            ));
+        }
+        refuse_protected(path.to_owned())?;
+        // No permission UI and no canonicalization through attacker-controlled
+        // links. UnixWriteCapability anchors every component with O_NOFOLLOW.
+        let guard = self.guard_resolved(path.to_owned()).await?;
+        #[cfg(unix)]
+        let inspection = inspect_capability_bounded(&guard.capability, remaining)?;
+        #[cfg(not(unix))]
+        let inspection = inspect_open_file_bounded(
+            &mut std::fs::File::open(guard.resolved())
+                .map_err(|e| SandboxError::Io(e.to_string()))?,
+            remaining,
+        )?;
+        let bytes = inspection
+            .bytes
+            .ok_or_else(|| SandboxError::Io("checkpoint source disappeared".into()))?;
+        if bytes.len() > remaining {
+            return Err(SandboxError::Io(
+                "checkpoint exceeds its byte allowance".into(),
+            ));
+        }
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        #[cfg(unix)]
+        let id = {
+            let parent = guard
+                .capability
+                .open_parent(false)?
+                .ok_or_else(|| SandboxError::Io("checkpoint source disappeared".into()))?;
+            let source = open_regular_file_at(&parent, &guard.capability.leaf)?
+                .ok_or_else(|| SandboxError::Io("checkpoint source disappeared".into()))?;
+            if inspect_open_file(
+                source
+                    .try_clone()
+                    .map_err(|e| SandboxError::Io(e.to_string()))?,
+            )?
+            .state
+                != inspection.state
+            {
+                return Err(SandboxError::Io(
+                    "checkpoint source changed during backup".into(),
+                ));
+            }
+            write_snapshot_capability(self.command_snapshots_dir(), &source, &bytes, false)?
+        };
+        #[cfg(not(unix))]
+        let id = Self::snapshot_if_exists_at(self.command_snapshots_dir(), guard.resolved())?
+            .ok_or_else(|| SandboxError::Io("checkpoint source disappeared".into()))?;
+        if self.inspect_guarded(&guard).await?.state != inspection.state {
+            let _ = std::fs::remove_file(self.command_snapshots_dir().join(&id));
+            return Err(SandboxError::Io(
+                "checkpoint source changed during backup".into(),
+            ));
+        }
+        let id = if self.command_snapshots.is_some() {
+            format!("command:{id}")
+        } else {
+            id
+        };
+        Ok((id, digest, bytes.len()))
+    }
+
+    /// A command checkpoint never overwrites a subsequent human edit.
+    pub async fn restore_revision(
+        &self,
+        file: &kernel::events::FileRollback,
+    ) -> Result<(), SandboxError> {
+        let guard = self.path_guard(&file.path).await?;
+        if let Some(expected) = &file.expected {
+            if guard.resolved() != self.root.join(&file.path) {
+                return Err(SandboxError::Conflict(
+                    "undo target now resolves through a different path; preserved it".into(),
+                ));
+            }
+            let inspection = self.inspect_guarded(&guard).await?;
+            let actual = inspection
+                .bytes
+                .as_ref()
+                .map(|bytes| format!("{:x}", sha2::Sha256::digest(bytes)));
+            if expected == "unknown" || actual.as_deref().unwrap_or("missing") != expected {
+                return Err(SandboxError::Io(format!(
+                    "{} changed after the command; preserved it",
+                    file.path
+                )));
+            }
+        }
+        self.restore_guarded(&guard, file.snapshot.as_deref()).await
+    }
+
+    pub async fn restore_plan(
+        &self,
+        files: &[kernel::events::FileRollback],
+    ) -> Result<usize, SandboxError> {
+        for file in files {
+            if let Some(id) = &file.snapshot
+                && !self.snapshot_path(id)?.is_file()
+            {
+                return Err(SandboxError::Io(
+                    "A required checkpoint has expired; no files were restored".into(),
+                ));
+            }
+        }
+        let mut count = 0;
+        for file in files {
+            self.restore_revision(file).await?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     pub fn exec_backend_label(&self) -> &str {
@@ -2710,7 +2960,10 @@ impl WorkspaceSandbox {
                     }
                     return Err(error);
                 }
-                Ok(snapshot_id)
+                let published = std::fs::File::open(&resolved)
+                    .map_err(|error| SandboxError::Io(error.to_string()))
+                    .and_then(inspect_open_file);
+                verify_publication(published, &contents, snapshot_id)
             })
             .await
             .map_err(|e| SandboxError::Io(e.to_string()))?
@@ -2782,8 +3035,12 @@ impl WorkspaceSandbox {
         #[cfg(unix)]
         {
             let capability = guard.capability.try_clone()?;
-            let snapshots = self.snapshots.clone();
-            let snapshot = snapshot.map(str::to_owned);
+            let snapshots = if snapshot.is_some_and(|id| id.starts_with("command:")) {
+                self.command_snapshots_dir().to_owned()
+            } else {
+                self.snapshots.clone()
+            };
+            let snapshot = snapshot.map(|id| id.strip_prefix("command:").unwrap_or(id).to_owned());
             tokio::task::spawn_blocking(move || {
                 restore_through_capability(&capability, &snapshots, snapshot.as_deref())
             })
@@ -2855,10 +3112,14 @@ impl WorkspaceSandbox {
     /// Snapshot ids are ULIDs (Crockford base32); reject anything else so a
     /// restore can never read a path outside the snapshots directory.
     fn snapshot_path(&self, id: &str) -> Result<PathBuf, SandboxError> {
+        let (directory, id) = match id.strip_prefix("command:") {
+            Some(id) => (self.command_snapshots_dir(), id),
+            None => (self.snapshots.as_path(), id),
+        };
         if id.len() != 26 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(SandboxError::Escape(format!("invalid snapshot id: {id}")));
         }
-        Ok(self.snapshots.join(id))
+        Ok(directory.join(id))
     }
 }
 

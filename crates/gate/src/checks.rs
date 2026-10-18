@@ -65,7 +65,7 @@ enum PreparedCommandBackend {
     #[cfg(test)]
     Direct(Arc<dyn ExecBackend>),
     Container {
-        backend: sandbox::exec::ContainerBackend,
+        backend: Box<sandbox::exec::ContainerBackend>,
         lease: ContainerLease,
     },
 }
@@ -285,14 +285,15 @@ impl CommandRunner {
                     Some("4g".into()),
                     Some(config.pids.unwrap_or(256).clamp(1, 512)),
                     container_name.clone(),
-                );
+                )
+                .with_user(config.user.clone());
                 if backend.containment() != Containment::OsFsJailNoNet {
                     return Err(
                         "configured backend does not confine both filesystem and network".into(),
                     );
                 }
                 Ok(PreparedCommandBackend::Container {
-                    backend,
+                    backend: Box::new(backend),
                     lease: ContainerLease::new(runtime, container_name),
                 })
             }
@@ -312,9 +313,10 @@ impl CommandRunner {
                     Some("4g".into()),
                     Some(256),
                     container_name.clone(),
-                );
+                )
+                .with_user(Some("65534:65534".into()));
                 Ok(PreparedCommandBackend::Container {
-                    backend,
+                    backend: Box::new(backend),
                     lease: ContainerLease::new(runtime.clone(), container_name),
                 })
             }
@@ -806,7 +808,7 @@ async fn execute_command(
             let lifecycle = tokio::spawn(async move {
                 let _check_env = check_env;
                 execute_container_lifecycle(
-                    backend,
+                    *backend,
                     lease,
                     request,
                     timeout,
@@ -875,6 +877,10 @@ async fn execute_container_lifecycle(
             return Ok(cancelled_before_start());
         }
 
+        let backend = backend
+            .prepare_execution()
+            .await
+            .map_err(|error| error.to_string())?;
         let create_command = backend
             .build_create_command(&request)
             .map_err(|error| error.to_string())?;

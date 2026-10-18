@@ -8,6 +8,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+pub mod fetch;
 mod workspace;
 pub use workspace::project_root;
 
@@ -64,7 +65,25 @@ fn arguments_with_environment(
     args: &[String],
     env: Vec<(OsString, OsString)>,
 ) -> Result<Vec<String>, String> {
-    let fixed = fixed();
+    configured_arguments(dir, args, env, false, false)
+}
+
+/// Raw content operations never execute even an operator-configured filter.
+pub fn raw_arguments(dir: &Path, args: &[String]) -> Result<Vec<String>, String> {
+    configured_arguments(dir, args, environment(), true, false)
+}
+
+fn configured_arguments(
+    dir: &Path,
+    args: &[String],
+    env: Vec<(OsString, OsString)>,
+    raw: bool,
+    operator_auth: bool,
+) -> Result<Vec<String>, String> {
+    let mut fixed = fixed();
+    if operator_auth {
+        fixed.retain(|setting| setting != "credential.helper=");
+    }
     let mut child = Command::new("git")
         .arg("--no-pager")
         .args(fixed.iter().flat_map(|value| ["-c", value]))
@@ -139,6 +158,10 @@ fn arguments_with_environment(
             blocked.insert(driver.to_owned());
         }
     }
+    if raw {
+        blocked.extend(drivers);
+        trusted.clear();
+    }
     let mut settings = fixed;
     let reading = args.first().is_some_and(|command| {
         matches!(
@@ -168,7 +191,7 @@ fn arguments_with_environment(
                 "clean=",
                 "smudge=",
                 "process=",
-                if reading {
+                if reading || raw {
                     "required=false"
                 } else {
                     "required=true"
@@ -225,7 +248,9 @@ fn trusted_origin(scope: &[u8], origin: &[u8], workspace: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0
+        meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o002 == 0
+            && (meta.mode() & 0o020 == 0 || private_group(meta.gid()))
     }
     #[cfg(not(unix))]
     {
@@ -233,6 +258,49 @@ fn trusted_origin(scope: &[u8], origin: &[u8], workspace: &Path) -> bool {
             .and_then(|home| std::fs::canonicalize(home).ok())
             .is_some_and(|home| real.starts_with(home))
     }
+}
+
+/// A user-private group (the Ubuntu default): the user's primary group, named after
+/// them and listing no members, so group write grants no one else.
+#[cfg(unix)]
+fn private_group(gid: libc::gid_t) -> bool {
+    use std::ffi::CStr;
+    if gid != unsafe { libc::getegid() } {
+        return false;
+    }
+    let mut user_buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut user: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let looked_up = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut user,
+            user_buffer.as_mut_ptr(),
+            user_buffer.len(),
+            &mut found,
+        )
+    };
+    if looked_up != 0 || found.is_null() {
+        return false;
+    }
+    let mut group_buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let looked_up = unsafe {
+        libc::getgrgid_r(
+            gid,
+            &mut group,
+            group_buffer.as_mut_ptr(),
+            group_buffer.len(),
+            &mut found,
+        )
+    };
+    if looked_up != 0 || found.is_null() {
+        return false;
+    }
+    let named = unsafe { CStr::from_ptr(group.gr_name) == CStr::from_ptr(user.pw_name) };
+    let alone = group.gr_mem.is_null() || unsafe { (*group.gr_mem).is_null() };
+    named && alone
 }
 
 #[cfg(test)]

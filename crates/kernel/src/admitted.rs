@@ -58,6 +58,32 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     sink.notice(&format!("Outbound request blocked: {}. Use /outbound allow {} to approve this exact payload.", review["reason"].as_str().unwrap_or("private content"), review["id"].as_str().unwrap_or_default()));
                     obs.payload["outbound"] = serde_json::json!({"id":review["id"]});
                 }
+                let reviews = self.egress.mutations.notices();
+                for review in &reviews {
+                    let action = if review["allowable"] == true {
+                        format!(
+                            " Use /protected allow {} to apply this exact change once.",
+                            review["id"].as_str().unwrap_or_default()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    sink.notice(&format!(
+                        "Protected change held: {}.{action}",
+                        review["reason"].as_str().unwrap_or("protected file")
+                    ));
+                }
+                if let Some(first) = reviews.first() {
+                    if obs.payload.get("mutation").is_none() {
+                        obs.payload["mutation"] = serde_json::json!({"id":first["id"]});
+                    }
+                    obs.payload["mutations"] = serde_json::json!(
+                        reviews
+                            .iter()
+                            .map(|review| serde_json::json!({"id":review["id"]}))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 obs
             };
             tokio::pin!(fut);
@@ -257,6 +283,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
         }
         let event = self.log.append(event).await?;
+        self.executor.observation_delivered(&tool, &obs);
         let screen = event.payload.get(crate::events::TOOL_SCREEN_FIELD).cloned();
         crate::events::strip_private_observation_fields(&mut obs.payload);
         window_events.push(event.id);

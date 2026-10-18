@@ -33,6 +33,7 @@ pub(crate) fn strip_private_observation_fields(payload: &mut Value) {
         object.remove(AGENT_REPORT_ACKS_FIELD);
         object.remove(TOOL_SCREEN_FIELD);
         object.remove(TOOL_ARTIFACT_FIELD);
+        object.remove("_checkpoint_files");
     }
 }
 
@@ -125,6 +126,7 @@ pub enum EventKind {
     AgentPatch,
     /// A patch merged into the working tree.
     AgentApplied,
+    ProtectedApplied,
 }
 
 impl EventKind {
@@ -157,6 +159,7 @@ impl EventKind {
             EventKind::AgentDelivered => "agent.delivered",
             EventKind::AgentPatch => "agent.patch",
             EventKind::AgentApplied => "agent.applied",
+            EventKind::ProtectedApplied => "protected.applied",
         }
     }
 
@@ -188,6 +191,7 @@ impl EventKind {
             "agent.delivered" => EventKind::AgentDelivered,
             "agent.patch" => EventKind::AgentPatch,
             "agent.applied" => EventKind::AgentApplied,
+            "protected.applied" => EventKind::ProtectedApplied,
             _ => return None,
         })
     }
@@ -415,6 +419,15 @@ impl Event {
             EventKind::AgentApplied,
             json!({ "dispatch": dispatch.to_string() }),
             TrustLabel::System,
+        )
+    }
+
+    pub fn protected_applied(s: &Session, id: &str, result: Value) -> Self {
+        Self::new(
+            s,
+            EventKind::ProtectedApplied,
+            json!({"id":id,"payload":result}),
+            TrustLabel::User,
         )
     }
 
@@ -886,6 +899,9 @@ pub fn cut_index(events: &[Event], at_event: Ulid) -> Option<usize> {
 pub struct FileRollback {
     pub path: String,
     pub snapshot: Option<String>,
+    /// Digest after the command, "missing", or "unknown" for an interrupted
+    /// command. Legacy file-tool records have no conditional revision.
+    pub expected: Option<String>,
 }
 
 /// Normalize recorded write paths so aliases share one rollback entry.
@@ -939,35 +955,81 @@ pub fn rollback_plan_in(
     let Some(idx) = cut_index(events, at_event) else {
         return Vec::new();
     };
-    let mut seen = std::collections::HashSet::new();
-    let mut plan = Vec::new();
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    let mut plan: Vec<FileRollback> = Vec::new();
+    let completed: std::collections::HashSet<_> = events[idx..]
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::ToolObs
+                && event.payload["payload"]["_checkpoint_files"].is_array()
+        })
+        .filter_map(|event| event.payload["intent_id"].as_str())
+        .collect();
     for e in &events[idx..] {
-        if e.kind != EventKind::ToolObs {
+        if !matches!(
+            e.kind,
+            EventKind::ToolObs | EventKind::ToolEffectPrepared | EventKind::ProtectedApplied
+        ) {
+            continue;
+        }
+        if e.kind == EventKind::ToolEffectPrepared
+            && e.payload["intent_id"]
+                .as_str()
+                .is_some_and(|id| completed.contains(id))
+        {
             continue;
         }
         // Observation payload is { intent_id, ok, payload: <tool result json> }.
-        let Some(result) = e.payload.get("payload").and_then(Value::as_object) else {
+        let Some(result) = (if e.kind == EventKind::ToolEffectPrepared {
+            Some(&e.payload)
+        } else {
+            e.payload.get("payload")
+        })
+        .and_then(Value::as_object) else {
             continue;
         };
-        // File-changing results (`write`, `edit`) are exactly those carrying
-        // both a `path` and a `snapshot` key (id or null), whatever the tool name.
-        if !result.contains_key("snapshot") {
-            continue;
+        let rows: Vec<_> = result
+            .get("_checkpoint_files")
+            .and_then(Value::as_array)
+            .map_or_else(|| vec![Value::Object(result.clone())], Clone::clone);
+        for row in rows {
+            let Some(result) = row.as_object() else {
+                continue;
+            };
+            // File-changing results (`write`, `edit`) are exactly those carrying
+            // both a `path` and a `snapshot` key (id or null), whatever the tool name.
+            if !result.contains_key("snapshot") {
+                continue;
+            }
+            let Some(path) = result.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let identity = rollback_path_identity(path, workspace_root);
+            let expected = result
+                .get("expected")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(at) = seen.get(&identity) {
+                // Preserve the first backup and the most recent command revision.
+                if expected.is_some() || plan[*at].expected.is_some() {
+                    plan[*at].expected = expected.or_else(|| Some("unknown".into()));
+                }
+                continue;
+            }
+            if result.get("before").is_some() && result.get("before") == result.get("expected") {
+                continue;
+            }
+            seen.insert(identity, plan.len());
+            let snapshot = result
+                .get("snapshot")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            plan.push(FileRollback {
+                path: path.to_string(),
+                snapshot,
+                expected,
+            });
         }
-        let Some(path) = result.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        if !seen.insert(rollback_path_identity(path, workspace_root)) {
-            continue; // keep the earliest write per path — that's the cut state
-        }
-        let snapshot = result
-            .get("snapshot")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        plan.push(FileRollback {
-            path: path.to_string(),
-            snapshot,
-        });
     }
     plan
 }
@@ -2701,11 +2763,13 @@ mod tests {
             vec![
                 FileRollback {
                     path: "src/lib.rs".into(),
-                    snapshot: Some("SNAP1".into())
+                    snapshot: Some("SNAP1".into()),
+                    expected: None,
                 },
                 FileRollback {
                     path: "src/main.rs".into(),
-                    snapshot: None
+                    snapshot: None,
+                    expected: None,
                 },
             ],
             "earliest post-cut write per path; pre-cut writes untouched"

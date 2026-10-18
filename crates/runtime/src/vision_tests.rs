@@ -60,49 +60,55 @@ fn auxiliary(address: &str) -> AuxiliaryVision {
 
 #[tokio::test]
 async fn the_auxiliary_model_receives_the_image_and_returns_a_description() {
-    let (address, server) = endpoint(1).await;
-    let aux = auxiliary(&address);
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        let (address, server) = endpoint(1).await;
+        let aux = auxiliary(&address);
 
-    let description = aux
-        .describe("hash-1", "image/png", b"pixels")
-        .await
-        .unwrap();
+        let description = aux
+            .describe("hash-1", "image/png", b"pixels")
+            .await
+            .unwrap();
 
-    assert_eq!(description, "A login form with a misaligned submit button.");
-    assert_eq!(aux.model(), "local/vision-model");
-    let request = &server.await.unwrap()[0];
-    assert_eq!(request["model"], "local/vision-model");
-    let content = request["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(
-        content[1]["image_url"]["url"],
-        format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(b"pixels")
-        )
-    );
+        assert_eq!(description, "A login form with a misaligned submit button.");
+        assert_eq!(aux.model(), "local/vision-model");
+        let request = &server.await.unwrap()[0];
+        assert_eq!(request["model"], "local/vision-model");
+        let content = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(b"pixels")
+            )
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn the_same_image_is_not_paid_for_twice() {
-    let (address, server) = endpoint(1).await;
-    let aux = auxiliary(&address);
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        let (address, server) = endpoint(1).await;
+        let aux = auxiliary(&address);
 
-    let first = aux
-        .describe("hash-1", "image/png", b"pixels")
-        .await
-        .unwrap();
-    let second = aux
-        .describe("hash-1", "image/png", b"pixels")
-        .await
-        .unwrap();
+        let first = aux
+            .describe("hash-1", "image/png", b"pixels")
+            .await
+            .unwrap();
+        let second = aux
+            .describe("hash-1", "image/png", b"pixels")
+            .await
+            .unwrap();
 
-    assert_eq!(first, second);
-    assert_eq!(
-        server.await.unwrap().len(),
-        1,
-        "the cached description must not reach the network"
-    );
+        assert_eq!(first, second);
+        assert_eq!(
+            server.await.unwrap().len(),
+            1,
+            "the cached description must not reach the network"
+        );
+    })
+    .await;
 }
 
 /// A real picture too large for a server comes back under the size asked for,
@@ -147,10 +153,13 @@ fn a_picture_refused_for_its_height_is_made_to_fit() {
 
 #[tokio::test]
 async fn an_unreachable_auxiliary_model_fails_loudly() {
-    let aux = auxiliary("http://127.0.0.1:1/v1");
-    let error = aux
-        .describe("hash-1", "image/png", b"pixels")
-        .await
-        .unwrap_err();
-    assert!(error.contains("auxiliary vision request failed"), "{error}");
+    kernel::auxiliary::scope(kernel::Budget::default(), String::new(), None, async {
+        let aux = auxiliary("http://127.0.0.1:1/v1");
+        let error = aux
+            .describe("hash-1", "image/png", b"pixels")
+            .await
+            .unwrap_err();
+        assert!(error.contains("auxiliary vision request failed"), "{error}");
+    })
+    .await;
 }

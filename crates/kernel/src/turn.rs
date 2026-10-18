@@ -34,11 +34,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut attempt = 0u32;
         let mut stalls = 0u32;
         let mut cut_call_retries = 0u32;
-        let mut thinking_off_tried = false;
+        let (mut thinking_off_tried, mut output_limit_retried) = (false, false);
         let (mut reasoning_reset, mut schemas_plain) = (false, false);
         // A rate-limited key was already given its one more try.
         let mut limit_retried = false;
-        let mut output_limit_retried = false;
         let mut request = prepared.clone();
         // The model does not change inside one call, so neither does its price.
         let price = self.price();
@@ -58,38 +57,36 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             )
             .await;
             let mut cut = crate::cut_off::CutOff::default();
+            let mut attempt_usage = None;
             let outcome = self
-                .stream_turn(&request, sink, cancel, wall_deadline, &mut cut, join)
+                .stream_turn(
+                    &request,
+                    sink,
+                    cancel,
+                    wall_deadline,
+                    &mut cut,
+                    join,
+                    &mut attempt_usage,
+                )
                 .await;
-            self.observe_hook_with(
+            self.observe_model_completion(
                 session,
-                medha_extension_api::HookPoint::PostModel,
-                serde_json::json!({
-                    "model": &request.model,
-                    "attempt": attempt,
-                    "outcome": match &outcome {
-                        Ok((_, _, _, _, _, true)) => "interrupted",
-                        Ok(_) => "completed",
-                        Err(_) => "failed",
-                    },
-                }),
+                &request.model,
+                attempt,
+                outcome.as_ref().map(|data| data.5).ok(),
                 cancel,
             )
             .await;
+            let (usage, error) = match &outcome {
+                Ok(data) => (data.4, None),
+                Err((error, _)) => (attempt_usage, Some(error)),
+            };
+            reservation
+                .reconcile_attempt(usage, price, error)
+                .map_err(KernelError::Budget)?;
             match outcome {
-                Ok(data) => {
-                    reservation
-                        .reconcile(data.4, price)
-                        .map_err(KernelError::Budget)?;
-                    break data;
-                }
+                Ok(data) => break data,
                 Err((e, emitted)) => {
-                    // No authoritative usage survived this attempt. The request
-                    // may nevertheless have reached the provider, so consume
-                    // its full worst-case reservation.
-                    reservation
-                        .reconcile(None, price)
-                        .map_err(KernelError::Budget)?;
                     if matches!(e, crate::provider::ProviderError::Truncated) {
                         if !cut.tool_call {
                             // Thinking used the whole allowance and nothing was
@@ -509,9 +506,35 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         ))
     }
 
+    async fn observe_model_completion(
+        &self,
+        session: &Session,
+        model: &str,
+        attempt: u32,
+        interrupted: Option<bool>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) {
+        self.observe_hook_with(
+            session,
+            medha_extension_api::HookPoint::PostModel,
+            serde_json::json!({
+                "model": model,
+                "attempt": attempt,
+                "outcome": match interrupted {
+                    Some(true) => "interrupted",
+                    Some(false) => "completed",
+                    None => "failed",
+                },
+            }),
+            cancel,
+        )
+        .await;
+    }
+
     /// Establish and consume one model stream, emitting deltas to the sink as
     /// they arrive. Returns the compatibility view and exact completed message.
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn stream_turn(
         &self,
         prepared: &crate::provider::PreparedModelRequest,
@@ -520,6 +543,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         wall_deadline: Option<tokio::time::Instant>,
         cut: &mut crate::cut_off::CutOff,
         join: &mut crate::seam::Join,
+        attempt_usage: &mut Option<crate::Usage>,
     ) -> Result<
         (
             String,
@@ -722,6 +746,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 Ok(Block::Usage(u)) => {
                     usage_report.observe(u);
                     usage = Some(u);
+                    *attempt_usage = Some(u);
                 }
                 Ok(Block::CompletedMessage(message)) => {
                     if completed.is_some() {

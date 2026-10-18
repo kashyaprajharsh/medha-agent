@@ -95,10 +95,12 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
     };
     let mut restored = 0;
     if scope != "conversation" {
-        for file in kernel::rollback_plan_in(&events, at, resources.workspace.root()) {
-            resources.workspace.restore(&file.path, file.snapshot.as_deref()).await.map_err(|error| format!("Restored {restored} files, then could not restore {}: {error}. Conversation was kept.", file.path))?;
-            restored += 1;
-        }
+        let files = kernel::rollback_plan_in(&events, at, resources.workspace.root());
+        restored = resources
+            .workspace
+            .restore_plan(&files)
+            .await
+            .map_err(|error| format!("Code restore stopped: {error}. Conversation was kept."))?;
     }
     let source = session.id;
     if let Some(id) = new_id {

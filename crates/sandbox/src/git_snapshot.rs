@@ -1,11 +1,15 @@
+#[cfg(any(windows, target_os = "linux", test))]
 use crate::exec::ExecError;
+use std::{collections::BTreeMap, path::Path};
+#[cfg(any(windows, target_os = "linux", test))]
 use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
 };
 
+#[cfg(any(windows, target_os = "linux", test))]
 const BYTES: usize = 16 * 1024 * 1024;
+#[cfg(any(windows, target_os = "linux", test))]
 const ENTRIES: usize = 4096;
 
 #[cfg(windows)]
@@ -39,10 +43,14 @@ impl crate::exec::ExecBackend for Backend {
         "host"
     }
 }
+#[cfg(any(windows, target_os = "linux", test))]
 type Slots = BTreeMap<PathBuf, Weak<(Mutex<bool>, Condvar)>>;
+#[cfg(any(windows, target_os = "linux", test))]
 static SLOTS: Mutex<Slots> = Mutex::new(BTreeMap::new());
 
+#[cfg(any(windows, target_os = "linux", test))]
 struct Lease(Arc<(Mutex<bool>, Condvar)>);
+#[cfg(any(windows, target_os = "linux", test))]
 impl Drop for Lease {
     fn drop(&mut self) {
         *self.0.0.lock().unwrap() = false;
@@ -50,13 +58,55 @@ impl Drop for Lease {
     }
 }
 
-#[derive(Clone, PartialEq)]
-enum Node {
-    Missing,
-    File(Vec<u8>, bool),
-    Directory(BTreeMap<std::ffi::OsString, Node>, bool),
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Mode {
+    readonly: bool,
+    #[cfg(unix)]
+    bits: u32,
 }
 
+impl Mode {
+    pub(crate) fn from(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            readonly: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            bits: {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn apply_file(self, file: &std::fs::File) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(self.bits))
+    }
+
+    #[cfg(not(unix))]
+    fn apply(self, path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(self.bits))
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = std::fs::metadata(path)?.permissions();
+            permissions.set_readonly(self.readonly);
+            std::fs::set_permissions(path, permissions)
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum Node {
+    Missing,
+    File(Vec<u8>, Mode),
+    Directory(BTreeMap<std::ffi::OsString, Node>, Mode),
+}
+
+#[cfg(any(windows, target_os = "linux", test))]
 pub(crate) struct Snapshot {
     root: PathBuf,
     entry: Node,
@@ -66,6 +116,7 @@ pub(crate) struct Snapshot {
     restored: bool,
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
 impl Snapshot {
     pub fn new(root: &Path) -> Result<Self, ExecError> {
         let root = root.canonicalize().map_err(failed)?;
@@ -158,14 +209,14 @@ impl Snapshot {
             }
             if let Node::Directory(_, readonly) = self.entry {
                 let mut permissions = std::fs::metadata(&git)?.permissions();
-                if permissions.readonly() != readonly {
+                if permissions.readonly() != readonly.readonly {
                     changed = true;
                     #[cfg(windows)]
-                    permissions.set_readonly(readonly);
+                    permissions.set_readonly(readonly.readonly);
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        permissions.set_mode(if readonly {
+                        permissions.set_mode(if readonly.readonly {
                             permissions.mode() & !0o222
                         } else {
                             permissions.mode() | 0o200
@@ -182,6 +233,7 @@ impl Snapshot {
     }
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
 impl Drop for Snapshot {
     fn drop(&mut self) {
         if !self.restored {
@@ -190,7 +242,48 @@ impl Drop for Snapshot {
     }
 }
 
-fn read(path: &Path, budget: &mut (usize, usize), recursive: bool) -> std::io::Result<Node> {
+#[cfg(any(windows, target_os = "linux", test))]
+pub(crate) fn read(
+    path: &Path,
+    budget: &mut (usize, usize),
+    recursive: bool,
+) -> std::io::Result<Node> {
+    #[cfg(unix)]
+    {
+        crate::git_snapshot_unix::read(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("snapshot has no parent"))?,
+            Path::new(
+                path.file_name()
+                    .ok_or_else(|| std::io::Error::other("snapshot has no name"))?,
+            ),
+            budget,
+            recursive,
+        )
+    }
+    #[cfg(not(unix))]
+    crate::snapshot_paths::at_path(path, |path| read_inner(path, budget, recursive))
+        .map(|value| value.unwrap_or(Node::Missing))
+}
+
+pub(crate) fn read_below(
+    root: &Path,
+    relative: &Path,
+    budget: &mut (usize, usize),
+) -> std::io::Result<Node> {
+    #[cfg(unix)]
+    {
+        crate::git_snapshot_unix::read(root, relative, budget, false)
+    }
+    #[cfg(not(unix))]
+    crate::snapshot_paths::below(root, relative, false, |path| {
+        read_inner(path, budget, false)
+    })
+    .map(|value| value.unwrap_or(Node::Missing))
+}
+
+#[cfg(not(unix))]
+fn read_inner(path: &Path, budget: &mut (usize, usize), recursive: bool) -> std::io::Result<Node> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Node::Missing),
@@ -234,16 +327,16 @@ fn read(path: &Path, budget: &mut (usize, usize), recursive: bool) -> std::io::R
             .0
             .checked_sub(bytes.len())
             .ok_or_else(|| std::io::Error::other("Git snapshot exceeds 16 MiB"))?;
-        Ok(Node::File(bytes, meta.permissions().readonly()))
+        Ok(Node::File(bytes, Mode::from(&meta)))
     } else if meta.is_dir() {
         let mut children = BTreeMap::new();
         if recursive {
             for entry in std::fs::read_dir(path)? {
                 let entry = entry?;
-                children.insert(entry.file_name(), read(&entry.path(), budget, true)?);
+                children.insert(entry.file_name(), read_inner(&entry.path(), budget, true)?);
             }
         }
-        Ok(Node::Directory(children, meta.permissions().readonly()))
+        Ok(Node::Directory(children, Mode::from(&meta)))
     } else {
         Err(std::io::Error::other(
             "Git control entry is not a regular file or directory",
@@ -251,6 +344,7 @@ fn read(path: &Path, budget: &mut (usize, usize), recursive: bool) -> std::io::R
     }
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
 fn remove(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -284,7 +378,38 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn restore_node(path: &Path, node: &Node) -> std::io::Result<()> {
+#[cfg(any(windows, target_os = "linux", test))]
+pub(crate) fn restore_node(path: &Path, node: &Node) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        crate::git_snapshot_unix::write(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("snapshot has no parent"))?,
+            Path::new(
+                path.file_name()
+                    .ok_or_else(|| std::io::Error::other("snapshot has no name"))?,
+            ),
+            node,
+            false,
+        )
+    }
+    #[cfg(not(unix))]
+    crate::snapshot_paths::at_path(path, |path| restore_inner(path, node))?
+        .ok_or_else(|| std::io::Error::other("snapshot parent disappeared"))
+}
+
+pub(crate) fn restore_below(root: &Path, relative: &Path, node: &Node) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        crate::git_snapshot_unix::write(root, relative, node, true)
+    }
+    #[cfg(not(unix))]
+    crate::snapshot_paths::below(root, relative, true, |path| restore_inner(path, node))?
+        .ok_or_else(|| std::io::Error::other("snapshot parent disappeared"))
+}
+
+#[cfg(not(unix))]
+fn restore_inner(path: &Path, node: &Node) -> std::io::Result<()> {
     remove(path)?;
     match node {
         Node::Missing => return Ok(()),
@@ -292,23 +417,19 @@ fn restore_node(path: &Path, node: &Node) -> std::io::Result<()> {
         Node::Directory(children, _) => {
             std::fs::create_dir(path)?;
             for (name, node) in children {
-                restore_node(&path.join(name), node)?;
+                restore_inner(&path.join(name), node)?;
             }
         }
     }
-    let readonly = match node {
+    let mode = match node {
         Node::File(_, value) | Node::Directory(_, value) => *value,
-        _ => false,
+        Node::Missing => return Ok(()),
     };
-    if readonly {
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
+    mode.apply(path)
 }
 
-fn linked(meta: &std::fs::Metadata) -> bool {
+#[cfg(any(windows, target_os = "linux", test))]
+pub(crate) fn linked(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -320,6 +441,7 @@ fn linked(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
 fn directory_id(path: &Path) -> std::io::Result<(u64, u64)> {
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_dir() || linked(&meta) {
@@ -350,6 +472,7 @@ fn directory_id(path: &Path) -> std::io::Result<(u64, u64)> {
     }
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
 fn failed(error: std::io::Error) -> ExecError {
     ExecError::Unavailable(format!("cannot snapshot Git control files: {error}"))
 }

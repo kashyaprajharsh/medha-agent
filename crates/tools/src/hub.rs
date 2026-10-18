@@ -207,40 +207,8 @@ fn with_file_lock<T>(
     operation()
 }
 
-#[cfg(not(windows))]
 fn atomic_replace(source: &Path, target: &Path) -> Result<(), String> {
-    std::fs::rename(source, target).map_err(|error| error.to_string())
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error().to_string())
-    } else {
-        Ok(())
-    }
+    file_ops::replace(source, target).map_err(|error| error.to_string())
 }
 
 /// Search metadata; package download, scanning, and approval happen on install.

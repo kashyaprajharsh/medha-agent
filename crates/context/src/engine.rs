@@ -549,6 +549,10 @@ impl PipelineEngine {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Existing compaction pipeline; 411 Clippy lines, shrink only."
+    )]
     async fn compile_inner(
         &self,
         messages: &[Message],

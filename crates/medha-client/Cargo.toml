@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "medha-client"
 version.workspace = true

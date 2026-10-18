@@ -1110,6 +1110,10 @@ impl PickerKind {
     }
     /// Dynamic labels for each row. For `Session`, each row is a one-line
     /// summary (date · events · title) matching the `--sessions` headless format.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Existing picker label catalogue; 318 Clippy lines, shrink only."
+    )]
     fn labels(&self) -> Vec<String> {
         match self {
             PickerKind::Reasoning(state) => state.labels(),

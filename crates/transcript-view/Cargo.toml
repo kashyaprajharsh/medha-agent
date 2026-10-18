@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "transcript-view"
 description = "What Medha's desktop transcript may show: safe Markdown and tool targets"

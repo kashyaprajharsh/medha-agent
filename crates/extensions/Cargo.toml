@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "extensions"
 version.workspace = true
@@ -7,6 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+file-ops = { path = "../file-ops" }
 medha-extension-api = { path = "../extension-api" }
 kernel = { path = "../kernel" }
 sandbox = { path = "../sandbox" }
@@ -23,8 +27,3 @@ ulid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
-  "Win32_Storage_FileSystem",
-] }

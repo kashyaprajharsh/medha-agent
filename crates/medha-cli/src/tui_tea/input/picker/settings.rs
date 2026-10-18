@@ -1,0 +1,83 @@
+use super::*;
+
+pub(super) fn activate(model: &mut Model) -> bool {
+    let Some(picker) = model.picker.as_mut() else {
+        return false;
+    };
+    if matches!(picker.kind, PickerKind::AutonomyMode) {
+        let selected = picker.selected;
+        model.picker = None;
+        if let Some((level, _)) = AUTONOMY_MODES.get(selected).copied() {
+            set_autonomy(model, level);
+        }
+        return true;
+    }
+    if matches!(picker.kind, PickerKind::Theme) {
+        let selected = picker.selected;
+        model.picker = None;
+        if let Some((id, _)) = super::theme::modes().get(selected).copied() {
+            set_theme(model, id);
+        }
+        return true;
+    }
+    // `/search` step 1: a provider was chosen. DuckDuckGo needs
+    // nothing more and commits here; the others advance to the key
+    // (Tavily/Brave) or URL (SearXNG) input.
+    if matches!(picker.kind, PickerKind::SearchProvider) {
+        let selected = picker.selected;
+        model.picker = None;
+        let Some((provider, _)) = SEARCH_PROVIDERS.get(selected).copied() else {
+            model.search_setup = None;
+            return true;
+        };
+        if provider == tools::SearchProvider::DuckDuckGo {
+            commit_search(model, provider, None);
+        } else if let Some(setup) = model.search_setup.as_mut() {
+            setup.provider = provider;
+            setup.step = SearchSetupStep::Secret;
+            model.push_notice(match provider {
+                tools::SearchProvider::Searxng => {
+                    "SearXNG selected — enter its instance URL".to_string()
+                }
+                _ => format!("{} selected — enter the API key", provider.label()),
+            });
+        }
+        return true;
+    }
+    // Server-reported context can complete setup without another field.
+    if let PickerKind::ModelDiscovery { models, query } = &picker.kind {
+        let choice = discovered_matches(models, query)
+            .get(picker.selected)
+            .map(|model| (*model).clone());
+        model.picker = None;
+        if model.model_setup.is_none() {
+            return true;
+        }
+        match choice {
+            Some(m) => {
+                let ctx_known = m.context_length.is_some();
+                if let Some(setup) = model.model_setup.as_mut() {
+                    setup.model = m.id;
+                    setup.max_ctx = m.context_length;
+                    setup.step = if ctx_known {
+                        ModelSetupStep::ConfirmTest
+                    } else {
+                        ModelSetupStep::ContextWindow
+                    };
+                }
+                if !ctx_known {
+                    model.push_notice(
+                        "the server didn't report a context window — enter it in tokens (blank = unknown)",
+                    );
+                }
+            }
+            None => {
+                if let Some(setup) = model.model_setup.as_mut() {
+                    setup.step = ModelSetupStep::ModelId;
+                }
+            }
+        }
+        return true;
+    }
+    false
+}

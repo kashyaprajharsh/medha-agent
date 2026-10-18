@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "runtime"
 version.workspace = true
@@ -7,6 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+file-ops = { path = "../file-ops" }
 kernel.workspace = true
 protocol = { package = "medha-protocol", path = "../protocol" }
 providers.workspace = true

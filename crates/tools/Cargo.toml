@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "tools"
 edition.workspace = true
@@ -7,6 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+file-ops = { path = "../file-ops" }
 git-safety = { path = "../git-safety" }
 kernel.workspace = true
 media.workspace = true

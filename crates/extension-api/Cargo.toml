@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "medha-extension-api"
 version.workspace = true

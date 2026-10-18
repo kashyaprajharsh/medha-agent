@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/file-ops",
     "crates/git-safety",
     "crates/kernel",
     "crates/medha-client",
@@ -15,6 +16,9 @@ version = "0.1.10"
 publish = false
 license = "Apache-2.0"
 rust-version = "1.89"
+
+[workspace.lints.clippy]
+too_many_lines = "deny"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

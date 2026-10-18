@@ -1602,6 +1602,10 @@ fn completed(model: &mut Model, stream: &mut View, done: Completion) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Existing backend completion dispatch; 413 Clippy lines, shrink only."
+)]
 fn settle(model: &mut Model, stream: &mut View, done: Completion) {
     let Some(peer) = &mut model.remote else {
         return;

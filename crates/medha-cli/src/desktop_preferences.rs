@@ -251,6 +251,10 @@ fn one_writer<T>(target: &Path, write: impl FnOnce() -> Result<T>) -> Result<T> 
     write()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Existing settings dispatch; 438 Clippy lines, shrink only."
+)]
 fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> {
     match method {
         "settings.list" => Ok(settings(&config::load()?.unwrap_or_default())),

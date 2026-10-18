@@ -1572,6 +1572,10 @@ fn stopped_label(reason: &StopReason) -> Option<&'static str> {
 /// Mid-turn messages steer at the next boundary; cancellation lets in-flight
 /// tools settle through the kernel interrupt handle.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Existing chat event loop; 440 Clippy lines, shrink only."
+)]
 pub async fn run<P, L, R>(
     kernel: Arc<Kernel<P, L>>,
     mut session: Session,

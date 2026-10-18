@@ -57,6 +57,10 @@ async fn request(chat: &runtime::session::Started, history: &mut Vec<Message>, s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Existing end-to-end trust scenario; 443 Clippy lines, shrink only."
+)]
 async fn live_chats_use_their_own_project_and_adopt_trust_changes_without_prompts() {
     let files = tempfile::tempdir().unwrap();
     let root = files.path().canonicalize().unwrap();

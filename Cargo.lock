@@ -1062,6 +1062,7 @@ version = "0.1.10"
 dependencies = [
  "async-trait",
  "fd-lock",
+ "file-ops",
  "kernel",
  "medha-extension-api",
  "sandbox",
@@ -1074,7 +1075,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "ulid",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1157,6 +1157,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "file-ops"
+version = "0.1.10"
+dependencies = [
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2864,6 +2871,7 @@ dependencies = [
  "async-trait",
  "dirs 5.0.1",
  "fd-lock",
+ "file-ops",
  "kernel",
  "libc",
  "serde",
@@ -3727,6 +3735,7 @@ dependencies = [
  "dirs 5.0.1",
  "extensions",
  "fd-lock",
+ "file-ops",
  "futures",
  "kernel",
  "keyring",
@@ -4301,6 +4310,7 @@ name = "store"
 version = "0.1.10"
 dependencies = [
  "async-trait",
+ "file-ops",
  "kernel",
  "rusqlite",
  "serde",
@@ -4310,7 +4320,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "ulid",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4837,6 +4846,7 @@ version = "0.1.10"
 dependencies = [
  "async-trait",
  "fd-lock",
+ "file-ops",
  "futures",
  "git-safety",
  "glob",

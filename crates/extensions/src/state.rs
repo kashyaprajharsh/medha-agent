@@ -193,38 +193,7 @@ pub(crate) fn write_state_file(path: &Path, state: &StateFile) -> Result<(), Err
     })
 }
 
-#[cfg(not(windows))]
 fn atomic_replace(source: &Path, target: &Path) -> Result<(), Error> {
-    fs::rename(source, target).map_err(|error| io_error("publishing plugin state", target, error))
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> Result<(), Error> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>()
-    };
-    let (source_wide, target_wide) = (wide(source), wide(target));
-    let result = unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            target_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(io_error(
-            "publishing plugin state",
-            target,
-            std::io::Error::last_os_error(),
-        ))
-    } else {
-        Ok(())
-    }
+    file_ops::replace(source, target)
+        .map_err(|error| io_error("publishing plugin state", target, error))
 }

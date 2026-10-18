@@ -163,7 +163,7 @@ in another process. Closing one viewer leaves remaining viewers attached.
 and live tool steps. The `gate` crate below is the offline Eval Gate, distinct
 from the kernel's interactive `HumanGate`.
 
-Source: [runtime construction](../crates/medha-cli/src/main.rs),
+Source: [runtime construction](../crates/runtime/src/session.rs),
 [desktop live bridge](../apps/desktop/src-tauri/src/live.rs),
 [tool registry](../crates/tools/src/lib.rs), and
 [kernel](../crates/kernel/src/loop_.rs).
@@ -183,6 +183,7 @@ Source: [runtime construction](../crates/medha-cli/src/main.rs),
 | `policy` | Deny-first authorization, shell scanner, content guard, skills guard |
 | `sandbox` | Execution backends: host, Seatbelt/Landlock, container, SSH |
 | `store` | SQLite event log with hash chain and artifact storage |
+| `file-ops` | Shared atomic file replacement for persistent stores |
 | `lockfile` | Configuration parsing (`medha.lock`) |
 | `permissions` | Ask-then-persist trust for out-of-workspace access |
 | `gate` | Eval Gate: scenario runner with deterministic checks |
@@ -259,7 +260,10 @@ See the [compaction flow](#compaction-flow) for request fitting and the
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| `loop_.rs` | Main agent loop | Orchestrates the turn-by-turn flow |
+| `loop_.rs` | Kernel entry points | Owns the public kernel and delegates session steps |
+| `session.rs`, `session/` | Session coordinator | Admission, request fitting, recovery, tool rounds and completion |
+| `turn.rs` | Model turn | Streams and retries a provider request |
+| `admitted.rs`, `dispatch.rs` | Tool execution | Settles reads, preserves mutation ordering and saves observations |
 | `budgets.rs` | Budget enforcement | Tracks turns, tokens, cost, time |
 | `gate.rs` | Human approval | Handles approval prompts |
 | `interrupts.rs` | Cancellation | Manages Esc key and message steering |
@@ -684,7 +688,7 @@ headless) that gate resolves to deny, so they fail closed rather than open.**
 
 ## Trust Flow & Web-Tainted Actions
 
-**Location:** `crates/kernel/src/loop_.rs`
+**Location:** `crates/kernel/src/session/`, `crates/kernel/src/admitted.rs` and `crates/kernel/src/dispatch.rs`
 
 ### What Is Web-Tainted?
 
@@ -1629,6 +1633,9 @@ Built on The Elm Architecture: `Model → Update(model, msg) → Model → View(
 The view is a **pure function of the model**, so the same state always renders
 identically — there is no shared mutable UI state to drift.
 
+Keyboard priority lives in `tui_tea/input.rs`; its `input/picker/` modules own
+picker actions and `input/composer.rs` owns composer editing and navigation.
+
 **Agent panes.** The main conversation and each recent child have separate transcript
 and scroll/follow state. With an empty composer, **Tab** opens a switcher containing
 `main`, running children and recent settled panes; ↑/↓ selects and Enter opens.
@@ -2275,7 +2282,7 @@ the old uncompacted view.
 Implementation: [context engine](../crates/context/src/engine.rs),
 [summarizer](../crates/context/src/compactor.rs),
 [user handoff](../crates/context/src/handoff.rs), and
-[kernel request loop](../crates/kernel/src/loop_.rs).
+[kernel request preparation](../crates/kernel/src/session/prepare.rs).
 
 ### Context Files
 
@@ -3517,8 +3524,15 @@ projection events, not automatically after every successful task.
 - [Compaction flow](#compaction-flow): how context is reduced and checked again.
 - [Retained context](#what-survives-full-compaction): what reaches the next model call.
 
-The runtime wiring lives in [main.rs](../crates/medha-cli/src/main.rs); the shared
-loop and dispatch logic live in [loop_.rs](../crates/kernel/src/loop_.rs).
+The shared runtime wiring lives in [session.rs](../crates/runtime/src/session.rs)
+and its topical modules. The kernel's [session coordinator](../crates/kernel/src/session.rs)
+calls named steps; [dispatch.rs](../crates/kernel/src/dispatch.rs) owns tool
+authorization and execution.
+
+The workspace uses Clippy's 300-line function limit in the existing lint step.
+Documented function-level exceptions cover existing oversized functions and may
+only shrink. These exceptions are reviewed against their recorded sizes;
+Clippy itself does not enforce a size cap inside an allowed function.
 
 ---
 

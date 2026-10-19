@@ -1935,6 +1935,39 @@ impl IsolatedHome {
 #[cfg(target_os = "macos")]
 const MKTEMP_SHIM: &str = include_str!("seatbelt_mktemp.sh");
 
+// Apple's /usr/bin developer launchers write a machine-selected cache outside
+// TMPDIR. Use the selected tool payload, without opening that cache to writes.
+#[cfg(target_os = "macos")]
+fn developer_bin() -> Option<&'static Path> {
+    static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let output = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("--print-path")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim()).join("usr/bin");
+        (path.is_absolute() && path.is_dir()).then_some(path)
+    })
+    .as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn developer_program(program: &str) -> String {
+    let path = Path::new(program);
+    if path.parent() == Some(Path::new("/usr/bin"))
+        && let Some(actual) = developer_bin()
+            .zip(path.file_name())
+            .map(|(bin, name)| bin.join(name))
+        && actual.is_file()
+    {
+        return actual.to_string_lossy().into_owned();
+    }
+    program.into()
+}
+
 /// Puts the private shims first on the child's PATH, whichever PATH it gets.
 #[cfg(target_os = "macos")]
 fn prepend_shims(cmd: &mut tokio::process::Command, req: &ExecRequest, home: &IsolatedHome) {
@@ -1946,7 +1979,17 @@ fn prepend_shims(cmd: &mut tokio::process::Command, req: &ExecRequest, home: &Is
         .map(|(_, value)| std::ffi::OsString::from(value))
         .or_else(|| (!req.clear_env).then(|| std::env::var_os("PATH")).flatten())
         .unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
-    let paths = std::iter::once(home.shims()).chain(std::env::split_paths(&inherited));
+    let paths =
+        std::iter::once(home.shims()).chain(std::env::split_paths(&inherited).flat_map(|path| {
+            // A custom tool earlier on PATH still wins over Apple's selected tools.
+            let developer = (path == Path::new("/usr/bin"))
+                .then(developer_bin)
+                .flatten();
+            developer
+                .map(Path::to_path_buf)
+                .into_iter()
+                .chain(std::iter::once(path))
+        }));
     if let Ok(joined) = std::env::join_paths(paths) {
         cmd.env("PATH", joined);
     }
@@ -2354,9 +2397,6 @@ fn workspace_contains_native_credentials(workspace: &Path) -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn apply_isolated_environment(cmd: &mut tokio::process::Command, home: &IsolatedHome) {
-    // Apple's tool launchers otherwise write their cache outside the private TMPDIR.
-    #[cfg(target_os = "macos")]
-    cmd.env("xcrun_nocache", "1");
     let home_path = &home.path;
     cmd.env("HOME", home_path)
         .env("TMPDIR", home_path.join("tmp"))
@@ -2684,7 +2724,7 @@ impl ExecBackend for SeatbeltBackend {
         let mut wrapped = Vec::with_capacity(req.args.len() + 3);
         wrapped.push("-p".to_string());
         wrapped.push(profile);
-        wrapped.push(req.program.clone());
+        wrapped.push(developer_program(&req.program));
         wrapped.extend(req.args.iter().cloned());
         let mut command = base_command("/usr/bin/sandbox-exec", &wrapped, req);
         crate::environment::clear_denied(command.as_std_mut(), network);
@@ -2972,11 +3012,8 @@ fn build_landlock_ruleset(
 #[async_trait]
 impl ExecBackend for LandlockBackend {
     fn protect(&self, req: &ExecRequest) -> Result<CommandResources, ExecError> {
-        // Where the system refuses the private view, Git's controls are put back after each command.
-        match crate::git_namespace::available() {
-            true => CommandResources::git(&self.control_roots(req)),
-            false => CommandResources::snapshot(&self.control_roots(req)),
-        }
+        crate::git_namespace::require()?;
+        CommandResources::git(&self.control_roots(req))
     }
     fn build_plugin_command(
         &self,
@@ -3014,13 +3051,9 @@ impl ExecBackend for LandlockBackend {
             self.effective_net(req),
         )?;
         let sockets = crate::socket_filter::program(self.effective_net(req));
-        let mounts = match crate::git_namespace::available() {
-            true => {
-                let protected = crate::git_controls::held(&self.control_roots(req))?;
-                Some(crate::git_namespace::Mounts::new(&protected)?)
-            }
-            false => None,
-        };
+        crate::git_namespace::require()?;
+        let protected = crate::git_controls::held(&self.control_roots(req))?;
+        let mounts = crate::git_namespace::Mounts::new(&protected)?;
 
         let mut cmd = std::process::Command::new(&req.program);
         cmd.args(&req.args).current_dir(&req.cwd);
@@ -3034,9 +3067,7 @@ impl ExecBackend for LandlockBackend {
         let mut slot = Some(ruleset);
         unsafe {
             cmd.pre_exec(move || {
-                if let Some(mounts) = &mounts {
-                    mounts.install()?;
-                }
+                mounts.install()?;
                 if let Some(r) = slot.take() {
                     let status = r
                         .restrict_self()
@@ -3754,6 +3785,41 @@ mod ssh_selection_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_payloads_replace_system_launchers_but_keep_custom_path_precedence() {
+        let bin = developer_bin().expect("developer tools installed");
+        assert_eq!(
+            developer_program("/usr/bin/git"),
+            bin.join("git").to_string_lossy()
+        );
+        assert_eq!(developer_program("git"), "git");
+        let mut request = req("python3", &["--version"], std::env::temp_dir());
+        request.clear_env = true;
+        request.env = vec![("PATH".into(), "/custom-tools:/usr/bin:/bin".into())];
+        let home = IsolatedHome::new();
+        let mut command = tokio::process::Command::new("python3");
+        prepend_shims(&mut command, &request, &home);
+        let path = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .unwrap()
+            .1
+            .unwrap();
+        let paths = std::env::split_paths(path).collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                home.shims(),
+                PathBuf::from("/custom-tools"),
+                bin.to_path_buf(),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin")
+            ]
+        );
+    }
 
     fn req(program: &str, args: &[&str], cwd: PathBuf) -> ExecRequest {
         ExecRequest {

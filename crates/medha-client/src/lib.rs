@@ -1139,7 +1139,8 @@ impl Backend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        inherit_nothing(&mut command);
+        inherit_nothing(&mut command)
+            .map_err(|error| format!("Could not isolate backend handles: {error}"))?;
         if !self.owned {
             outlive_the_app(&mut command);
         }
@@ -1214,7 +1215,7 @@ fn owner_available(directory: &Path) -> bool {
 /// backend that took its end would never read it, and closing that terminal
 /// would hang its shell.
 #[cfg(unix)]
-fn inherit_nothing(command: &mut Command) {
+fn inherit_nothing(command: &mut Command) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -1235,10 +1236,28 @@ fn inherit_nothing(command: &mut Command) {
             Ok(())
         });
     }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn inherit_nothing(_command: &mut Command) {}
+fn inherit_nothing(_command: &mut Command) -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation},
+        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+    // Stdio::null configures the new standard handles, but CreateProcess also
+    // inherits existing inheritable handles. Never retain the caller's pipes.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(stream) };
+        if !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 fn outlive_the_app(command: &mut Command) {

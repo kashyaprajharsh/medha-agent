@@ -86,11 +86,10 @@ async fn native_commands_cannot_plant_git_controls_but_can_stage_and_commit() {
     assert_eq!(head.stdout, b"real staged content\n");
 }
 
-/// On a system that refuses the private view (Ubuntu 24.04 by default),
-/// commands still run, Git still works, and planted controls are put back.
+/// A refusing system must leave the command unrun, including its first write.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn where_the_system_refuses_the_private_view_controls_are_restored() {
+async fn where_the_system_refuses_the_private_view_commands_fail_closed() {
     crate::git_namespace::REFUSED.with(|refused| refused.set(true));
     let scratch = test_support::scratch("medha-git-refused");
     let root = scratch.canonicalize().unwrap();
@@ -112,22 +111,20 @@ async fn where_the_system_refuses_the_private_view_controls_are_restored() {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "printf planted >> .git/config; printf planted > .git/hooks/pre-commit; git add note && git -c core.hooksPath=/dev/null -c user.name=Test -c user.email=test@example.invalid commit -qm saved".into()],
         cwd: root.clone(), env: vec![], clear_env: true, read_roots: vec![], write_roots: vec![],
-    }).await.unwrap();
+    }).await;
     crate::git_namespace::REFUSED.with(|refused| refused.set(false));
-    println!(
-        "refused view: status={:?}\nstderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+    assert!(
+        output
+            .unwrap_err()
+            .to_string()
+            .contains("No command was run")
     );
-    assert_eq!(output.status, Some(0), "commands stopped working");
     assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), original);
     assert!(!root.join(".git/hooks/pre-commit").exists());
-    let head = std::process::Command::new("git")
-        .args(["show", "HEAD:note"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
-    assert_eq!(head.stdout, b"real staged content\n");
+    assert!(
+        !root.join(".git/index").exists(),
+        "git add must not have run"
+    );
 }
 
 #[cfg(target_os = "linux")]

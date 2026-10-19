@@ -1,15 +1,15 @@
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 use crate::exec::ExecError;
 use std::{collections::BTreeMap, path::Path};
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 use std::{
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
 };
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 const BYTES: usize = 16 * 1024 * 1024;
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 const ENTRIES: usize = 4096;
 
 #[cfg(windows)]
@@ -43,14 +43,14 @@ impl crate::exec::ExecBackend for Backend {
         "host"
     }
 }
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 type Slots = BTreeMap<PathBuf, Weak<(Mutex<bool>, Condvar)>>;
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 static SLOTS: Mutex<Slots> = Mutex::new(BTreeMap::new());
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 struct Lease(Arc<(Mutex<bool>, Condvar)>);
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 impl Drop for Lease {
     fn drop(&mut self) {
         *self.0.0.lock().unwrap() = false;
@@ -106,7 +106,7 @@ pub(crate) enum Node {
     Directory(BTreeMap<std::ffi::OsString, Node>, Mode),
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 pub(crate) struct Snapshot {
     root: PathBuf,
     entry: Node,
@@ -116,7 +116,7 @@ pub(crate) struct Snapshot {
     restored: bool,
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 impl Snapshot {
     pub fn new(root: &Path) -> Result<Self, ExecError> {
         let root = root.canonicalize().map_err(failed)?;
@@ -245,7 +245,7 @@ impl Snapshot {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 impl Drop for Snapshot {
     fn drop(&mut self) {
         if !self.restored {
@@ -254,7 +254,7 @@ impl Drop for Snapshot {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 pub(crate) fn read(
     path: &Path,
     budget: &mut (usize, usize),
@@ -356,7 +356,7 @@ fn read_inner(path: &Path, budget: &mut (usize, usize), recursive: bool) -> std:
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 fn remove(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -390,7 +390,7 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 pub(crate) fn restore_node(path: &Path, node: &Node) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -440,7 +440,7 @@ fn restore_inner(path: &Path, node: &Node) -> std::io::Result<()> {
     mode.apply(path)
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 pub(crate) fn linked(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -453,7 +453,7 @@ pub(crate) fn linked(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 fn directory_id(path: &Path) -> std::io::Result<(u64, u64)> {
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_dir() || linked(&meta) {
@@ -484,7 +484,7 @@ fn directory_id(path: &Path) -> std::io::Result<(u64, u64)> {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, test))]
 fn failed(error: std::io::Error) -> ExecError {
     ExecError::Unavailable(format!("cannot snapshot Git control files: {error}"))
 }

@@ -117,6 +117,14 @@ impl Mounts {
 
 /// Whether this system lets an ordinary program set up the private view the
 /// mounts need. Ubuntu 24.04 and some hardened systems refuse it by default.
+pub(crate) fn require() -> Result<(), ExecError> {
+    if available() {
+        Ok(())
+    } else {
+        Err(ExecError::Unavailable("native Git protection requires private user/mount namespaces; the OS refused setup. No command was run. Allow user namespaces for the Medha executable in the system's security policy.".into()))
+    }
+}
+
 pub(crate) fn available() -> bool {
     use std::os::unix::process::CommandExt;
     #[cfg(test)]

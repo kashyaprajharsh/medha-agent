@@ -140,6 +140,10 @@ jobs:
           rust-analyzer --version
           clangd --version
 
+      - name: Permit namespaces for CI test executables
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/test_namespaces.sh
+
       # Use an explicit non-updating browser, rather than the runner image's
       # machine-wide Chrome installation. Real rendering/security tests remain required.
       - name: Provision Windows test browser
@@ -224,6 +228,11 @@ jobs:
 
       - name: Install window dependencies
         run: npm ci
+
+      - name: Permit namespaces for CI test executables
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: bash .github/scripts/test_namespaces.sh
 
       # The shell embeds the built window and checks the bundled program exists,
       # so both come before anything in Rust is compiled.

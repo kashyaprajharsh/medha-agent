@@ -433,7 +433,10 @@ With the default `native` backend, the sandbox blocks:
 Linux combines Landlock with a private user/mount namespace and read-only binds
 for those Git controls. Commands cannot undo the mounts or enter another mount
 namespace. If setup fails, commands fail with a clear error; native execution
-never falls back to the host. Missing control entries get harmless placeholders
+never falls back to the host or to after-command Git restoration. On systems
+such as Ubuntu with restricted user namespaces, an administrator must permit
+namespace creation for the Medha executable through the system security policy.
+Missing control entries get harmless placeholders
 while commands use the folder, removed when their last holder finishes. This can
 leave empty metadata after a process crash; it does not grant permission to run a
 hook. Containers bind the same controls read-only while keeping Git data writable.
@@ -1741,6 +1744,10 @@ on the chat that started it, the desktop nests it under that chat, and
 **Desktop updates.** Signed updates use the release's raw NSIS installer on
 Windows, raw AppImage on Linux, or application tarball on macOS. The unused ZIP
 update reader is disabled, removing its vulnerable extraction dependency.
+
+Backend startup does not retain the launching command's standard-input/output
+pipes, including on Windows. Commands such as `medha trust --yes` return while
+the shared backend stays available for subsequent requests.
 
 **Theme.** Four palettes, each a whole visual identity rather than a set of text
 colours: `dark` (intellect-gold on warm ink) and `light` (ink on parchment) are the

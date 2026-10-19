@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 pub struct CommandResources {
     protected_content: Vec<crate::protected_commands::Snapshot>,
     pub(crate) _protected: Vec<Arc<Protected>>,
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     snapshot: Vec<crate::git_snapshot::Snapshot>,
 }
 
@@ -27,12 +27,12 @@ impl CommandResources {
         Ok(Self {
             protected_content: Vec::new(),
             _protected: crate::git_controls::prepare(roots)?,
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(windows)]
             snapshot: Vec::new(),
         })
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     pub(crate) fn snapshot(roots: &[PathBuf]) -> Result<Self, ExecError> {
         let mut roots: Vec<_> = roots
             .iter()
@@ -51,28 +51,20 @@ impl CommandResources {
         })
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn finish(self) -> Option<String> {
+        #[cfg(windows)]
         let mut notices: Vec<_> = self
             .snapshot
             .into_iter()
             .filter_map(crate::git_snapshot::Snapshot::restore)
             .collect();
+        #[cfg(not(windows))]
+        let mut notices = Vec::new();
         notices.extend(
             self.protected_content
                 .into_iter()
                 .filter_map(crate::protected_commands::Snapshot::finish),
         );
-        (!notices.is_empty()).then(|| notices.join("\n"))
-    }
-
-    #[cfg(not(any(windows, target_os = "linux")))]
-    pub(crate) fn finish(self) -> Option<String> {
-        let notices = self
-            .protected_content
-            .into_iter()
-            .filter_map(crate::protected_commands::Snapshot::finish)
-            .collect::<Vec<_>>();
         (!notices.is_empty()).then(|| notices.join("\n"))
     }
 }

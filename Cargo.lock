@@ -2459,6 +2459,7 @@ dependencies = [
  "medha-protocol",
  "serde_json",
  "tokio",
+ "windows-sys 0.60.2",
  "wire",
 ]
 

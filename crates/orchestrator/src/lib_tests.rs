@@ -76,7 +76,10 @@ fn control() -> (Arc<Recorder>, AgentControl) {
 }
 
 fn deliverable(runner: Arc<dyn ChildRunner>, cancel: CancellationToken) -> AgentControl {
-    AgentControl::new(runner, cancel).with_outbox(Arc::new(MemoryOutbox::default()))
+    AgentControl::new(runner, cancel)
+        // In-memory runners need no five-second production cleanup window.
+        .with_cancel_grace(Duration::from_millis(100))
+        .with_outbox(Arc::new(MemoryOutbox::default()))
 }
 
 async fn until(what: &str, mut ready: impl FnMut() -> bool) {

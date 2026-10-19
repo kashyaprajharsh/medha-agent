@@ -42,3 +42,19 @@ media = { path = "crates/media" }
 # implementation while keeping Medha's own code debuggable.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Image transforms and tokenization dominate CPU time in debug/test runs.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.media]
+opt-level = 3
+
+[profile.dev.package.tiktoken-rs]
+opt-level = 3

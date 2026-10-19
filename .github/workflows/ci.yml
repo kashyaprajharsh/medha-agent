@@ -22,6 +22,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Keep file/line backtraces without generating full type-level debug data.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # Only the runner that installs language servers enables their end-to-end tests.
   MEDHA_LSP_E2E: "0"
 
@@ -91,6 +94,9 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       # Report every platform even if one fails.
       fail-fast: false
@@ -159,6 +165,11 @@ jobs:
           if (!(Test-Path $browser)) { throw 'Chrome for Testing executable is missing' }
           Write-Output "Browser: $browser; version: $((Get-Item $browser).VersionInfo.FileVersion)"
           "MEDHA_BROWSER=$browser" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Cache workspace-library compilations by content as well as dependencies.
+      - uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:

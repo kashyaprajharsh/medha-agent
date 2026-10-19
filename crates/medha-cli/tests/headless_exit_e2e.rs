@@ -208,7 +208,7 @@ fn required_completion_failure_exits_nonzero_but_plan_does_not_run_checks() {
     let done = Arc::new(AtomicBool::new(false));
     let server_done = done.clone();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
         while !server_done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             let (mut stream, _) = match listener.accept() {
                 Ok(pair) => pair,
@@ -273,7 +273,8 @@ fn required_completion_failure_exits_nonzero_but_plan_does_not_run_checks() {
             .env_remove("MEDHA_VERIFY")
             .env("MEDHA_BASE_URL", format!("http://{address}/v1"))
             .env("MEDHA_MAX_CTX", "32000")
-            .env("MEDHA_MAX_WALL", "5")
+            // Exercise verification outcomes, not cold-start speed on a busy runner.
+            .env("MEDHA_MAX_WALL", "30")
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);

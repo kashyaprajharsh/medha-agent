@@ -656,6 +656,8 @@ async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit
             .contains("HOLD terminal cancellation")
     );
     viewer.until(|frame| kind(frame, "turn.started")).await;
+    // The other viewer can see the turn before the terminal has consumed it.
+    terminal.until("thinking");
     terminal.type_text("\x1b");
     viewer.until(|frame| kind(frame, "turn.cancelled")).await;
     world.provider.release.send(()).unwrap();

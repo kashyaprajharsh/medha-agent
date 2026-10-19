@@ -2151,7 +2151,9 @@ Shared-backend chats retain the calling client's captured credentials.
 The shared provider catalogue retains **models.dev** provider names, endpoints,
 package classifications, documentation, model limits, capabilities and pricing.
 A bundled snapshot supports first use offline; a last-known-good disk cache
-survives failed refreshes. The daemon refreshes stale metadata in the background
+survives failed refreshes. The cache is stored at `$MEDHA_HOME/models_dev_cache.json`
+(`~/.medha/models_dev_cache.json` by default), so separately configured Medha homes
+keep separate metadata. The daemon refreshes stale metadata in the background
 on a weekly TTL, and clients can request a refresh explicitly. Concurrent callers
 share one bounded fetch; readers hold immutable snapshots with a revision.
 Package names are metadata and are never executed as provider adapters.

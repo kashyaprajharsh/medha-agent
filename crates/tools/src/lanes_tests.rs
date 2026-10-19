@@ -57,7 +57,10 @@ fn a_write_is_placed_at_the_real_file() {
         file(&root, Some("src/new/deep.rs")),
         path_key(&root.join("src/new/deep.rs"))
     );
-    assert_eq!(file(&root, Some("src/new/../../x")), WHOLE);
+    for path in ["src/new/../../x", "src/new/../main.rs", "src/main.rs/../x"] {
+        assert_eq!(file(&root, Some(path)), WHOLE, "{path}");
+    }
+    assert_eq!(file(&root, root.join("src/main.rs").to_str()), main);
     assert_eq!(file(&root, None), WHOLE);
     assert_eq!(tree(&root), path_key(&root));
 }

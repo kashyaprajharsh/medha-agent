@@ -145,7 +145,7 @@ async fn backups_include_untracked_exclude_ignored_and_preserve_later_human_work
             .restore_revision(
                 files
                     .iter()
-                    .find(|file| file.path.ends_with("/tracked"))
+                    .find(|file| Path::new(&file.path).ends_with("tracked"))
                     .unwrap()
             )
             .await

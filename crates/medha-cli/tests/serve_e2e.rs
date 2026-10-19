@@ -1189,10 +1189,11 @@ struct World {
 async fn gemini_reasoning_choices_and_model_switches_are_shared_between_viewers() {
     let world = World::new();
     let folder = world.folder("gemini-settings");
-    // A current local snapshot makes catalogue resolution deterministic/offline
-    // and keeps this test away from the owner's HOME and credentials.
+    // The catalogue belongs to this backend's MEDHA_HOME, even when the OS
+    // home is different (Windows does not resolve it from HOME/USERPROFILE).
     let os_home = world.root.path().join("os-home");
-    std::fs::create_dir_all(os_home.join(".medha")).unwrap();
+    std::fs::create_dir_all(&os_home).unwrap();
+    std::fs::create_dir_all(world.home()).unwrap();
     let fetched = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1202,7 +1203,7 @@ async fn gemini_reasoning_choices_and_model_switches_are_shared_between_viewers(
         "google/gemini-fixture-only":{"reasoning_efforts":["low","high"]}
     }});
     std::fs::write(
-        os_home.join(".medha/models_dev_cache.json"),
+        world.home().join("models_dev_cache.json"),
         snapshot.to_string(),
     )
     .unwrap();

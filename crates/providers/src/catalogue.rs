@@ -111,7 +111,10 @@ fn offline() -> bool {
 
 fn global() -> &'static Arc<Catalogue> {
     CATALOGUE.get_or_init(|| {
-        let path = dirs::home_dir().map(|home| home.join(".medha/models_dev_cache.json"));
+        let path = std::env::var_os("MEDHA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".medha")))
+            .map(|home| home.join("models_dev_cache.json"));
         Arc::new(Catalogue::new(path, API_URL.into()))
     })
 }

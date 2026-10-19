@@ -31,8 +31,19 @@ pub(crate) fn tree(root: &Path) -> String {
 
 /// Lane of a write to the file `path` names; one that cannot be placed runs alone.
 pub(crate) fn file(root: &Path, path: Option<&str>) -> String {
-    path.and_then(|path| real(&root.join(path)))
-        .map_or(WHOLE.into(), |path| path_key(&path))
+    path.and_then(|path| {
+        let mut joined = root.to_path_buf();
+        for part in Path::new(path).components() {
+            // Windows normalizes `..` when pushing onto a verbatim path.
+            // Inspect it before that can hide an unknown or non-directory parent.
+            if part == std::path::Component::ParentDir && !joined.is_dir() {
+                return None;
+            }
+            joined.push(part);
+        }
+        real(&joined)
+    })
+    .map_or(WHOLE.into(), |path| path_key(&path))
 }
 
 /// Whether a shell command only reads: every program in it is a known reader,

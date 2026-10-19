@@ -2165,6 +2165,8 @@ labelled indicative when taken from the public catalogue.
 
 Saving or switching a live chat's model uses that same context-resolution order,
 including a fresh server metadata lookup when no explicit window is saved.
+The desktop action edits a saved profile; environment-only models instead point
+to the model configuration (`MEDHA_MAX_CTX` for an environment override).
 
 Desktop and TUI select a provider before asking for access and a model. Custom
 endpoints and manual model IDs remain available. Endpoint templates require

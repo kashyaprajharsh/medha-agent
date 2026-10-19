@@ -563,7 +563,7 @@ export function WorkSurface(props: Props) {
                 ) : (
                   <>
                     Unknown, so compaction waits for the server to refuse.{" "}
-                    {props.settings?.profile && props.onEditModel && (
+                    {props.settings?.profiles.some((profile) => profile.name === props.settings?.profile) && props.onEditModel ? (
                       <button
                         type="button"
                         className="btn-line"
@@ -571,6 +571,8 @@ export function WorkSurface(props: Props) {
                       >
                         Set context window
                       </button>
+                    ) : (
+                      "Set a context window in your model configuration."
                     )}
                   </>
                 )}

@@ -2165,6 +2165,30 @@ test("saving a new default refreshes an open chat's model picker without restart
   assert.ok(reloaded.every((call) => call.change.profile === "new"));
 });
 
+test("context details edit the exact saved profile and do not offer a broken editor for environment-only models", async () => {
+  const { WorkSurface } = await import(await moduleUrl("WorkSurface"));
+  const edited = [];
+  const props = {
+    tab: "context", blocks: [], run: null, showReasoning: false,
+    sessionKey: null, sessionId: null, locked: false,
+    onFile() {}, onTab() {}, onClose() {}, onAgent() {}, ensureOpen: async () => {},
+    onEditModel: (profile) => edited.push(profile),
+  };
+  await act(() => root.render(h(WorkSurface, { ...props, settings: {
+    ...settings, profile: "saved", profiles: [{ name: "saved" }], context_limit: undefined,
+  } })));
+  await click(namedButton("Set context window"));
+  assert.deepEqual(edited, ["saved"]);
+  await act(() => root.render(h(WorkSurface, { ...props, settings: {
+    ...settings, profile: "override", profiles: [], context_limit: undefined,
+  } })));
+  assert.equal(namedButton("Set context window"), undefined);
+  assert.match(document.querySelector(".context-details").textContent, /Unknown.*model configuration/);
+  await act(() => root.render(h(WorkSurface, { ...props, settings })));
+  assert.ok(document.querySelector(".context-details").textContent.includes(settings.context_limit.toLocaleString()));
+  assert.equal(namedButton("Set context window"), undefined);
+});
+
 test("choosing a discovered Gemini model lets the backend name its profile and preserves the exact model ID", async () => {
   const { Settings } = await import(await moduleUrl("Settings"));
   const writes = [];

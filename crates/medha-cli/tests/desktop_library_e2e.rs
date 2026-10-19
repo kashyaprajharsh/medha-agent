@@ -1,6 +1,4 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{Value, json};
 
@@ -28,33 +26,22 @@ impl Library {
     }
 }
 
-/// A model that refuses at once, so a turn ends without retrying.
-fn refusing_model() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let _ = std::io::Read::read(&mut stream, &mut [0u8; 8192]);
-            let _ = stream.write_all(
-                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-        }
-    });
-    format!("http://{address}/v1")
-}
-
-/// A chat whose first message was saved; the model refusing it is enough.
+/// Seed saved history; library listing does not need a model request.
 fn used_chat(folder: &Path, home: &Path) {
-    std::fs::create_dir_all(folder).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_medha"))
-        .arg("hello there")
-        .current_dir(folder)
-        .env("MEDHA_HOME", home)
-        .env("MEDHA_BASE_URL", refusing_model())
-        .env("MEDHA_MODEL", "test-model")
-        .env("MEDHA_API_KEY", "test-key")
-        .env("MEDHA_PROTOCOL", "open-ai-chat")
-        .output()
+    use kernel::{Event, EventLog, Session};
+
+    started_chat(folder, home);
+    let state = std::fs::read_dir(home.join("projects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("events.db").is_file())
+        .unwrap();
+    let log = store::SqliteLog::open(state.join("events.db")).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(log.append(Event::user_message(&Session::new(), "hello there")))
         .unwrap();
 }
 

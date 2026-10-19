@@ -1106,8 +1106,10 @@ pub(super) fn resource_reply(model: &mut Model, resource: Resource, after: After
             }
         },
         Resource::Pulse(notice) => model.upsert_notice("pulse", notice.messages.join("\n")),
-        Resource::Sessions(sessions) => { let sessions = sessions.into_iter().filter_map(|session| session.id.parse().ok().map(|id| kernel::SessionMeta { id, title: session.title.unwrap_or_default(),
-            started_ts: session.started, last_ts: session.updated, events: session.events })).collect(); model.picker = Some(Picker::new(PickerKind::Session(sessions))); },
+        Resource::Sessions(sessions) => { let sessions = sessions.into_iter().filter_map(|session| session.id.parse().ok().map(|id| {
+            let title = session.title.unwrap_or_default();
+            let title = match session.agents { 0 => title, 1 => format!("{title} · 1 sub-agent"), n => format!("{title} · {n} sub-agents") };
+            kernel::SessionMeta { id, title, started_ts: session.started, last_ts: session.updated, events: session.events, parent: None } })).collect(); model.picker = Some(Picker::new(PickerKind::Session(sessions))); },
         Resource::Skills(catalogue) => {
             let text = catalogue.skills.iter().map(|skill| format!("{}  {} — {}{}", if skill.enabled && skill.available { "✔" } else { "○" }, skill.name, skill.description,
                 if !skill.enabled { " (disabled)" } else if !skill.available { " (missing tools)" } else { "" })).chain(catalogue.errors.iter().map(|error| format!("! {error}"))).collect::<Vec<_>>().join("\n");

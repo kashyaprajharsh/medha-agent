@@ -1810,7 +1810,8 @@ fn warn_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
 }
 
 fn print_sessions(log: &store::SqliteLog) -> Result<()> {
-    let sessions = log.list_sessions()?;
+    let mut sessions = log.list_sessions()?;
+    sessions.retain(|session| session.parent.is_none());
     if sessions.is_empty() {
         println!("No sessions yet in this workspace.");
         return Ok(());

@@ -2069,7 +2069,7 @@ test("saving a new default refreshes an open chat's model picker without restart
   globalThis.cancelAnimationFrame = dom.window.cancelAnimationFrame.bind(dom.window);
   HTMLElement.prototype.scrollIntoView = () => {};
   const saved = [{ name: "old", profile: { model: "old-model", base_url: "http://localhost/v1", protocol: "open-ai-chat", auth: "none" } }];
-  let defaultName = "old", receive;
+  let defaultName = "old", receive, failProfileReload = false;
   const active = new Map(), calls = [], opened = [];
   const catalogue = () => saved.map((model) => ({ ...model, default: model.name === defaultName, key_present: false }));
   const currentSettings = (name) => ({
@@ -2089,7 +2089,11 @@ test("saving a new default refreshes an open chat's model picker without restart
     liveCall: async (key, method, change) => {
       calls.push({ key, method, change });
       if (method === "extensions.reload") return {};
-      assert.ok(["session.settings", "session.configure"].includes(method), method);
+      if (method === "session.profile.saved" && failProfileReload) {
+        failProfileReload = false;
+        throw new Error("Finish or stop active work before changing session settings.");
+      }
+      assert.ok(["session.settings", "session.configure", "session.profile.saved"].includes(method), method);
       if (method === "session.configure") active.set(key, change.profile);
       return currentSettings(active.get(key));
     },
@@ -2139,6 +2143,26 @@ test("saving a new default refreshes an open chat's model picker without restart
   await click(chip());
   assert.equal(opened.length, 2);
   assert.equal(active.get(opened[1]), "new", "a new chat starts on the new default");
+
+  // Saving a model's settings reaches the chats that use it, and only those.
+  calls.length = 0;
+  await act(async () => window.dispatchEvent(new CustomEvent("medha-preferences", { detail: { profile: "old" } })));
+  await act(async () => {});
+  assert.ok(!calls.some((call) => call.method === "session.profile.saved"), "another model's save leaves these chats alone");
+  await act(async () => window.dispatchEvent(new CustomEvent("medha-preferences", { detail: { profile: "new" } })));
+  await act(async () => {});
+  const reloaded = calls.filter((call) => call.method === "session.profile.saved");
+  calls.length = 0;
+  failProfileReload = true;
+  await act(async () => window.dispatchEvent(new CustomEvent("medha-preferences", { detail: { profile: "new" } })));
+  await act(async () => {});
+  const failedKey = calls.find((call) => call.method === "session.profile.saved").key;
+  calls.length = 0;
+  await act(async () => receive(failedKey, { method: "settings", params: currentSettings("new") }));
+  await act(async () => {});
+  assert.ok(calls.some((call) => call.key === failedKey && call.method === "session.profile.saved"), "a save refused at a turn boundary is retried rather than lost");
+  assert.ok(reloaded.length > 0, "a chat on the saved model re-reads it");
+  assert.ok(reloaded.every((call) => call.change.profile === "new"));
 });
 
 test("choosing a discovered Gemini model lets the backend name its profile and preserves the exact model ID", async () => {

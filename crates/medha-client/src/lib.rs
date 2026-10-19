@@ -563,7 +563,14 @@ impl Connection {
                         return Err(OPEN_ELSEWHERE.into());
                     }
                     if !listening && (!ours || live.clients > 0) {
-                        return self.follow_live(live, hear);
+                        match self.follow_live(live, Arc::clone(&hear)) {
+                            // Our closing chat can disappear between list and attach.
+                            Err(error)
+                                if ours
+                                    && error == "no such session"
+                                    && Instant::now() < deadline => {}
+                            result => return result,
+                        }
                     }
                 }
             }

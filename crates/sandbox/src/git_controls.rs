@@ -154,7 +154,7 @@ fn prepare_one(root: &Path) -> Result<Arc<Protected>, ExecError> {
     Ok(protected)
 }
 
-fn validate_aliases(paths: &[PathBuf]) -> Result<(), ExecError> {
+pub(crate) fn validate_aliases(paths: &[PathBuf]) -> Result<(), ExecError> {
     let mut pending = paths.to_vec();
     let mut visited = 0usize;
     while let Some(path) = pending.pop() {

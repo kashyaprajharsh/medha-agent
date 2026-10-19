@@ -14,7 +14,8 @@ pub(crate) fn append(path: &Path, record: &str) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    // Windows needs read access for handle metadata and the exclusive file lock.
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

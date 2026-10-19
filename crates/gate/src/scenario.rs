@@ -54,8 +54,8 @@ pub struct Contract {
 /// A single deterministic check. Authored as a one-key YAML map, e.g.
 /// `- command: { run: "sh test.sh", expect_exit: 0 }` or
 /// `- unchanged: { pattern: "tests/**", allow_zero_matches: false }`.
-/// A hand-written [`Deserialize`] (below) reads that shape directly — serde_yaml
-/// won't map a bare externally-tagged enum onto it, and a `!tag` form would be
+/// A hand-written [`Deserialize`] (below) reads that shape directly — a YAML
+/// deserializer won't map a bare externally-tagged enum onto it, and a `!tag` form would be
 /// worse to author.
 ///
 /// Every check is deterministic and model-free.
@@ -222,7 +222,7 @@ impl Scenario {
         };
         let text = std::fs::read_to_string(&file)
             .map_err(|e| GateError::Scenario(format!("reading {}: {e}", file.display())))?;
-        let mut scn: Scenario = serde_yaml::from_str(&text)
+        let mut scn: Scenario = serde_saphyr::from_str(&text)
             .map_err(|e| GateError::Scenario(format!("parsing {}: {e}", file.display())))?;
         scn.base_dir = base_dir.canonicalize().map_err(|e| {
             GateError::Scenario(format!(

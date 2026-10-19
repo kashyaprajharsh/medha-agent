@@ -125,14 +125,12 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
         )?;
         system = live_context.replace_memory(&k3.text);
         if !k3.text.is_empty() {
-            log.append(kernel::Event::context_file(
-                session,
-                "memory recall index",
-                &k3.text,
-                false,
-                k3.trust,
-            ))
-            .await?;
+            kernel.record_with_first_message(kernel::OpeningContext {
+                path: "memory recall index".into(),
+                content: k3.text.clone(),
+                blocked: false,
+                trust: k3.trust,
+            });
         }
     }
     session.autonomy = autonomy;
@@ -145,18 +143,16 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
         );
     }
     for file in startup_context.iter().chain(persona_file.iter()) {
-        log.append(kernel::Event::context_file(
-            session,
-            &file.path.display().to_string(),
-            &file.content,
-            file.blocked(),
-            if file.global {
+        kernel.record_with_first_message(kernel::OpeningContext {
+            path: file.path.display().to_string(),
+            content: file.content.clone(),
+            blocked: file.blocked(),
+            trust: if file.global {
                 kernel::TrustLabel::User
             } else {
                 kernel::TrustLabel::Workspace
             },
-        ))
-        .await?;
+        });
     }
     Ok(system)
 }

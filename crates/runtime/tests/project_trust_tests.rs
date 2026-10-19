@@ -128,8 +128,14 @@ while True:
     sys.stdout.buffer.write(b'Content-Length: ' + str(len(reply)).encode() + b'\r\n\r\n' + reply)
     sys.stdout.buffer.flush()
 "#).unwrap();
+    // Windows has no native no-network jail; this fixture tests trust/revocation.
+    let network = if cfg!(windows) {
+        "[lsp]\nallow_network = true\n"
+    } else {
+        ""
+    };
     let lock = format!(
-        "[memory]\nwrite_approval = 'none'\n[pricing]\ninput_per_mtok = 1\noutput_per_mtok = 2\n[[lsp.servers]]\nid = 'fixture'\ntrust = 'workspace'\ncommand = ['python3', '{}']\nlanguages = ['g7']\nroot_markers = ['.git']\n",
+        "[memory]\nwrite_approval = 'none'\n[pricing]\ninput_per_mtok = 1\noutput_per_mtok = 2\n{network}[[lsp.servers]]\nid = 'fixture'\ntrust = 'workspace'\ncommand = ['python3', '{}']\nlanguages = ['g7']\nroot_markers = ['.git']\n",
         server.display()
     );
     std::fs::write(a.root.join("medha.lock"), &lock).unwrap();

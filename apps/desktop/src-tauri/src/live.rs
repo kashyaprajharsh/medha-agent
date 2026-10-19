@@ -32,6 +32,7 @@ const REQUESTS: &[&str] = &[
     "session.settings",
     "session.presentation",
     "session.configure",
+    "session.profile.saved",
     "agent.control",
     "patch.list",
     "patch.apply",

@@ -9,6 +9,7 @@ import { useFile, useKeyed } from "./outputFiles";
 import { Gallery } from "./OutputGallery";
 import { Unshown } from "./OutputPlate";
 import { Rendered } from "./OutputRendered";
+import { stepZoom, useZoomGestures } from "./OutputZoom";
 
 const LANGUAGE: Partial<Record<OutputKind, string>> = {
   diagram: "mermaid",
@@ -23,7 +24,6 @@ const EXTENSION: Partial<Record<OutputKind, string>> = {
   page: "html",
   slides: "html",
 };
-const ZOOMS = [0.5, 0.75, 1, 1.5, 2, 3];
 const OFFLINE = "Offline. Only this revision's saved local assets are available. Preview permission is separate from the agent's network permission.";
 
 function Tool(props: { icon: IconName; label: string; onClick: () => void; pressed?: boolean; disabled?: boolean }) {
@@ -157,10 +157,9 @@ function Viewer({ open }: { open: Output }) {
       .then(async (writer) => writer.writeDeck(slidesOf(await exactText()), name))
       .then((bytes) => api.saveOutput(`${name}.pptx`, { bytes }))
       );
-  const zoomBy = (by: number) => {
-    const at = ZOOMS.indexOf(zoom ?? 1);
-    setZoom(ZOOMS[Math.min(ZOOMS.length - 1, Math.max(0, at + by))]);
-  };
+  const zoomable = !code && (kind === "image" || kind === "diagram" || kind === "drawing");
+  const zoomBy = (by: number) => setZoom(stepZoom(zoom, by));
+  useZoomGestures(canvas, zoomable && !problem, zoom, setZoom, large);
 
   const viewer = (
     <div className={`out-viewer ${large ? "large" : ""}`}>
@@ -187,7 +186,7 @@ function Viewer({ open }: { open: Output }) {
           </button>
         )}
         <div className="out-tools">
-          {!code && (kind === "image" || kind === "diagram" || kind === "drawing") && (
+          {zoomable && (
             <>
               <Tool icon="zoomout" label="Zoom out" onClick={() => zoomBy(-1)} />
               <button type="button" className="out-fit" onClick={() => setZoom(undefined)}>
@@ -271,7 +270,7 @@ function Viewer({ open }: { open: Output }) {
         {touch && (
           <p>
             <Icon name={web ? "globe" : "lock"} />
-            {touch}
+            <span className="out-touch">{touch}</span>
             {page && (
               <button type="button" className="out-allow" onClick={() => allow?.(open, !web)}>
                 {web ? "Go offline" : "Allow HTTPS internet for this preview"}

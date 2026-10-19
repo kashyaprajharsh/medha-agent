@@ -1226,7 +1226,7 @@ async fn gemini_reasoning_choices_and_model_switches_are_shared_between_viewers(
                 &folder,
                 json!({"method":"settings.model.save","params":{
                     "name":name,"default":default,"key":SECRET,
-                    "profile":{"protocol":"gemini-interactions","base_url":world.provider.url,
+                    "profile":{"protocol":"gemini-interactions","provider_id":"google","base_url":world.provider.url,
                         "model":model,"auth":"x-goog-api-key","max_ctx":128000,"reasoning":"effort"}
                 }}),
             )

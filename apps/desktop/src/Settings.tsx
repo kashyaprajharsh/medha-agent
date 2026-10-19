@@ -67,9 +67,13 @@ const LOOKS = [
 export function Settings({
   sessionKey,
   ensureOpen,
+  editModel,
+  onEditedModel,
 }: {
   sessionKey: string | null;
   ensureOpen: () => Promise<void>;
+  editModel?: string;
+  onEditedModel?: () => void;
 }) {
   const context = useWorkspace();
   const api = context.api;
@@ -116,6 +120,13 @@ export function Settings({
       active = false;
     };
   }, [tab, refresh]);
+  useEffect(() => {
+    const asked = editModel && models.find((model) => model.name === editModel);
+    if (!asked) return;
+    setTab("models");
+    setEditing(asked);
+    onEditedModel?.();
+  }, [editModel, models, onEditedModel]);
   async function act(method: string, params: Record<string, unknown>) {
     setBusy(true);
     setError("");
@@ -126,7 +137,9 @@ export function Settings({
       setEditing(undefined);
       setConfirm(undefined);
       setRefresh((value) => value + 1);
-      window.dispatchEvent(new CustomEvent("medha-preferences"));
+      // A saved model names itself so chats already using it can take the change.
+      const profile = method === "settings.model.save" && typeof params.name === "string" && params.name ? params.name : undefined;
+      window.dispatchEvent(new CustomEvent("medha-preferences", { detail: profile ? { profile } : undefined }));
     } catch (cause) {
       setError(String(cause));
       throw cause;

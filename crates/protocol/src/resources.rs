@@ -315,6 +315,9 @@ pub struct SessionSummary {
     pub model: Option<String>,
     #[serde(default)]
     pub events: u64,
+    /// Sub-agents this chat started; their own sessions are not listed separately.
+    #[serde(default)]
+    pub agents: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

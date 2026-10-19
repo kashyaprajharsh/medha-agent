@@ -229,6 +229,64 @@ async fn run_case(
 }
 
 #[tokio::test]
+async fn opening_context_is_retried_before_the_first_message_after_a_log_failure() {
+    let log = Arc::new(FailOnceLog::new(EventKind::ContextFileLoaded));
+    let kernel = Kernel::new(
+        Arc::new(ScriptedProvider::new("state.write")),
+        log.clone(),
+        Arc::new(CountingMutation {
+            executions: AtomicUsize::new(0),
+            memory: false,
+        }),
+        Arc::new(Passthrough),
+        Arc::new(Artifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    for path in ["AGENTS.md", "MEMORY.md"] {
+        kernel.record_with_first_message(kernel::OpeningContext {
+            path: path.into(),
+            content: "instructions".into(),
+            blocked: false,
+            trust: kernel::TrustLabel::Workspace,
+        });
+    }
+    let session = Session::new();
+    let run = || {
+        kernel.run_session(
+            &session,
+            vec![Message::user("write")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+    };
+    assert!(run().await.is_err());
+    assert!(log.events(session.id).await.is_empty());
+    run().await.unwrap();
+    let events = log.events(session.id).await;
+    assert_eq!(events[0].kind, EventKind::ContextFileLoaded);
+    assert_eq!(events[0].payload["path"], "AGENTS.md");
+    assert_eq!(events[1].kind, EventKind::ContextFileLoaded);
+    assert_eq!(events[1].payload["path"], "MEMORY.md");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::ContextFileLoaded)
+            .count(),
+        2
+    );
+    assert!(
+        events
+            .iter()
+            .position(|event| event.kind == EventKind::UserMessage)
+            .unwrap()
+            > 1
+    );
+}
+
+#[tokio::test]
 async fn policy_append_failure_fails_closed_before_execution() {
     let (log, executor, session, result) = run_case(EventKind::PolicyDecision, false).await;
     assert!(

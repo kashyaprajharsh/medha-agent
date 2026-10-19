@@ -1727,6 +1727,21 @@ while another session change is in progress. A successful boundary returns focus
 main and retires the old session's pane roster, preventing old output from appearing
 under a new session id.
 
+**Session lists.** A chat writes nothing to the log until its first message: the
+instruction files and memory its prompt was built from are recorded then, ahead of
+that message and of everything the run reads, so trust and taint are decided
+exactly as before. Opening a chat and leaving therefore leaves no session behind.
+Chats from older builds that hold only startup context are left out of the
+`/resume` picker, `medha --sessions` and the desktop sidebar; their events stay in
+the log, so the audit chain is untouched. A
+sub-agent's own session is not offered on its own: the terminal shows it as a count
+on the chat that started it, the desktop nests it under that chat, and
+`medha --continue` resumes the most recent chat, never a sub-agent.
+
+**Desktop updates.** Signed updates use the release's raw NSIS installer on
+Windows, raw AppImage on Linux, or application tarball on macOS. The unused ZIP
+update reader is disabled, removing its vulnerable extraction dependency.
+
 **Theme.** Four palettes, each a whole visual identity rather than a set of text
 colours: `dark` (intellect-gold on warm ink) and `light` (ink on parchment) are the
 signature pair, joined by `indigo` — nīla, gold on resist-dyed cloth — and `copper`,
@@ -2136,11 +2151,20 @@ Package names are metadata and are never executed as provider adapters.
 
 Saved profiles can qualify metadata with `provider_id`, while retaining their
 existing protocol, endpoint and credential record. Explicit profile overrides
-take precedence. Prices, context windows and capabilities require an exact
-catalogue identity, including its provider when qualified. Similar names and
-unknown deployments stay unknown; enter explicit prices/window for a custom
-deployment when needed. Prices feed the cost meter and are
+take precedence. Prices, context windows and capabilities require an exact catalogue identity,
+including its provider when qualified; similar names stay unknown. A context
+window resolves in order: the profile's own value, the window the server reports
+in `/v1/models` (`max_model_len`, `context_length` or `context_window`), then the
+exact catalogue entry's window. Limits from other providers are never borrowed.
+With none of these the chat shows the
+window as unknown (`ctx ?` in the TUI, a "Set context window" action in the
+desktop chat details) and compaction waits for the server to refuse a request.
+A window larger than the deployment serves is corrected by that refusal. Prices
+feed the cost meter and are
 labelled indicative when taken from the public catalogue.
+
+Saving or switching a live chat's model uses that same context-resolution order,
+including a fresh server metadata lookup when no explicit window is saved.
 
 Desktop and TUI select a provider before asking for access and a model. Custom
 endpoints and manual model IDs remain available. Endpoint templates require

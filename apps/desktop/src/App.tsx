@@ -124,6 +124,8 @@ export function App() {
   };
   const [control, setControl] = useState<Control | null>(null);
   const [defaults, setDefaults] = useState<SessionSettings>();
+  // A model whose editor Settings opens on, asked for from the chat's details.
+  const [editModel, setEditModel] = useState<string>();
   // With no model saved, setup opens by itself once; a task typed meanwhile waits for it.
   const [modelless, setModelless] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -618,9 +620,15 @@ export function App() {
     [toggleRun],
   );
   const preferenceReload = useRef(new Set<string>());
+  // Chats whose own model was just saved re-read it, so a new window or key applies there too.
+  const profileReload = useRef(new Map<string, string>());
   useEffect(() => {
-    const update = () => {
-      Object.keys(live).forEach((key) => preferenceReload.current.add(key));
+    const update = (event: Event) => {
+      const saved = (event as CustomEvent<{ profile?: string } | undefined>).detail?.profile;
+      Object.keys(live).forEach((key) => {
+        preferenceReload.current.add(key);
+        if (saved && live[key]?.settings?.profile === saved) profileReload.current.set(key, saved);
+      });
       void refresh(true);
     };
     window.addEventListener("medha-preferences", update);
@@ -636,9 +644,20 @@ export function App() {
       )
         continue;
       preferenceReload.current.delete(key);
-      void api
-        .liveCall(key, "extensions.reload")
-        .catch((cause) => setError(String(cause)));
+      const profile = profileReload.current.get(key);
+      profileReload.current.delete(key);
+      void (async () => {
+        try {
+          await api.liveCall(key, "extensions.reload");
+          if (profile) await api.liveCall(key, "session.profile.saved", { profile });
+        } catch (cause) {
+          // A turn can start between the idle check and the backend request.
+          // Keep the update for its next idle boundary instead of losing it.
+          preferenceReload.current.add(key);
+          if (profile && !profileReload.current.has(key)) profileReload.current.set(key, profile);
+          setError(String(cause));
+        }
+      })();
     }
   }, [live, defaults]);
   const actions: Action[] = [
@@ -956,6 +975,8 @@ export function App() {
               if (currentKey)
                 await ensureOpen(currentKey, draftKey ? null : selected);
             }}
+            editModel={editModel}
+            onEditedModel={() => setEditModel(undefined)}
           />
         )}
         <div
@@ -1150,6 +1171,10 @@ export function App() {
             }}
             locked={settingsLocked}
             onFile={setPreview}
+            onEditModel={(profile) => {
+              setEditModel(profile);
+              setPage("settings");
+            }}
           />
         )
       )}

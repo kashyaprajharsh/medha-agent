@@ -256,13 +256,12 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                                     .await
                                     .capabilities;
                             }
-                            if resolved.provider.max_ctx.is_none() {
-                                resolved.provider.max_ctx =
-                                    providers::models_dev::profile_context_window(
-                                        &resolved.provider,
-                                    )
-                                    .await;
-                            }
+                            resolved.provider.max_ctx = runtime::model::context_window(
+                                &resolved.provider,
+                                &resolved.credential,
+                            )
+                            .await
+                            .0;
                             providers::models_dev::resolve_reasoning_efforts(
                                 &mut resolved.provider,
                             )

@@ -384,20 +384,29 @@ pub(crate) async fn read<L: EventLog>(
                 messages: vec![config::pulse(cfg.as_ref(), None, None, Some(workspace)).render()],
             })
         }
-        Read::Sessions => Reply::Sessions(
-            log.sessions()
-                .await
-                .into_iter()
-                .map(|session| protocol::SessionSummary {
-                    id: session.id.to_string(),
-                    started: session.started_ts,
-                    updated: session.last_ts,
-                    title: Some(session.title),
-                    model: None,
-                    events: session.events,
-                })
-                .collect(),
-        ),
+        // Sub-agents are counted on the chat that started them, not resumed on their own.
+        Read::Sessions => {
+            let sessions = log.sessions().await;
+            let mut agents = std::collections::HashMap::<ulid::Ulid, u32>::new();
+            for parent in sessions.iter().filter_map(|session| session.parent) {
+                *agents.entry(parent).or_default() += 1;
+            }
+            Reply::Sessions(
+                sessions
+                    .into_iter()
+                    .filter(|session| session.parent.is_none())
+                    .map(|session| protocol::SessionSummary {
+                        id: session.id.to_string(),
+                        started: session.started_ts,
+                        updated: session.last_ts,
+                        title: Some(session.title),
+                        model: None,
+                        events: session.events,
+                        agents: agents.get(&session.id).copied().unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        }
         Read::Skills => {
             let fallback;
             let store = match live_skills {

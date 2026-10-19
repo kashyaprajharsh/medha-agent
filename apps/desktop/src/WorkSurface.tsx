@@ -36,6 +36,7 @@ type Props = {
   focusChange?: { path: string; at: number };
   ensureOpen: () => Promise<void>;
   locked: boolean;
+  onEditModel?: (profile: string) => void;
 };
 
 export function WorkSurface(props: Props) {
@@ -557,9 +558,22 @@ export function WorkSurface(props: Props) {
               </dd>
               <dt>Context window</dt>
               <dd>
-                {props.settings?.context_limit
-                  ? `${props.settings.context_limit.toLocaleString()} tokens`
-                  : "Not reported"}
+                {props.settings?.context_limit ? (
+                  `${props.settings.context_limit.toLocaleString()} tokens`
+                ) : (
+                  <>
+                    Unknown, so compaction waits for the server to refuse.{" "}
+                    {props.settings?.profile && props.onEditModel && (
+                      <button
+                        type="button"
+                        className="btn-line"
+                        onClick={() => props.onEditModel?.(props.settings!.profile!)}
+                      >
+                        Set context window
+                      </button>
+                    )}
+                  </>
+                )}
               </dd>
               {props.state?.contextPressure?.usable !== undefined && (
                 <>

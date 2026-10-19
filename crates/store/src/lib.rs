@@ -689,7 +689,9 @@ impl SqliteLog {
 
     /// List every session in the log, newest activity first — for the resume
     /// picker. Title is the first user message (truncated); a session with no
-    /// user message (pre-logging, or empty) shows a placeholder.
+    /// user message (pre-logging, or a sub-agent) shows a placeholder. A chat
+    /// now logs nothing before its first message; one from older builds that
+    /// holds only startup context is not listed, and its events stay in the log.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>, StoreError> {
         let conn = self
             .conn
@@ -697,13 +699,19 @@ impl SqliteLog {
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT e1.session_id, MIN(e1.ts), MAX(e1.ts), COUNT(*),
+                "WITH spawns AS MATERIALIZED (
+                    SELECT session_id AS parent, json_extract(payload, '$.child') AS child
+                    FROM events WHERE kind = 'agent.spawned')
+                 SELECT e1.session_id, MIN(e1.ts), MAX(e1.ts), COUNT(*),
                     (SELECT e2.payload FROM events e2
                      WHERE e2.session_id = e1.session_id AND e2.kind = 'user.message'
                        AND e2.trust = 'user' AND json_extract(e2.payload, '$.hook') IS NULL
-                     ORDER BY e2.rowid ASC LIMIT 1)
+                     ORDER BY e2.rowid ASC LIMIT 1),
+                    (SELECT parent FROM spawns
+                     WHERE child = e1.session_id AND parent <> e1.session_id LIMIT 1)
                  FROM events e1
                  GROUP BY e1.session_id
+                 HAVING SUM(e1.kind NOT IN ('context.file_loaded', 'context.file_blocked')) > 0
                  ORDER BY MAX(e1.ts) DESC",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -715,13 +723,14 @@ impl SqliteLog {
                     r.get::<_, f64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, started, last, count, first_user) =
+            let (id, started, last, count, first_user, parent) =
                 row.map_err(|e| StoreError::Db(e.to_string()))?;
             let Ok(id) = Ulid::from_string(&id) else {
                 continue;
@@ -746,6 +755,7 @@ impl SqliteLog {
                 started_ts: started,
                 last_ts: last,
                 events: count as u64,
+                parent: parent.and_then(|parent| Ulid::from_string(&parent).ok()),
             });
         }
         Ok(out)
@@ -1897,6 +1907,55 @@ mod tests {
         assert_eq!(sessions[1].id, s1.id);
         assert_eq!(sessions[1].title, "first task here");
         assert_eq!(sessions[1].events, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unused_chat_is_not_listed_and_a_sub_agent_is_listed_under_its_chat() {
+        let dir = std::env::temp_dir().join(format!("medha-sess-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let session = |_: ()| kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
+        let (opened, chat, agent) = (session(()), session(()), session(()));
+        log.append(Event::context_file(
+            &opened,
+            "memory recall index",
+            "remembered",
+            false,
+            TrustLabel::Memory,
+        ))
+        .await
+        .unwrap();
+        log.append(Event::user_message(&chat, "review the repo"))
+            .await
+            .unwrap();
+        let mut spawned = Event::agent_spawned(&chat, "reviewer", "review", &[]);
+        spawned.payload["child"] = serde_json::json!(agent.id.to_string());
+        log.append(spawned).await.unwrap();
+        log.append(Event::agent_spawned(&agent, "reviewer", "review", &[]))
+            .await
+            .unwrap();
+        log.append(Event::model_text(&agent, "done")).await.unwrap();
+
+        let sessions = log.list_sessions().unwrap();
+        assert!(sessions.iter().all(|listed| listed.id != opened.id));
+        let parent = |id| {
+            sessions
+                .iter()
+                .find(|listed| listed.id == id)
+                .unwrap()
+                .parent
+        };
+        assert_eq!(parent(chat.id), None);
+        assert_eq!(parent(agent.id), Some(chat.id));
+        assert_eq!(
+            log.events(opened.id).await.len(),
+            1,
+            "the unused chat's log is kept"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

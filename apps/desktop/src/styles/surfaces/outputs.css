@@ -761,6 +761,13 @@
 .out-canvas:has(.out-diagram.on-paper) {
   background: var(--paper);
 }
+.out-canvas:has(.zoomed, .out-image[style*="width"]) {
+  cursor: grab;
+}
+.out-canvas.panning {
+  cursor: grabbing;
+  user-select: none;
+}
 .out-canvas > :is(.out-diagram, .out-page, .out-deck, .out-pdf, .out-video, .out-sound, .out-document, .source-code) {
   width: 100%;
 }
@@ -846,6 +853,8 @@
 }
 .out-foot {
   display: grid;
+  /* A long blocked URL wraps inside the viewer instead of pushing the Allow button out. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--s-2);
   padding: 0 var(--s-5) var(--s-4);
   font-size: var(--text-sm);
@@ -859,6 +868,7 @@
   color: var(--text);
   font-weight: 600;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 .out-foot:empty {
   display: none;
@@ -866,8 +876,15 @@
 .out-foot p {
   margin: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--s-2);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.out-touch {
+  flex: 1 1 24ch;
+  min-width: 0;
 }
 .out-versions {
   position: absolute;

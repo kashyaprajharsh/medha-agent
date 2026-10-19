@@ -2354,6 +2354,9 @@ fn workspace_contains_native_credentials(workspace: &Path) -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn apply_isolated_environment(cmd: &mut tokio::process::Command, home: &IsolatedHome) {
+    // Apple's tool launchers otherwise write their cache outside the private TMPDIR.
+    #[cfg(target_os = "macos")]
+    cmd.env("xcrun_nocache", "1");
     let home_path = &home.path;
     cmd.env("HOME", home_path)
         .env("TMPDIR", home_path.join("tmp"))
@@ -2817,6 +2820,7 @@ impl LandlockBackend {
             "/etc/resolv.conf",
             "/etc/hosts",
             "/etc/nsswitch.conf",
+            "/etc/gitconfig",
             "/etc/localtime",
             "/etc/passwd",
             "/etc/group",

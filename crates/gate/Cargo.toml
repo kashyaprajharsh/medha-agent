@@ -16,7 +16,7 @@ lockfile = { path = "../lockfile" }
 sandbox = { path = "../sandbox" }
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9"
+serde-saphyr = "2"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

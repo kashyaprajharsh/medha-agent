@@ -656,6 +656,15 @@ fn open_link(url: String) -> Result<(), String> {
     }
     files::open_path(std::path::Path::new(&url))
 }
+/// The project-trust card reads its review and trusts the shown checkout; no
+/// other shared resource change is reachable from the webview.
+fn project_trust_request(method: &str, params: &Value) -> bool {
+    match method {
+        "application.resources" => params["resource"] == "project_trust",
+        "application.resources.change" => params["action"] == "trust_project",
+        _ => false,
+    }
+}
 #[tauri::command]
 async fn settings_request(
     state: State<'_, DesktopState>,
@@ -695,6 +704,7 @@ async fn settings_request(
         "instructions.save",
     ]
     .contains(&method.as_str())
+        && !project_trust_request(&method, &params)
     {
         return Err("Unsupported settings action".into());
     }
@@ -814,6 +824,43 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod settings_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn the_webview_reaches_project_trust_but_no_other_resource_change() {
+        assert!(project_trust_request(
+            "application.resources",
+            &serde_json::json!({"resource":"project_trust"})
+        ));
+        assert!(project_trust_request(
+            "application.resources.change",
+            &serde_json::json!({"action":"trust_project","data":{}})
+        ));
+        for (method, params) in [
+            (
+                "application.resources",
+                serde_json::json!({"resource":"models"}),
+            ),
+            (
+                "application.resources.change",
+                serde_json::json!({"action":"update_model_key","data":{}}),
+            ),
+            (
+                "application.resources.change",
+                serde_json::json!({"action":"revoke_project_trust"}),
+            ),
+            (
+                "settings.unknown",
+                serde_json::json!({"action":"trust_project"}),
+            ),
+        ] {
+            assert!(!project_trust_request(method, &params), "{method} {params}");
+        }
+    }
 }
 
 #[cfg(test)]

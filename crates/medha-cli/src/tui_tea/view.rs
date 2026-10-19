@@ -1609,6 +1609,8 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 ""
             }
         ),
+        // Counted but with no window known: compaction waits for the server to refuse.
+        None if model.context_pressure.is_some() => "ctx ?".to_string(),
         None => "ctx —".to_string(),
     };
     // Mark indicative list prices; self-hosted routes may not incur them.

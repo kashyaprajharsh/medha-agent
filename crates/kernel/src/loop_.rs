@@ -508,6 +508,14 @@ impl std::fmt::Debug for SessionClaim {
     }
 }
 
+/// A file the chat's prompt was built from, recorded once the chat is used.
+pub struct OpeningContext {
+    pub path: String,
+    pub content: String,
+    pub blocked: bool,
+    pub trust: TrustLabel,
+}
+
 pub struct Kernel<P: Provider, L: EventLog> {
     pub provider: Arc<P>,
     pub log: Arc<L>,
@@ -529,6 +537,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     image_side: std::sync::atomic::AtomicU32,
     /// Stored results that came from outside; reading one back is outside text too.
     outside_stored: std::sync::Mutex<std::collections::HashMap<String, TrustLabel>>,
+    /// Startup context recorded with the first message, so an unused chat leaves no log.
+    opening: std::sync::Mutex<Vec<OpeningContext>>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     request_context: Option<Arc<dyn crate::context::RequestContext>>,
     max_parallel_tools: usize,
@@ -759,6 +769,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             shrinks_images: Default::default(),
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
+            opening: Default::default(),
             progressive_context: None,
             request_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
@@ -802,6 +813,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             shrinks_images: Default::default(),
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
+            opening: Default::default(),
             progressive_context: self.progressive_context.clone(),
             request_context: self.request_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
@@ -972,6 +984,49 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
     pub fn session_owner(&self) -> Option<Arc<dyn SessionOwner>> {
         self.session_owner.clone()
+    }
+
+    /// Record `context` in the log with the chat's first message, not before it.
+    pub fn record_with_first_message(&self, context: OpeningContext) {
+        self.opening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(context);
+    }
+
+    /// Written ahead of everything the run reads, exactly as if logged at startup.
+    async fn record_opening(&self, session: &Session) -> Result<(), KernelError> {
+        let opening = std::mem::take(
+            &mut *self
+                .opening
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut pending = opening.into_iter();
+        while let Some(context) = pending.next() {
+            if let Err(error) = self
+                .log
+                .append(Event::context_file(
+                    session,
+                    &context.path,
+                    &context.content,
+                    context.blocked,
+                    context.trust,
+                ))
+                .await
+            {
+                let mut opening = self
+                    .opening
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let newer = std::mem::take(&mut *opening);
+                opening.push(context);
+                opening.extend(pending);
+                opening.extend(newer);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub fn reserve_session(&self, session: ulid::Ulid) -> Result<Option<SessionClaim>, String> {

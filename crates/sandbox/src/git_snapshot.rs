@@ -142,6 +142,18 @@ impl Snapshot {
         drop(busy);
         let lease = Lease(slot);
         let git = root.join(".git");
+        let protected = if git.is_dir() {
+            ["config", "commondir", "hooks"]
+                .map(|name| git.join(name))
+                .into_iter()
+                .filter(|path| path.symlink_metadata().is_ok())
+                .collect::<Vec<_>>()
+        } else if git.symlink_metadata().is_ok() {
+            vec![git.clone()]
+        } else {
+            Vec::new()
+        };
+        crate::git_controls::validate_aliases(&protected)?;
         let mut budget = (BYTES, ENTRIES);
         let mut entry = read(&git, &mut budget, false).map_err(failed)?;
         let mut controls = BTreeMap::new();

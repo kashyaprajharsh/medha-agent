@@ -9,6 +9,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
         interrupts: &mut Option<crate::interrupts::InterruptQueue>,
     ) -> Flow<Ready> {
+        self.record_opening(session).await?;
         // `None` (headless) → a token that never trips; every cancel path is dead.
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
         // A sub-agent or a headless run has nobody pausing between its turns.

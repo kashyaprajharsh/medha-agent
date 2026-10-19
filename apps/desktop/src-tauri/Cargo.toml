@@ -37,7 +37,8 @@ wire = { path = "../../../crates/wire" }
 medha-client = { path = "../../../crates/medha-client" }
 protocol = { package = "medha-protocol", path = "../../../crates/protocol" }
 transcript-view = { path = "../../../crates/transcript-view" }
-tauri-plugin-updater = "2"
+# Releases ship raw NSIS/AppImage installers and macOS tarballs, never ZIP updates.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

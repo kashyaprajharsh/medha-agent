@@ -29,8 +29,9 @@ thiserror.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["process"] }
 # Skills: parse/emit SKILL.md frontmatter. YAML is the ecosystem standard;
-# TOML stays as a read-only legacy fallback.
-serde_yaml = "0.9"
+# TOML stays as a read-only legacy fallback. A safe-Rust parser (serde_yaml is
+# deprecated and its libyaml translation unmaintained).
+serde-saphyr = "2"
 toml = "0.8"
 similar = "2"
 regex = "1"

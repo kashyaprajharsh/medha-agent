@@ -694,6 +694,8 @@ pub struct SessionMeta {
     pub started_ts: f64,
     pub last_ts: f64,
     pub events: u64,
+    /// The chat that started this sub-agent's session; pickers show it under that chat.
+    pub parent: Option<Ulid>,
 }
 
 /// An owned, RAII mutation lease. The kernel knows nothing about how a backend

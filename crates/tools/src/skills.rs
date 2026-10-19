@@ -1574,9 +1574,9 @@ impl SaveSpec {
             required_tools: self.required_tools.clone(),
             version,
         };
-        // serde_yaml::to_string on a plain struct is stable and correctly
-        // escapes strings — safer than hand-formatting the frontmatter.
-        let frontmatter = serde_yaml::to_string(&fm).unwrap_or_default();
+        // A YAML serializer on a plain struct is stable and correctly escapes
+        // strings — safer than hand-formatting the frontmatter.
+        let frontmatter = serde_saphyr::to_string(&fm).unwrap_or_default();
         format!("---\n{frontmatter}---\n\n{}\n", self.procedure.trim())
     }
 }
@@ -1720,7 +1720,7 @@ fn parse_skill_md(text: &str) -> Result<ParsedMd, String> {
     // Find the closing fence at the start of a line.
     let (fm_src, body) =
         split_at_closing_fence(rest).ok_or("missing closing '---' frontmatter fence")?;
-    let mut fm: Frontmatter = serde_yaml::from_str(fm_src).or_else(|yaml_err| {
+    let mut fm: Frontmatter = serde_saphyr::from_str(fm_src).or_else(|yaml_err| {
         toml::from_str(fm_src).map_err(|_| format!("invalid frontmatter YAML: {yaml_err}"))
     })?;
     // A multi-line description is fine on disk; the manifest renders it as one
@@ -2864,10 +2864,8 @@ mod tests {
         assert!(v["procedure"].as_str().unwrap().contains("flyctl launch"));
         assert_eq!(v["bundled_files"][0]["file"], "references/checklist.md");
         assert!(
-            v["bundled_files"][0]["abs_path"]
-                .as_str()
-                .unwrap()
-                .ends_with("references/checklist.md")
+            std::path::Path::new(v["bundled_files"][0]["abs_path"].as_str().unwrap())
+                .ends_with(std::path::Path::new("references").join("checklist.md"))
         );
         let page = futures::executor::block_on(tool.execute(&json!({
             "name": "deploy-fly",

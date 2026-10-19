@@ -35,7 +35,7 @@ fn syntax_error(path: &str, text: &str) -> Option<Result<(), String>> {
                 .map_err(|error| error.to_string()),
         ),
         "yaml" | "yml" => Some(
-            serde_yaml::from_str::<serde_yaml::Value>(text)
+            serde_saphyr::from_str::<serde::de::IgnoredAny>(text)
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
         ),

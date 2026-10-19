@@ -20,6 +20,34 @@ pub struct Model {
     pub credential: Option<String>,
 }
 
+/// One resolution route for startup and live profile changes; deployments can differ.
+pub async fn context_window(
+    profile: &providers::ProviderProfile,
+    credential: &str,
+) -> (Option<u32>, &'static str) {
+    if let Some(limit) = profile.max_ctx {
+        return (Some(limit), "config/env");
+    }
+    if !profile.base_url.is_empty()
+        && matches!(
+            profile.protocol,
+            kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
+        )
+        && let Ok(models) =
+            providers::openai_compat::list_models_for_profile(profile, credential).await
+        && let Some(limit) = models
+            .iter()
+            .find(|model| model.id == profile.model)
+            .and_then(|model| model.context_length)
+    {
+        return (Some(limit), "discovered from /v1/models");
+    }
+    (
+        providers::models_dev::profile_context_window(profile).await,
+        "models.dev",
+    )
+}
+
 pub async fn resolve(
     lock: &lockfile::MedhaLock,
     options: &SessionOptions,
@@ -123,33 +151,7 @@ pub async fn resolve(
     let active_profile = resolved.name.clone();
 
     // Context limits resolve from config, server metadata, then models.dev.
-    let (mut max_ctx, mut ctx_source) = (resolved.provider.max_ctx, "config/env");
-    if max_ctx.is_none()
-        && !resolved.provider.base_url.is_empty()
-        && matches!(
-            resolved.provider.protocol,
-            kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
-        )
-        && let Ok(models) = providers::openai_compat::list_models_for_profile(
-            &resolved.provider,
-            &resolved.credential,
-        )
-        .await
-        && let Some(c) = models
-            .iter()
-            .find(|m| m.id == model_name)
-            .and_then(|m| m.context_length)
-    {
-        max_ctx = Some(c);
-        ctx_source = "discovered from /v1/models";
-    }
-    if max_ctx.is_none()
-        && !model_name.is_empty()
-        && let Some(c) = providers::models_dev::profile_context_window(&resolved.provider).await
-    {
-        max_ctx = Some(c);
-        ctx_source = "models.dev";
-    }
+    let (max_ctx, ctx_source) = context_window(&resolved.provider, &resolved.credential).await;
     match max_ctx {
         _ if model_name.is_empty() => {} // nothing configured yet — stay quiet
         Some(n) => {
@@ -175,7 +177,8 @@ pub async fn resolve(
         }
         None => notices.say(&format!(
             "note: context window unknown for '{model_name}' (not reported by the server \
-             or found on models.dev) — compaction disabled. Set MEDHA_MAX_CTX=<tokens> to enable it."
+             or listed in the model catalogue), so compaction waits for the server to refuse a \
+             request. Set it in Settings → Models or with MEDHA_MAX_CTX=<tokens>."
         )),
     }
 

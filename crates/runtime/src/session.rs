@@ -456,7 +456,11 @@ async fn resolve_resume(
     let id = match resume {
         Resume::Id(idstr) => ulid::Ulid::from_string(idstr.trim())
             .map_err(|_| anyhow::anyhow!("invalid session id '{idstr}'"))?,
-        Resume::Latest => match log.list_sessions()?.into_iter().next() {
+        Resume::Latest => match log
+            .list_sessions()?
+            .into_iter()
+            .find(|s| s.parent.is_none())
+        {
             Some(s) => s.id,
             None => {
                 notices.say("no prior sessions to continue — starting fresh");

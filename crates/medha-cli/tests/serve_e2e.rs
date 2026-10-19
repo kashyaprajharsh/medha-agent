@@ -448,10 +448,12 @@ impl Backend {
             );
             if let (Ok(address), Ok(token)) = found
                 && let Ok(stream) = wire::connect(&address).await
+                // A restarting backend may replace a stale token after we read it.
+                && let Ok(client) = Client::meet(stream, &token).await
             {
-                return Client::meet(stream, &token).await;
+                return client;
             }
-            assert!(Instant::now() < deadline, "the backend never listened");
+            assert!(Instant::now() < deadline, "the backend never authenticated");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -673,22 +675,23 @@ async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit
 }
 
 impl Client {
-    async fn meet<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, token: &str) -> Self {
+    async fn meet<S: AsyncRead + AsyncWrite + Send + 'static>(
+        stream: S,
+        token: &str,
+    ) -> Result<Self, wire::Refusal> {
         let (read, write) = tokio::io::split(stream);
         let mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> =
             BufReader::new(Box::new(read));
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(write);
-        let welcome = wire::greet(&mut reader, &mut writer, token, ROLES)
-            .await
-            .expect("the backend did not admit a client holding its token");
+        let welcome = wire::greet(&mut reader, &mut writer, token, ROLES).await?;
         assert_eq!(welcome["result"]["protocol"], 1);
-        Self {
+        Ok(Self {
             reader,
             writer,
             events: Default::default(),
             heard: String::new(),
             asked: 0,
-        }
+        })
     }
 
     /// The next frame in the order it arrived: one set aside while an answer

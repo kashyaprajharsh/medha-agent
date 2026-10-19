@@ -1656,9 +1656,9 @@ fn spawn_background_captured(
     let child_slot = Arc::new(Mutex::new(Some(child)));
     let supervisor_child = child_slot.clone();
     let resource_capture = capture.clone();
+    // Restoration and secret redaction need the standard thread stack.
     let supervisor = std::thread::Builder::new()
         .name(format!("medha-proc-{pid}"))
-        .stack_size(128 * 1024)
         .spawn(move || {
             let mut child = supervisor_child
                 .lock()

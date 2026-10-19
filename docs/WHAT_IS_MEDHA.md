@@ -1517,6 +1517,8 @@ terminal command call the same backend operation. Denied actions stay denied.
 After web text, commands retain the existing G6 policy: a network-denied jail does
 not gain another pre-run approval. Command resources capture protected checkout
 content and its digest, then compare and repair changes after process cleanup.
+This protection also applies to the first command in a fresh process, before
+completion is reported.
 An exact restored change can be reapplied once from its notice. Ordinary source
 edits get no new review. Before web, shell policy is unchanged. Repair cannot undo
 execution while content was modified, transient changes undone before comparison,

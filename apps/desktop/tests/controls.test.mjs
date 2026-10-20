@@ -2207,9 +2207,8 @@ test("choosing a discovered Gemini model lets the backend name its profile and p
   const button = (text) => [...document.querySelectorAll("button")].find((node) => node.textContent.trim() === text);
   await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
   await click(button("Add model"));
+  await click(providerRow("Google Gemini"));
   assert.equal(button("Choose a protocol"), undefined, "a named provider selects its protocol");
-  await click(button("Choose a provider"));
-  await click(option("Google Gemini"));
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
   await act(() => {
     const key = document.querySelector('input[type="password"]');
@@ -2217,11 +2216,10 @@ test("choosing a discovered Gemini model lets the backend name its profile and p
     key.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await click(button("Find models on this server"));
-  await click(button("Choose a model"));
-  await click(option("gemini-3.8-flash"));
+  await click(modelRow("gemini-3.8-flash"));
   const inputFor = (label) => [...document.querySelectorAll("label")].find((node) => node.textContent.startsWith(label)).querySelector("input");
   assert.equal(inputFor("Model ID").value, "gemini-3.8-flash");
-  const name = inputFor("Profile name");
+  const name = inputFor("Name");
   assert.equal(name.value, "", "let the backend derive a valid, unique profile name");
   assert.equal(name.required, false);
   await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
@@ -2233,6 +2231,13 @@ test("choosing a discovered Gemini model lets the backend name its profile and p
 });
 
 const namedButton = (label) => [...document.querySelectorAll("button")].find((node) => node.textContent.trim() === label);
+// The connect sheet: a provider is a row in its list, a found model a row in the form.
+function providerRow(name) {
+  return [...document.querySelectorAll(".pv-row")].find((node) => node.querySelector("b")?.textContent.trim() === name);
+}
+function modelRow(id) {
+  return [...document.querySelectorAll(".cx-model")].find((node) => node.querySelector("b")?.textContent.trim() === id);
+}
 async function inputValue(input, value) {
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
   await act(() => {
@@ -2256,6 +2261,7 @@ async function providerForm(settingsApi) {
   await click(namedButton("Add model"));
   assert.equal(namedButton("Choose a protocol"), undefined);
 }
+const searchBox = () => document.querySelector('input[aria-label="Search providers, or paste a key"]');
 
 test("provider search saves its identity without reusing another endpoint's key or automatically testing", async () => {
   const calls = [];
@@ -2266,13 +2272,13 @@ test("provider search saves its identity without reusing another endpoint's key 
     assert.equal(method, "settings.list");
     return providerSettings([providerFixture], [existing]);
   });
-  await click(namedButton("Choose a provider"));
-  await inputValue(document.querySelector('input[placeholder="Search providers"]'), "Fixture");
-  await click(option("Fixture Provider"));
+  await inputValue(searchBox(), "Fixture");
+  await click(providerRow("Fixture Provider"));
   assert.equal(fieldInput("API endpoint").value, providerFixture.url);
-  assert.equal(fieldInput("API key").placeholder, "Paste API key", "same host with another account path is a different credential target");
-  assert.equal(namedButton("Find models on this server").disabled, true);
-  await inputValue(fieldInput("API key"), "dummy-only-key");
+  assert.equal(fieldInput("Key").placeholder, "Paste your Fixture Provider key", "same host with another account path is a different credential target");
+  assert.equal(namedButton("Find models on this server"), undefined, "nothing is looked up before a key");
+  assert.match(document.body.textContent, /Paste your key to see Fixture Provider’s models/);
+  await inputValue(fieldInput("Key"), "dummy-only-key");
   await inputValue(fieldInput("Model ID"), "fixture-model");
   await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   const save = calls.find((call) => call.method === "settings.model.save");
@@ -2282,35 +2288,34 @@ test("provider search saves its identity without reusing another endpoint's key 
   assert.ok(!calls.some((call) => call.method === "settings.model.test" || call.method === "settings.model.discover"));
 });
 
-test("provider refresh is a secondary labelled control and reports failure before a provider is chosen", async () => {
-  let finishRefresh, rejectRefresh;
+test("provider refresh is a secondary labelled control beside the search and reports failure", async () => {
+  let finishRefresh, rejectRefresh, lists = 0;
   await providerForm(async (method = "settings.list") => {
-    if (method === "settings.list") return providerSettings();
+    if (method === "settings.list") { lists++; return providerSettings(); }
     if (method === "application.providers.refresh") return new Promise((resolve, reject) => { finishRefresh = resolve; rejectRefresh = reject; });
     assert.fail(method);
   });
-  const refresh = document.querySelector('.model-provider-heading button[aria-label="Refresh provider catalogue"]');
+  const refresh = document.querySelector('.pv-search button[aria-label="Refresh provider catalogue"]');
   assert.ok(refresh);
   assert.equal(refresh.type, "button");
   assert.ok(refresh.classList.contains("icon-btn"));
   assert.ok(!refresh.classList.contains("btn-line"));
-  const unavailable = document.querySelector(".model-provider-field details");
-  assert.match(unavailable.querySelector("summary").textContent, /Not available yet/);
+  const unavailable = document.querySelector(".pv-unavailable");
+  assert.match(unavailable.querySelector("summary").textContent, /need a connection Medha doesn't have yet/);
   assert.match(unavailable.textContent, /Native Future.*This native protocol is not implemented/);
   assert.equal(unavailable.querySelector("button"), null, "unavailable entries cannot start setup");
-  assert.equal(document.querySelector(".model-provider-heading label").htmlFor, namedButton("Choose a provider").id);
   await click(refresh);
   assert.equal(refresh.disabled, true);
   assert.equal(refresh.getAttribute("aria-busy"), "true");
   await act(async () => rejectRefresh(new Error("Catalogue is unavailable. Try again later.")));
   assert.match(document.querySelector('[role="alert"]').textContent, /Catalogue is unavailable/);
   assert.equal(refresh.disabled, false);
-  await click(namedButton("Choose a provider")); await click(option(providerFixture.name));
-  await inputValue(fieldInput("Model ID"), "my-model");
+  const before = lists;
   await click(refresh);
   await act(async () => finishRefresh({}));
-  assert.ok(!document.querySelector('.model-provider-error'));
-  assert.equal(fieldInput("Model ID").value, "my-model", "refresh preserves the model draft");
+  assert.ok(!document.querySelector(".pv-error"));
+  assert.ok(lists > before, "a refreshed catalogue is read again");
+  await click(providerRow(providerFixture.name));
   assert.equal(fieldInput("API endpoint").value, providerFixture.url);
 });
 
@@ -2327,14 +2332,16 @@ test("saved custom servers appear under Custom endpoint and reuse only their exa
     if (method === "settings.model.save") return { saved: true };
     assert.fail(method);
   });
-  await click(namedButton("Choose a provider"));
-  assert.ok(!option("private-gateway.test"), "a user's own endpoint is not a public provider");
-  await click(option("Custom endpoint"));
+  const ownRows = [...document.querySelectorAll(".pv-row")].filter((row) => row.textContent.includes("private-gateway.test"));
+  assert.ok(ownRows.length > 0, "the person's own servers are offered again under Custom");
+  assert.ok(ownRows.every((row) => row.textContent.includes("Your server")), "a user's own endpoint is not a public provider");
+  await click(providerRow("Another server"));
   assert.equal(fieldInput("API endpoint").value, "");
   await click(namedButton("Enter a new endpoint"));
   await click(option("private-gateway.test/team-a/v1"));
   assert.equal(fieldInput("API endpoint").value, address);
-  assert.match(fieldInput("API key").placeholder, /saved key/);
+  assert.match(document.querySelector(".cx-keyline").textContent, /Saved on this computer/);
+  assert.equal(fieldInput("Key"), undefined, "a saved key is used, not asked for again");
   const discovery = calls.find((call) => call.method === "settings.model.discover");
   assert.equal(discovery.params.profile.base_url, address);
   assert.equal(discovery.params.profile.auth, "bearer");
@@ -2361,9 +2368,8 @@ test("saved custom servers appear under Custom endpoint and reuse only their exa
 
   await act(() => root.render(null));
   await providerForm(async () => providerSettings());
-  await click(namedButton("Choose a provider"));
-  assert.ok(!option("private-gateway.test"), "the endpoint does not appear in another user's empty setup");
-  await click(option("Custom endpoint"));
+  assert.ok(![...document.querySelectorAll(".pv-row")].some((row) => row.textContent.includes("private-gateway.test")), "the endpoint does not appear in another user's empty setup");
+  await click(providerRow("Another server"));
   assert.ok(!namedButton("Enter a new endpoint"), "no saved-server picker is needed without saved servers");
 });
 
@@ -2379,11 +2385,11 @@ test("model setup distinguishes a timeout from a rejected model and keeps saving
     if (method === "settings.model.save") { writes.push(params); return { saved: true }; }
     assert.fail(method);
   });
-  await click(namedButton("Choose a provider")); await click(option(providerFixture.name));
-  await inputValue(fieldInput("API key"), "dummy-only-key");
+  await click(providerRow(providerFixture.name));
+  await inputValue(fieldInput("Key"), "dummy-only-key");
   await inputValue(fieldInput("Model ID"), "fixture-model");
-  assert.match(document.body.textContent, /5 minutes per request, 8 minutes in total/);
-  await click(namedButton("Test model"));
+  assert.match(document.body.textContent, /up to four small test requests, which your provider may bill/);
+  await click(namedButton("Check connection"));
   assert.match(document.querySelector('[role="status"]').textContent, /Text: timed out/);
   assert.ok(!document.querySelector('[role="status"]').textContent.includes("Text: failed"));
   assert.match(document.querySelector('[role="status"]').textContent, /Streaming: skipped/);
@@ -2401,12 +2407,12 @@ test("switching to a saved custom server never offers the previous provider's ca
     if (method === "settings.model.discover") throw new Error("Discovery unavailable");
     assert.fail(method);
   });
-  await click(namedButton("Choose a provider")); await click(option(providerFixture.name));
+  await click(providerRow(providerFixture.name));
   assert.match(document.body.textContent, /Showing catalogue models/);
-  await click(namedButton(providerFixture.name)); await click(option("Custom endpoint"));
+  await click(namedButton("‹ All providers")); await click(providerRow("Another server"));
   await click(namedButton("Enter a new endpoint")); await click(option("private-gateway.test"));
   assert.ok(!document.body.textContent.includes("Showing catalogue models"));
-  assert.ok(!namedButton("Choose a model"));
+  assert.equal(document.querySelector(".cx-model"), null);
   assert.match(document.body.textContent, /enter the model ID manually/);
 });
 
@@ -2422,15 +2428,15 @@ test("failed discovery offers catalogue models, clears stale context and permits
     if (method === "settings.model.save") return { saved: true };
     assert.fail(method);
   });
-  await click(namedButton("Choose a provider")); await click(option(provider.name));
-  await inputValue(fieldInput("API key"), "dummy-only-key");
+  await click(providerRow(provider.name));
+  await inputValue(fieldInput("Key"), "dummy-only-key");
   await click(namedButton("Find models on this server"));
   assert.match(document.querySelector(".model-discovery").parentElement.textContent, /availability is unverified/);
-  await click(namedButton("Choose a model")); await click(option("fixture-model"));
+  await click(modelRow("fixture-model"));
   assert.equal(fieldInput("Context window").value, "8000");
-  await click(namedButton("fixture-model")); await click(option("manual-window"));
+  await click(modelRow("manual-window"));
   assert.equal(fieldInput("Context window").value, "", "the earlier model's context must not persist");
-  await click(namedButton("Test model"));
+  await click(namedButton("Check connection"));
   assert.ok(finishTest, "test runs only on explicit click");
   await inputValue(fieldInput("Model ID"), "other-model");
   const failed = { status: "failed", failure: "access_restricted", message: "old model not allowed" };
@@ -2839,14 +2845,12 @@ test("a second model on a server whose key is saved asks for no key and lists it
   };
   await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
   await click(namedButton("Add model"));
-  await click(namedButton("Choose a provider"));
-  await click(option("Custom endpoint"));
+  await click(providerRow("Another server"));
   await click(namedButton("Enter a new endpoint"));
   await click(option("integrate.api.nvidia.com"));
   await act(async () => {});
   assert.deepEqual(calls.map(([method, params]) => [method, params.profile.base_url, params.key]), [["settings.model.discover", nvidia, ""]], "the saved key is used; none is typed or sent");
-  await click(namedButton("Choose a model"));
-  await click(option("meta/muse-glimmer-30b"));
+  await click(modelRow("meta/muse-glimmer-30b"));
   await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   const [, saved] = calls.at(-1);
   assert.deepEqual([saved.profile.model, saved.profile.base_url, saved.profile.auth, saved.key], ["meta/muse-glimmer-30b", nvidia, "bearer", ""]);

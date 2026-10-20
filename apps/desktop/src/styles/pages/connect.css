@@ -1,9 +1,88 @@
-/* Connect a model: ChatGPT sign-in, plan models and accounts (mocks S1 to S7). */
+/* Connect a model: the provider list and form (mocks C to C5), ChatGPT sign-in and accounts (S1 to S7). */
+.cx-connect { display: flex; flex-direction: column; gap: var(--s-3); padding-top: var(--s-6); flex: 1 0 auto; }
+/* The sheet scrolls; nothing in it is squeezed, or a model list would shrink to nothing. */
+.cx-sheet > .cx-form, .cx-sheet > .cg-sheet, .cx-form > *, .cx-connect > *, .pv-list > *, .cg-sheet > * { flex-shrink: 0; }
+/* Connecting a model needs the room of the mocks: a provider row and its button side by side. */
+.cx-sheet:has(.pv-list, .cx-form, .cg-sheet) { width: min(540px, calc(100vw - 20px)); }
+/* Footers stay at the sheet's foot, solid, so the list scrolls under them rather than through them. */
+.pv-foot, .cx-foot, .cg-foot { position: sticky; bottom: -24px; z-index: 1; padding: var(--s-4) 0 24px; border-top: 1px solid var(--hair); background: var(--overlay); }
+.cx-connect h2, .cx-form h2 { font-size: var(--text-xl); font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+.pv-list { display: flex; flex-direction: column; gap: var(--s-2); flex: 1 0 auto; }
+.pv-search { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 6px 0 14px; border-radius: var(--r-md); background: var(--raised); box-shadow: inset 0 0 0 1px var(--line); color: var(--faint); }
+.pv-search:focus-within { box-shadow: inset 0 0 0 1.5px var(--gold); }
+.pv-search input { flex: 1; border: 0; background: transparent; color: var(--text); font: inherit; outline: none; min-width: 0; }
+.pv-search input.filled { font-family: var(--font-mono); font-size: var(--text-sm); }
+.pv-filters { display: flex; gap: 18px; margin: var(--s-2) 0 0; font-size: var(--text-sm); color: var(--dim); flex-wrap: wrap; }
+.pv-filters [aria-selected="true"] { color: var(--text); box-shadow: 0 9px 0 -7px var(--gold); }
+.pv-group { font-size: var(--text-sm); color: var(--faint); margin: var(--s-4) var(--s-1) var(--s-1); }
+.pv-rows { display: grid; }
+.pv-row { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: 10px var(--s-1); border-bottom: 1px solid var(--hair); text-align: left; width: 100%; }
+button.pv-row:hover { background: var(--hover); }
+.pv-row:has(.cg-button) .pv-text small { white-space: normal; }
+.pv-foot { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-3); margin-top: auto; color: var(--faint); font-size: var(--text-sm); }
+.pv-foot details { max-height: 40vh; overflow-y: auto; }
+.pv-foot summary { cursor: pointer; }
+.cx-label { display: flex; justify-content: space-between; align-items: baseline; font-size: var(--text-sm); color: var(--dim); margin: var(--s-3) 0 0; }
+.cx-keyline { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 14px; border-radius: var(--r-md); background: var(--raised); box-shadow: inset 0 0 0 1px var(--hair); font-size: var(--text-sm); }
+.cx-keyline .grow { flex: 1; }
+.cx-address { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--faint); }
+.cx-passed { display: inline-flex; align-items: center; gap: var(--s-2); color: var(--ok); font-size: var(--text-sm); }
+.cx-ghost { color: var(--dim); font-size: var(--text-sm); padding: 9px var(--s-3); border-radius: var(--r-full); }
+.cx-ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.pv-text { display: grid; min-width: 0; }
+.pv-text b { font-weight: 600; font-size: var(--text-md); }
+.pv-text small { font-weight: 400; color: var(--dim); font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-state { display: inline-flex; align-items: center; gap: 7px; color: var(--faint); font-size: var(--text-sm); white-space: nowrap; }
+.pv-state.ok { color: var(--ok); }
+.pv-tile { width: 38px; height: 38px; border-radius: var(--r-md); background: var(--hover); display: grid; place-items: center; flex: none; color: var(--text); }
+.pv-logo { display: block; background: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; }
+.pv-initial { font-weight: 600; color: var(--dim); }
+.pv-error { color: var(--err); font-size: var(--text-sm); }
+.pv-note { color: var(--faint); font-size: var(--text-sm); margin: var(--s-2) var(--s-1); }
+.pv-found { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: var(--s-4) var(--s-1); border-bottom: 1px solid var(--hair); }
+.pv-found .pv-other { grid-column: 2 / -1; justify-self: start; }
+.pv-ask { display: grid; gap: 2px; margin: var(--s-3) var(--s-1); }
+.pv-ask small { color: var(--dim); font-size: var(--text-sm); }
+.pv-unavailable { margin-top: var(--s-4); color: var(--faint); font-size: var(--text-sm); }
+.pv-unavailable ul { margin: var(--s-2) 0 0; padding-left: 18px; display: grid; gap: 4px; }
+/* The form sits on the sheet itself, not in a card of its own. */
+.cx-sheet .settings-form.cx-form, .cx-sheet .cx-form { box-shadow: none; }
+.settings-form.cx-form { display: flex; flex-direction: column; gap: var(--s-3); max-width: none; margin: 0; padding: var(--s-6) 0 0; background: none; border: 0; box-shadow: none; border-radius: 0; animation: none; flex: 1 0 auto; }
+.cx-form .cg-who { margin-top: 0; }
+.cx-back { align-self: flex-start; color: var(--dim); font-size: var(--text-sm); }
+.cx-saved { display: flex; align-items: center; gap: var(--s-2); color: var(--ok); font-size: var(--text-sm); }
+.cx-warn { display: grid; grid-template-columns: auto 1fr; gap: var(--s-3); align-items: center; padding: var(--s-3) 14px; border-radius: var(--r-md); background: var(--gold-wash); }
+.cx-warn b { font-weight: 600; }
+.cx-warn p { margin: 0; color: var(--dim); font-size: var(--text-sm); }
+.cx-warn .cg-actions { grid-column: 1 / -1; }
+.cx-note { color: var(--warn); font-size: var(--text-sm); }
+.cx-model-search { min-height: 38px; padding: 0 var(--s-3); border-radius: var(--r-md); border: 0; background: var(--raised); box-shadow: inset 0 0 0 1px var(--hair); color: var(--text); font: inherit; font-size: var(--text-sm); }
+.cx-model-search:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--gold); }
+.cx-models { display: grid; max-height: 280px; overflow-y: auto; }
+.cx-model { display: grid; grid-template-columns: 22px 1fr 72px 130px; gap: 10px; align-items: center; padding: 10px 6px; border-bottom: 1px solid var(--hair); text-align: left; font-variant-numeric: tabular-nums; }
+.cx-model > span:nth-child(3), .cx-model > span:nth-child(4) { text-align: right; color: var(--dim); }
+.cx-model.head { color: var(--faint); font-size: var(--text-xs); border-bottom: 0; padding-bottom: var(--s-1); }
+.cx-model b { font-weight: 500; }
+.cx-model.on b { font-weight: 600; }
+.cx-model .tick { color: var(--gold); font-weight: 700; }
+button.cx-model:hover { background: var(--hover); }
+.cx-advanced { border-top: 1px solid var(--hair); padding-top: var(--s-3); }
+.cx-advanced > summary { cursor: pointer; color: var(--dim); display: flex; justify-content: space-between; list-style: none; padding: var(--s-1) var(--s-1) var(--s-3); }
+.cx-advanced > summary::-webkit-details-marker { display: none; }
+.cx-advanced[open] > summary span:last-child { transform: rotate(90deg); }
+.cx-advanced[open] > summary { margin-bottom: var(--s-3); border-bottom: 1px solid var(--hair); }
+.cx-foot { display: flex; flex-direction: column; align-items: stretch; gap: var(--s-3); margin-top: auto; }
+.cx-foot > .cg-actions { justify-content: flex-end; }
+.cx-foot button, .pv-foot button, .cg-foot button { white-space: nowrap; flex: none; }
+.cx-label-row { display: flex; justify-content: space-between; align-items: baseline; }
+.cx-finding { display: flex; align-items: center; gap: var(--s-2); color: var(--dim); font-size: var(--text-sm); padding: var(--s-3) var(--s-1); }
+.cx-find { align-self: flex-start; }
+.cx-foot p { margin: 0; }
 .cg-mark { flex: none; }
 .cg-button { display: inline-flex; align-items: center; gap: var(--s-2); white-space: nowrap; border-radius: var(--r-full); padding: 9px 18px 9px 14px; font-weight: 500; font-size: var(--text-md); background: var(--plan-bg); color: var(--plan-ink); }
 .cg-link { color: var(--dim); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line); font-size: var(--text-sm); }
 .cg-planline { display: inline-flex; align-items: center; gap: 7px; color: var(--dim); font-size: var(--text-sm); }
-.cg-sheet { display: flex; flex-direction: column; min-height: 100%; padding-top: var(--s-2); }
+.cg-sheet { display: flex; flex-direction: column; flex: 1 0 auto; padding-top: var(--s-2); }
 .cg-sheet h2 { font-size: var(--text-xl); font-weight: 600; letter-spacing: -0.01em; margin: 0; }
 .cg-who { display: flex; gap: 14px; align-items: center; margin-top: var(--s-6); }
 .cg-who small { color: var(--faint); font-size: var(--text-sm); }
@@ -33,7 +112,7 @@
 .cg-note b { color: var(--text); font-weight: 600; }
 .cg-choice { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: var(--s-4); }
 .cg-actions { display: inline-flex; gap: var(--s-2); align-items: center; }
-.cg-foot { display: flex; justify-content: space-between; align-items: center; gap: var(--s-3); margin-top: auto; padding: var(--s-4) 0 var(--s-5); border-top: 1px solid var(--hair); position: sticky; bottom: 0; background: inherit; }
+.cg-foot { display: flex; justify-content: space-between; align-items: center; gap: var(--s-3); margin-top: auto; }
 .cg-accounts { margin-top: var(--s-4); }
 .cg-row { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: var(--s-3) var(--s-1); border-bottom: 1px solid var(--hair); }
 .cg-row .cg-tile { width: 38px; height: 38px; }

@@ -11,7 +11,27 @@ export type Protocol = {
   discovery: boolean;
   providers: Provider[];
 };
-export type Found = { id: string; context_length: number | null };
+export type Found = {
+  id: string;
+  context_length: number | null;
+  /** What the catalogue knows, when it lists the model: display name, USD per million tokens, tool use. */
+  name?: string | null;
+  input_per_mtok?: number | null;
+  output_per_mtok?: number | null;
+  tools?: boolean | null;
+};
+
+/** "1.05M" or "400K": a model's context in a table column. */
+export function contextShort(tokens: number | null) {
+  if (!tokens) return "";
+  return tokens >= 1_000_000 ? `${Number((tokens / 1_000_000).toFixed(2))}M` : `${Math.round(tokens / 1000)}K`;
+}
+
+/** "$2 / $10" or "$0.10 / $0.50" per million tokens in and out, or "" when the catalogue has no price. */
+export function priceLabel(model: Found) {
+  const dollars = (value: number) => (Number.isInteger(value) ? `$${value}` : `$${value.toFixed(2)}`);
+  return model.input_per_mtok != null && model.output_per_mtok != null ? `${dollars(model.input_per_mtok)} / ${dollars(model.output_per_mtok)}` : "";
+}
 
 /** A server on this computer answers without a key, so it can be looked for unasked. */
 export function isLocal(url: string) {

@@ -200,6 +200,33 @@ fn settings(cfg: &config::Config) -> Value {
         .collect();
     json!({ "models": models, "fallback": cfg.fallback, "protocols": protocols, "catalogue_revision": catalogue.revision, "unavailable_providers": catalogue.providers.iter().filter(|p| !p.available).map(|p| json!({"id":p.id,"name":p.name,"reason":p.unavailable_reason})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
 }
+/// Found models with what the catalogue knows of them: display name, list price and tool use.
+fn listed(profile: &config::ProviderConfig, models: &[providers::discovery::ModelInfo]) -> Vec<Value> {
+    let catalogue = providers::catalogue::snapshot();
+    let record = profile
+        .provider_id
+        .as_deref()
+        .and_then(|id| catalogue.providers.iter().find(|record| record.id == id));
+    models
+        .iter()
+        .map(|model| {
+            let mut probe = profile.clone();
+            probe.model = model.id.clone();
+            let meta = catalogue.entries.get(&probe.catalogue_model_id().to_lowercase());
+            let name = record
+                .and_then(|record| record.models.iter().find(|listed| listed.id == model.id))
+                .map(|listed| listed.name.clone());
+            json!({
+                "id": model.id,
+                "context_length": model.context_length.or(meta.and_then(|meta| meta.context)),
+                "name": name,
+                "input_per_mtok": meta.and_then(|meta| meta.input_per_mtok),
+                "output_per_mtok": meta.and_then(|meta| meta.output_per_mtok),
+                "tools": meta.and_then(|meta| meta.capabilities.as_ref()).and_then(|caps| caps.tool_calls),
+            })
+        })
+        .collect()
+}
 fn instruction_path(workspace: &Path, kind: &str) -> Result<std::path::PathBuf> {
     match kind {
         "persona" => Ok(config::medha_home()?.join("PERSONA.md")),
@@ -734,9 +761,7 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             let credential = config::setup_credential(&profile, params["key"].as_str(), allow)?;
             let models =
                 providers::discovery::list_models_for_profile(&profile, &credential).await?;
-            Ok(
-                json!({"models": models.iter().map(|model| json!({"id": model.id, "context_length": model.context_length})).collect::<Vec<_>>() }),
-            )
+            Ok(json!({ "models": listed(&profile, &models) }))
         }
         // Read only from the key's opening letters: no request, and the key is not kept.
         "settings.model.recognise_key" => {

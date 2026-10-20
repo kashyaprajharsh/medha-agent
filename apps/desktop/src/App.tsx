@@ -1058,6 +1058,9 @@ export function App() {
                 onApprove={approveCurrent}
                 openSession={run?.childId}
                 onOpenAgent={openAgent}
+                onSwitchModel={(profile) => {
+                  if (currentKey) void configure(currentKey, draftKey ? null : selected, { profile });
+                }}
               />
             )}
           </div>

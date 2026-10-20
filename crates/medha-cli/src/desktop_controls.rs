@@ -29,6 +29,7 @@ fn profile_views(cfg: &config::Config) -> Vec<protocol::Profile> {
             protocol: profile.provider.protocol.as_str().to_owned(),
             default: profile.is_default,
             reasoning_support: support(profile.provider.reasoning),
+            chatgpt_plan: profile.provider.auth == providers::AuthKind::ChatGptPlan,
         })
         .collect()
 }

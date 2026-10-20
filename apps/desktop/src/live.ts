@@ -722,6 +722,12 @@ function lastLine(text?: string) {
   return line || undefined;
 }
 
+/** The ChatGPT plan's own refusal, from the OpenAI code in a turn error; `undefined` for any other error. */
+export function planRefusal(message: string) {
+  // Anywhere in the text: the turn's own wording may follow the code.
+  return /\b(subscription_sharing_[a-z_]+|chatpass_v2_[a-z_]+)\b/.exec(message)?.[1];
+}
+
 export function explainError(message: string) {
   if (/no model configured/i.test(message)) {
     return "No model is connected yet. Choose “No model yet” below to connect one.";

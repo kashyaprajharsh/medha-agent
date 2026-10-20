@@ -3,6 +3,7 @@ import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
 import {
   explainError,
+  planRefusal,
   queuedMessages,
   type LiveItem,
   type Approval,
@@ -21,6 +22,7 @@ import { TurnHead } from "./Transcript";
 import { UserText } from "./UserText";
 import { ProjectTrustNotice } from "./ProjectTrustNotice";
 import { OutboundNotice } from "./OutboundNotice";
+import { PlanLimit } from "./ChatGpt";
 
 // A live reply is newer than anything saved, so its outputs sort last.
 const LIVE = 1e12;
@@ -65,6 +67,8 @@ type Props = {
   onApprove: (approval: Approval, decision: ApprovalChoice) => void;
   openSession?: string | null;
   onOpenAgent: (agent: LiveAgent) => void;
+  /** Moves this session to another saved model, as the composer's model picker does. */
+  onSwitchModel?: (profile: string) => void;
 };
 
 export const LiveTail = memo(function LiveTail({
@@ -74,7 +78,9 @@ export const LiveTail = memo(function LiveTail({
   showReasoning,
   openSession,
   onOpenAgent,
+  onSwitchModel,
 }: Props) {
+  const plan = state.error ? planRefusal(state.error) : undefined;
   const working =
     state.status === "running" ||
     (state.status === "starting" && state.sent.length > 0);
@@ -208,7 +214,14 @@ export const LiveTail = memo(function LiveTail({
       {state.projectTrust && <ProjectTrustNotice key={`${state.sessionId}:${state.projectTrust.root}:${state.projectTrust.fingerprint}`} review={state.projectTrust} session={state.sessionId} />}
       {state.outbound && <OutboundNotice key={`${state.sessionId}:${state.outbound.id}`} review={state.outbound} />}
       {state.mutations?.map(review => <OutboundNotice kind="protected" key={`${state.sessionId}:${review.id}`} review={review} />)}
-      {state.error && (
+      {plan && (
+        <PlanLimit
+          code={plan}
+          others={(state.settings?.profiles ?? []).filter((profile) => !profile.chatgpt_plan).map((profile) => profile.name)}
+          onSwitch={(profile) => onSwitchModel?.(profile)}
+        />
+      )}
+      {state.error && !plan && (
         <div className="error inline" role="alert">
           <b>
             {working

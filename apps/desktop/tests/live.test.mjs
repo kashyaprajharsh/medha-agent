@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
     module: ts.ModuleKind.ESNext,
   },
 });
-const { reduceLive, startingLive, recordSent, queuedMessages, explainError } = await import(
+const { reduceLive, startingLive, recordSent, queuedMessages, explainError, planRefusal } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
 );
 const event = (kind, params = {}) => ({
@@ -590,4 +590,13 @@ test("a refused request shows the provider's reason instead of blaming the key",
   // No readable reason still must not claim the key is wrong.
   assert.doesNotMatch(explainError("provider error: provider returned status 403: <html>Forbidden</html>"), /rejected the credentials/);
   assert.match(explainError('provider error: provider returned status 401: {"detail":"Invalid API Key"}'), /rejected the credentials/);
+});
+
+test("a ChatGPT plan limit is told apart from other failures, wherever the turn's wording puts its code", () => {
+  // As the backend words it: the plan error's own text, then whatever the turn adds.
+  const limit = "ChatGPT plan: Plan limit reached (subscription_sharing_usage_limit_exceeded). Nothing was retried.";
+  assert.equal(planRefusal(limit), "subscription_sharing_usage_limit_exceeded");
+  assert.equal(planRefusal("ChatGPT plan: no (chatpass_v2_scope_not_authorized)"), "chatpass_v2_scope_not_authorized");
+  // A rate limit from an ordinary key is not the plan's, so it keeps the usual message.
+  assert.equal(planRefusal("provider returned status 429: rate limit"), undefined);
 });

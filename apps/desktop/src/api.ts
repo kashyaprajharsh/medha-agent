@@ -87,6 +87,7 @@ export type SessionSettings = {
     protocol: string;
     default: boolean;
     reasoning_support: string;
+    chatgpt_plan?: boolean;
   }[];
   profile: string | null;
   model: string | null;

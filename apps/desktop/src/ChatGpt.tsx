@@ -189,6 +189,24 @@ function PlanModels({ account, onSwitch, onSaved }: { account: ChatGptAccount; o
   </>;
 }
 
+/** The plan's limit stops the chat; the person may move this session to another model. */
+export function PlanLimit({ code, others, onSwitch }: { code: string; others: string[]; onSwitch: (profile: string) => void }) {
+  const api = useWorkspaceApi();
+  const limit = code === "subscription_sharing_usage_limit_exceeded";
+  return <div className="cg-limit" role="alert">
+    <div>
+      <b>{limit ? "Your ChatGPT plan's limit for Medha is reached." : "Your ChatGPT plan cannot be used for this right now."}</b>
+      <p>{limit
+        ? "Medha paused instead of switching models. ChatGPT settings show when it resets and let you change Medha's limit."
+        : "OpenAI declined to use your plan for this request. Choose another model, or check your plan in ChatGPT settings."}</p>
+    </div>
+    <span className="cg-actions">
+      <button type="button" className="btn-gold" onClick={() => void api.openLink(MANAGE_USAGE)}>Manage usage</button>
+      {others.slice(0, 3).map((name) => <button type="button" key={name} className="btn-line" onClick={() => onSwitch(name)}>Switch to {name}</button>)}
+    </span>
+  </div>;
+}
+
 /** Shown once, after the first model on the plan is added. */
 export function PlanNotice({ onClose }: { onClose: () => void }) {
   const api = useWorkspaceApi();

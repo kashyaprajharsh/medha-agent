@@ -348,6 +348,9 @@ pub struct Profile {
     pub protocol: String,
     pub default: bool,
     pub reasoning_support: ReasoningSupport,
+    /// Sends with the signed-in ChatGPT plan rather than a key.
+    #[serde(default)]
+    pub chatgpt_plan: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

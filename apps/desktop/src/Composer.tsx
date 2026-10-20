@@ -7,6 +7,7 @@ import {
   SessionSettings,
 } from "./api";
 import { Icon, type IconName } from "./Icon";
+import { PlanLine } from "./ChatGpt";
 import { MessageTokens, type MessageToken, type TokenLayout } from "./MessageTokens";
 
 export type Control = "model" | "reasoning" | "mode";
@@ -579,6 +580,7 @@ export function Composer(props: Props) {
               <Icon name="down" className="icon chip-caret" />
             </button>
           ))}
+          {props.settings?.profiles.find((profile) => profile.name === props.settings?.profile)?.chatgpt_plan && <PlanLine />}
           {props.control && (
             <div
               className={`control-popover ${props.control}`}

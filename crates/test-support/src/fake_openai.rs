@@ -108,7 +108,7 @@ impl FakeOpenAi {
         self.state.lock().unwrap().revoke = Some(status);
     }
 
-    /// Requests seen so far: method and path, and the form body.
+    /// Requests seen so far: method and path, then the form body, or for a GET its authorization.
     pub fn seen(&self) -> Vec<(String, String)> {
         self.state.lock().unwrap().seen.clone()
     }
@@ -151,14 +151,27 @@ async fn answer(mut socket: tokio::net::TcpStream, base: String, state: Arc<Mute
         .rsplit_once(' ')
         .map_or("", |(start, _)| start)
         .to_owned();
+    let authorization = head
+        .lines()
+        .map(str::to_ascii_lowercase)
+        .find(|line| line.starts_with("authorization:"))
+        .unwrap_or_default();
     let (status, reply) = {
         let mut state = state.lock().unwrap();
-        state.seen.push((request.clone(), body));
+        // A GET has no body; what it shows is the token it carried.
+        let shown = if request.starts_with("GET") {
+            authorization
+        } else {
+            body
+        };
+        state.seen.push((request.clone(), shown));
         match request.as_str() {
             "GET /.well-known/openid-configuration" => ("200 OK", json!({"issuer": base, "authorization_endpoint": format!("{base}/api/accounts/authorize"), "token_endpoint": format!("{base}/api/accounts/oauth/token"), "revocation_endpoint": format!("{base}/api/accounts/oauth/revoke"), "jwks_uri": format!("{base}/.well-known/jwks.json")}).to_string()),
             "GET /.well-known/jwks.json" => ("200 OK", jwks(KID)),
             "POST /api/accounts/oauth/token" => state.tokens.pop_front().map_or(("500 Internal Server Error", "{}".into()), |(status, body)| (status, body.to_string())),
             "POST /api/accounts/oauth/revoke" => (state.revoke.unwrap_or("200 OK"), String::new()),
+            // The plan route's model list, as OpenAI shapes it.
+            "GET /v1/models" => ("200 OK", json!({"models": [{"slug": "gpt-plan", "display_name": "Plan model", "visibility": "list"}]}).to_string()),
             _ => ("404 Not Found", "{}".into()),
         }
     };

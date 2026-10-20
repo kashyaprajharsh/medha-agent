@@ -522,13 +522,30 @@ impl Provider for ProviderClient {
         // MEDHA_DEBUG_HTTP=1 prints the exact JSON sent.
         http::debug_json_request("POST", &url, &request.body);
 
-        let mut post = self.http_for(&connection.profile)?.post(&url);
-        for (name, value) in &request.headers {
-            post = post.header(name, value);
+        let send = |credential: &str| -> Result<reqwest::RequestBuilder, ProviderError> {
+            let mut post = self.http_for(&connection.profile)?.post(&url);
+            for (name, value) in &request.headers {
+                post = post.header(name, value);
+            }
+            Ok(http::with_profile(post, &connection.profile, credential)?.json(&request.body))
+        };
+        // A ChatGPT plan's token comes from the signed-in account, renewed once if OpenAI refuses it.
+        let plan = connection.profile.auth == crate::AuthKind::ChatGptPlan;
+        let credential = match plan {
+            true => crate::chatgpt::plan_token(false).await?,
+            false => connection.credential.clone(),
+        };
+        let mut response = http::send_model_request(send(&credential)?).await?;
+        if plan && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let renewed = crate::chatgpt::plan_token(true).await?;
+            response = http::send_model_request(send(&renewed)?).await?;
         }
-        let outgoing = http::with_profile(post, &connection.profile, &connection.credential)?
-            .json(&request.body);
-        let response = http::require_success(http::send_model_request(outgoing).await?).await?;
+        let response = http::require_success(response)
+            .await
+            .map_err(|error| match plan {
+                true => crate::chatgpt::plan_status(error),
+                false => error,
+            })?;
         let idle = http::stream_idle(&connection.profile);
         let origin = protocol::Origin {
             server: connection.profile.base_url.clone(),

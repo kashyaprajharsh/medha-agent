@@ -24,8 +24,9 @@ pub enum AuthKind {
 }
 
 impl AuthKind {
+    /// A ChatGPT plan's token comes from the signed-in account, never from a saved key.
     pub const fn requires_credential(self) -> bool {
-        !matches!(self, Self::None)
+        !matches!(self, Self::None | Self::ChatGptPlan)
     }
 
     pub const fn as_str(self) -> &'static str {

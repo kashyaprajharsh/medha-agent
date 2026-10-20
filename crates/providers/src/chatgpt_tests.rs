@@ -179,6 +179,7 @@ async fn signing_in_again_reuses_the_registration_and_names_the_account() {
         client_id: "oaiapp_1",
         id_token_hint: Some("old.id.token"),
         login_hint: Some("a@b.test"),
+        consent: false,
     };
     let (_, link) = Attempt::begin(
         &issuer("http://unused.test"),
@@ -193,6 +194,26 @@ async fn signing_in_again_reuses_the_registration_and_names_the_account() {
     assert_eq!(link["login_hint"], "a@b.test");
     assert_eq!(link["redirect_uri"], "http://127.0.0.1:4000/auth/callback");
     assert!(!link.contains_key("agent_name_hint"));
+    assert!(
+        !link.contains_key("prompt"),
+        "an ordinary sign-in forces no consent"
+    );
+
+    // Enabling plan use after a decline asks for consent again.
+    let enabling = Returning {
+        client_id: "oaiapp_1",
+        id_token_hint: None,
+        login_hint: None,
+        consent: true,
+    };
+    let (_, link) = Attempt::begin(
+        &issuer("http://unused.test"),
+        4000,
+        "urn:uuid:host-1",
+        Some(enabling),
+    )
+    .unwrap();
+    assert_eq!(query(&link)["prompt"], "consent");
 }
 
 /// A saved registration (if any), the callback built from the attempt's state, and the refusal.
@@ -205,6 +226,7 @@ async fn a_callback_that_does_not_match_this_attempt_is_refused_before_any_reque
         client_id: "oaiapp_1",
         id_token_hint: None,
         login_hint: None,
+        consent: false,
     };
     let cases: [Mismatch; 5] = [
         (
@@ -338,4 +360,72 @@ async fn discovery_keeps_every_endpoint_on_the_issuers_own_origin() {
             "{elsewhere}"
         );
     }
+}
+
+/// The token source is process-wide, so the plan route's whole journey is one test.
+#[tokio::test]
+async fn a_plan_model_uses_the_accounts_token_renews_once_and_keeps_its_limit_apart() {
+    use crate::{AuthKind, ProviderClient, ProviderProfile};
+    use futures::StreamExt;
+    use kernel::{CompiledContext, Message, Protocol, Provider};
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    use_tokens(std::sync::Arc::new(move |refused| {
+        seen.lock().unwrap().push(refused);
+        let token = if refused { "renewed" } else { "first" };
+        Box::pin(async move { Ok(token.to_owned()) })
+    }));
+    let completed = r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}}"#;
+    let server = Server::scripted(vec![
+        answer("200 OK", json!({"models": [{"slug": "gpt-a", "display_name": "A", "visibility": "list"}, {"slug": "gpt-hidden", "visibility": "hide"}]})),
+        answer("401 Unauthorized", json!({"detail": "expired"})),
+        Response::sse(format!("{completed}\n\n")),
+        answer("429 Too Many Requests", json!({"error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "Plan limit reached"}})),
+    ])
+    .await;
+    let mut profile =
+        ProviderProfile::openai_chat(format!("{}/v1", server.url), "gpt-a", AuthKind::ChatGptPlan);
+    profile.protocol = Protocol::OpenAiResponses;
+
+    let listed = crate::discovery::list_models_for_profile(&profile, "")
+        .await
+        .unwrap();
+    let ids: Vec<_> = listed.iter().map(|model| model.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["gpt-a"],
+        "only models meant to be listed, in OpenAI's order"
+    );
+
+    let client = ProviderClient::from_profile(profile, "").unwrap();
+    let context = CompiledContext {
+        model: String::new(),
+        messages: vec![Message::user("hi")],
+        ordered: None,
+        tools: Vec::new(),
+    };
+    let blocks: Vec<_> = client.stream(&context).await.unwrap().collect().await;
+    assert!(blocks.iter().all(Result::is_ok), "{blocks:?}");
+    let limited = client.stream(&context).await.err().unwrap();
+    assert!(
+        matches!(&limited, kernel::ProviderError::ChatGptPlan { code, .. } if code == "subscription_sharing_usage_limit_exceeded"),
+        "{limited:?}"
+    );
+
+    assert_eq!(*asked.lock().unwrap(), [false, false, true, false]);
+    let bearer = |index: usize| {
+        let head = server.requests.lock().unwrap()[index]
+            .0
+            .to_ascii_lowercase();
+        head.lines()
+            .find(|line| line.starts_with("authorization:"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(bearer(1), "authorization: bearer first");
+    assert_eq!(
+        bearer(2),
+        "authorization: bearer renewed",
+        "the refused token was sent again"
+    );
 }

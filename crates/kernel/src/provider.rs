@@ -343,6 +343,9 @@ pub enum ProviderError {
     Response(String),
     #[error("provider stream error: {0}")]
     Stream(String),
+    /// OpenAI declined to use the ChatGPT plan, with its code; never handed to another model unasked.
+    #[error("ChatGPT plan: {message} ({code})")]
+    ChatGptPlan { code: String, message: String },
 }
 
 /// Actionable provider failure classes. Keeping these separate prevents the
@@ -442,6 +445,11 @@ impl ProviderError {
             | ProviderError::ResponseTimeout { .. }
             | ProviderError::ProgressTimeout { .. } => ProviderFailure::Fatal,
             ProviderError::Response(message) => classify_rejection(None, message),
+            // OpenAI asks for a later retry only when availability could not be checked.
+            ProviderError::ChatGptPlan { code, .. } if code.ends_with("_unavailable") => {
+                ProviderFailure::Transient
+            }
+            ProviderError::ChatGptPlan { .. } => ProviderFailure::Fatal,
             ProviderError::Status(code, message) => {
                 if *code == 429 || (500..600).contains(code) {
                     return ProviderFailure::Transient;

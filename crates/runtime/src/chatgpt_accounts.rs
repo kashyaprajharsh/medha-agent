@@ -100,7 +100,15 @@ struct Inner {
 #[derive(Clone)]
 pub struct Accounts(Arc<Inner>);
 
-static OPENAI: LazyLock<Accounts> = LazyLock::new(|| Accounts::at(chatgpt::ISSUER));
+static OPENAI: LazyLock<Accounts> = LazyLock::new(|| Accounts::at(&issuer_url()));
+
+/// OpenAI, unless `MEDHA_CHATGPT_ISSUER` names a sign-in server on this machine, as tests do.
+fn issuer_url() -> String {
+    std::env::var("MEDHA_CHATGPT_ISSUER")
+        .ok()
+        .filter(|url| url.starts_with("http://127.0.0.1:"))
+        .unwrap_or_else(|| chatgpt::ISSUER.to_owned())
+}
 
 /// A sign-in waiting for the browser; dropping it closes the listener and frees the port.
 pub struct SignIn {
@@ -145,8 +153,9 @@ impl Accounts {
             .clone()
     }
 
-    /// Open a sign-in: a new account, or `again` signing in a registered one.
-    pub async fn begin(&self, again: Option<&str>) -> Result<SignIn> {
+    /// Open a sign-in: a new account, or `again` signing in a registered one;
+    /// `consent` asks again for plan use declined before.
+    pub async fn begin(&self, again: Option<&str>, consent: bool) -> Result<SignIn> {
         let registry = registry()?;
         let again = again
             .map(|client_id| {
@@ -168,6 +177,7 @@ impl Accounts {
             client_id: &account.client_id,
             id_token_hint: hint.as_ref().map(|saved| saved.id_token.as_str()),
             login_hint: account.email.as_deref(),
+            consent,
         });
         let (attempt, link) = Attempt::begin(&issuer, listener.port(), &host_id, returning)?;
         Ok(SignIn {
@@ -300,13 +310,42 @@ impl Accounts {
         }
     }
 
+    /// OpenAI refused the token in memory: renew it, unless another chat already has.
+    pub async fn after_refusal(&self, client_id: &str) -> Result<String> {
+        let live = self.live(client_id);
+        let refused = live
+            .tokens
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|tokens| tokens.access_token);
+        let _renewing = live.renewing.lock().await;
+        let current = live
+            .tokens
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|tokens| tokens.access_token);
+        if let Some(current) = current.filter(|current| Some(current) != refused.as_ref()) {
+            return Ok(current);
+        }
+        self.renew_from(client_id, refused.as_deref()).await
+    }
+
     /// Renew once, under the account's renewal lock held by the caller.
     async fn renew(&self, client_id: &str) -> Result<String> {
+        self.renew_from(client_id, None).await
+    }
+
+    /// `refused` is a token OpenAI turned down, which a saved copy must not hand back.
+    async fn renew_from(&self, client_id: &str, refused: Option<&str>) -> Result<String> {
         let saved =
             saved(client_id).ok_or_else(|| anyhow!("Sign in to ChatGPT to use this model."))?;
         let live = self.live(client_id);
         // A newer token saved by another Medha process is used, not renewed again.
-        if saved.expires_at.saturating_sub(chatgpt::now()) > RENEW_SOON {
+        if saved.expires_at.saturating_sub(chatgpt::now()) > RENEW_SOON
+            && Some(saved.access_token.as_str()) != refused
+        {
             *live.tokens.lock().unwrap() = Some(saved.tokens());
             return Ok(saved.access_token);
         }
@@ -376,6 +415,27 @@ impl SignIn {
             plan_enabled: grant.tokens.plan_enabled(),
         })
     }
+}
+
+/// Let every model on a ChatGPT plan ask the active account for its token; later calls do nothing.
+pub fn install() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        providers::chatgpt::use_tokens(Arc::new(|refused| {
+            Box::pin(async move {
+                let active = registry()
+                    .ok()
+                    .and_then(|registry| registry.active)
+                    .ok_or("Sign in to ChatGPT to use this model.")?;
+                let accounts = Accounts::openai();
+                let token = match refused {
+                    true => accounts.after_refusal(&active).await,
+                    false => accounts.access_token(&active).await,
+                };
+                token.map_err(|error| error.to_string())
+            })
+        }));
+    });
 }
 
 fn registry() -> Result<Registry> {

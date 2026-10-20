@@ -1649,7 +1649,11 @@ pub fn deployment_credential(
     profile: &providers::ProviderProfile,
     supplied: Option<&str>,
 ) -> Result<String> {
-    if profile.auth == providers::AuthKind::None {
+    // A ChatGPT plan shares api.openai.com with API keys; it must never pick one up.
+    if !profile.auth.requires_credential() {
+        if profile.auth == providers::AuthKind::ChatGptPlan {
+            crate::chatgpt_accounts::install();
+        }
         return Ok(String::new());
     }
     let credential = match supplied.filter(|value| !value.trim().is_empty()) {
@@ -1707,6 +1711,9 @@ fn resolve_keyed(cfg: &Config, name: &str, api_key: &str, key_from_env: bool) ->
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
     let api_key = normalize_api_key(api_key);
     provider.validate().map_err(anyhow::Error::msg)?;
+    if provider.auth == providers::AuthKind::ChatGptPlan {
+        crate::chatgpt_accounts::install();
+    }
     if provider.auth.requires_credential() && api_key.is_empty() {
         anyhow::bail!(
             "model profile '{name}' requires a credential; choose 'Add or update an API key' in /model"

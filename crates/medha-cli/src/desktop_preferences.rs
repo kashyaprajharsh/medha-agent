@@ -711,6 +711,9 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
     if let Some(result) = crate::desktop_skills::handle(method, params, workspace).await {
         return result;
     }
+    if let Some(result) = crate::chatgpt_signin::handle(method, params).await {
+        return result;
+    }
     match method {
         "extensions.mcp.registry" => {
             crate::desktop_mcp_registry::search(

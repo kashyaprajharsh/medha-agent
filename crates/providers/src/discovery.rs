@@ -33,6 +33,12 @@ pub async fn list_models_for_profile(
             "model discovery authentication requires a credential".into(),
         ));
     }
+    // A ChatGPT plan lists the models of the signed-in account, with its own token.
+    let plan_token = match profile.auth {
+        crate::AuthKind::ChatGptPlan => Some(crate::chatgpt::plan_token(false).await?),
+        _ => None,
+    };
+    let credential = plan_token.as_deref().unwrap_or(credential);
     let gemini = profile.protocol == Protocol::GeminiInteractions;
     let url = match gemini {
         true => format!("{}/models", profile.base_url.trim_end_matches('/')),
@@ -73,7 +79,15 @@ async fn list_openai_chat_models(
 ) -> Result<Vec<ModelInfo>, ProviderError> {
     #[derive(Deserialize)]
     struct ModelsResp {
-        data: Vec<ModelEntry>,
+        data: Option<Vec<ModelEntry>>,
+        /// The ChatGPT plan route lists its models here instead, in the order to show them.
+        models: Option<Vec<PlanEntry>>,
+    }
+    #[derive(Deserialize)]
+    struct PlanEntry {
+        slug: String,
+        #[serde(default)]
+        visibility: Option<String>,
     }
     // Separate fields, not serde aliases: some servers send several and aliases fail as duplicates.
     #[derive(Deserialize)]
@@ -92,19 +106,34 @@ async fn list_openai_chat_models(
         .await
         .map_err(crate::transport::http::connection_failed)?;
     let body = http::bounded_body(http::require_success(resp).await?, DISCOVERY_MAX_BYTES).await?;
-    let parsed: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
+    let invalid = || {
         ProviderError::Decode(
             "The server returned an invalid model list; enter a model ID manually.".into(),
         )
-    })?;
-    if parsed.data.len() > DISCOVERY_MAX_MODELS {
+    };
+    let parsed: ModelsResp = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let listed = match (parsed.data, parsed.models) {
+        (Some(data), _) => data,
+        (None, Some(plan)) => plan
+            .into_iter()
+            .filter(|model| model.visibility.as_deref() == Some("list"))
+            .map(|model| ModelEntry {
+                id: model.slug,
+                context_length: None,
+                context_window: None,
+                max_model_len: None,
+            })
+            .collect(),
+        (None, None) => return Err(invalid()),
+    };
+    if listed.len() > DISCOVERY_MAX_MODELS {
         return Err(ProviderError::Decode(
             "model discovery returned too many models".into(),
         ));
     }
     let mut seen = std::collections::HashSet::new();
     let mut models = Vec::new();
-    for model in parsed.data {
+    for model in listed {
         validate_discovered_id(&model.id)?;
         if seen.insert(model.id.clone()) {
             models.push(ModelInfo {

@@ -57,6 +57,59 @@ impl std::error::Error for Error {}
 
 pub type Http = reqwest::Client;
 
+/// Gives the ChatGPT plan's access token; `true` asks for a new one after OpenAI refused the last.
+pub type TokenSource = std::sync::Arc<
+    dyn Fn(bool) -> futures::future::BoxFuture<'static, Result<String, String>> + Send + Sync,
+>;
+
+static TOKENS: std::sync::RwLock<Option<TokenSource>> = std::sync::RwLock::new(None);
+
+/// Every client using a ChatGPT plan asks this source, so no saved model carries a token.
+pub fn use_tokens(source: TokenSource) {
+    *TOKENS.write().unwrap() = Some(source);
+}
+
+pub(crate) async fn plan_token(refused: bool) -> Result<String, kernel::ProviderError> {
+    let source = TOKENS.read().unwrap().clone();
+    let source =
+        source.ok_or_else(|| plan("sign_in_required", "Sign in to ChatGPT to use this model."))?;
+    source(refused)
+        .await
+        .map_err(|message| plan("sign_in_required", &message))
+}
+
+fn plan(code: &str, message: &str) -> kernel::ProviderError {
+    kernel::ProviderError::ChatGptPlan {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+/// OpenAI's ChatGPT plan codes become their own error; anything else stays as it was.
+pub(crate) fn plan_error(code: &str, message: &str) -> Option<kernel::ProviderError> {
+    (code.starts_with("subscription_sharing_") || code.starts_with("chatpass_v2_"))
+        .then(|| plan(code, message))
+}
+
+/// A refused HTTP answer on the plan route, read for OpenAI's plan code.
+pub(crate) fn plan_status(error: kernel::ProviderError) -> kernel::ProviderError {
+    let body = match &error {
+        kernel::ProviderError::Status(_, body) | kernel::ProviderError::Throttled { body, .. } => {
+            body
+        }
+        _ => return error,
+    };
+    let said: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let code = said
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str);
+    let message = said
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str);
+    code.and_then(|code| plan_error(code, message.unwrap_or(code)))
+        .unwrap_or(error)
+}
+
 /// The connection sign-in uses: no ambient proxy, no redirects, a bound on every request.
 pub fn http() -> Http {
     crate::transport::http::builder()
@@ -111,6 +164,8 @@ pub struct Returning<'a> {
     pub client_id: &'a str,
     pub id_token_hint: Option<&'a str>,
     pub login_hint: Option<&'a str>,
+    /// Ask again for permissions declined before, such as plan use; never on an ordinary sign-in.
+    pub consent: bool,
 }
 
 /// What the browser brought back to the callback.
@@ -216,6 +271,9 @@ impl Attempt {
                     }
                     if let Some(hint) = saved.login_hint {
                         query.append_pair("login_hint", hint);
+                    }
+                    if saved.consent {
+                        query.append_pair("prompt", "consent");
                     }
                 }
                 None => {

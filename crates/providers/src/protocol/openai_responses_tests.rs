@@ -303,11 +303,8 @@ fn a_reply_that_did_not_complete_runs_no_tool() {
         ),
         (
             json!({"type": "response.failed", "response": {"status": "failed", "error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "limit"}}}),
-            |error| {
-                error
-                    .to_string()
-                    .contains("subscription_sharing_usage_limit_exceeded")
-            },
+            // The plan's limit mid-stream is its own error, so no other model takes over unasked.
+            |error| matches!(error, ProviderError::ChatGptPlan { code, .. } if code == "subscription_sharing_usage_limit_exceeded"),
         ),
     ] {
         let mut decoder = decoder();

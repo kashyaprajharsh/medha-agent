@@ -14,6 +14,7 @@ mod chat_history;
 mod chat_presentation;
 mod chat_questions;
 mod chat_session;
+mod chatgpt_signin;
 mod connectors;
 mod desktop_changes;
 mod desktop_controls;

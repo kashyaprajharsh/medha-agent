@@ -6,6 +6,13 @@ fn status(code: u16, body: &str) -> ProviderError {
     ProviderError::Status(code, body.into())
 }
 
+fn plan(code: &str) -> ProviderError {
+    ProviderError::ChatGptPlan {
+        code: code.into(),
+        message: "limit".into(),
+    }
+}
+
 /// Every kind of failure, as a server sends it, has one row: what is tried on
 /// the same model first, and whether a model the user listed may then take over.
 #[test]
@@ -42,6 +49,22 @@ fn each_kind_of_failure_has_its_own_recovery() {
             None,
         ),
         (ProviderError::Truncated, First::Continue, None),
+        // The ChatGPT plan's own limit stops for the person; a check that failed is tried again.
+        (
+            plan("subscription_sharing_usage_limit_exceeded"),
+            First::Nothing,
+            None,
+        ),
+        (
+            plan("subscription_sharing_user_not_eligible"),
+            First::Nothing,
+            None,
+        ),
+        (
+            plan("subscription_sharing_usage_unavailable"),
+            First::Retry,
+            None,
+        ),
         // Worth another try on the same model, then another model's turn.
         (throttled, First::Retry, Some("it is still rate limited")),
         (

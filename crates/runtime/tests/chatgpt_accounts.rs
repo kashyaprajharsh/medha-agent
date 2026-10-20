@@ -46,7 +46,7 @@ async fn sign_in(
     refresh: &str,
     expires_in: u64,
 ) -> anyhow::Result<runtime::chatgpt_accounts::Status> {
-    let attempt = accounts.begin(again).await?;
+    let attempt = accounts.begin(again, false).await?;
     let link = query(attempt.link());
     fake.grant(Grant {
         client_id: "oaiapp_1",
@@ -62,6 +62,31 @@ async fn sign_in(
         browser(&link["redirect_uri"], &link["state"], issued)
     );
     status
+}
+
+/// A model list server that records the authorization each request carried.
+async fn models_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = headers.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = vec![0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            if let Some(line) = head.lines().find(|line| line.starts_with("authorization:")) {
+                seen.lock().unwrap().push(line.trim().to_owned());
+            }
+            let body = r#"{"models":[{"slug":"gpt-a","visibility":"list"}]}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        }
+    });
+    (url, headers)
 }
 
 fn token_requests(fake: &FakeOpenAi) -> usize {
@@ -84,7 +109,7 @@ async fn a_chatgpt_account_signs_in_renews_once_and_signs_out_without_leaving_se
     let accounts = Accounts::at(&fake.url);
 
     // The install id is made once and reused; a dropped sign-in frees its port.
-    let first = accounts.begin(None).await.unwrap();
+    let first = accounts.begin(None, false).await.unwrap();
     let link = query(first.link());
     assert_eq!(link["client_id"], "dynamic_agent_client");
     assert!(link["ext_agent_host_id"].starts_with("urn:uuid:"));
@@ -94,7 +119,7 @@ async fn a_chatgpt_account_signs_in_renews_once_and_signs_out_without_leaving_se
         .unwrap();
     drop(first);
     std::net::TcpListener::bind(("127.0.0.1", port)).expect("the dropped sign-in kept its port");
-    let again = query(accounts.begin(None).await.unwrap().link());
+    let again = query(accounts.begin(None, false).await.unwrap().link());
     assert_eq!(again["ext_agent_host_id"], link["ext_agent_host_id"]);
 
     // A first sign-in keeps the account and its plan permission; no token reaches config.toml.
@@ -105,6 +130,29 @@ async fn a_chatgpt_account_signs_in_renews_once_and_signs_out_without_leaving_se
     let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(
         config.contains("oaiapp_1") && !config.contains("access-r1") && !config.contains("r1\"")
+    );
+
+    // A plan model never picks up the API key saved for the same address; its token is the account's.
+    runtime::config::store_key("https://api.openai.com/v1", "sk-proj-saved-api-key").unwrap();
+    let (models, headers) = models_server().await;
+    let mut plan = providers::ProviderProfile::openai_chat(
+        "https://api.openai.com/v1",
+        "gpt-a",
+        providers::AuthKind::ChatGptPlan,
+    );
+    plan.protocol = kernel::Protocol::OpenAiResponses;
+    assert_eq!(
+        runtime::config::deployment_credential(&plan, None).unwrap(),
+        ""
+    );
+    runtime::chatgpt_accounts::install();
+    plan.base_url = models;
+    providers::discovery::list_models_for_profile(&plan, "")
+        .await
+        .unwrap();
+    assert_eq!(
+        headers.lock().unwrap().as_slice(),
+        ["authorization: bearer access-r1"]
     );
 
     // A fresh token is served from memory, and after a restart from the store, without OpenAI.

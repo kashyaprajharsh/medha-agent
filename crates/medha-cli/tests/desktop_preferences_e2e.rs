@@ -157,6 +157,117 @@ fn of_several_saves_made_from_the_same_text_one_is_kept_and_the_rest_are_told() 
 }
 
 #[test]
+fn a_chatgpt_sign_in_through_the_backend_lists_plan_models_and_never_hands_out_a_token() {
+    use test_support::fake_openai::{FakeOpenAi, Grant};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let server = tokio::runtime::Runtime::new().unwrap();
+    let fake = server.block_on(FakeOpenAi::start());
+    let mut bridge = Bridge {
+        backend: backend::Backend::start(&home, &[("MEDHA_CHATGPT_ISSUER", fake.url.clone())]),
+        workspace: workspace.clone(),
+    };
+    let mut replies = Vec::new();
+    let link_of = |reply: &Value| -> std::collections::HashMap<String, String> {
+        url::Url::parse(reply["link"].as_str().unwrap())
+            .unwrap()
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    };
+
+    // The surface opens the link; the browser comes back while another call waits for it.
+    let begun = bridge.ok("settings.chatgpt.begin", json!({}));
+    let link = link_of(&begun);
+    fake.grant(Grant {
+        client_id: "oaiapp_1",
+        subject: "user-1",
+        nonce: &link["nonce"],
+        scope: "chatgpt.tokens.use.direct email offline_access openid profile resource.invoke",
+        refresh: "r1",
+        expires_in: 3600,
+    });
+    let waiting = {
+        let (home, workspace) = (home.clone(), workspace.clone());
+        std::thread::spawn(move || {
+            backend::Backend::join(&home).ask(&workspace, "settings.chatgpt.finish", json!({}))
+        })
+    };
+    let port = url::Url::parse(&link["redirect_uri"])
+        .unwrap()
+        .port()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let back = format!(
+            "GET /auth/callback?code=c&state={}&client_id=oaiapp_1 HTTP/1.1\r\nHost: x\r\n\r\n",
+            link["state"]
+        );
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            stream.write_all(back.as_bytes()).unwrap();
+            let mut page = String::new();
+            let _ = std::io::Read::read_to_string(&mut stream, &mut page);
+            if page.contains("Signed in") {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sign-in never listened"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let finished = waiting.join().unwrap().unwrap();
+    assert_eq!(finished["account"]["email"], "user-1@example.test");
+    assert_eq!(finished["account"]["plan_enabled"], true);
+    replies.push(finished);
+
+    // A plan model lists the account's models with its token, never a saved key.
+    let profile = json!({"protocol": "open-ai-responses", "base_url": format!("{}/v1", fake.url), "model": "discovery", "auth": "chatgpt-plan"});
+    let models = bridge.ok("settings.model.discover", json!({"profile": profile}));
+    assert_eq!(models["models"][0]["id"], "gpt-plan");
+    let listed = fake
+        .seen()
+        .into_iter()
+        .find(|(request, _)| request == "GET /v1/models")
+        .unwrap();
+    assert_eq!(listed.1, "authorization: bearer access-r1");
+    let accounts = bridge.ok("settings.chatgpt.accounts", json!({}));
+    assert_eq!(accounts["accounts"][0]["active"], true);
+    replies.extend([begun, models, accounts.clone()]);
+    for reply in &replies {
+        assert!(
+            !reply.to_string().contains("access-r1"),
+            "an answer carried the token: {reply}"
+        );
+    }
+
+    // A cancelled sign-in has nothing left to finish.
+    bridge.ok("settings.chatgpt.begin", json!({"client_id": "oaiapp_1"}));
+    bridge.ok("settings.chatgpt.cancel", json!({}));
+    let finish = bridge.call("settings.chatgpt.finish", json!({}));
+    assert!(
+        finish["error"]
+            .as_str()
+            .unwrap()
+            .contains("Start a ChatGPT sign-in first")
+    );
+
+    // Signing out ends the session at OpenAI and keeps the account for later.
+    let out = bridge.ok(
+        "settings.chatgpt.sign_out",
+        json!({"client_id": "oaiapp_1"}),
+    );
+    assert_eq!(out["revoked"], true);
+    let after = bridge.ok("settings.chatgpt.accounts", json!({}));
+    assert_eq!(after["accounts"][0]["signed_in"], false);
+    drop(server);
+}
+
+#[test]
 fn a_key_for_another_provider_is_neither_sent_nor_saved_unless_the_user_insists() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("project");

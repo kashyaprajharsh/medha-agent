@@ -519,11 +519,12 @@ fn unfinished(response: &Value) -> ProviderError {
                 reason.unwrap_or("no reason given")
             )),
         },
-        _ => ProviderError::Response(format!(
-            "{} ({})",
-            text("/error/message").unwrap_or("the response failed"),
-            text("/error/code").unwrap_or("no code"),
-        )),
+        _ => {
+            let message = text("/error/message").unwrap_or("the response failed");
+            let code = text("/error/code").unwrap_or("no code");
+            crate::chatgpt::plan_error(code, message)
+                .unwrap_or_else(|| ProviderError::Response(format!("{message} ({code})")))
+        }
     }
 }
 

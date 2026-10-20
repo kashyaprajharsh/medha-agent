@@ -131,6 +131,9 @@ impl ProviderError {
             (_, ProviderError::ResponseTimeout { .. } | ProviderError::ProgressTimeout { .. }) => {
                 (First::Nothing, Some("it did not answer in time"))
             }
+            // The plan's own limits and rules: a person decides on another model, so none stands in.
+            (ProviderFailure::Transient, ProviderError::ChatGptPlan { .. }) => (First::Retry, None),
+            (_, ProviderError::ChatGptPlan { .. }) => (First::Nothing, None),
             (_, ProviderError::Refused(_)) => (First::Nothing, Some("it declined to answer")),
             (_, ProviderError::Certificate(_)) => (
                 First::Nothing,

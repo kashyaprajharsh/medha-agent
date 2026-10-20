@@ -179,48 +179,103 @@ fn a_chatgpt_sign_in_through_the_backend_lists_plan_models_and_never_hands_out_a
             .collect()
     };
 
-    // The surface opens the link; the browser comes back while another call waits for it.
+    // A sheet that started twice: naming the older sign-in touches nothing newer.
+    let older = bridge.ok("settings.chatgpt.begin", json!({}));
     let begun = bridge.ok("settings.chatgpt.begin", json!({}));
+    bridge.ok("settings.chatgpt.cancel", json!({"id": older["id"]}));
+    let stale = bridge.call("settings.chatgpt.finish", json!({"id": older["id"]}));
+    assert!(
+        stale["error"]
+            .as_str()
+            .unwrap()
+            .contains("newer ChatGPT sign-in")
+    );
+
+    // The surface opens the link; the browser comes back while another call waits for it.
+    let finish_in_background = |id: Value| {
+        let (home, workspace) = (home.clone(), workspace.clone());
+        std::thread::spawn(move || {
+            let mine = json!({ "id": id });
+            backend::Backend::join(&home).ask(&workspace, "settings.chatgpt.finish", mine)
+        })
+    };
+    let come_back = |link: &std::collections::HashMap<String, String>, issued: &str| {
+        let port = url::Url::parse(&link["redirect_uri"])
+            .unwrap()
+            .port()
+            .unwrap();
+        let back = format!(
+            "GET /auth/callback?code=c&state={}{issued} HTTP/1.1\r\nHost: x\r\n\r\n",
+            link["state"]
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                stream.write_all(back.as_bytes()).unwrap();
+                let mut page = String::new();
+                let _ = std::io::Read::read_to_string(&mut stream, &mut page);
+                if page.contains("Signed in") {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sign-in never listened"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // OpenAI turns down a new registration's first code swap, as it did on a real sign-in;
+    // its guide says to authorize again as the issued client, never to register anew.
     let link = link_of(&begun);
+    fake.token("400 Bad Request", json!({"error": "invalid_grant"}));
+    let waiting = finish_in_background(begun["id"].clone());
+    come_back(&link, "&client_id=oaiapp_1");
+    let again = waiting.join().unwrap().unwrap();
+    let retry = link_of(&again["again"]);
+    assert_eq!(retry["client_id"], "oaiapp_1");
+    assert!(
+        !retry.contains_key("agent_name_hint"),
+        "only a first registration names Medha"
+    );
+    assert_eq!(retry["ext_agent_host_id"], link["ext_agent_host_id"]);
+
+    // The returning callback may leave out the client ID; the one kept for the attempt is used.
     fake.grant(Grant {
         client_id: "oaiapp_1",
         subject: "user-1",
-        nonce: &link["nonce"],
+        nonce: &retry["nonce"],
         scope: "chatgpt.tokens.use.direct email offline_access openid profile resource.invoke",
         refresh: "r1",
         expires_in: 3600,
     });
-    let waiting = {
-        let (home, workspace) = (home.clone(), workspace.clone());
-        std::thread::spawn(move || {
-            backend::Backend::join(&home).ask(&workspace, "settings.chatgpt.finish", json!({}))
-        })
-    };
-    let port = url::Url::parse(&link["redirect_uri"])
-        .unwrap()
-        .port()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let back = format!(
-            "GET /auth/callback?code=c&state={}&client_id=oaiapp_1 HTTP/1.1\r\nHost: x\r\n\r\n",
-            link["state"]
-        );
-        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            stream.write_all(back.as_bytes()).unwrap();
-            let mut page = String::new();
-            let _ = std::io::Read::read_to_string(&mut stream, &mut page);
-            if page.contains("Signed in") {
-                break;
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the sign-in never listened"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let waiting = finish_in_background(again["again"]["id"].clone());
+    come_back(&retry, "");
     let finished = waiting.join().unwrap().unwrap();
+
+    // Each swap proves this attempt's PKCE and repeats its exact callback and resource.
+    let swaps: Vec<_> = fake
+        .seen()
+        .into_iter()
+        .filter(|(request, _)| request == "POST /api/accounts/oauth/token")
+        .map(|(_, form)| -> std::collections::HashMap<String, String> {
+            url::form_urlencoded::parse(form.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .collect();
+    assert_eq!(swaps.len(), 2);
+    for (swap, link) in swaps.iter().zip([&link, &retry]) {
+        use base64::Engine;
+        use sha2::Digest;
+        let proof = sha2::Sha256::digest(swap["code_verifier"].as_bytes());
+        let proof = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof);
+        assert_eq!(proof, link["code_challenge"]);
+        assert_eq!(swap["redirect_uri"], link["redirect_uri"]);
+        assert_eq!(swap["resource"], link["resource"]);
+        assert_eq!(swap["client_id"], "oaiapp_1");
+    }
     assert_eq!(finished["account"]["email"], "user-1@example.test");
     assert_eq!(finished["account"]["plan_enabled"], true);
     replies.push(finished);

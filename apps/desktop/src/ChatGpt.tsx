@@ -38,14 +38,16 @@ const planProfile = (model: string) =>
 const cleaned = (cause: unknown) => String(cause).replace(/^Error:\s*/, "");
 
 type Step =
-  | { at: "waiting"; link: string }
+  | { at: "waiting"; link: string; again?: boolean }
   | { at: "models"; account: ChatGptAccount }
   | { at: "off"; account: ChatGptAccount }
   | { at: "failed"; why: string };
 
 /** Sign in, then pick a model on the plan; `again` signs a registered account in again. */
-export function ChatGptSheet({ again, onClose, onSaved, onUseKey }: {
+export function ChatGptSheet({ again, onClose, onSaved, onUseKey, firstRun }: {
   again?: string;
+  /** The first model anyone saves becomes the default. */
+  firstRun?: boolean;
   onClose: () => void;
   onSaved: (name: string) => void;
   onUseKey: () => void;
@@ -55,6 +57,9 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey }: {
   const [notice, setNotice] = useState(false);
   const attempt = useRef(0);
   const added = useRef("");
+  // The backend's number for the sign-in this sheet is waiting on, so a cancel names only it.
+  const pending = useRef<number | undefined>(undefined);
+  const cancel = (id: number) => void api.settings("settings.chatgpt.cancel", { id }).catch(() => undefined);
 
   async function signIn(clientId?: string, consent = false) {
     const mine = ++attempt.current;
@@ -62,10 +67,21 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey }: {
     try {
       const begun = await api.settings("settings.chatgpt.begin", { client_id: clientId, consent });
       const link = begun.link as string;
-      if (mine !== attempt.current) return;
+      const id = begun.id as number;
+      // A sign-in this sheet moved on from frees its port at once.
+      if (mine !== attempt.current) return cancel(id);
+      pending.current = id;
       setStep({ at: "waiting", link });
       void api.openLink(link);
-      const finished = await api.settings("settings.chatgpt.finish");
+      let finished = await api.settings("settings.chatgpt.finish", { id });
+      // OpenAI asked for one more pass as the newly issued client: only the account picker.
+      while (finished.again && mine === attempt.current) {
+        const again = finished.again as { link: string; id: number };
+        pending.current = again.id;
+        setStep({ at: "waiting", link: again.link, again: true });
+        void api.openLink(again.link);
+        finished = await api.settings("settings.chatgpt.finish", { id: again.id });
+      }
       if (mine !== attempt.current) return;
       const account = finished.account as ChatGptAccount;
       setStep({ at: account.plan_enabled ? "models" : "off", account });
@@ -77,7 +93,7 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey }: {
     void signIn(again);
     return () => {
       attempt.current++;
-      void api.settings("settings.chatgpt.cancel").catch(() => undefined);
+      if (pending.current !== undefined) cancel(pending.current);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -88,7 +104,7 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey }: {
     <div className="cg-sheet">
       {title}
       {!step && <p className="quiet cg-gap">Opening ChatGPT…</p>}
-      {step?.at === "waiting" && <Waiting link={step.link} onCancel={onClose} />}
+      {step?.at === "waiting" && <Waiting link={step.link} again={step.again} onCancel={onClose} />}
       {step?.at === "failed" && <div className="cg-gap">
         <p role="alert">{step.why}</p>
         <div className="cg-choice"><button type="button" className="btn-gold" onClick={() => void signIn(again)}>Try again</button></div>
@@ -101,7 +117,7 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey }: {
         </div>
         <p className="quiet">Allowing it opens ChatGPT once more to ask for that permission.</p>
       </div>}
-      {step?.at === "models" && <PlanModels account={step.account} onSwitch={() => void signIn()} onSaved={(name) => {
+      {step?.at === "models" && <PlanModels account={step.account} firstRun={firstRun} onSwitch={() => void signIn()} onSaved={(name) => {
         added.current = name;
         if (seen()) onSaved(name);
         else setNotice(true);
@@ -118,11 +134,13 @@ function markSeen() {
   try { localStorage.setItem(NOTICE_SEEN, "1"); } catch { /* shown again next time */ }
 }
 
-function Waiting({ link, onCancel }: { link: string; onCancel: () => void }) {
+function Waiting({ link, again, onCancel }: { link: string; again?: boolean; onCancel: () => void }) {
   const api = useWorkspaceApi();
   const [copied, setCopied] = useState(false);
   return <>
-    <p className="cg-wait"><span className="cg-pulse" /><span><b>Continue in your browser.</b> Sign in to ChatGPT and allow Medha to use your plan. This page updates by itself when you are done.</span></p>
+    <p className="cg-wait"><span className="cg-pulse" />{again
+      ? <span><b>One more step in your browser.</b> Pick your ChatGPT account once more to finish connecting Medha. This page updates by itself.</span>
+      : <span><b>Continue in your browser.</b> Sign in to ChatGPT and allow Medha to use your plan. This page updates by itself when you are done.</span>}</p>
     <p className="cg-label">Browser did not open?</p>
     <div className="cg-linkbox">
       <code>{link}</code>
@@ -134,11 +152,11 @@ function Waiting({ link, onCancel }: { link: string; onCancel: () => void }) {
   </>;
 }
 
-function PlanModels({ account, onSwitch, onSaved }: { account: ChatGptAccount; onSwitch: () => void; onSaved: (name: string) => void }) {
+function PlanModels({ account, onSwitch, onSaved, firstRun }: { account: ChatGptAccount; onSwitch: () => void; onSaved: (name: string) => void; firstRun?: boolean }) {
   const api = useWorkspaceApi();
   const [models, setModels] = useState<Found[]>();
   const [chosen, setChosen] = useState("");
-  const [asDefault, setAsDefault] = useState(false);
+  const [asDefault, setAsDefault] = useState(Boolean(firstRun));
   const [busy, setBusy] = useState("");
   const [problem, setProblem] = useState("");
   useEffect(() => {

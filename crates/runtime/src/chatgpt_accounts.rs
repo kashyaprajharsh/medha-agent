@@ -167,11 +167,6 @@ impl Accounts {
                     .ok_or_else(|| anyhow!("No ChatGPT account is registered as {client_id}"))
             })
             .transpose()?;
-        let host_id = host_id()?;
-        let issuer = self.issuer().await?;
-        let listener = loopback::bind(Some(chatgpt::PREFERRED_PORT))
-            .await
-            .context("could not open the sign-in listener")?;
         let hint = again.as_ref().and_then(|account| saved(&account.client_id));
         let returning = again.as_ref().map(|account| Returning {
             client_id: &account.client_id,
@@ -179,6 +174,31 @@ impl Accounts {
             login_hint: account.email.as_deref(),
             consent,
         });
+        self.open(returning, again.clone()).await
+    }
+
+    /// Authorize again with the client ID a registration was just issued, after OpenAI turned
+    /// down its code swap; its sign-in guide says to recover this way rather than register anew.
+    pub async fn begin_issued(&self, client_id: &str) -> Result<SignIn> {
+        let returning = Returning {
+            client_id,
+            id_token_hint: None,
+            login_hint: None,
+            consent: false,
+        };
+        self.open(Some(returning), None).await
+    }
+
+    async fn open(
+        &self,
+        returning: Option<Returning<'_>>,
+        again: Option<Registration>,
+    ) -> Result<SignIn> {
+        let host_id = host_id()?;
+        let issuer = self.issuer().await?;
+        let listener = loopback::bind(Some(chatgpt::PREFERRED_PORT))
+            .await
+            .context("could not open the sign-in listener")?;
         let (attempt, link) = Attempt::begin(&issuer, listener.port(), &host_id, returning)?;
         Ok(SignIn {
             accounts: self.clone(),
@@ -377,6 +397,18 @@ impl std::fmt::Display for SignInAgain {
 
 impl std::error::Error for SignInAgain {}
 
+/// OpenAI turned down a new registration's code swap; authorize again as this issued client ID.
+#[derive(Debug)]
+pub struct Reauthorize(pub String);
+
+impl std::fmt::Display for Reauthorize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChatGPT sign-in needs one more step in the browser.")
+    }
+}
+
+impl std::error::Error for Reauthorize {}
+
 impl SignIn {
     /// Where to send the person; show it as well as opening it, for machines with no browser.
     pub fn link(&self) -> &str {
@@ -396,10 +428,14 @@ impl SignIn {
             client_id: redirect.get("client_id"),
         };
         let accounts = &self.accounts;
-        let grant = self
+        let grant = match self
             .attempt
             .finish(&accounts.0.http, &self.issuer, callback)
-            .await?;
+            .await
+        {
+            Err(chatgpt::Error::Reauthorize(client_id)) => bail!(Reauthorize(client_id)),
+            other => other?,
+        };
         if let Some(again) = &self.again
             && again.subject != grant.subject
         {

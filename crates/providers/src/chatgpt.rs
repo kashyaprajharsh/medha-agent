@@ -40,6 +40,8 @@ pub enum Error {
     SignInAgain(String),
     /// Something did not match this attempt or OpenAI's rules; nothing was kept.
     Invalid(String),
+    /// OpenAI turned down the code swap; per its sign-in guide, authorize again with this issued client ID.
+    Reauthorize(String),
 }
 
 impl std::fmt::Display for Error {
@@ -49,6 +51,9 @@ impl std::fmt::Display for Error {
             Self::Declined => f.write_str("ChatGPT sign-in was declined in the browser."),
             Self::SignInAgain(why) => write!(f, "Sign in to ChatGPT again: {why}"),
             Self::Invalid(why) => write!(f, "ChatGPT sign-in failed: {why}"),
+            Self::Reauthorize(_) => {
+                f.write_str("ChatGPT sign-in needs one more step in the browser.")
+            }
         }
     }
 }
@@ -332,9 +337,7 @@ impl Attempt {
             read_json(http.post(&issuer.token_endpoint).form(&form).send().await)
                 .await
                 .map_err(|error| match error {
-                    Error::SignInAgain(_) => {
-                        Error::Invalid("the sign-in code was used or expired; start again".into())
-                    }
+                    Error::SignInAgain(_) => Error::Reauthorize(client_id.clone()),
                     other => other,
                 })?;
         let id_token = answer
@@ -454,13 +457,21 @@ async fn read_json<T: serde::de::DeserializeOwned>(
         return Err(Error::Temporary(status.to_string()));
     }
     if !status.is_success() {
-        let code = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| value["error"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| status.to_string());
+        let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+        let code = value["error"]
+            .as_str()
+            .map_or_else(|| status.to_string(), str::to_owned);
+        // OpenAI's own reason says which of a code's several causes this was; it never holds a token.
+        let told = match value["error_description"]
+            .as_str()
+            .filter(|why| !why.is_empty())
+        {
+            Some(why) => format!("{code}: {why}"),
+            None => code.clone(),
+        };
         return Err(match code.as_str() {
-            gone if GONE.contains(&gone) => Error::SignInAgain(code),
-            _ => Error::Invalid(code),
+            gone if GONE.contains(&gone) => Error::SignInAgain(told),
+            _ => Error::Invalid(told),
         });
     }
     serde_json::from_slice(&body).map_err(|error| Error::Invalid(error.to_string()))

@@ -1,7 +1,7 @@
 //! Google Gemini Interactions API v1. Stateless (`store: false`): the whole history
 //! is sent each time, so every thought signature must be replayed unchanged.
 
-use super::{Reply, Settings, Wire};
+use super::{Origin, Reply, Settings, Wire};
 use crate::ProviderProfile;
 use crate::protocol::openai_chat::{wire_name_map, wire_tool_name};
 use crate::transport::sse::SseEvent;
@@ -1014,6 +1014,7 @@ impl Wire for Interactions {
         streaming: bool,
         idle: std::time::Duration,
         names: HashMap<String, String>,
+        _origin: Origin,
     ) -> BoxFuture<'static, Result<Reply, ProviderError>> {
         Box::pin(stream::read(
             response,
@@ -1028,7 +1029,7 @@ impl Wire for Interactions {
         body: &mut serde_json::Map<String, Value>,
         tokens: u64,
         _profile: &ProviderProfile,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<bool, ProviderError> {
         let generation_config = body
             .entry("generation_config")
             .or_insert_with(|| json!({}))
@@ -1037,13 +1038,14 @@ impl Wire for Interactions {
                 ProviderError::Decode("prepared Gemini generation_config is not an object".into())
             })?;
         generation_config.insert("max_output_tokens".into(), json!(tokens));
-        Ok(())
+        Ok(true)
     }
 
     fn set_reasoning(
         &self,
         body: &mut Value,
         config: &ReasoningConfig,
+        _profile: &ProviderProfile,
     ) -> Result<(), ProviderError> {
         apply_reasoning(body, config)
     }

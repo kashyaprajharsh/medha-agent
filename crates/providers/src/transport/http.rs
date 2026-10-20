@@ -307,7 +307,7 @@ pub(crate) fn with_profile(
     let credential = credential.trim();
     request = match profile.auth {
         AuthKind::None => request,
-        AuthKind::Bearer => with_bearer(request, credential),
+        AuthKind::Bearer | AuthKind::ChatGptPlan => with_bearer(request, credential),
         AuthKind::XApiKey => request.header("x-api-key", credential),
         AuthKind::XGoogApiKey => request.header("x-goog-api-key", credential),
     };

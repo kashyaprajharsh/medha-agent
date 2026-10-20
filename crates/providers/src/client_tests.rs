@@ -1283,3 +1283,100 @@ mod reasoning_request_tests {
         assert!(req.body.get("chat_template_kwargs").is_none());
     }
 }
+
+mod responses_tests {
+    use super::*;
+    use crate::test_http::{Response, Server};
+    use kernel::{ContentPart, ModelMessage, ToolResultPart};
+
+    fn completed(output: serde_json::Value) -> Response {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": output, "usage": {"input_tokens": 9, "output_tokens": 3}},
+        });
+        Response::sse(format!("data: {event}\n\n"))
+    }
+
+    /// A tool turn and the turn after it: the sealed reasoning, the call and its result go back.
+    #[tokio::test]
+    async fn the_next_turn_sends_back_the_call_its_result_and_the_sealed_reasoning() {
+        let server = Server::scripted(vec![
+            completed(serde_json::json!([
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed-1", "summary": []},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "fs_read", "arguments": "{\"path\":\"a.rs\"}"},
+            ])),
+            completed(serde_json::json!([
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            ])),
+        ])
+        .await;
+        let mut profile =
+            ProviderProfile::openai_chat(format!("{}/v1", server.url), "gpt-x", AuthKind::Bearer);
+        profile.protocol = Protocol::OpenAiResponses;
+        profile.reasoning = ReasoningSupport::Effort;
+        let provider = ProviderClient::from_profile(profile, "key").unwrap();
+        let tools = vec![kernel::ToolSpec {
+            name: "fs.read".into(),
+            description: "read".into(),
+            schema: serde_json::json!({"type": "object"}),
+            blast_radius: kernel::BlastRadius::Read,
+            category: kernel::ToolCategory::Read,
+            icon: "r".into(),
+        }];
+        let mut history = vec![Message::user("open a.rs").ordered()];
+        let context = |history: &Vec<ModelMessage>| CompiledContext {
+            model: String::new(),
+            messages: Vec::new(),
+            ordered: Some(history.clone()),
+            tools: tools.clone(),
+        };
+
+        let first = drain(provider.stream(&context(&history)).await.unwrap()).await;
+        let blocks: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        let kept = blocks.iter().find_map(|block| match block {
+            Block::CompletedMessage(message) => Some(message.clone()),
+            _ => None,
+        });
+        history.push(kept.expect("the finished turn is kept"));
+        history.push(ModelMessage {
+            role: kernel::Role::Tool,
+            parts: vec![ContentPart::ToolResult(ToolResultPart {
+                tool_call_id: "call_1".into(),
+                content: "fn main() {}".into(),
+                provider_state: Vec::new(),
+            })],
+            trust: None,
+        });
+        let second = drain(provider.stream(&context(&history)).await.unwrap()).await;
+        assert!(second.iter().all(Result::is_ok));
+
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            requests[1].0.starts_with("POST /v1/responses "),
+            "{}",
+            requests[1].0
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&requests[1].1).unwrap();
+        let input = sent["input"].as_array().unwrap();
+        let kinds: Vec<_> = input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+        assert_eq!(input[1]["encrypted_content"], "sealed-1");
+        assert_eq!(
+            (input[2]["call_id"].as_str(), input[2]["name"].as_str()),
+            (Some("call_1"), Some("fs_read"))
+        );
+        assert_eq!(input[3]["output"], "fn main() {}");
+        assert_eq!(sent["store"], false);
+    }
+}

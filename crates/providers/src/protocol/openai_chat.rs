@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions: request JSON, address and reply decoding; the client owns keys.
 
-use super::{Reply, Settings, Wire, requested_effort};
+use super::{Origin, Reply, Settings, Wire, requested_effort};
 use crate::ProviderProfile;
 use crate::transport::sse::SseEvent;
 use crate::transport::stream::{self, StreamDecoder};
@@ -1194,6 +1194,7 @@ impl Wire for Chat {
         streaming: bool,
         idle: std::time::Duration,
         names: HashMap<String, String>,
+        _origin: Origin,
     ) -> BoxFuture<'static, Result<Reply, ProviderError>> {
         Box::pin(stream::read(
             response,
@@ -1208,7 +1209,7 @@ impl Wire for Chat {
         body: &mut serde_json::Map<String, serde_json::Value>,
         tokens: u64,
         profile: &ProviderProfile,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<bool, ProviderError> {
         let field = if body.contains_key("max_completion_tokens") {
             "max_completion_tokens"
         } else if body.contains_key("max_tokens") {
@@ -1217,13 +1218,14 @@ impl Wire for Chat {
             profile.chat_token_limit_field()
         };
         body.insert(field.into(), serde_json::json!(tokens));
-        Ok(())
+        Ok(true)
     }
 
     fn set_reasoning(
         &self,
         body: &mut serde_json::Value,
         config: &ReasoningConfig,
+        _profile: &ProviderProfile,
     ) -> Result<(), ProviderError> {
         let object = body.as_object_mut().ok_or_else(|| {
             ProviderError::Decode("prepared model request is not an object".into())

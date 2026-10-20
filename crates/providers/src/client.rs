@@ -429,7 +429,9 @@ impl Provider for ProviderClient {
             return Ok(None);
         };
         let profile = &self.connection.lock().unwrap().profile;
-        wire.set_output_limit(object, max_output_tokens, profile)?;
+        if !wire.set_output_limit(object, max_output_tokens, profile)? {
+            return Ok(None);
+        }
         Ok(Some(request.with_body(body)))
     }
 
@@ -447,7 +449,7 @@ impl Provider for ProviderClient {
             return Ok(None);
         };
         let mut body = request.body.clone();
-        wire.set_reasoning(&mut body, config)?;
+        wire.set_reasoning(&mut body, config, &connection.profile)?;
         Ok(Some(request.with_body(body)))
     }
 
@@ -501,7 +503,11 @@ impl Provider for ProviderClient {
             .json(&request.body);
         let response = http::require_success(http::send_model_request(outgoing).await?).await?;
         let idle = http::stream_idle(&connection.profile);
-        wire.read(response, streaming, idle, names).await
+        let origin = protocol::Origin {
+            server: connection.profile.base_url.clone(),
+            model: request.model.clone(),
+        };
+        wire.read(response, streaming, idle, names, origin).await
     }
 }
 

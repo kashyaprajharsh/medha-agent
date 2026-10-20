@@ -18,6 +18,9 @@ pub enum AuthKind {
     Bearer,
     XApiKey,
     XGoogApiKey,
+    /// A ChatGPT sign-in token: sent as a bearer, on the narrower plan route.
+    #[serde(rename = "chatgpt-plan")]
+    ChatGptPlan,
 }
 
 impl AuthKind {
@@ -31,6 +34,7 @@ impl AuthKind {
             Self::Bearer => "bearer",
             Self::XApiKey => "x-api-key",
             Self::XGoogApiKey => "x-goog-api-key",
+            Self::ChatGptPlan => "chatgpt-plan",
         }
     }
 

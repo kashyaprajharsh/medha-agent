@@ -21,7 +21,7 @@ pub async fn list_models_for_profile(
     profile.validate().map_err(ProviderError::Decode)?;
     if !matches!(
         profile.protocol,
-        Protocol::OpenAiChat | Protocol::GeminiInteractions
+        Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::GeminiInteractions
     ) {
         return Err(ProviderError::Decode(format!(
             "model discovery is not implemented for {}",
@@ -33,12 +33,10 @@ pub async fn list_models_for_profile(
             "model discovery authentication requires a credential".into(),
         ));
     }
-    let url = match profile.protocol {
-        Protocol::OpenAiChat => openai_chat::endpoint_url(&profile.base_url, "/models")?,
-        Protocol::GeminiInteractions => {
-            format!("{}/models", profile.base_url.trim_end_matches('/'))
-        }
-        Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
+    let gemini = profile.protocol == Protocol::GeminiInteractions;
+    let url = match gemini {
+        true => format!("{}/models", profile.base_url.trim_end_matches('/')),
+        false => openai_chat::endpoint_url(&profile.base_url, "/models")?,
     };
     // Bounded timeout: this runs at startup before the UI paints, so a slow or
     // unreachable endpoint must not hang the launch (it falls back gracefully).
@@ -53,14 +51,9 @@ pub async fn list_models_for_profile(
         .build()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
     let discovery = async {
-        match profile.protocol {
-            Protocol::OpenAiChat => {
-                list_openai_chat_models(&client, &url, profile, credential).await
-            }
-            Protocol::GeminiInteractions => {
-                list_gemini_models(&client, &url, profile, credential).await
-            }
-            Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
+        match gemini {
+            true => list_gemini_models(&client, &url, profile, credential).await,
+            false => list_openai_chat_models(&client, &url, profile, credential).await,
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(15), discovery)

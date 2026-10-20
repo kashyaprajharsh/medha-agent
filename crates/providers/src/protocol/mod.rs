@@ -1,5 +1,6 @@
 pub(crate) mod gemini_interactions;
 pub(crate) mod openai_chat;
+pub(crate) mod openai_responses;
 
 use crate::ProviderProfile;
 use futures::future::BoxFuture;
@@ -24,6 +25,13 @@ pub(crate) struct Settings<'a> {
 
 pub(crate) type Reply = BoxStream<'static, Result<Block, ProviderError>>;
 
+/// The server and model a reply came from; state sealed to them is replayed nowhere else.
+#[derive(Clone)]
+pub(crate) struct Origin {
+    pub server: String,
+    pub model: String,
+}
+
 /// Everything the client does differently per wire format.
 pub(crate) trait Wire: Send + Sync {
     /// The request body and any headers it needs.
@@ -39,17 +47,20 @@ pub(crate) trait Wire: Send + Sync {
         streaming: bool,
         idle: Duration,
         names: HashMap<String, String>,
+        origin: Origin,
     ) -> BoxFuture<'static, Result<Reply, ProviderError>>;
+    /// False when this route takes no output cap at all.
     fn set_output_limit(
         &self,
         body: &mut Map<String, Value>,
         tokens: u64,
         profile: &ProviderProfile,
-    ) -> Result<(), ProviderError>;
+    ) -> Result<bool, ProviderError>;
     fn set_reasoning(
         &self,
         body: &mut Value,
         config: &ReasoningConfig,
+        profile: &ProviderProfile,
     ) -> Result<(), ProviderError>;
     /// This format's own limits on a setting the model's levels already allow.
     fn check_reasoning(&self, config: &ReasoningConfig) -> Result<(), ProviderError>;
@@ -69,6 +80,7 @@ pub(crate) fn wire(protocol: Protocol) -> Result<&'static dyn Wire, ProviderErro
     match protocol {
         Protocol::OpenAiChat => Ok(&openai_chat::Chat),
         Protocol::GeminiInteractions => Ok(&gemini_interactions::Interactions),
+        Protocol::OpenAiResponses => Ok(&openai_responses::Responses),
         other => Err(ProviderError::Decode(format!(
             "ProviderClient does not implement {}",
             other.as_str()

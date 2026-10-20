@@ -3,6 +3,7 @@
 pub mod catalogue;
 #[cfg(test)]
 mod certificate_tests;
+pub mod chatgpt;
 pub mod client;
 pub mod discovery;
 #[cfg(test)]

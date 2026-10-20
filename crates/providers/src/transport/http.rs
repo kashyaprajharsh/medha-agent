@@ -91,7 +91,7 @@ pub(crate) fn client() -> reqwest::Client {
     builder().build().expect("provider HTTP client")
 }
 
-fn builder() -> reqwest::ClientBuilder {
+pub(crate) fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)

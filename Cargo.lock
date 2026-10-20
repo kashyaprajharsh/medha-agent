@@ -3270,10 +3270,12 @@ version = "0.1.10"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64",
  "dirs 5.0.1",
  "futures",
  "kernel",
  "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

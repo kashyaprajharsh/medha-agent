@@ -18,6 +18,9 @@ async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 sha2 = "0.10"
+# Already in the build through TLS: checks ChatGPT ID-token signatures and makes sign-in secrets.
+ring = "0.17"
+base64 = "0.22"
 tracing = "0.1"
 async-stream = "0.3"
 dirs = "5"

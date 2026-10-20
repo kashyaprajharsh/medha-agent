@@ -42,6 +42,7 @@ impl Server {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let base = url.clone();
         let task = tokio::spawn(async move {
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -69,6 +70,11 @@ impl Server {
                 };
                 seen.lock().unwrap().push((head, body));
                 tokio::time::sleep(response.delay).await;
+                // An answer that names this server writes `{base}` for its address.
+                let response = Response {
+                    body: response.body.replace("{base}", &base),
+                    ..response
+                };
                 let header = format!(
                     "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     response.status,

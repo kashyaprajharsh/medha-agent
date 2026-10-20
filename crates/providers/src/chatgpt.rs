@@ -55,8 +55,10 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub type Http = reqwest::Client;
+
 /// The connection sign-in uses: no ambient proxy, no redirects, a bound on every request.
-pub fn http() -> reqwest::Client {
+pub fn http() -> Http {
     crate::transport::http::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -406,6 +408,25 @@ async fn read_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).map_err(|error| Error::Invalid(error.to_string()))
 }
 
+/// An opaque id for this install, made once and kept: `urn:uuid:` and a random version 4 UUID.
+pub fn new_host_id() -> Result<String, Error> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| Error::Invalid("no secure random source".into()))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "urn:uuid:{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
 fn random() -> Result<String, Error> {
     let mut bytes = [0u8; 32];
     SystemRandom::new()
@@ -414,7 +435,8 @@ fn random() -> Result<String, Error> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn now() -> u64 {
+/// Unix seconds, as token expiry is kept.
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())

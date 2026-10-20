@@ -18,6 +18,7 @@ context.workspace = true
 media.workspace = true
 tools = { path = "../tools" }
 mcp = { path = "../mcp" }
+loopback = { path = "../loopback" }
 lockfile = { path = "../lockfile" }
 extensions = { path = "../extensions" }
 lsp = { path = "../lsp" }
@@ -50,6 +51,7 @@ libc = "0.2"
 test-support = { path = "../test-support" }
 tempfile = "3"
 tokio = { workspace = true, features = ["net", "io-util"] }
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

@@ -3280,6 +3280,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "test-support",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -3798,6 +3799,7 @@ dependencies = [
  "keyring",
  "libc",
  "lockfile",
+ "loopback",
  "lsp",
  "mcp",
  "medha-protocol",
@@ -3819,6 +3821,7 @@ dependencies = [
  "tools",
  "tracing",
  "ulid",
+ "url",
  "windows-sys 0.60.2",
 ]
 
@@ -4662,7 +4665,11 @@ dependencies = [
 name = "test-support"
 version = "0.1.10"
 dependencies = [
+ "base64",
+ "ring",
+ "serde_json",
  "tempfile",
+ "tokio",
  "vt100",
 ]
 

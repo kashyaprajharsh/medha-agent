@@ -40,6 +40,12 @@ pub struct Config {
     /// User-scoped, secret-free MCP definitions.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
+    /// ChatGPT sign-ins without their tokens, which stay in the credential store.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::chatgpt_accounts::Registry::is_empty"
+    )]
+    pub chatgpt: crate::chatgpt_accounts::Registry,
 }
 
 impl McpServer {
@@ -1984,7 +1990,7 @@ impl mcp::TokenStore for McpTokens {
     }
 }
 
-fn purge_credential(cred_id: &str) -> Result<()> {
+pub(crate) fn purge_credential(cred_id: &str) -> Result<()> {
     // Keep removal atomic with concurrent loads and stores across both layers.
     let result = with_credentials_lock(|| {
         if let Ok(path) = credentials_path() {

@@ -4095,7 +4095,11 @@ dependencies = [
 name = "test-support"
 version = "0.1.10"
 dependencies = [
+ "base64 0.22.1",
+ "ring",
+ "serde_json",
  "tempfile",
+ "tokio",
  "vt100",
 ]
 

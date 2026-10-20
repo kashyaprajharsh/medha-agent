@@ -1,37 +1,10 @@
 use super::*;
 use crate::test_http::{Response, Server};
-use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair, RsaPublicKeyComponents};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use test_support::fake_openai::{b64, jwks, sign};
 
-/// A throwaway key made only to sign these tests' ID tokens.
-const KEY: &[u8] = include_bytes!("fixtures/test-only-signing-key.pk8");
 const PLAN: &str = "chatgpt.tokens.use.direct email offline_access openid profile resource.invoke";
-
-fn b64(bytes: impl AsRef<[u8]>) -> String {
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn jwks(kid: &str) -> String {
-    let pair = RsaKeyPair::from_pkcs8(KEY).unwrap();
-    let public = RsaPublicKeyComponents::<Vec<u8>>::from(pair.public());
-    json!({"keys": [{"kid": kid, "kty": "RSA", "alg": "RS256", "n": b64(&public.n), "e": b64(&public.e)}]})
-        .to_string()
-}
-
-fn sign(header: &Value, claims: &Value) -> String {
-    let signed = format!("{}.{}", b64(header.to_string()), b64(claims.to_string()));
-    let pair = RsaKeyPair::from_pkcs8(KEY).unwrap();
-    let mut signature = vec![0; pair.public().modulus_len()];
-    pair.sign(
-        &RSA_PKCS1_SHA256,
-        &SystemRandom::new(),
-        signed.as_bytes(),
-        &mut signature,
-    )
-    .unwrap();
-    format!("{signed}.{}", b64(signature))
-}
 
 fn claims(nonce: &str) -> Value {
     json!({"iss": ISSUER, "aud": "oaiapp_1", "sub": "user-1", "email": "a@b.test", "nonce": nonce, "exp": now() + 3600})

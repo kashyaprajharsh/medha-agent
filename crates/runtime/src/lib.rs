@@ -4,6 +4,7 @@ pub mod agents;
 pub mod approvals;
 pub mod attachments;
 pub mod budget;
+pub mod chatgpt_accounts;
 pub mod config;
 pub mod key_pool;
 pub mod lease;

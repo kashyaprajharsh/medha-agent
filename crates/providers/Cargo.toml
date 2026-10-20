@@ -29,5 +29,6 @@ tokio = { workspace = true, features = ["time"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "test-util"] }
 tempfile = "3"
+test-support = { path = "../test-support" }
 # A real https server for the private-certificate test; same crypto as the client.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

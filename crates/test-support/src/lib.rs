@@ -3,6 +3,8 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+pub mod fake_openai;
+
 /// A temporary folder removed when dropped, pass or fail; usable wherever a path is.
 pub struct Scratch {
     _dir: tempfile::TempDir,

@@ -11,6 +11,11 @@ publish.workspace = true
 
 [dependencies]
 tempfile = "3"
+# The fake OpenAI sign-in server and its signed ID tokens.
+tokio = { workspace = true, features = ["net", "io-util", "rt"] }
+serde_json.workspace = true
+ring = "0.17"
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 vt100 = "0.16.2"

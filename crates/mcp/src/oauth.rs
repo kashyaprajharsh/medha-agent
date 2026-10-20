@@ -19,11 +19,7 @@ use rmcp::transport::auth::{
     AuthError, AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
     OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
-    time::timeout,
-};
+use tokio::time::timeout;
 
 use crate::{
     Error, UrlSink,
@@ -31,9 +27,6 @@ use crate::{
 };
 
 /// What the browser is told once the provider redirects back.
-const DONE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Medha</title>\
-<body style=\"font:16px system-ui;padding:3rem\">\
-<p>Authorization complete — you can close this tab and return to Medha.</p>";
 const MAX_OAUTH_BODY: usize = 1024 * 1024;
 const MAX_OAUTH_REDIRECTS: usize = 5;
 
@@ -396,13 +389,10 @@ pub(crate) async fn authorize(
     require_secure(url)?;
     // Bind before starting the flow: the port is part of the redirect URI the
     // provider is asked to honour.
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = loopback::bind(None)
         .await
         .map_err(|error| Error::Auth(format!("could not open a callback listener: {error}")))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| Error::Auth(error.to_string()))?
-        .port();
+    let port = listener.port();
 
     // Discovery and registration hit endpoints named by the server's own metadata,
     // so transport policy must hold for the whole exchange. Those go over
@@ -420,11 +410,13 @@ pub(crate) async fn authorize(
     policy.validate(&authorize_url)?;
     // Announce first: on a headless box the browser open is the part that fails.
     let _ = announce.send(authorize_url.clone());
-    open_browser(&authorize_url);
+    loopback::open_browser(&authorize_url);
 
-    let callback = timeout(wait, accept_callback(listener))
+    let redirect = timeout(wait, listener.redirect())
         .await
-        .map_err(|_| Error::Auth("timed out waiting for the browser redirect".into()))??;
+        .map_err(|_| Error::Auth("timed out waiting for the browser redirect".into()))?
+        .map_err(|error| Error::Auth(format!("callback listener failed: {error}")))?;
+    let callback = callback(&redirect)?;
     // rmcp validates the CSRF state and the RFC 9207 issuer for us.
     state
         .handle_callback_with_issuer(&callback.code, &callback.state, callback.issuer.as_deref())
@@ -441,104 +433,27 @@ struct Callback {
     issuer: Option<String>,
 }
 
-/// Accept the single redirect the provider sends back. Browsers also fetch
-/// `/favicon.ico`, so keep listening until a request actually carries the grant.
-async fn accept_callback(listener: TcpListener) -> Result<Callback, Error> {
-    loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(|error| Error::Auth(format!("callback listener failed: {error}")))?;
-        // The listener is loopback-bound already; refuse anything else outright
-        // rather than parsing a grant that came from off-box.
-        if !peer.ip().is_loopback() {
-            continue;
-        }
-        let mut reader = BufReader::new(stream);
-        let mut request = String::new();
-        if reader.read_line(&mut request).await.is_err() {
-            continue;
-        }
-        let target = request.split_whitespace().nth(1).unwrap_or_default();
-        let query = query_pairs(target);
-        let find = |key: &str| {
-            query
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value.clone())
-        };
-
-        let outcome = match (find("code"), find("state"), find("error")) {
-            (_, _, Some(error)) => Some(Err(Error::Auth(format!(
-                "the provider denied authorization: {error}"
-            )))),
-            (Some(code), Some(state), None) => Some(Ok(Callback {
-                code,
-                state,
-                issuer: find("iss"),
-            })),
-            _ => None,
-        };
-
-        let body = match &outcome {
-            Some(Ok(_)) => DONE_PAGE,
-            Some(Err(_)) => {
-                "<!doctype html><meta charset=utf-8><p>Authorization failed — \
-                 return to Medha for details."
-            }
-            None => "<!doctype html><meta charset=utf-8><p>Waiting for the authorization redirect…",
-        };
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let mut stream = reader.into_inner();
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-
-        if let Some(outcome) = outcome {
-            return outcome;
-        }
+/// The grant the provider sent back, or its refusal.
+fn callback(redirect: &loopback::Redirect) -> Result<Callback, Error> {
+    if let Some(error) = redirect.get("error") {
+        return Err(Error::Auth(format!(
+            "the provider denied authorization: {error}"
+        )));
     }
-}
-
-/// Percent-decoded query pairs from a raw request target (`/callback?a=b`).
-fn query_pairs(target: &str) -> Vec<(String, String)> {
-    url::Url::parse(&format!("http://127.0.0.1{target}"))
-        .map(|url| {
-            url.query_pairs()
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Best effort — the URL is announced first, so a headless box still works.
-/// Windows uses `rundll32`, not `cmd /C start`: `cmd` treats `&` as a command
-/// separator, which truncated authorization URLs and ran the remainder.
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let (program, args) = ("open", vec![url]);
-    #[cfg(target_os = "linux")]
-    let (program, args) = ("xdg-open", vec![url]);
-    #[cfg(target_os = "windows")]
-    let (program, args) = ("rundll32", vec!["url.dll,FileProtocolHandler", url]);
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let (program, args): (&str, Vec<&str>) = ("", Vec::new());
-
-    if !program.is_empty() {
-        let _ = std::process::Command::new(program)
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    let (Some(code), Some(state)) = (redirect.get("code"), redirect.get("state")) else {
+        return Err(Error::Auth("the redirect carried no grant".into()));
+    };
+    Ok(Callback {
+        code: code.into(),
+        state: state.into(),
+        issuer: redirect.get("iss").map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     #[test]
     fn plaintext_remote_urls_are_refused() {
@@ -548,15 +463,6 @@ mod tests {
         assert!(require_secure("http://mcp.example.com/mcp").is_err());
         assert!(require_secure("ftp://example.com").is_err());
         assert!(require_secure("not a url").is_err());
-    }
-
-    #[test]
-    fn callback_query_is_decoded() {
-        let pairs = query_pairs("/callback?code=a%2Fb&state=xyz&iss=https%3A%2F%2Fissuer");
-        assert_eq!(pairs[0], ("code".into(), "a/b".into()));
-        assert_eq!(pairs[1], ("state".into(), "xyz".into()));
-        assert_eq!(pairs[2], ("iss".into(), "https://issuer".into()));
-        assert!(query_pairs("/favicon.ico").is_empty());
     }
 
     /// A provider that registers a client only when it is redirected to `localhost`.

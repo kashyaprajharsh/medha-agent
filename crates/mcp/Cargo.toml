@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 kernel.workspace = true
+loopback = { path = "../loopback" }
 dirs = "5"
 sandbox = { path = "../sandbox" }
 serde.workspace = true

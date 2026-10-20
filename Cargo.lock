@@ -2227,6 +2227,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "loopback"
+version = "0.1.10"
+dependencies = [
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "lopdf"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,6 +2368,7 @@ dependencies = [
  "futures",
  "kernel",
  "libc",
+ "loopback",
  "oauth2",
  "reqwest 0.13.4",
  "rmcp",

@@ -252,8 +252,12 @@ fn a_streamed_reply_releases_tools_only_at_completion_with_stamped_reasoning_and
         .collect();
     assert_eq!(thinking, "first\n\nsecond");
 
+    // As OpenAI streams it: the sealed blob only on the item's own done event, not in the final frame.
+    let sealed = json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed", "summary": [{"type": "summary_text", "text": "first"}]});
+    let item_done = json!({"type": "response.output_item.done", "output_index": 0, "item": sealed});
+    assert!(decoder.push(&event(item_done)).unwrap().is_empty());
     let output = json!([
-        {"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed", "summary": [{"type": "summary_text", "text": "first"}]},
+        {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "first"}]},
         {"type": "function_call", "id": "fc_1", "call_id": "call_9", "name": "fs_read", "arguments": "{\"path\":\"src/a.rs\"}"},
     ]);
     let usage = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 40}, "output_tokens": 50, "output_tokens_details": {"reasoning_tokens": 30}, "total_tokens": 150});

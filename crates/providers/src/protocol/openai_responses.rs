@@ -569,7 +569,7 @@ fn output_parts(
 pub(crate) struct ResponseDecoder {
     names: HashMap<String, String>,
     origin: Origin,
-    /// Finished items by output index, used when the terminal event omits `output`.
+    /// Finished items by output index; the terminal frame only fills in items never finished.
     items: BTreeMap<u64, Vec<ContentPart>>,
     /// Calls being written: call id, wire name, and the arguments so far.
     calls: HashMap<u64, (String, String, String)>,
@@ -595,13 +595,15 @@ impl ResponseDecoder {
         if response.get("status").and_then(Value::as_str) != Some("completed") {
             return Err(unfinished(response));
         }
-        let mut parts = output_parts(response, &self.names, &self.origin)?;
-        if parts.is_empty() {
-            parts = std::mem::take(&mut self.items)
-                .into_values()
-                .flatten()
-                .collect();
+        // Each item's own done event is authoritative: the final frame may omit sealed reasoning.
+        let mut items = std::mem::take(&mut self.items);
+        let terminal = response.get("output").and_then(Value::as_array);
+        for (index, item) in terminal.into_iter().flatten().enumerate() {
+            if let std::collections::btree_map::Entry::Vacant(slot) = items.entry(index as u64) {
+                slot.insert(item_parts(item, &self.names, &self.origin)?);
+            }
         }
+        let parts = items.into_values().flatten().collect();
         self.terminal = true;
         Ok(finished(parts, response.get("usage")))
     }

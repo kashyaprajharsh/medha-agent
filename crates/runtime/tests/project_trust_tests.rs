@@ -111,7 +111,8 @@ async fn live_chats_use_their_own_project_and_adopt_trust_changes_without_prompt
     }
     let server = a.root.join("server.py");
     std::fs::write(&server, r#"import json, os, sys, time
-open('server.pid', 'w').write(str(os.getpid()))
+with open('server.pid.tmp', 'w') as pid: pid.write(str(os.getpid()))
+os.replace('server.pid.tmp', 'server.pid')
 if os.path.exists('hang-start'): time.sleep(60)
 while True:
     size = 0

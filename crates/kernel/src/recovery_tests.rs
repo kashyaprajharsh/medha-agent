@@ -130,6 +130,22 @@ fn each_kind_of_failure_has_its_own_recovery() {
             Some("its server refused the request"),
         ),
         (
+            status(
+                400,
+                r#"{"error":{"code":"invalid_encrypted_content","message":"Encrypted content could not be verified"}}"#,
+            ),
+            First::StaleReasoning,
+            Some("its server refused the request"),
+        ),
+        (
+            status(
+                400,
+                "bad_request: encrypted content could not be decrypted or parsed",
+            ),
+            First::StaleReasoning,
+            Some("its server refused the request"),
+        ),
+        (
             status(400, "Your request was flagged by our safety system"),
             First::Nothing,
             Some("it declined to answer"),

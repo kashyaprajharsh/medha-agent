@@ -1074,6 +1074,15 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// This request without the sealed reasoning it carried back; later requests
+    /// leave out what was sealed before now. `None` when it carried none.
+    fn without_replayed_reasoning(
+        &self,
+        _request: &PreparedModelRequest,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        Ok(None)
+    }
+
     /// Whether this server is sent a model's earlier thinking back with each request.
     fn replays_reasoning(&self) -> bool {
         false

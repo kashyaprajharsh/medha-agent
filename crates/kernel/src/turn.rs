@@ -35,7 +35,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut stalls = 0u32;
         let mut cut_call_retries = 0u32;
         let (mut thinking_off_tried, mut output_limit_retried) = (false, false);
-        let (mut reasoning_reset, mut schemas_plain) = (false, false);
+        let (mut reasoning_reset, mut schemas_plain, mut reasoning_stripped) =
+            (false, false, false);
         // A rate-limited key was already given its one more try.
         let mut limit_retried = false;
         let mut request = prepared.clone();
@@ -273,6 +274,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 sink.notice(
                                     "This server could not use the pattern rules in the tool \
                                      descriptions. Sending them without those rules…",
+                                );
+                            })
+                        }
+                        crate::recovery::First::StaleReasoning if !reasoning_stripped => {
+                            reasoning_stripped = true;
+                            let adjusted = self.provider.without_replayed_reasoning(&request);
+                            adjusted.ok().flatten().inspect(|_| {
+                                sink.notice(
+                                    "This server could not open earlier reasoning from this chat. \
+                                     Sending without it…",
                                 );
                             })
                         }

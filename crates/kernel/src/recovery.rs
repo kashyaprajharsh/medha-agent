@@ -25,6 +25,8 @@ pub enum First {
     DefaultReasoning,
     /// Send it once more with tool descriptions free of pattern rules.
     PlainSchemas,
+    /// Send it once more without earlier reasoning the server could not open.
+    StaleReasoning,
     /// Nothing: the same request would get the same answer.
     Nothing,
 }
@@ -90,6 +92,9 @@ impl ProviderError {
         };
         let refused = "its server refused the request";
         let (first, stand_in) = match (kind, self) {
+            _ if crate::rejections::stale_reasoning(&refusal) => {
+                (First::StaleReasoning, Some(refused))
+            }
             _ if crate::rejections::reasoning_setting(&refusal) => {
                 (First::DefaultReasoning, Some(refused))
             }

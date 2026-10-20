@@ -21,6 +21,15 @@ pub(crate) struct Settings<'a> {
     pub plain_schemas: bool,
     pub scope: &'a RequestScope,
     pub stable_system: Option<&'a str>,
+    /// Sealed reasoning from before this moment (ms since the epoch) is not sent back.
+    pub replay_after: Option<u64>,
+}
+
+/// Milliseconds since the epoch, the clock sealed reasoning is stamped with.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 pub(crate) type Reply = BoxStream<'static, Result<Block, ProviderError>>;

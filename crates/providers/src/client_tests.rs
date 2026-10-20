@@ -1314,7 +1314,7 @@ mod responses_tests {
             ProviderProfile::openai_chat(format!("{}/v1", server.url), "gpt-x", AuthKind::Bearer);
         profile.protocol = Protocol::OpenAiResponses;
         profile.reasoning = ReasoningSupport::Effort;
-        let provider = ProviderClient::from_profile(profile, "key").unwrap();
+        let provider = ProviderClient::from_profile(profile.clone(), "key").unwrap();
         let tools = vec![kernel::ToolSpec {
             name: "fs.read".into(),
             description: "read".into(),
@@ -1378,5 +1378,34 @@ mod responses_tests {
         );
         assert_eq!(input[3]["output"], "fn main() {}");
         assert_eq!(sent["store"], false);
+        drop(requests);
+
+        // Refused as stale: stripped once, then not sent again until the model changes.
+        let replays = |provider: &ProviderClient| {
+            let request = provider.prepare_request(&context(&history)).unwrap();
+            request.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        };
+        let request = provider.prepare_request(&context(&history)).unwrap();
+        let stripped = provider
+            .without_replayed_reasoning(&request)
+            .unwrap()
+            .unwrap();
+        assert!(
+            stripped.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
+        );
+        assert!(
+            !replays(&provider),
+            "a stale blob is not sent on every later turn"
+        );
+        provider.switch_provider_profile(profile, "key").unwrap();
+        assert!(replays(&provider), "a model switch starts replay afresh");
     }
 }

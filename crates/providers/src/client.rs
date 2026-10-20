@@ -36,6 +36,8 @@ pub struct ProviderClient {
     keys: Mutex<Option<KeySource>>,
     /// Connections that also trust a certificate file, by that file's path.
     trusting: Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    /// Sealed reasoning from before this moment is not sent back; reset on a switch.
+    replay_after: Mutex<Option<u64>>,
 }
 
 #[derive(Clone)]
@@ -89,6 +91,7 @@ impl ProviderClient {
             plain_schemas: std::sync::atomic::AtomicBool::new(false),
             keys: Mutex::new(None),
             trusting: Mutex::default(),
+            replay_after: Mutex::new(None),
         }
     }
 
@@ -183,6 +186,7 @@ impl ProviderClient {
         let reasoning = reconcile_reasoning_for_switch(&profile, self.reasoning());
         validate_reasoning(&profile, &reasoning)?;
         *self.reasoning.lock().unwrap() = reasoning;
+        *self.replay_after.lock().unwrap() = None;
         *self.connection.lock().unwrap() = Connection {
             profile,
             credential,
@@ -316,6 +320,28 @@ impl Provider for ProviderClient {
         self.turn_to_next_key(status, asked)
     }
 
+    fn without_replayed_reasoning(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        let mut body = request.body.clone();
+        let input = body
+            .get_mut("input")
+            .and_then(serde_json::Value::as_array_mut);
+        let Some(input) = input.filter(|_| request.protocol == Protocol::OpenAiResponses) else {
+            return Ok(None);
+        };
+        let before = input.len();
+        input.retain(|item| item["type"] != "reasoning");
+        if input.len() == before {
+            return Ok(None);
+        }
+        // A second refusal means even fresh reasoning fails, so none goes back to this model.
+        let mut after = self.replay_after.lock().unwrap();
+        *after = Some(after.map_or_else(protocol::now_ms, |_| u64::MAX));
+        Ok(Some(request.with_body(body)))
+    }
+
     fn with_plain_schemas(
         &self,
         request: &PreparedModelRequest,
@@ -397,6 +423,7 @@ impl Provider for ProviderClient {
                 .load(std::sync::atomic::Ordering::Relaxed),
             scope,
             stable_system: stable_system.as_deref(),
+            replay_after: *self.replay_after.lock().unwrap(),
         };
         let (body, headers) = wire.prepare(ctx, &settings)?;
         let mut prepared =

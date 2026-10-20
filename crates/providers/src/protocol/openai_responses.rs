@@ -46,14 +46,17 @@ pub(crate) fn prepare_body(
         .iter()
         .map(|(wire, canonical)| (canonical.as_str(), wire.as_str()))
         .collect();
-    let origin = Origin {
-        server: server(&profile.base_url),
-        model: settings.model.to_string(),
+    let replay = Replay {
+        origin: Origin {
+            server: server(&profile.base_url),
+            model: settings.model.to_string(),
+        },
+        after: settings.replay_after.unwrap_or(0),
     };
     let (instructions, input) = lower_messages(
         &context.ordered_messages(),
         &canonical_to_wire,
-        &origin,
+        &replay,
         plan,
     )?;
 
@@ -128,10 +131,16 @@ fn reasoning_fields(
     body.insert("include".into(), json!(["reasoning.encrypted_content"]));
 }
 
+/// Which sealed reasoning may go back: this server and model, sealed after `after`.
+struct Replay {
+    origin: Origin,
+    after: u64,
+}
+
 fn lower_messages(
     messages: &[ModelMessage],
     canonical_to_wire: &HashMap<&str, &str>,
-    origin: &Origin,
+    replay: &Replay,
     plan: bool,
 ) -> Result<(Option<String>, Vec<Value>), ProviderError> {
     let mut system = String::new();
@@ -152,7 +161,7 @@ fn lower_messages(
                 input.push(json!({"type": "message", "role": "user", "content": content}));
             }
             Role::Assistant => {
-                lower_assistant(&message.parts, canonical_to_wire, origin, plan, &mut input)?
+                lower_assistant(&message.parts, canonical_to_wire, replay, plan, &mut input)?
             }
             Role::Tool => lower_tool_results(&message.parts, &mut input)?,
         }
@@ -163,7 +172,7 @@ fn lower_messages(
 fn lower_assistant(
     parts: &[ContentPart],
     canonical_to_wire: &HashMap<&str, &str>,
-    origin: &Origin,
+    replay: &Replay,
     plan: bool,
     input: &mut Vec<Value>,
 ) -> Result<(), ProviderError> {
@@ -180,7 +189,7 @@ fn lower_assistant(
                 }
             }
             ContentPart::Reasoning(part) => {
-                if let Some(item) = replayable(&part.provider_state, origin)? {
+                if let Some(item) = replayable(&part.provider_state, replay)? {
                     input.push(item);
                 }
             }
@@ -330,8 +339,9 @@ fn reject_own_state(states: &[ProviderState], location: &str) -> Result<(), Prov
 
 static FOREIGN_DROPPED: AtomicBool = AtomicBool::new(false);
 
-/// The reasoning item to send back, if it was sealed by this exact server and model.
-fn replayable(states: &[ProviderState], origin: &Origin) -> Result<Option<Value>, ProviderError> {
+/// The reasoning item to send back, if this exact server and model sealed it in time.
+fn replayable(states: &[ProviderState], replay: &Replay) -> Result<Option<Value>, ProviderError> {
+    let origin = &replay.origin;
     let own: Vec<_> = states
         .iter()
         .filter(|state| state.protocol == Protocol::OpenAiResponses)
@@ -360,6 +370,9 @@ fn replayable(states: &[ProviderState], origin: &Origin) -> Result<Option<Value>
         if !FOREIGN_DROPPED.swap(true, Ordering::Relaxed) {
             tracing::info!("earlier reasoning from another server or model is not sent back");
         }
+        return Ok(None);
+    }
+    if value.get("sealed_at").and_then(Value::as_u64).unwrap_or(0) < replay.after {
         return Ok(None);
     }
     let summary = value
@@ -421,6 +434,7 @@ fn item_parts(
                         "item": {"encrypted_content": blob, "summary": item.get("summary").cloned().unwrap_or_else(|| json!([]))},
                         "server": server(&origin.server),
                         "model": origin.model,
+                        "sealed_at": super::now_ms(),
                     }),
                 }]
             });

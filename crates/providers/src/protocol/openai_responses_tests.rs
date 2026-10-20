@@ -99,6 +99,7 @@ fn body(profile: &ProviderProfile, messages: Vec<ModelMessage>) -> Result<Value,
             plain_schemas: false,
             scope: &RequestScope::default(),
             stable_system: None,
+            replay_after: None,
         },
     )
 }

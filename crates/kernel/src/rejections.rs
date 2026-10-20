@@ -95,6 +95,16 @@ pub(crate) fn reasoning_setting(lower: &str) -> bool {
         || UNSUPPORTED.iter().any(|said| lower.contains(said))
 }
 
+/// The server could not open reasoning it sealed earlier: its key rotated, or another
+/// gateway wrapped the request. Every wording here was met on a real endpoint.
+pub(crate) fn stale_reasoning(lower: &str) -> bool {
+    lower.contains("invalid_encrypted_content")
+        || lower.contains("could not decrypt the provided encrypted_content")
+        || lower.contains("encrypted content could not be decrypted or parsed")
+        || (lower.contains("encrypted content for item") && lower.contains("could not be verified"))
+        || (lower.contains("encrypted_content") && lower.contains("was not issued to this caller"))
+}
+
 /// A local server could not turn a tool's description into its grammar: it
 /// takes few of the `pattern` and `format` rules a description may carry.
 pub(crate) fn tool_grammar(lower: &str) -> bool {

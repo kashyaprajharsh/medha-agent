@@ -134,6 +134,15 @@ impl Provider for Scripted {
         Ok(Some(request.with_body(body)))
     }
 
+    fn without_replayed_reasoning(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        let mut body = request.body.clone();
+        body["replayed_reasoning"] = json!(false);
+        Ok(Some(request.with_body(body)))
+    }
+
     fn with_request_reasoning(
         &self,
         request: &PreparedModelRequest,
@@ -722,10 +731,8 @@ async fn the_next_saved_key_is_tried_before_another_model() {
     assert_eq!(*provider.standing_in.lock().unwrap(), 1);
 }
 
-/// A server that refuses one thing in the request gets the request once more
-/// without it: the reasoning setting it will not take, or the pattern rules in
-/// tool descriptions it cannot use. A block under content rules is not sent
-/// again, and is said in plain words.
+/// A request refused for one thing (a reasoning setting, pattern rules, sealed reasoning
+/// it cannot open) goes once more without it; a content block is never sent again.
 #[tokio::test]
 async fn a_request_refused_for_one_thing_is_sent_once_more_without_it() {
     let answered = (vec![text("answered")], Whole);
@@ -749,6 +756,10 @@ async fn a_request_refused_for_one_thing_is_sent_once_more_without_it() {
     let provider = refusing("error parsing grammar: unknown escape at \\d", 1);
     assert_eq!(run(provider.clone()).await.stop, Ok(StopReason::Finished));
     assert_eq!(second_body(&provider, "plain_schemas"), json!(true));
+
+    let provider = refusing(r#"{"error":{"code":"invalid_encrypted_content"}}"#, 1);
+    assert_eq!(run(provider.clone()).await.stop, Ok(StopReason::Finished));
+    assert_eq!(second_body(&provider, "replayed_reasoning"), json!(false));
 
     // Refused again without it: the server's words end the turn, after one retry only.
     let stuck = refusing(mandatory, usize::MAX);

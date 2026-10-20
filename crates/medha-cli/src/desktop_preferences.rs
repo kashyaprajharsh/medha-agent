@@ -201,7 +201,10 @@ fn settings(cfg: &config::Config) -> Value {
     json!({ "models": models, "fallback": cfg.fallback, "protocols": protocols, "catalogue_revision": catalogue.revision, "unavailable_providers": catalogue.providers.iter().filter(|p| !p.available).map(|p| json!({"id":p.id,"name":p.name,"reason":p.unavailable_reason})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
 }
 /// Found models with what the catalogue knows of them: display name, list price and tool use.
-fn listed(profile: &config::ProviderConfig, models: &[providers::discovery::ModelInfo]) -> Vec<Value> {
+fn listed(
+    profile: &config::ProviderConfig,
+    models: &[providers::discovery::ModelInfo],
+) -> Vec<Value> {
     let catalogue = providers::catalogue::snapshot();
     let record = profile
         .provider_id

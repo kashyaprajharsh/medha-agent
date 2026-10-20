@@ -1,4 +1,6 @@
-export type Provider = { id?: string; name: string; url: string; auth: string; protocol?: string; parameters?: string[]; models?: Found[] };
+export type ConnectionOptions = { headers?: Record<string, string>; ca_cert_file?: string | null; proxy?: string | null };
+export type UnavailableProvider = { id: string; name: string; reason?: string | null };
+export type Provider = ConnectionOptions & { id?: string; name: string; url: string; auth: string; protocol?: string; parameters?: string[]; models?: Found[] };
 export const providerKey = (provider: Provider) => provider.id ?? (provider.protocol ? `${provider.protocol}:${provider.url}` : provider.url);
 export type ModelTestResult = Record<"text" | "streaming" | "tools", { status: "passed" | "failed" | "skipped"; message: string; failure: string | null }>;
 export type Protocol = {
@@ -34,7 +36,7 @@ export const plainName = (name: string) => name.replace(/\s*\(local\)$/, "");
 export const authFor = (choice: { custom: boolean; auth: string }, key: string) => (choice.custom && !key ? "none" : choice.auth);
 
 /** The profile a new model is saved as; everything unasked keeps the value Settings would give it. */
-export function profileFor(connection: { protocol: string; url: string; auth: string; provider_id?: string }, model = "", context: number | null = null) {
+export function profileFor(connection: ConnectionOptions & { protocol: string; url: string; auth: string; provider_id?: string }, model = "", context: number | null = null) {
   return {
     model: model || "model-discovery",
     base_url: connection.url,
@@ -48,7 +50,9 @@ export function profileFor(connection: { protocol: string; url: string; auth: st
     token_counter: "none",
     token_accounting: "adaptive",
     chat_token_limit: "auto",
-    headers: {},
+    headers: { ...connection.headers },
+    ca_cert_file: connection.ca_cert_file ?? null,
+    proxy: connection.proxy ?? null,
     ...(connection.provider_id ? { provider_id: connection.provider_id } : {}),
   };
 }

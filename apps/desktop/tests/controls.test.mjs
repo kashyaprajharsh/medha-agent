@@ -2294,6 +2294,10 @@ test("provider refresh is a secondary labelled control and reports failure befor
   assert.equal(refresh.type, "button");
   assert.ok(refresh.classList.contains("icon-btn"));
   assert.ok(!refresh.classList.contains("btn-line"));
+  const unavailable = document.querySelector(".model-provider-field details");
+  assert.match(unavailable.querySelector("summary").textContent, /Not available yet/);
+  assert.match(unavailable.textContent, /Native Future.*This native protocol is not implemented/);
+  assert.equal(unavailable.querySelector("button"), null, "unavailable entries cannot start setup");
   assert.equal(document.querySelector(".model-provider-heading label").htmlFor, namedButton("Choose a provider").id);
   await click(refresh);
   assert.equal(refresh.disabled, true);
@@ -2313,10 +2317,12 @@ test("provider refresh is a secondary labelled control and reports failure befor
 test("saved custom servers appear under Custom endpoint and reuse only their exact saved key", async () => {
   const calls = [];
   const address = "https://private-gateway.test/team-a/v1";
-  const existing = { name: "private", default: true, key_present: true, profile: { protocol: "open-ai-chat", model: "old", base_url: address, auth: "bearer" } };
+  const connection = { provider_id: "cloudflare-workers-ai", headers: { "x-company": "tenant-a" }, ca_cert_file: "/company.pem", proxy: "http://proxy.test:8080" };
+  const existing = { name: "private", default: true, key_present: true, profile: { ...connection, protocol: "open-ai-chat", model: "old", base_url: address, auth: "bearer", max_ctx: 64000, max_output_tokens: 8192 } };
+  const other = { ...existing, name: "other-account", profile: { ...existing.profile, base_url: "https://private-gateway.test/team-b/v1", headers: { "x-company": "tenant-b" } } };
   await providerForm(async (method = "settings.list", params) => {
     calls.push({ method, params });
-    if (method === "settings.list") return providerSettings([providerFixture], [existing]);
+    if (method === "settings.list") return providerSettings([providerFixture], [existing, other]);
     if (method === "settings.model.discover") return { models: [{ id: "fixture-model", context_length: 8000 }] };
     if (method === "settings.model.save") return { saved: true };
     assert.fail(method);
@@ -2326,18 +2332,32 @@ test("saved custom servers appear under Custom endpoint and reuse only their exa
   await click(option("Custom endpoint"));
   assert.equal(fieldInput("API endpoint").value, "");
   await click(namedButton("Enter a new endpoint"));
-  await click(option("private-gateway.test"));
+  await click(option("private-gateway.test/team-a/v1"));
   assert.equal(fieldInput("API endpoint").value, address);
   assert.match(fieldInput("API key").placeholder, /saved key/);
   const discovery = calls.find((call) => call.method === "settings.model.discover");
   assert.equal(discovery.params.profile.base_url, address);
   assert.equal(discovery.params.profile.auth, "bearer");
   assert.equal(discovery.params.key, "");
+  for (const [key, value] of Object.entries(connection)) assert.deepEqual(discovery.params.profile[key], value, key);
   await inputValue(fieldInput("Model ID"), "another-model");
   await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   const save = calls.find((call) => call.method === "settings.model.save");
   assert.equal(save.params.profile.base_url, address);
-  assert.equal(save.params.profile.provider_id, null, "a custom server has no catalogue provider identity");
+  for (const [key, value] of Object.entries(connection)) assert.deepEqual(save.params.profile[key], value, key);
+  assert.equal(save.params.profile.max_ctx, null, "the old model's window is not copied");
+  assert.equal(save.params.profile.max_output_tokens, null, "the old model's output cap is not copied");
+
+  // Reopening a resolved catalogue deployment must not ask for its account again.
+  await act(() => root.render(null));
+  const { Settings } = await import(await moduleUrl("Settings"));
+  const reopened = { ...existing, name: "another-model", profile: save.params.profile };
+  const native = { ...providerFixture, id: connection.provider_id, parameters: ["CLOUDFLARE_ACCOUNT_ID"], url: "https://fixture.test/${CLOUDFLARE_ACCOUNT_ID}/v1" };
+  globalThis.__medhaControlsTest.api = { settings: async () => providerSettings([native], [reopened]) };
+  await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {}, editModel: reopened.name })));
+  assert.equal(fieldInput("CLOUDFLARE ACCOUNT ID"), undefined);
+  assert.equal(namedButton("Use endpoint"), undefined);
+  assert.equal(fieldInput("API endpoint").value, address);
 
   await act(() => root.render(null));
   await providerForm(async () => providerSettings());

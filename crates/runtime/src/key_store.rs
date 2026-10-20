@@ -2,8 +2,9 @@
 //! No key leaves one store until every key has arrived in the other.
 
 use super::{
-    Config, CredentialsFile, KEYRING_SERVICE, credentials_path, key_store_forced, mcp_key_id,
-    mcp_oauth_id, prefer_keychain, search_cred_id, with_credentials_lock, write_credentials_file,
+    Config, KEYRING_SERVICE, credentials_path, key_store_forced, mcp_key_id, mcp_oauth_id,
+    prefer_keychain, read_credentials_file, search_cred_id, with_credentials_lock,
+    write_credentials_file,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -112,13 +113,7 @@ pub fn move_keys(cfg: &Config, to_keychain: bool) -> Result<()> {
     );
     with_credentials_lock(|| {
         let path = credentials_path()?;
-        let mut creds: CredentialsFile = match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("reading {}", path.display()))?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-        };
+        let mut creds = read_credentials_file(&path)?;
         // Already there: the other store holds only leftovers, which must not win.
         let stale = if prefer_keychain() == to_keychain {
             Vec::new()

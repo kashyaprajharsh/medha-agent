@@ -55,6 +55,7 @@ pub(super) fn activate(model: &mut Model) -> bool {
                     protocol::ModelAuth::Bearer
                 }));
                 setup.provider_id = saved.provider_id;
+                setup.connection = saved.connection;
                 setup.base_url = saved.base_url;
                 setup.provider = provider;
                 setup.step = ModelSetupStep::ApiKey;

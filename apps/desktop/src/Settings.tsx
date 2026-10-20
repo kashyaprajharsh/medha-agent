@@ -8,16 +8,17 @@ import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
 import { useWorkspace } from "./Workspace";
-import { profileFor, providerKey, type Provider as Preset, type Protocol as ModelProtocol, type ModelTestResult } from "./modelSetup";
-import { ModelTest, ProviderFields } from "./ProviderSetup";
+import { profileFor, providerKey, type ConnectionOptions, type UnavailableProvider, type Provider as Preset, type Protocol as ModelProtocol, type ModelTestResult } from "./modelSetup";
+import { ModelTest, ProviderFields, UnavailableProviders } from "./ProviderSetup";
 import { Spinner } from "./Spinner";
 type Model = {
   name: string;
-  profile: Record<string, unknown> & {
+  profile: Record<string, unknown> & ConnectionOptions & {
     model: string;
     base_url: string;
     protocol: string;
     auth: string;
+    provider_id?: string | null;
   };
   default: boolean;
   key_present: boolean;
@@ -78,6 +79,7 @@ export function Settings({
   const context = useWorkspace();
   const api = context.api;
   const [protocols, setProtocols] = useState<ModelProtocol[]>([]);
+  const [unavailable, setUnavailable] = useState<UnavailableProvider[]>([]);
   const [tab, setTab] = useState("models");
   const [models, setModels] = useState<Model[]>([]);
   const [standIns, setStandIns] = useState<string[]>([]);
@@ -112,6 +114,7 @@ export function Settings({
           setModels(result.models as Model[]);
           setStandIns((result.fallback as string[] | undefined) ?? []);
           setProtocols(result.protocols as ModelProtocol[]);
+          setUnavailable((result.unavailable_providers as UnavailableProvider[]) ?? []);
           setSearch(result.search as Search);
         }
       })
@@ -203,6 +206,7 @@ export function Settings({
                 model={editing}
                 saved={models}
                 protocols={protocols}
+                unavailable={unavailable}
                 busy={busy}
                 onCancel={() => setEditing(undefined)}
                 onSave={(params) => act("settings.model.save", params)}
@@ -424,6 +428,7 @@ function ModelForm({
   model,
   saved,
   protocols,
+  unavailable,
   busy,
   onSave,
   onCancel,
@@ -431,6 +436,7 @@ function ModelForm({
   model: Model | null;
   saved: Model[];
   protocols: ModelProtocol[];
+  unavailable: UnavailableProvider[];
   busy: boolean;
   onSave: (params: Record<string, unknown>) => Promise<void>;
   onCancel: () => void;
@@ -441,7 +447,10 @@ function ModelForm({
   const [url, setUrl] = useState(model?.profile.base_url || "");
   const [protocol, setProtocol] = useState(model?.profile.protocol || "");
   const [providerId, setProviderId] = useState((model?.profile.provider_id as string | undefined) ?? "");
+  // Saved deployments already have a resolved endpoint.
+  const [needsParameters, setNeedsParameters] = useState(false);
   const [catalogueProtocols, setCatalogueProtocols] = useState<ModelProtocol[]>();
+  const [catalogueUnavailable, setCatalogueUnavailable] = useState<UnavailableProvider[]>();
   const availableProtocols = catalogueProtocols ?? protocols;
   const selectedProtocol = availableProtocols.find((item) => item.value === protocol);
   const presets = availableProtocols.filter((p) => p.available).flatMap((p) => p.providers.map((provider) => ({ ...provider, protocol: p.value })));
@@ -464,7 +473,12 @@ function ModelForm({
     url: profile.base_url,
     auth: profile.auth,
     protocol: profile.protocol,
+    id: profile.provider_id ?? undefined,
+    headers: profile.headers,
+    ca_cert_file: profile.ca_cert_file,
+    proxy: profile.proxy,
   }));
+  const serverKey = (server: Preset) => `${server.protocol}:${server.url}`;
   /** A key is stored per address, so any saved model there already holds it. */
   const keySavedAt = (address: string) =>
     saved.some((item) => item.key_present && item.profile.base_url === address);
@@ -522,7 +536,7 @@ function ModelForm({
     testVersion.current++;
     setTested(undefined); setTesting(false);
     return () => { testVersion.current++; };
-  }, [id, url, protocol, key, auth, context, output, headers, reasoning, efforts, images, counter, accounting, tokenField]);
+  }, [id, url, protocol, providerId, key, auth, certificate, proxy, context, output, headers, reasoning, efforts, images, counter, accounting, tokenField]);
   useEffect(
     () => () => {
       discoveryVersion.current++;
@@ -552,6 +566,8 @@ function ModelForm({
     setAccounting("adaptive");
     setTokenField("auto");
     setHeaders([]);
+    setCertificate("");
+    setProxy("");
   }
   function chooseProvider(selected: Preset | undefined, choice: string) {
     const nextProtocol = selected?.protocol || protocol || availableProtocols.find((p) => p.available)?.value || "";
@@ -561,10 +577,14 @@ function ModelForm({
     setUrl(selected?.parameters?.length ? "" : selected?.url || "");
     setAuth(nextAuth);
     setProviderId(selected?.id ?? "");
+    setNeedsParameters(Boolean(selected?.parameters?.length));
     resetConnection();
+    setHeaders(Object.entries(selected?.headers ?? {}));
+    setCertificate(selected?.ca_cert_file ?? "");
+    setProxy(selected?.proxy ?? "");
     // Reuse only the selected address's saved key, never another provider's.
     if (selected && availableProtocols.find((p) => p.value === nextProtocol)?.discovery && !selected.parameters?.length && keySavedAt(selected.url))
-      void discover(profileFor({ protocol: nextProtocol, url: selected.url, auth: nextAuth, provider_id: selected.id }), "", selected.models ?? []);
+      void discover(profileFor({ ...selected, protocol: nextProtocol, auth: nextAuth, provider_id: selected.id }), "", selected.models ?? []);
   }
   function profile() {
     return {
@@ -624,7 +644,10 @@ function ModelForm({
     try {
       await api.settings("application.providers.refresh", {});
       const reply = await api.settings();
-      if (version === catalogueVersion.current) setCatalogueProtocols(reply.protocols as ModelProtocol[]);
+      if (version === catalogueVersion.current) {
+        setCatalogueProtocols(reply.protocols as ModelProtocol[]);
+        setCatalogueUnavailable((reply.unavailable_providers as UnavailableProvider[]) ?? []);
+      }
     } catch (cause) { if (version === catalogueVersion.current) setCatalogueError(String(cause).replace(/^Error:\s*/, "")); }
     finally { if (version === catalogueVersion.current) setCatalogueBusy(false); }
   }
@@ -714,16 +737,17 @@ function ModelForm({
             <option value="custom">Custom endpoint</option>
           </Select>
           {catalogueError && <p className="model-provider-error" role="alert">{catalogueError}</p>}
+          <UnavailableProviders providers={catalogueUnavailable ?? unavailable} />
       </div>
       {protocol && preset && (
         <>
-          {provider?.parameters?.length ? <ProviderFields key={providerKey(provider)} provider={provider} disabled={busy} onChange={() => { setUrl(""); setKey(""); resetDiscovery(); }} onResolved={(url) => { setUrl(url); resetDiscovery(); }} /> : null}
+          {needsParameters && provider?.parameters?.length ? <ProviderFields key={providerKey(provider)} provider={provider} disabled={busy} onChange={() => { setUrl(""); setKey(""); resetDiscovery(); }} onResolved={(url) => { setUrl(url); resetDiscovery(); }} /> : null}
           {preset === "custom" && own.length > 0 && <>
             <label>
               Saved custom server
-              <Select value={savedServer ? providerKey(savedServer) : "new"} search="Search saved servers" disabled={busy} onChange={(event) => chooseProvider(own.find((item) => providerKey(item) === event.target.value), "custom")}>
+              <Select value={savedServer ? serverKey(savedServer) : "new"} search="Search saved servers" disabled={busy} onChange={(event) => chooseProvider(own.find((item) => serverKey(item) === event.target.value), "custom")}>
                 <option value="new">Enter a new endpoint</option>
-                {own.map((item) => <option key={providerKey(item)} value={providerKey(item)}>{item.name}</option>)}
+                {own.map((item) => <option key={serverKey(item)} value={serverKey(item)}>{item.name}</option>)}
               </Select>
             </label>
             <p className="quiet">Only endpoints from your saved models appear here.</p>

@@ -1,10 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkspaceApi } from "./Workspace";
-import type { ModelTestResult, Provider } from "./modelSetup";
+import type { ModelTestResult, Provider, UnavailableProvider } from "./modelSetup";
+
+/** Catalogue entries remain visible without offering an unsupported connection. */
+export function UnavailableProviders({ providers }: { providers: UnavailableProvider[] }) {
+  if (!providers.length) return null;
+  return <details className="provider-unavailable quiet">
+    <summary>Not available yet ({providers.length})</summary>
+    <ul>{providers.map((provider) => <li key={provider.id}><b>{provider.name}</b> — {provider.reason || "This provider is not available yet."}</li>)}</ul>
+  </details>;
+}
 
 /** Endpoint values are explicit and validated by the shared backend. */
-export function ProviderFields({ provider, disabled, onChange, onResolved }: {
-  provider: Provider; disabled: boolean; onChange: () => void; onResolved: (url: string) => void;
+export function ProviderFields({ provider, disabled, onChange, onResolved, inputClassName }: {
+  provider: Provider; disabled: boolean; onChange: () => void; onResolved: (url: string) => void; inputClassName?: string;
 }) {
   const api = useWorkspaceApi();
   const [values, setValues] = useState<Record<string, string>>({});
@@ -25,7 +34,7 @@ export function ProviderFields({ provider, disabled, onChange, onResolved }: {
   return <div>
     {(provider.parameters ?? []).map((name) => <label key={name}>
       {name.replaceAll("_", " ")}
-      <input value={values[name] ?? ""} disabled={disabled || busy} autoComplete="off" onChange={(event) => { setValues({ ...values, [name]: event.target.value }); onChange(); setError(""); }} />
+      <input className={inputClassName} value={values[name] ?? ""} disabled={disabled || busy} autoComplete="off" onChange={(event) => { setValues({ ...values, [name]: event.target.value }); onChange(); setError(""); }} />
     </label>)}
     <p className="quiet">These values complete the endpoint. Enter your API key separately.</p>
     <button type="button" className="btn-line" disabled={disabled || busy || !(provider.parameters ?? []).every((name) => values[name]?.trim())} onClick={() => void resolve()}>{busy ? "Checking endpoint…" : "Use endpoint"}</button>

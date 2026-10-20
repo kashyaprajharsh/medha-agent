@@ -2185,6 +2185,23 @@ explicit non-secret values; catalogue refresh cannot redirect a saved key or
 rewrite a saved endpoint. Provider HTTP requests do not follow redirects.
 Discovery is bounded by time, response bytes, pages and model count.
 
+Reusing a saved server in Desktop or TUI keeps its provider identity, exact
+endpoint, authentication kind, custom headers, certificate file and explicit
+proxy. Discovery, the optional setup test and saving use the same connection
+settings. The new model resolves its own context/output limits and capabilities;
+the previous model's limits are not copied. Settings and first-run setup list
+unsupported providers under "Not available yet", with their reasons; those
+entries cannot start a connection.
+First-run provider search uses the same inset search control as the model
+picker, with a fixed height while the provider list scrolls. Endpoint parameter
+fields use the existing setup input styling.
+
+Saving, removing or moving keys requires a readable, valid credential file.
+Only a missing file creates an empty store. If an existing file is unreadable
+or malformed, the operation stops with an error in the existing form, preserving
+the file and saved model configuration. Parse errors never include lines from
+the credential file. Normal setup adds no approval dialogs or extra steps.
+
 Each saved model can set an explicit HTTP/HTTPS `proxy` URL in its advanced
 settings or profile data. It is off by default. Generation, token counting and
 discovery use that same proxy. Configuring it authorizes this profile's
@@ -2202,7 +2219,7 @@ An unpaired environment key gives a configuration error. Keys entered explicitly
 for one selected endpoint remain explicit endpoint-scoped inputs.
 
 The optional setup test sends only synthetic messages, with at most four requests
-and a 45-second total deadline. It reports text, streaming completion and a
+with five minutes per request and eight minutes total. It reports text, streaming completion and a
 fabricated function-call/result round trip separately, without running tools or
 entering the agent retry loop. Catalogue availability, account access and tested
 capabilities remain separate: a model listing alone is not a verification claim.

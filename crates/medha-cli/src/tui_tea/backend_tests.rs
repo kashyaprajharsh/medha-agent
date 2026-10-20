@@ -349,12 +349,14 @@ async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth
         "provider_id":"cloudflare-workers-ai", "auth":"x-api-key",
         "name":"old-model", "model":"old", "protocol":"open-ai-chat",
         "base_url":"https://gateway.test/tenant-a/v1", "context_limit":8000,
+        "headers":{"x-tenant":"tenant-a"}, "ca_cert_file":"/company.pem", "proxy":"http://proxy.test:8080",
         "default":true, "key_present":true, "requires_key":true
     }))
     .unwrap();
     let mut duplicate = profile.clone();
     duplicate.name = "other-model".into();
     let peer = f.model.remote.as_mut().unwrap();
+    let connection = profile.connection.clone();
     peer.models.profiles = vec![profile, duplicate];
     peer.models.providers = vec![setup_provider()];
     begin_model_setup(&mut f.model);
@@ -368,6 +370,24 @@ async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth
         1
     );
     setup_enter(&mut f.model);
+    let Effect::Discover(discovery) = &f
+        .model
+        .remote
+        .as_ref()
+        .unwrap()
+        .pending
+        .front()
+        .unwrap()
+        .effect
+    else {
+        panic!("missing discovery")
+    };
+    assert_eq!(discovery.connection, connection);
+    assert_eq!(
+        f.model.model_setup.as_ref().unwrap().max_ctx,
+        None,
+        "the old model's window is not this model's window"
+    );
     assert!(
         matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
         Effect::Discover(request) if request.base_url == "https://gateway.test/tenant-a/v1" && request.key.0.is_empty() && request.auth == Some(protocol::ModelAuth::XApiKey))
@@ -376,11 +396,25 @@ async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth
         &mut f,
         Ok(Answer::Discovered(vec![protocol::DiscoveredModel {
             id: "new".into(),
-            context_length: Some(8000),
+            context_length: Some(16000),
         }])),
     );
     setup_enter(&mut f.model);
     setup_enter(&mut f.model);
+    let Effect::Change(protocol::ChangeResource::SaveModel(draft), _) = &f
+        .model
+        .remote
+        .as_ref()
+        .unwrap()
+        .pending
+        .front()
+        .unwrap()
+        .effect
+    else {
+        panic!("missing save")
+    };
+    assert_eq!(draft.connection, connection);
+    assert_eq!(draft.context_limit, Some(16000));
     assert!(
         matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
         Effect::Change(protocol::ChangeResource::SaveModel(draft), _) if draft.base_url == "https://gateway.test/tenant-a/v1" && draft.auth == Some(protocol::ModelAuth::XApiKey) && draft.key.is_none() && draft.provider_id.as_deref() == Some("cloudflare-workers-ai"))
@@ -887,7 +921,7 @@ async fn closing_a_form_before_its_save_finishes_cannot_activate_that_profile() 
         protocol::ChangeResource::SaveModel(protocol::ModelDraft {
             provider_id: None,
             auth: None,
-            headers: BTreeMap::new(),
+            connection: Default::default(),
             name: None,
             protocol: protocol::ModelProtocol::OpenAiChat,
             base_url: "http://localhost/v1".into(),
@@ -1043,6 +1077,7 @@ async fn the_key_list_adds_one_more_key_or_forgets_the_one_chosen() {
     let listed = protocol::ModelProfile {
         provider_id: None,
         auth: None,
+        connection: Default::default(),
         name: "main".into(),
         model: "m".into(),
         protocol: protocol::ModelProtocol::OpenAiChat,

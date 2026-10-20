@@ -36,7 +36,22 @@
   }
 }
 .fr-head {
+  flex: none;
   padding: 22px 24px 14px;
+}
+.fr-search {
+  flex: none;
+  margin: 0 var(--s-6) var(--s-2);
+  background: var(--well);
+}
+.fr-catalogue {
+  flex: none;
+  display: grid;
+  gap: var(--s-2);
+  padding: 0 var(--s-6) var(--s-2);
+}
+.fr-catalogue > .fr-link {
+  justify-self: start;
 }
 .fr-head h2 {
   margin: 0;
@@ -263,6 +278,7 @@
   font-size: var(--text-sm);
 }
 .fr-foot {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 12px;

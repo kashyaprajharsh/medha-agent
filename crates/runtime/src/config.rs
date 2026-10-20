@@ -815,7 +815,7 @@ pub fn key_present(id: &str) -> bool {
     load_key(id).is_some()
 }
 pub fn remove_key(id: &str) -> Result<()> {
-    purge_credential(id);
+    purge_credential(id)?;
     anyhow::ensure!(
         !key_present(id),
         "The credential store could not remove this key"
@@ -1705,7 +1705,7 @@ pub fn prefer_keychain() -> bool {
     std::env::var("MEDHA_CRED_STORE")
         .ok()
         .filter(|v| !v.is_empty())
-        .or_else(|| read_credentials_file(&credentials_path().ok()?).store)
+        .or_else(|| read_credentials_file(&credentials_path().ok()?).ok()?.store)
         .unwrap_or_else(|| {
             option_env!("MEDHA_DEFAULT_CRED_STORE")
                 .unwrap_or("file")
@@ -1727,16 +1727,29 @@ struct CredentialsFile {
     keys: BTreeMap<String, String>,
 }
 
-fn read_credentials_file(path: &std::path::Path) -> CredentialsFile {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| toml::from_str(&text).ok())
-        .inspect(|creds: &CredentialsFile| {
-            for key in creds.keys.values() {
-                kernel::redact::remember_stored(key);
-            }
-        })
-        .unwrap_or_default()
+fn read_credentials_file(path: &std::path::Path) -> Result<CredentialsFile> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CredentialsFile::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not read saved keys at {}. The file has not been changed",
+                    path.display()
+                )
+            });
+        }
+    };
+    // TOML diagnostics can include source lines containing a key.
+    let creds: CredentialsFile = toml::from_str(&text).map_err(|_| {
+        anyhow::anyhow!("Could not parse saved keys at {}. Repair the file before saving keys; it has not been changed", path.display())
+    })?;
+    for key in creds.keys.values() {
+        kernel::redact::remember_stored(key);
+    }
+    Ok(creds)
 }
 
 fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Result<()> {
@@ -1840,7 +1853,7 @@ fn holding_credentials_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<
 
 fn write_key_file_locked(base_url: &str, key: &str) -> Result<()> {
     let path = credentials_path()?;
-    let mut creds = read_credentials_file(&path);
+    let mut creds = read_credentials_file(&path)?;
     creds.keys.insert(base_url.to_string(), key.to_string());
     write_credentials_file(&path, &creds)
 }
@@ -1848,6 +1861,7 @@ fn write_key_file_locked(base_url: &str, key: &str) -> Result<()> {
 fn file_load_key(base_url: &str) -> Option<String> {
     let path = credentials_path().ok()?;
     read_credentials_file(&path)
+        .ok()?
         .keys
         .get(base_url)
         .filter(|k| !k.is_empty())
@@ -1933,15 +1947,15 @@ impl mcp::TokenStore for McpTokens {
     }
 
     fn clear(&self, server: &str, url: &str) {
-        purge_credential(&mcp_oauth_id(server, url));
+        let _ = purge_credential(&mcp_oauth_id(server, url));
     }
 }
 
-fn purge_credential(cred_id: &str) {
+fn purge_credential(cred_id: &str) -> Result<()> {
     // Keep removal atomic with concurrent loads and stores across both layers.
     let result = with_credentials_lock(|| {
         if let Ok(path) = credentials_path() {
-            let mut creds = read_credentials_file(&path);
+            let mut creds = read_credentials_file(&path)?;
             if creds.keys.remove(cred_id).is_some() {
                 write_credentials_file(&path, &creds)?;
             }
@@ -1951,9 +1965,10 @@ fn purge_credential(cred_id: &str) {
         }
         Ok(())
     });
-    if let Err(error) = result {
+    if let Err(error) = &result {
         tracing::warn!(target: "medha_credentials", credential = cred_id, %error, "could not purge credential");
     }
+    result
 }
 
 pub fn store_mcp_key(id: &str, server: &McpServer, key: &str) -> Result<()> {
@@ -1987,12 +2002,12 @@ pub fn credential_store_label() -> &'static str {
 
 /// Forget a server's OAuth sign-in; its definition and any API key stay.
 pub fn mcp_sign_out(id: &str, server: &McpServer) {
-    purge_credential(&mcp_oauth_id(id, &server.url));
+    let _ = purge_credential(&mcp_oauth_id(id, &server.url));
 }
 
 pub fn delete_mcp_key(id: &str, server: &McpServer) {
-    purge_credential(&mcp_key_id(id, server));
-    purge_credential(&mcp_oauth_id(id, &server.url));
+    let _ = purge_credential(&mcp_key_id(id, server));
+    let _ = purge_credential(&mcp_oauth_id(id, &server.url));
 }
 
 pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
@@ -2092,18 +2107,10 @@ pub fn load_key(base_url: &str) -> Option<String> {
 pub(crate) fn read_key(id: &str) -> Result<Option<String>> {
     with_credentials_lock(|| {
         let path = credentials_path()?;
-        let filed = match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let mut credentials = toml::from_str::<CredentialsFile>(&text)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                for value in credentials.keys.values() {
-                    kernel::redact::remember_stored(value);
-                }
-                credentials.keys.remove(id).filter(|key| !key.is_empty())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-        };
+        let filed = read_credentials_file(&path)?
+            .keys
+            .remove(id)
+            .filter(|key| !key.is_empty());
         if !prefer_keychain() {
             return Ok(filed.or_else(|| keychain_load_key(id)));
         }
@@ -2511,7 +2518,7 @@ mod tests {
     fn credentials_file_round_trips_and_stays_owner_only() {
         let dir = std::env::temp_dir().join(format!("medha-creds-{}", ulid::Ulid::new()));
         let path = dir.join("credentials.toml");
-        assert!(read_credentials_file(&path).keys.is_empty());
+        assert!(read_credentials_file(&path).unwrap().keys.is_empty());
 
         let mut creds = CredentialsFile::default();
         creds
@@ -2519,13 +2526,13 @@ mod tests {
             .insert("http://one.example/v1".into(), "sk-one".into());
         write_credentials_file(&path, &creds).unwrap();
 
-        let mut creds = read_credentials_file(&path);
+        let mut creds = read_credentials_file(&path).unwrap();
         creds
             .keys
             .insert("http://two.example/v1".into(), "sk-two".into());
         write_credentials_file(&path, &creds).unwrap();
 
-        let creds = read_credentials_file(&path);
+        let creds = read_credentials_file(&path).unwrap();
         assert_eq!(creds.keys.get("http://one.example/v1").unwrap(), "sk-one");
         assert_eq!(creds.keys.get("http://two.example/v1").unwrap(), "sk-two");
 
@@ -2536,7 +2543,7 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "credentials file must be owner-only");
 
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            write_credentials_file(&path, &read_credentials_file(&path)).unwrap();
+            write_credentials_file(&path, &read_credentials_file(&path).unwrap()).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "0600 must be restored on write");
         }

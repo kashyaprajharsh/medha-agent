@@ -209,5 +209,9 @@ fn provider_commands_are_typed_scoped_and_keep_key_and_header_debugging_private(
         .is_err()
     );
     let legacy: ModelDraft = serde_json::from_value(json!({"name":null,"protocol":"open-ai-chat","base_url":"http://localhost/v1","model":"m","context_limit":null,"key":null})).unwrap();
-    assert!(legacy.provider_id.is_none() && legacy.auth.is_none() && legacy.headers.is_empty());
+    assert!(
+        legacy.provider_id.is_none()
+            && legacy.auth.is_none()
+            && legacy.connection.headers.is_empty()
+    );
 }

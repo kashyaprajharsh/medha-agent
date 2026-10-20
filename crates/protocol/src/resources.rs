@@ -47,12 +47,35 @@ pub enum SearchProvider {
     Searxng,
 }
 
+/// Connection settings reused by discovery, setup tests and saved models.
+/// Model-specific limits and capabilities are deliberately kept outside it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConnection {
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub ca_cert_file: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+impl std::fmt::Debug for ModelConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelConnection")
+            .field("headers", &"[redacted]")
+            .field("ca_cert_file", &self.ca_cert_file)
+            .field("proxy", &"[redacted]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default)]
     pub auth: Option<super::ModelAuth>,
+    #[serde(flatten)]
+    pub connection: ModelConnection,
     pub name: String,
     pub model: String,
     pub protocol: ModelProtocol,
@@ -86,8 +109,8 @@ pub struct ModelDraft {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub auth: Option<super::ModelAuth>,
-    #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub connection: ModelConnection,
     pub name: Option<String>,
     pub protocol: ModelProtocol,
     pub base_url: String,
@@ -105,7 +128,7 @@ impl std::fmt::Debug for ModelDraft {
             .field("model", &self.model)
             .field("auth", &self.auth)
             .field("context_limit", &self.context_limit)
-            .field("headers", &"[redacted]")
+            .field("connection", &self.connection)
             .field("key", &self.key)
             .finish()
     }
@@ -539,7 +562,11 @@ impl Command for ChangeResource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoverModels {
     #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
     pub auth: Option<super::ModelAuth>,
+    #[serde(flatten)]
+    pub connection: ModelConnection,
     pub protocol: ModelProtocol,
     pub base_url: String,
     pub key: Secret,

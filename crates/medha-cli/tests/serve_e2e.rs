@@ -85,7 +85,10 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     let Some((line, body)) = read_request(&mut stream) else {
         return;
     };
-    if !line.starts_with("post /v1/chat/completions") {
+    let target = line.split_whitespace().nth(1).unwrap_or_default();
+    let chat_path = target == "/v1/chat/completions"
+        || url::Url::parse(target).is_ok_and(|url| url.path() == "/v1/chat/completions");
+    if !line.starts_with("post ") || !chat_path {
         let models = r#"{"data":[{"id":"test-model","context_length":128000}]}"#;
         return respond(&mut stream, "application/json", models);
     }
@@ -95,6 +98,11 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     body["_test_authorization"] = json!(
         line.lines()
             .find_map(|header| header.strip_prefix("authorization:"))
+            .map(str::trim)
+    );
+    body["_test_company"] = json!(
+        line.lines()
+            .find_map(|header| header.strip_prefix("x-company:"))
             .map(str::trim)
     );
     let asked = last_user(&body);
@@ -1350,7 +1358,7 @@ async fn typed_application_resources_preserve_credentials_and_reject_stale_grant
     let change = ChangeResource::SaveModel(protocol::ModelDraft {
         provider_id: None,
         auth: None,
-        headers: Default::default(),
+        connection: Default::default(),
         name: Some("saved".into()),
         protocol: protocol::ModelProtocol::OpenAiChat,
         base_url: world.provider.url.clone(),
@@ -1685,13 +1693,23 @@ async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_bef
         config_before,
         "reading/resolving metadata must not rewrite saved endpoints"
     );
+    let certificate = folder.join("company.pem");
+    std::fs::write(
+        &certificate,
+        include_str!("../../providers/src/test_tls/ca.pem"),
+    )
+    .unwrap();
     let mut draft = protocol::ModelDraft {
         provider_id: Some("fixture".into()),
         auth: Some(protocol::ModelAuth::Bearer),
-        headers: Default::default(),
+        connection: protocol::ModelConnection {
+            headers: [("x-company".into(), "tenant-a".into())].into(),
+            ca_cert_file: Some(certificate.to_string_lossy().into_owned()),
+            proxy: Some(world.provider.url.clone()),
+        },
         name: Some("new-provider".into()),
         protocol: protocol::ModelProtocol::OpenAiChat,
-        base_url: world.provider.url.clone(),
+        base_url: "http://deployment.invalid/v1".into(),
         model: "fixture-model".into(),
         context_limit: Some(8000),
         key: None,
@@ -1729,6 +1747,7 @@ async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_bef
     for _ in 0..4 {
         let request = world.provider.seen.recv_timeout(WAIT).unwrap();
         assert_eq!(request["_test_authorization"], "bearer dummy-setup-only");
+        assert_eq!(request["_test_company"], "tenant-a");
     }
     let credentials_before =
         std::fs::read_to_string(world.home().join("credentials.toml")).unwrap_or_default();
@@ -1737,12 +1756,76 @@ async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_bef
         "Test alone does not save a key"
     );
     client.about(&folder, json!({"method":"application.resources.change","params":protocol::ChangeResource::SaveModel(draft.clone())})).await.unwrap();
+    let models: protocol::ResourceResult = serde_json::from_value(
+        client
+            .about(
+                &folder,
+                json!({"method":"application.resources","params":protocol::ReadResource::Models}),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let protocol::ResourceResult::Models(models) = models else {
+        panic!("missing models")
+    };
+    assert_eq!(
+        models
+            .profiles
+            .iter()
+            .find(|p| p.name == "new-provider")
+            .unwrap()
+            .connection,
+        draft.connection
+    );
     draft.key = None;
-    let discovered: Vec<protocol::DiscoveredModel> = serde_json::from_value(client.about(&folder, json!({"method":"application.models.discover","params":{"protocol":"open-ai-chat","base_url":draft.base_url,"auth":"bearer","key":""}})).await.unwrap()).unwrap();
+    let discovery = json!({"protocol":"open-ai-chat","base_url":draft.base_url,"auth":"bearer","key":"","headers":draft.connection.headers,"ca_cert_file":draft.connection.ca_cert_file,"proxy":draft.connection.proxy});
+    let discovered: Vec<protocol::DiscoveredModel> = serde_json::from_value(
+        client
+            .about(
+                &folder,
+                json!({"method":"application.models.discover","params":discovery}),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         discovered[0].id, "test-model",
         "the exact saved deployment key is reusable"
     );
+    let mut invalid = discovery.clone();
+    invalid["ca_cert_file"] = json!(folder.join("missing.pem"));
+    assert!(
+        client
+            .about(
+                &folder,
+                json!({"method":"application.models.discover","params":invalid})
+            )
+            .await
+            .is_err(),
+        "discovery ignored the saved CA file"
+    );
+    // A save against a damaged credential file must preserve both keys and config.
+    let credential_path = world.home().join("credentials.toml");
+    let original_keys = std::fs::read(&credential_path).unwrap();
+    let original_config = std::fs::read(world.home().join("config.toml")).unwrap();
+    let damaged = b"[keys]\nold = \"dummy-secret-in-broken-toml\"\nbroken = [";
+    std::fs::write(&credential_path, damaged).unwrap();
+    let refused = client.about(&folder, json!({"method":"settings.model.save","params":{"name":"must-not-save","profile":{"protocol":"open-ai-chat","base_url":draft.base_url,"model":"other"},"key":"dummy-new-key"}})).await.unwrap_err();
+    assert!(refused.contains("Could not parse saved keys"));
+    assert!(!refused.contains("dummy-secret-in-broken-toml"));
+    assert_eq!(std::fs::read(&credential_path).unwrap(), damaged);
+    assert_eq!(
+        std::fs::read(world.home().join("config.toml")).unwrap(),
+        original_config
+    );
+    std::fs::remove_file(&credential_path).unwrap();
+    std::fs::create_dir(&credential_path).unwrap();
+    assert!(client.about(&folder, json!({"method":"settings.model.save","params":{"name":"must-not-save","profile":{"protocol":"open-ai-chat","base_url":draft.base_url,"model":"other"},"key":"dummy-new-key"}})).await.is_err());
+    assert!(credential_path.is_dir());
+    std::fs::remove_dir(&credential_path).unwrap();
+    std::fs::write(&credential_path, original_keys).unwrap();
     draft.base_url.push_str("/another-account");
     assert!(
         client

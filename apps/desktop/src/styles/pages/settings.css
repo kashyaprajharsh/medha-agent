@@ -13,6 +13,18 @@
   color: var(--err);
   font-size: var(--text-sm);
 }
+.provider-unavailable > summary {
+  cursor: pointer;
+}
+.provider-unavailable > ul {
+  display: grid;
+  gap: var(--s-2);
+  max-height: calc(var(--s-8) * 5);
+  overflow-y: auto;
+  margin: var(--s-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
 
 .section-title,
 .usage-block h3,

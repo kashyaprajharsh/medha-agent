@@ -17,8 +17,9 @@ import {
   type Protocol,
   type Provider,
   type ModelTestResult,
+  type UnavailableProvider,
 } from "./modelSetup";
-import { ModelTest, ProviderFields } from "./ProviderSetup";
+import { ModelTest, ProviderFields, UnavailableProviders } from "./ProviderSetup";
 
 type Step = "choose" | "connect" | "models" | "manual";
 type Choice = Provider & { custom: boolean };
@@ -42,7 +43,7 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
   const [providerQuery, setProviderQuery] = useState("");
   const [tested, setTested] = useState<ModelTestResult>();
   const [testing, setTesting] = useState(false);
-  const [unavailable, setUnavailable] = useState<{ id: string; name: string; reason: string }[]>([]);
+  const [unavailable, setUnavailable] = useState<UnavailableProvider[]>([]);
   const [typed, setTyped] = useState("");
   const [context, setContext] = useState("");
   const [published, setPublished] = useState<{ model: string; size: number | null }>();
@@ -273,7 +274,10 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
 
         {step === "choose" && (
           <>
-            <input className="fr-in" value={providerQuery} aria-label="Search providers" placeholder="Search providers" onChange={(event) => setProviderQuery(event.target.value)} />
+            <div className="model-search fr-search">
+              <Icon name="search" />
+              <input type="search" value={providerQuery} aria-label="Search providers" placeholder="Search providers" onChange={(event) => setProviderQuery(event.target.value)} />
+            </div>
             <ul className="fr-list">
               {local.length > 0 && <li className="fr-group">On this computer</li>}
               {local.map(row)}
@@ -289,9 +293,11 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
                 </button>
               </li>
             </ul>
-            <button type="button" className="fr-link" disabled={busy} onClick={() => void refreshCatalogue()}>{busy ? "Refreshing…" : "Refresh provider catalogue"}</button>
-            {unavailable.length > 0 && <details><summary>Providers needing another protocol or sign-in method ({unavailable.length})</summary><ul>{unavailable.map((p) => <li key={p.id}>{p.name} — {p.reason}</li>)}</ul></details>}
-            {error && <p className="fr-err" role="alert">{error}</p>}
+            <div className="fr-catalogue">
+              <button type="button" className="fr-link" disabled={busy} onClick={() => void refreshCatalogue()}>{busy ? "Refreshing…" : "Refresh provider catalogue"}</button>
+              <UnavailableProviders providers={unavailable} />
+              {error && <p className="fr-err" role="alert">{error}</p>}
+            </div>
           </>
         )}
 
@@ -307,10 +313,10 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
 
         {step === "connect" && choice && (
           <div className="fr-body">
-            {choice.custom && protocols.length > 1 && <label>Protocol<select value={protocol} onChange={(event) => { attempt.current++; setProtocol(event.target.value); setChoice({ ...choice, auth: protocols.find((p) => p.value === event.target.value)?.auth ?? choice.auth }); setError(""); }}>
+            {choice.custom && protocols.length > 1 && <label>Protocol<select className="fr-in" value={protocol} onChange={(event) => { attempt.current++; setProtocol(event.target.value); setChoice({ ...choice, auth: protocols.find((p) => p.value === event.target.value)?.auth ?? choice.auth }); setError(""); }}>
               {protocols.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
             </select></label>}
-            {choice.parameters?.length ? <ProviderFields key={providerKey(choice)} provider={choice} disabled={busy} onChange={() => { attempt.current++; setUrl(""); setKey(""); }} onResolved={setUrl} /> : null}
+            {choice.parameters?.length ? <ProviderFields key={providerKey(choice)} provider={choice} inputClassName="fr-in" disabled={busy} onChange={() => { attempt.current++; setUrl(""); setKey(""); }} onResolved={setUrl} /> : null}
             {(choice.custom || choice.auth === "none") && (
               <label>
                 Address

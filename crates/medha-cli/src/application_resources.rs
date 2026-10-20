@@ -48,6 +48,11 @@ pub(crate) fn models() -> Result<protocol::ModelCatalogue, String> {
             Ok(protocol::ModelProfile {
                 provider_id: profile.provider_id,
                 auth: Some(decoded(json!(profile.auth))?),
+                connection: protocol::ModelConnection {
+                    headers: profile.headers,
+                    ca_cert_file: profile.ca_cert_file,
+                    proxy: profile.proxy,
+                },
                 name: saved.name,
                 model: profile.model,
                 protocol: decoded(
@@ -116,7 +121,9 @@ fn draft_profile(draft: &protocol::ModelDraft) -> Result<providers::ProviderProf
     let mut profile = providers::ProviderProfile::openai_chat(&draft.base_url, &draft.model, auth);
     profile.provider_id = draft.provider_id.clone();
     profile.protocol = protocol;
-    profile.headers = draft.headers.clone();
+    profile.headers = draft.connection.headers.clone();
+    profile.ca_cert_file = draft.connection.ca_cert_file.clone();
+    profile.proxy = draft.connection.proxy.clone();
     profile.max_ctx = draft.context_limit;
     profile.validate()?;
     if !matches!(
@@ -791,25 +798,19 @@ pub(crate) async fn folder<L: EventLog>(
         },
         "application.models.discover" => match decoded::<protocol::DiscoverModels>(params) {
             Ok(request) => {
-                let protocol = decoded(json!(request.protocol));
-                match protocol {
-                    Ok(protocol) => {
-                        let mut profile = providers::ProviderProfile::openai_chat(
-                            &request.base_url,
-                            "discovery",
-                            if request.key.0.is_empty() && request.auth.is_none() {
-                                providers::AuthKind::None
-                            } else {
-                                providers::AuthKind::for_protocol(protocol)
-                            },
-                        );
-                        profile.protocol = protocol;
-                        if let Some(auth) = request.auth {
-                            profile.auth = match decoded(json!(auth)) {
-                                Ok(auth) => auth,
-                                Err(error) => return Some(Err(error)),
-                            };
-                        }
+                let profile = draft_profile(&protocol::ModelDraft {
+                    provider_id: request.provider_id,
+                    auth: request.auth,
+                    connection: request.connection,
+                    name: None,
+                    protocol: request.protocol,
+                    base_url: request.base_url,
+                    model: "discovery".into(),
+                    context_limit: None,
+                    key: Some(request.key.clone()),
+                });
+                match profile {
+                    Ok(profile) => {
                         let credential =
                             match config::deployment_credential(&profile, Some(&request.key.0)) {
                                 Ok(key) => key,

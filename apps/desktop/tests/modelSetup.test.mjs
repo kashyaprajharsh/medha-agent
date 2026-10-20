@@ -42,6 +42,8 @@ test("a model saved here is the one Settings would save", () => {
     token_accounting: "adaptive",
     chat_token_limit: "auto",
     headers: {},
+    ca_cert_file: null,
+    proxy: null,
   });
 });
 

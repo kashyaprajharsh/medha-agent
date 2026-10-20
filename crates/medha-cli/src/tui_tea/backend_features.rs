@@ -710,7 +710,9 @@ fn advance_model_setup(model: &mut Model) {
                 setup.api_key = value;
                 setup.step = ModelSetupStep::Discovering;
                 Some(Effect::Discover(protocol::DiscoverModels {
+                    provider_id: setup.provider_id.clone(),
                     auth: setup.auth,
+                    connection: setup.connection.clone(),
                     protocol: model_protocol(setup.protocol),
                     base_url: setup.base_url.clone(),
                     key: protocol::Secret(setup.api_key.clone()),
@@ -812,7 +814,7 @@ fn setup_draft(setup: &ModelSetup) -> protocol::ModelDraft {
     protocol::ModelDraft {
         provider_id: setup.provider_id.clone(),
         auth: setup.auth,
-        headers: BTreeMap::new(),
+        connection: setup.connection.clone(),
         name: None,
         protocol: model_protocol(setup.protocol),
         base_url: setup.base_url.clone(),
@@ -853,6 +855,9 @@ fn profiles(catalogue: &protocol::ModelCatalogue) -> Vec<config::ModelProfile> {
             );
             provider.protocol = kernel_protocol(profile.protocol);
             provider.provider_id = profile.provider_id.clone();
+            provider.headers = profile.connection.headers.clone();
+            provider.ca_cert_file = profile.connection.ca_cert_file.clone();
+            provider.proxy = profile.connection.proxy.clone();
             provider.auth = match profile.auth {
                 Some(protocol::ModelAuth::None) => providers::AuthKind::None,
                 Some(protocol::ModelAuth::Bearer) => providers::AuthKind::Bearer,

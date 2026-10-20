@@ -10,6 +10,11 @@ mod fallback_tests;
 mod key_rotation;
 pub mod keys;
 mod learned;
+#[cfg(test)]
+#[path = "../examples/update_logos/rules.rs"]
+mod logo_rules;
+#[cfg(test)]
+mod logo_tests;
 pub mod model_test;
 pub mod models_dev;
 pub mod profile;

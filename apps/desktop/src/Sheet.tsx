@@ -6,7 +6,7 @@ import { Icon } from "./Icon";
  * The one thing a row opens: its full detail, from the right, over the page.
  * It leaves the way it came, so `onClose` is told only once it is gone.
  */
-export function Sheet({ label, onClose, children }: { label: string; onClose: () => void; children: ReactNode }) {
+export function Sheet({ label, onClose, onBack, children }: { label: string; onClose: () => void; onBack?: () => void; children: ReactNode }) {
   const [leaving, setLeaving] = useState(false);
   const close = () => (matchMedia("(prefers-reduced-motion: reduce)").matches ? onClose() : setLeaving(true));
   useEffect(() => {
@@ -16,7 +16,8 @@ export function Sheet({ label, onClose, children }: { label: string; onClose: ()
     return () => clearTimeout(done);
   }, [leaving, onClose]);
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && close();
+    // Esc steps back first where there is a step to go back to.
+    const onKey = (event: KeyboardEvent) => event.key === "Escape" && (onBack ? onBack() : close());
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });

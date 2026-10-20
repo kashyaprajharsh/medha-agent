@@ -2477,14 +2477,15 @@ test("first-run setup filters providers and keeps unsupported providers visible 
     assert.fail("No model test should run automatically: " + method);
   } };
   await act(async () => root.render(h(FirstRun, { onDone() {}, onClose() {} })));
-  await inputValue(document.querySelector('[aria-label="Search providers"]'), "Fixture");
-  assert.ok(!document.querySelector(".fr-list").textContent.includes("Other Provider"));
-  assert.match(document.querySelector("details").textContent, /Native Future.*not implemented/);
-  await click([...document.querySelectorAll(".fr-row")].find((node) => node.textContent.includes("Fixture Provider")));
-  await inputValue(fieldInput("API key"), "dummy-first-run-key");
-  await click(namedButton("Find models"));
-  await click(namedButton("Use catalogue models"));
+  await inputValue(searchBox(), "Fixture");
+  assert.equal(providerRow("Other Provider"), undefined);
+  assert.match(document.querySelector(".pv-unavailable").textContent, /Native Future.*not implemented/);
+  await click(providerRow("Fixture Provider"));
+  await inputValue(fieldInput("Key"), "dummy-key");
+  await click(namedButton("Find models on this server"));
   assert.match(document.body.textContent, /availability is unverified/);
+  assert.equal(document.querySelector(".checkbox-label"), null, "the first model is always the default");
+  await click(modelRow("fixture-model"));
   await click(namedButton("Start"));
   assert.equal(writes.length, 1);
   assert.equal(writes[0].profile.provider_id, "fixture");
@@ -2500,23 +2501,29 @@ test("first-run provider selection chooses Gemini without a protocol question an
     calls.push({ method, params });
     if (method === "settings.list") return { ...providerSettings(), protocols: [
       ...providerSettings().protocols,
-      { value: "gemini-interactions", label: "Gemini Interactions", available: true, auth: "x-goog-api-key", providers: [google] },
+      { value: "gemini-interactions", label: "Gemini Interactions", available: true, auth: "x-goog-api-key", discovery: true, providers: [google] },
     ] };
     if (method === "settings.model.discover") return { models: [{ id: "gemini-fixture", context_length: 8000 }] };
     if (method === "settings.model.save") return { saved: true };
     assert.fail(method);
   } };
-  await act(async () => root.render(h(FirstRun, { onDone() {}, onClose() {} })));
-  assert.equal(document.querySelector(".fr-tabs"), null, "protocol does not precede a named provider");
-  await click([...document.querySelectorAll(".fr-row")].find((node) => node.textContent.includes("Google Gemini")));
-  await inputValue(fieldInput("API key"), "dummy-gemini-key");
-  await click(namedButton("Find models"));
+  let closed = 0;
+  await act(async () => root.render(h(FirstRun, { onDone() {}, onClose() { closed++; } })));
+  await click(providerRow("Google Gemini"));
+  assert.equal(namedButton("Choose a protocol"), undefined, "protocol does not precede a named provider");
+  await inputValue(fieldInput("Key"), "dummy-gemini-key");
+  await click(namedButton("Find models on this server"));
+  await click(modelRow("gemini-fixture"));
   await click(namedButton("Start"));
   const profile = calls.find((call) => call.method === "settings.model.save").params.profile;
   assert.deepEqual([profile.protocol, profile.provider_id, profile.auth], ["gemini-interactions", "google", "x-goog-api-key"]);
-  await click(namedButton("Change"));
-  await click([...document.querySelectorAll(".fr-row")].find((node) => node.textContent.includes("Custom endpoint")));
-  assert.equal(document.querySelector(".fr-body select").options.length, 2, "custom endpoints retain explicit protocol selection");
+  await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+  assert.equal(closed, 0, "Esc steps back to the list before it closes anything");
+  await click(providerRow("Another server"));
+  await click(namedButton("OpenAI Chat"));  assert.ok(option("OpenAI Chat") && option("Gemini Interactions"), "custom endpoints retain explicit protocol selection");
+  await click(namedButton("‹ All providers"));
+  await click(namedButton("Not now"));
+  assert.equal(closed, 1);
 });
 
 async function extensionForm(kind, chooseExtensionSource) {

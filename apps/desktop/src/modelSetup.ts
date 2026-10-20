@@ -77,12 +77,6 @@ export function profileFor(connection: ConnectionOptions & { protocol: string; u
   };
 }
 
-export function contextLabel(tokens: number | null) {
-  if (!tokens) return "";
-  const size = tokens >= 1_000_000 ? `${Number((tokens / 1_000_000).toFixed(1))}M` : `${Math.round(tokens / 1000)}k`;
-  return `${size} context`;
-}
-
 /**
  * What an empty context size leads to. `published` is the size a session would look up:
  * a number, `null` when there is none, `undefined` while that is not known yet.

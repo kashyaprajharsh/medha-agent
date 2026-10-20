@@ -19,8 +19,9 @@ type Filter = "all" | "plans" | "keys" | "local" | "custom";
 const looksLikeKey = (text: string) => /^\S{16,}$/.test(text) && /\d/.test(text) && /[a-z]/i.test(text);
 
 /** Where a model can come from: a plan, a key, this computer, or a server of one's own (mocks C, C1, C3). */
-export function ConnectList({ protocols, servers, savedKeys, unavailable, onChoose, onClose, onRefresh, refreshing, refreshError }: {
+export function ConnectList({ protocols, servers, savedKeys, unavailable, onChoose, onClose, onRefresh, refreshing, refreshError, closeLabel = "Close" }: {
   protocols: Protocol[];
+  closeLabel?: string;
   /** The person's own servers from saved models, offered again under Custom. */
   servers: Listed[];
   onClose: () => void;
@@ -141,7 +142,7 @@ export function ConnectList({ protocols, servers, savedKeys, unavailable, onChoo
           <summary>{unavailable.length} providers need a connection Medha doesn't have yet</summary>
           <ul>{unavailable.map((provider) => <li key={provider.id}><b>{provider.name}</b>: {provider.reason || "Not available yet."}</li>)}</ul>
         </details> : <span />}
-        <button type="button" className="cg-link" onClick={onClose}>Close</button>
+        <button type="button" className="cg-link" onClick={onClose}>{closeLabel}</button>
       </div>
     </div>
   );

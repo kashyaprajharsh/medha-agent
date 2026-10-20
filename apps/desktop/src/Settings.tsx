@@ -8,13 +8,13 @@ import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
 import { useWorkspace } from "./Workspace";
-import { contextShort, plainName, priceLabel, profileFor, providerKey, type Found, type ConnectionOptions, type UnavailableProvider, type Provider as Preset, type Protocol as ModelProtocol, type ModelTestResult } from "./modelSetup";
+import { contextShort, plainName, priceLabel, profileFor, providerKey, reasonFor, sizeNote, type Found, type ConnectionOptions, type UnavailableProvider, type Provider as Preset, type Protocol as ModelProtocol, type ModelTestResult } from "./modelSetup";
 import { ModelTest, ProviderFields } from "./ProviderSetup";
 import { ChatGptAccounts, ChatGptSheet, ContinueWithChatGpt } from "./ChatGpt";
 import { ConnectList, type Chosen, type Listed } from "./ConnectList";
 import { ProviderLogo } from "./ProviderLogo";
 import { Spinner } from "./Spinner";
-type Model = {
+export type Model = {
   name: string;
   profile: Record<string, unknown> & ConnectionOptions & {
     model: string;
@@ -263,9 +263,9 @@ export function Settings({
               />
             )}
             {editing !== undefined && (
-              <Sheet label={editing ? `Edit ${editing.name}` : "Add model"} onClose={closeConnect}>
+              <Sheet label={editing ? `Edit ${editing.name}` : "Add model"} onClose={closeConnect} onBack={editing === null && connect ? () => setConnect(undefined) : undefined}>
                 {editing === null && !connect ? (
-                  <div className="cx-connect">
+                  <div className="cx-pick">
                     <h2>Add model</h2>
                     <ConnectList
                       protocols={protocols}
@@ -512,7 +512,7 @@ export function Settings({
   );
 }
 /** Servers already in use that no catalogue provider covers, offered again so a second model needs no retyped address. */
-function ownServers(saved: Model[], protocols: ModelProtocol[]): Listed[] {
+export function ownServers(saved: Model[], protocols: ModelProtocol[]): Listed[] {
   const presets = protocols.filter((p) => p.available).flatMap((p) => p.providers.map((provider) => ({ ...provider, protocol: p.value })));
   const reused = [
     ...new Map(
@@ -537,7 +537,7 @@ function ownServers(saved: Model[], protocols: ModelProtocol[]): Listed[] {
   }));
 }
 
-function ModelForm({
+export function ModelForm({
   model,
   saved,
   protocols,
@@ -547,6 +547,7 @@ function ModelForm({
   onCancel,
   onBack,
   onSwitch,
+  firstRun,
 }: {
   model: Model | null;
   saved: Model[];
@@ -559,8 +560,11 @@ function ModelForm({
   onBack?: () => void;
   /** Start again with the provider a typed key belongs to, keeping the key. */
   onSwitch: (provider: Listed, key: string) => void;
+  /** The one model a new person starts with: always the default, "Start" to save, "Not now" to leave. */
+  firstRun?: boolean;
 }) {
   const api = useWorkspace().api;
+  const form = useRef<HTMLFormElement>(null);
   const [name, setName] = useState(model?.name || "");
   const [id, setId] = useState(model?.profile.model || "");
   const [url, setUrl] = useState(model?.profile.base_url || "");
@@ -583,7 +587,7 @@ function ModelForm({
   });
   const [auth, setAuth] = useState(model?.profile.auth || "none");
   const [key, setKey] = useState("");
-  const [isDefault, setDefault] = useState(model?.default || false);
+  const [isDefault, setDefault] = useState(model?.default || Boolean(firstRun));
   const [context, setContext] = useState(String(model?.profile.max_ctx || ""));
   const [output, setOutput] = useState(
     String(model?.profile.max_output_tokens || ""),
@@ -620,6 +624,7 @@ function ModelForm({
   const [typingId, setTypingId] = useState(false);
   // Whether the context size was filled in from a listed model rather than typed.
   const listedContext = useRef(false);
+  const [published, setPublished] = useState<{ model: string; size: number | null }>();
   const [discovering, setDiscovering] = useState(false);
   const [discoveryError, setDiscoveryError] = useState("");
   const [tested, setTested] = useState<ModelTestResult>();
@@ -774,7 +779,7 @@ function ModelForm({
     } catch (cause) {
       if (version !== discoveryVersion.current) return;
       setDiscoveryError(
-        `${String(cause)} ${fallback.length ? "Showing catalogue models; account availability is unverified." : "You can enter the model ID manually."}`,
+        `${reasonFor(cause, url)} ${fallback.length ? "Showing catalogue models; account availability is unverified." : "You can enter the model ID manually."}`,
       );
       setDiscovered(fallback);
     } finally {
@@ -799,6 +804,22 @@ function ModelForm({
   const brand = plainName(provider?.name ?? savedServer?.name ?? (url ? hostOf(url) : "your server"));
   const ownServer = preset === "custom" && !providerId;
   const needsKey = auth !== "none" && !key.trim() && !keySavedAt(url);
+  // A model with no size given: say what Medha will use instead, from the published size.
+  const unsized = !context && id.trim() ? id.trim() : "";
+  useEffect(() => {
+    if (!unsized || !protocol || !url) return;
+    let current = true;
+    const timer = window.setTimeout(() => {
+      void api
+        .settings("settings.model.context", { profile: profileFor({ protocol, url, auth: "none", provider_id: providerId || undefined }, unsized) })
+        .then((reply) => current && setPublished({ model: unsized, size: (reply.published as number | null) ?? null }))
+        .catch(() => {});
+    }, 300);
+    return () => {
+      current = false;
+      window.clearTimeout(timer);
+    };
+  }, [api, unsized, protocol, url, providerId]);
   const modelId = (
     <label>
       Model ID
@@ -869,6 +890,7 @@ function ModelForm({
   );
   return (
     <form
+      ref={form}
       className="settings-form cx-form"
       onSubmit={(event) => {
         event.preventDefault();
@@ -905,7 +927,7 @@ function ModelForm({
           {preset === "custom" && speaks}
           {auth !== "none" && keySavedAt(url) && !changingKey ? (
             <>
-              <p className="cx-label"><span>Key</span><button type="button" className="cg-link" onClick={() => setChangingKey(true)}>Change</button></p>
+              <p className="cx-field-label"><span>Key</span><button type="button" className="cg-link" onClick={() => setChangingKey(true)}>Change</button></p>
               <div className="cx-keyline"><span className="cg-dot" /><span className="grow">Saved on this computer</span><span className="quiet">Sent only to {hostOf(url)}</span></div>
             </>
           ) : auth !== "none" && (
@@ -949,7 +971,7 @@ function ModelForm({
             </div>
           )}
           {elsewhere?.warning && <p className="cx-note" role="status">{elsewhere.warning}</p>}
-          <div className="model-discovery cx-label">
+          <div className="model-discovery cx-field-label">
             <span>Model</span>
             <span className="cg-actions">
               {discovered.some((item) => item.tools != null) && (
@@ -1016,6 +1038,7 @@ function ModelForm({
                     setContext(item.context_length ? String(item.context_length) : "");
                     listedContext.current = Boolean(item.context_length);
                   }}
+                  onDoubleClick={() => form.current?.requestSubmit()}
                 >
                   <span className="tick">{id === item.id ? "✓" : ""}</span>
                   <b>{item.name || item.id}</b>
@@ -1055,7 +1078,9 @@ function ModelForm({
               />
             </label>
             <p className="quiet">
-              For local models, use the context window configured on your server.
+              {unsized && published?.model === unsized.trim()
+                ? sizeNote(discovered.some((item) => item.id === unsized), published.size)
+                : "For local models, use the context window configured on your server."}
             </p>
             {preset !== "custom" && endpoint}
             {model && preset !== "custom" && speaks}
@@ -1245,17 +1270,17 @@ function ModelForm({
             </button>
             <p className="quiet">Use the API key field for credentials.</p>
           </details>
-          <label className="checkbox-label">
+          {!firstRun && <label className="checkbox-label">
             <input
               type="checkbox"
               checked={isDefault}
               onChange={(event) => setDefault(event.target.checked)}
             />
             Use as the default model for new chats
-          </label>
+          </label>}
         </>
       )}
-      <div className="cx-foot">
+      <div className="cx-formfoot">
         {passed ? (
           <span className="cx-passed"><span className="cg-dot" />Replies, streams and calls tools</span>
         ) : (
@@ -1266,12 +1291,12 @@ function ModelForm({
           </p>
         )}
         <span className="cg-actions">
-          {model && <button type="button" className="cx-ghost" onClick={onCancel}>Cancel</button>}
+          {(model || firstRun) && <button type="button" className="cx-ghost" onClick={onCancel}>{firstRun ? "Not now" : "Cancel"}</button>}
           {protocol && preset && (
             <>
               <button type="button" className="cx-ghost" disabled={busy || testing || discovering || !id.trim() || !url || (auth !== "none" && !key.trim() && !keySavedAt(url))} onClick={() => void testModel()}>{testing ? "Checking…" : tested ? "Check again" : "Check connection"}</button>
               <button className="btn-gold" disabled={busy || !selectedProtocol?.available}>
-                {busy ? "Saving…" : model ? "Save" : "Add model"}
+                {busy ? "Saving…" : model ? "Save" : firstRun ? "Start" : "Add model"}
               </button>
             </>
           )}

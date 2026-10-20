@@ -1,12 +1,12 @@
 /* Connect a model: the provider list and form (mocks C to C5), ChatGPT sign-in and accounts (S1 to S7). */
-.cx-connect { display: flex; flex-direction: column; gap: var(--s-3); padding-top: var(--s-6); flex: 1 0 auto; }
+.cx-pick { display: flex; flex-direction: column; gap: var(--s-3); padding-top: var(--s-6); flex: 1 0 auto; }
 /* The sheet scrolls; nothing in it is squeezed, or a model list would shrink to nothing. */
-.cx-sheet > .cx-form, .cx-sheet > .cg-sheet, .cx-form > *, .cx-connect > *, .pv-list > *, .cg-sheet > * { flex-shrink: 0; }
+.cx-sheet > .cx-form, .cx-sheet > .cg-sheet, .cx-form > *, .cx-pick > *, .pv-list > *, .cg-sheet > * { flex-shrink: 0; }
 /* Connecting a model needs the room of the mocks: a provider row and its button side by side. */
 .cx-sheet:has(.pv-list, .cx-form, .cg-sheet) { width: min(540px, calc(100vw - 20px)); }
 /* Footers stay at the sheet's foot, solid, so the list scrolls under them rather than through them. */
-.pv-foot, .cx-foot, .cg-foot { position: sticky; bottom: -24px; z-index: 1; padding: var(--s-4) 0 24px; border-top: 1px solid var(--hair); background: var(--overlay); }
-.cx-connect h2, .cx-form h2 { font-size: var(--text-xl); font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+.pv-foot, .cx-formfoot, .cg-foot { position: sticky; bottom: -24px; z-index: 1; padding: var(--s-4) 0 24px; border-top: 1px solid var(--hair); background: var(--overlay); }
+.cx-pick h2, .cx-form h2 { font-size: var(--text-xl); font-weight: 600; letter-spacing: -0.01em; margin: 0; }
 .pv-list { display: flex; flex-direction: column; gap: var(--s-2); flex: 1 0 auto; }
 .pv-search { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 6px 0 14px; border-radius: var(--r-md); background: var(--raised); box-shadow: inset 0 0 0 1px var(--line); color: var(--faint); }
 .pv-search:focus-within { box-shadow: inset 0 0 0 1.5px var(--gold); }
@@ -22,7 +22,7 @@ button.pv-row:hover { background: var(--hover); }
 .pv-foot { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-3); margin-top: auto; color: var(--faint); font-size: var(--text-sm); }
 .pv-foot details { max-height: 40vh; overflow-y: auto; }
 .pv-foot summary { cursor: pointer; }
-.cx-label { display: flex; justify-content: space-between; align-items: baseline; font-size: var(--text-sm); color: var(--dim); margin: var(--s-3) 0 0; }
+.cx-field-label { display: flex; justify-content: space-between; align-items: baseline; font-size: var(--text-sm); color: var(--dim); margin: var(--s-3) 0 0; }
 .cx-keyline { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 14px; border-radius: var(--r-md); background: var(--raised); box-shadow: inset 0 0 0 1px var(--hair); font-size: var(--text-sm); }
 .cx-keyline .grow { flex: 1; }
 .cx-address { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--faint); }
@@ -71,13 +71,13 @@ button.cx-model:hover { background: var(--hover); }
 .cx-advanced > summary::-webkit-details-marker { display: none; }
 .cx-advanced[open] > summary span:last-child { transform: rotate(90deg); }
 .cx-advanced[open] > summary { margin-bottom: var(--s-3); border-bottom: 1px solid var(--hair); }
-.cx-foot { display: flex; flex-direction: column; align-items: stretch; gap: var(--s-3); margin-top: auto; }
-.cx-foot > .cg-actions { justify-content: flex-end; }
-.cx-foot button, .pv-foot button, .cg-foot button { white-space: nowrap; flex: none; }
+.cx-formfoot { display: flex; flex-direction: column; align-items: stretch; gap: var(--s-3); margin-top: auto; }
+.cx-formfoot > .cg-actions { justify-content: flex-end; }
+.cx-formfoot button, .pv-foot button, .cg-foot button { white-space: nowrap; flex: none; }
 .cx-label-row { display: flex; justify-content: space-between; align-items: baseline; }
 .cx-finding { display: flex; align-items: center; gap: var(--s-2); color: var(--dim); font-size: var(--text-sm); padding: var(--s-3) var(--s-1); }
 .cx-find { align-self: flex-start; }
-.cx-foot p { margin: 0; }
+.cx-formfoot p { margin: 0; }
 .cg-mark { flex: none; }
 .cg-button { display: inline-flex; align-items: center; gap: var(--s-2); white-space: nowrap; border-radius: var(--r-full); padding: 9px 18px 9px 14px; font-weight: 500; font-size: var(--text-md); background: var(--plan-bg); color: var(--plan-ink); }
 .cg-link { color: var(--dim); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line); font-size: var(--text-sm); }

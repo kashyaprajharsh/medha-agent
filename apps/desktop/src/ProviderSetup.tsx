@@ -1,15 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkspaceApi } from "./Workspace";
-import type { ModelTestResult, Provider, UnavailableProvider } from "./modelSetup";
-
-/** Catalogue entries remain visible without offering an unsupported connection. */
-export function UnavailableProviders({ providers }: { providers: UnavailableProvider[] }) {
-  if (!providers.length) return null;
-  return <details className="provider-unavailable quiet">
-    <summary>Not available yet ({providers.length})</summary>
-    <ul>{providers.map((provider) => <li key={provider.id}><b>{provider.name}</b> — {provider.reason || "This provider is not available yet."}</li>)}</ul>
-  </details>;
-}
+import type { ModelTestResult, Provider } from "./modelSetup";
 
 /** Endpoint values are explicit and validated by the shared backend. */
 export function ProviderFields({ provider, disabled, onChange, onResolved, inputClassName }: {

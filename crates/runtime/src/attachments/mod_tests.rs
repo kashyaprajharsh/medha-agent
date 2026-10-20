@@ -192,12 +192,13 @@ async fn custom_chat_endpoint_receives_image_after_compaction_and_restart() {
     let log = Arc::new(kernel::InMemoryLog::new());
     let session = kernel::Session::new();
     let runtime = || {
-        let provider = providers::ProviderClient::new(
+        let mut profile = providers::ProviderProfile::openai_chat(
             format!("http://{address}/custom/v1"),
-            "fixture-key",
             "local/custom-vision-model",
-        )
-        .with_max_ctx(16_000);
+            providers::AuthKind::Bearer,
+        );
+        profile.max_ctx = Some(16_000);
+        let provider = providers::ProviderClient::from_profile(profile, "fixture-key").unwrap();
         provider.set_streaming(false);
         kernel::Kernel::new(
             Arc::new(provider),

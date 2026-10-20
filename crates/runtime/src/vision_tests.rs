@@ -53,7 +53,12 @@ async fn endpoint(replies: usize) -> (String, tokio::task::JoinHandle<Vec<serde_
 }
 
 fn auxiliary(address: &str) -> AuxiliaryVision {
-    let provider = providers::ProviderClient::new(address, "aux-key", "local/vision-model");
+    let profile = providers::ProviderProfile::openai_chat(
+        address,
+        "local/vision-model",
+        providers::AuthKind::Bearer,
+    );
+    let provider = providers::ProviderClient::from_profile(profile, "aux-key").unwrap();
     provider.set_streaming(false);
     AuxiliaryVision::new(provider)
 }

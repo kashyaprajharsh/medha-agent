@@ -1,9 +1,19 @@
 use super::*;
 use kernel::{Message, Role};
 
+fn chat_client(base_url: impl Into<String>, key: &str, model: &str) -> ProviderClient {
+    let auth = if key.is_empty() {
+        AuthKind::None
+    } else {
+        AuthKind::Bearer
+    };
+    ProviderClient::from_profile(ProviderProfile::openai_chat(base_url, model, auth), key).unwrap()
+}
+
 mod count_tokens_tests {
     use super::*;
-    use kernel::{BlastRadius, ToolCategory, ToolSpec};
+    use crate::client::token_count::vllm_tokenize_url;
+    use kernel::{BlastRadius, TokenCountQuality, ToolCategory, ToolSpec};
 
     fn tool(name: &str) -> ToolSpec {
         ToolSpec {
@@ -48,7 +58,7 @@ mod count_tokens_tests {
             Message::user("u"),
             Message::tool_result("c1", "t"),
         ];
-        let provider = ProviderClient::new("http://x/v1", "", "m");
+        let provider = chat_client("http://x/v1", "", "m");
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -57,7 +67,7 @@ mod count_tokens_tests {
                 tools: vec![tool("fs.read")],
             })
             .unwrap();
-        let body = vllm_tokenize_body_from_prepared(&prepared);
+        let body = openai_chat::vllm_tokenize_body(&prepared);
         assert_eq!(body["add_generation_prompt"], serde_json::json!(true));
         assert!(body.get("stream").is_none());
         assert_eq!(body["tools"][0]["function"]["name"], "fs_read");
@@ -75,7 +85,7 @@ mod count_tokens_tests {
             Message::system("earlier summary"), // mid-array (compaction)
             Message::new(Role::Assistant, "ok"),
         ];
-        let provider = ProviderClient::new("http://x/v1", "", "m");
+        let provider = chat_client("http://x/v1", "", "m");
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -84,7 +94,7 @@ mod count_tokens_tests {
                 tools: Vec::new(),
             })
             .unwrap();
-        let body = vllm_tokenize_body_from_prepared(&prepared);
+        let body = openai_chat::vllm_tokenize_body(&prepared);
         let arr = body["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "system");
@@ -95,7 +105,7 @@ mod count_tokens_tests {
 
     #[test]
     fn generic_openai_chat_does_not_probe_a_vendor_count_route() {
-        let provider = ProviderClient::new("http://127.0.0.1:1/v1", "", "m");
+        let provider = chat_client("http://127.0.0.1:1/v1", "", "m");
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -110,7 +120,7 @@ mod count_tokens_tests {
 
     #[test]
     fn fingerprint_changes_when_the_prepared_tool_schema_changes() {
-        let provider = ProviderClient::new("http://x/v1", "", "m");
+        let provider = chat_client("http://x/v1", "", "m");
         let make = |tools| {
             provider
                 .prepare_request(&CompiledContext {
@@ -153,7 +163,7 @@ mod count_tokens_tests {
                 .unwrap();
         });
 
-        let provider = ProviderClient::new(format!("http://{address}/v1"), "key", "m");
+        let provider = chat_client(format!("http://{address}/v1"), "key", "m");
         assert!(provider.streaming(), "the request must ask for a stream");
         let context = CompiledContext {
             model: "m".into(),
@@ -218,7 +228,7 @@ mod count_tokens_tests {
                 .unwrap();
         });
 
-        let provider = ProviderClient::new(format!("http://{address}/v1"), "key", "m");
+        let provider = chat_client(format!("http://{address}/v1"), "key", "m");
         let context = CompiledContext {
             model: "m".into(),
             messages: vec![Message::user("hi")],
@@ -450,9 +460,9 @@ mod gemini_client_tests {
         );
         profile.protocol = Protocol::GeminiInteractions;
         profile.reasoning = ReasoningSupport::Effort;
-        let provider = ProviderClient::from_profile(profile, "test-secret")
-            .unwrap()
-            .with_reasoning(ReasoningConfig {
+        let provider = ProviderClient::from_profile(profile, "test-secret").unwrap();
+        provider
+            .set_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Minimal),
             })
@@ -603,9 +613,9 @@ mod gemini_client_tests {
                     AuthKind::XGoogApiKey,
                 );
                 profile.protocol = Protocol::GeminiInteractions;
-                let provider = ProviderClient::from_profile(profile, "dummy-key")
-                    .unwrap()
-                    .with_reasoning(ReasoningConfig {
+                let provider = ProviderClient::from_profile(profile, "dummy-key").unwrap();
+                provider
+                    .set_reasoning(ReasoningConfig {
                         enabled: Some(true),
                         effort: Some(ReasoningEffort::High),
                     })
@@ -674,7 +684,7 @@ mod gemini_client_tests {
 
     #[test]
     fn gemini_profile_switch_is_atomic_and_output_retry_rewrites_generation_config() {
-        let provider = ProviderClient::new("http://chat.test/v1", "", "chat-model");
+        let provider = chat_client("http://chat.test/v1", "", "chat-model");
         let mut profile = ProviderProfile::openai_chat(
             "https://generativelanguage.googleapis.com/v1",
             "gemini-model",
@@ -801,7 +811,9 @@ mod reasoning_request_tests {
 
     #[test]
     fn server_default_output_keeps_context_protection_without_inventing_a_wire_cap() {
-        let provider = ProviderClient::new("http://x", "", "m").with_max_ctx(128_000);
+        let mut profile = ProviderProfile::openai_chat("http://x", "m", AuthKind::None);
+        profile.max_ctx = Some(128_000);
+        let provider = ProviderClient::from_profile(profile, "").unwrap();
         assert_eq!(
             provider
                 .model_limits()
@@ -822,42 +834,43 @@ mod reasoning_request_tests {
 
     #[test]
     fn effort_uses_the_portable_top_level_openai_field() {
-        let p = ProviderClient::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig {
-                enabled: Some(true),
-                effort: Some(ReasoningEffort::High),
-            })
-            .unwrap();
+        let p = chat_client("http://x", "", "m");
+        p.set_reasoning(ReasoningConfig {
+            enabled: Some(true),
+            effort: Some(ReasoningEffort::High),
+        })
+        .unwrap();
         assert_eq!(p.reasoning_effort_value(), Some("high"));
     }
 
     #[test]
     fn minimal_is_not_silently_raised_on_the_compatible_route() {
-        let p = ProviderClient::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig {
-                enabled: Some(true),
-                effort: Some(ReasoningEffort::Minimal),
-            })
-            .unwrap();
+        let p = chat_client("http://x", "", "m");
+        p.set_reasoning(ReasoningConfig {
+            enabled: Some(true),
+            effort: Some(ReasoningEffort::Minimal),
+        })
+        .unwrap();
         assert_eq!(p.reasoning_effort_value(), Some("minimal"));
     }
 
     #[test]
     fn explicit_off_sends_none_not_a_silent_omit() {
         // Compatible servers disable thinking via reasoning_effort:"none".
-        let p = ProviderClient::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig {
-                enabled: Some(false),
-                effort: None,
-            })
-            .unwrap();
+        let p = chat_client("http://x", "", "m");
+        p.set_reasoning(ReasoningConfig {
+            enabled: Some(false),
+            effort: None,
+        })
+        .unwrap();
         assert_eq!(p.reasoning_effort_value(), Some("none"));
     }
 
     #[test]
     fn profile_switch_resets_carried_effort_for_an_unsupported_model() {
-        let provider = ProviderClient::new("http://one", "", "model")
-            .with_reasoning(ReasoningConfig {
+        let provider = chat_client("http://one", "", "model");
+        provider
+            .set_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Low),
             })
@@ -1065,13 +1078,12 @@ mod reasoning_request_tests {
         let mut profile = ProviderProfile::openai_chat("http://x", "m", AuthKind::None);
         profile.max_ctx = Some(128_000);
         profile.max_output_tokens = Some(512);
-        let p = ProviderClient::from_profile(profile, "")
-            .unwrap()
-            .with_reasoning(ReasoningConfig {
-                enabled: Some(true),
-                effort: Some(ReasoningEffort::Medium),
-            })
-            .unwrap();
+        let p = ProviderClient::from_profile(profile, "").unwrap();
+        p.set_reasoning(ReasoningConfig {
+            enabled: Some(true),
+            effort: Some(ReasoningEffort::Medium),
+        })
+        .unwrap();
         let request = p
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -1107,13 +1119,15 @@ mod reasoning_request_tests {
 
     #[test]
     fn untouched_reasoning_sends_no_effort_field() {
-        let p = ProviderClient::new("http://x", "", "m");
+        let p = chat_client("http://x", "", "m");
         assert!(p.reasoning_effort_value().is_none());
     }
 
     #[test]
     fn switching_connection_updates_model_and_context_for_the_next_turn() {
-        let p = ProviderClient::new("http://one", "", "first").with_max_ctx(8_192);
+        let mut first = ProviderProfile::openai_chat("http://one", "first", AuthKind::None);
+        first.max_ctx = Some(8_192);
+        let p = ProviderClient::from_profile(first, "").unwrap();
         assert_eq!(p.active_model(), "first");
         assert_eq!(p.context_window(), Some(8_192));
 
@@ -1148,12 +1162,12 @@ mod reasoning_request_tests {
 
     #[test]
     fn full_request_json_actually_contains_the_field() {
-        let p = ProviderClient::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig {
-                enabled: Some(true),
-                effort: Some(ReasoningEffort::Medium),
-            })
-            .unwrap();
+        let p = chat_client("http://x", "", "m");
+        p.set_reasoning(ReasoningConfig {
+            enabled: Some(true),
+            effort: Some(ReasoningEffort::Medium),
+        })
+        .unwrap();
         let req = p
             .prepare_request(&CompiledContext {
                 model: String::new(),

@@ -82,10 +82,7 @@ async fn list_openai_chat_models(
     struct ModelsResp {
         data: Vec<ModelEntry>,
     }
-    // Servers spell the context window differently, and some (e.g. Groq) report
-    // MORE than one of these keys at once. A serde field with `alias`es treats
-    // them as one field and errors on "duplicate field" when several are present,
-    // so read each independently and coalesce.
+    // Separate fields, not serde aliases: some servers send several and aliases fail as duplicates.
     #[derive(Deserialize)]
     struct ModelEntry {
         id: String,
@@ -164,9 +161,7 @@ async fn list_gemini_models(
 
     let mut page_token: Option<String> = None;
     let mut models = std::collections::BTreeMap::<String, Option<u32>>::new();
-    // Google currently permits up to 1000 entries per page. Keep pagination
-    // bounded and reject a repeated token instead of looping on a malformed
-    // upstream response.
+    // Pages are bounded and a repeated token is refused, so a bad server cannot loop us.
     let mut seen_tokens = std::collections::HashSet::new();
     let mut pages = 0;
     let mut remaining = DISCOVERY_MAX_BYTES;
@@ -199,10 +194,7 @@ async fn list_gemini_models(
         }
 
         for model in page.models {
-            // The Models API also returns embedding-only models. When methods
-            // are advertised, exclude entries that have no generative action.
-            // An empty methods list remains visible because absence is unknown,
-            // not proof that Interactions is unsupported.
+            // Drop embedding-only models; an empty method list is unknown, so it stays.
             let generative = model.supported_generation_methods.is_empty()
                 || model.supported_generation_methods.iter().any(|method| {
                     matches!(

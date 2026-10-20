@@ -9,16 +9,19 @@ use futures::stream::BoxStream;
 use kernel::{
     Block, CompiledContext, ImageInputMode, ImageSupport, InputTokenCount, ModelLimits,
     PreparedModelRequest, Protocol, Provider, ProviderCaps, ProviderError, ReasoningConfig,
-    ReasoningEffort, ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality,
-    ToolCallStrategy,
+    ReasoningEffort, ReasoningSupport, TokenAccountingMode, TokenCountError, ToolCallStrategy,
 };
 use std::sync::Mutex;
 
+mod fallback;
+mod reasoning;
+mod token_count;
+
+use fallback::{Fallbacks, KeySource};
+use reasoning::{profile_reasoning_efforts, reconcile_reasoning_for_switch, validate_reasoning};
+
 pub struct ProviderClient {
-    /// Active connection is mutable between turns so an interactive surface can
-    /// switch a saved model profile without rebuilding the kernel. A stream
-    /// snapshots it before its first await, so one request always uses exactly
-    /// one endpoint/model/key tuple.
+    /// Swapped only between turns; a stream snapshots it, so one request uses one model and key.
     connection: Mutex<Connection>,
     http: reqwest::Client,
     caps: ProviderCaps,
@@ -36,185 +39,38 @@ pub struct ProviderClient {
     trusting: Mutex<std::collections::HashMap<String, reqwest::Client>>,
 }
 
-/// Every key saved for the server at this address, first to last.
-type KeySource = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
-
 #[derive(Clone)]
 struct Connection {
     profile: ProviderProfile,
     credential: String,
 }
 
-/// Looks up the models that stand in, in the user's order, when one is needed.
-type StandIns = Box<dyn Fn() -> Vec<(ProviderProfile, String)> + Send + Sync>;
-
-/// How long a limited model is rested when its server does not say.
-const REST: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// The models to try, in the user's order, when their own cannot be used.
-#[derive(Default)]
-struct Fallbacks {
-    source: Option<StandIns>,
-    /// While the user's own model is left alone after a limit.
-    rested_until: Option<tokio::time::Instant>,
-    listed: Vec<Connection>,
-    next: usize,
-    /// The user's own model and its reasoning setting, held while one stands in.
-    own: Option<(Connection, ReasoningConfig)>,
-}
-
-impl Fallbacks {
-    /// Read the list when the own model first fails this turn, not when the
-    /// chat opened, leaving out the model that failed: it never stands in for itself.
-    fn read(&mut self, client: &ProviderClient) {
-        if self.own.is_some() || self.next != 0 {
-            return;
-        }
-        let failed = client.connection.lock().unwrap().profile.clone();
-        let listed = self.source.as_ref().map(|source| source());
-        self.listed = listed
-            .into_iter()
-            .flatten()
-            .filter(|(profile, _)| {
-                profile.model != failed.model || profile.base_url != failed.base_url
-            })
-            .map(|(profile, credential)| Connection {
-                profile,
-                credential,
-            })
-            .collect();
-    }
-}
-
-fn validate_reasoning(
-    profile: &ProviderProfile,
-    config: &ReasoningConfig,
-) -> Result<(), ProviderError> {
-    if config == &ReasoningConfig::default() {
-        return Ok(());
-    }
-    if profile.reasoning == ReasoningSupport::Unsupported {
-        return Err(ProviderError::Decode(
-            "reasoning controls are disabled by this model profile".into(),
-        ));
-    }
-    let effort = if config.enabled == Some(false) {
-        Some(ReasoningEffort::None)
-    } else {
-        config.effort
-    };
-    if let Some(effort) = effort
-        && !profile_reasoning_efforts(profile).contains(&effort)
-    {
+fn check_profile(profile: &ProviderProfile, credential: &str) -> Result<(), ProviderError> {
+    profile.validate().map_err(ProviderError::Decode)?;
+    if !matches!(
+        profile.protocol,
+        Protocol::OpenAiChat | Protocol::GeminiInteractions
+    ) {
         return Err(ProviderError::Decode(format!(
-            "reasoning effort '{}' is not supported by this protocol/model profile; available: {}",
-            effort.as_str(),
-            profile_reasoning_efforts(profile)
-                .iter()
-                .map(|e| e.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "ProviderClient does not implement {}",
+            profile.protocol.as_str()
         )));
     }
-    match profile.protocol {
-        Protocol::OpenAiChat => {
-            // Compatible servers use `reasoning_effort: "none"` to disable.
-            if config.enabled == Some(true) && config.effort.is_none() {
-                return Err(ProviderError::Decode(
-                    "open-ai-chat cannot enable reasoning without an explicit effort".into(),
-                ));
-            }
-        }
-        Protocol::GeminiInteractions => {
-            if config.enabled == Some(false) {
-                return Err(ProviderError::Decode(
-                    "gemini-interactions v1 has no portable thinking-disable control; use server default instead"
-                        .into(),
-                ));
-            }
-        }
-        Protocol::OpenAiResponses | Protocol::AnthropicMessages => {}
+    if profile.auth.requires_credential() && credential.trim().is_empty() {
+        return Err(ProviderError::Decode(format!(
+            "{} authentication requires a credential",
+            profile.protocol.as_str()
+        )));
     }
     Ok(())
 }
 
-fn profile_reasoning_efforts(profile: &ProviderProfile) -> Vec<ReasoningEffort> {
-    if profile.reasoning == ReasoningSupport::Unsupported {
-        return Vec::new();
-    }
-    let levels = profile.reasoning_efforts.as_deref().unwrap_or_else(|| {
-        if profile.protocol == Protocol::GeminiInteractions {
-            gemini_interactions::known_reasoning_efforts(&profile.model).unwrap_or(&[])
-        } else {
-            ReasoningEffort::ALL
-        }
-    });
-    levels
-        .iter()
-        .copied()
-        .filter(|effort| profile.reasoning_efforts.is_some() || *effort != ReasoningEffort::Ultra)
-        .filter(|effort| {
-            profile.protocol != Protocol::GeminiInteractions
-                || matches!(
-                    effort,
-                    ReasoningEffort::Minimal
-                        | ReasoningEffort::Low
-                        | ReasoningEffort::Medium
-                        | ReasoningEffort::High
-                )
-        })
-        .collect()
-}
-
-/// Neutralize a carried reasoning setting that the target profile can't accept,
-/// so a model switch never hard-fails on a protocol/support mismatch. Returns
-/// the default ("untouched" — let the server decide) in those cases; otherwise
-/// keeps the setting unchanged. An explicit `set_reasoning` stays strict.
-fn reconcile_reasoning_for_switch(
-    profile: &ProviderProfile,
-    config: ReasoningConfig,
-) -> ReasoningConfig {
-    if validate_reasoning(profile, &config).is_err() {
-        ReasoningConfig::default()
-    } else {
-        config
-    }
-}
-
-fn protocol_is_implemented(protocol: Protocol) -> bool {
-    matches!(
-        protocol,
-        Protocol::OpenAiChat | Protocol::GeminiInteractions
-    )
-}
-
 impl ProviderClient {
-    /// Construct the inert provider used while the interactive first-run model
-    /// setup is open. This is deliberately separate from [`Self::from_profile`]:
-    /// persisted and environment-derived profiles must always pass validation.
+    /// Inert client for first-run setup; saved profiles always go through [`Self::from_profile`].
     pub fn unconfigured() -> Self {
         Self::with_connection(Connection {
             profile: ProviderProfile::openai_chat("", "", AuthKind::None),
             credential: String::new(),
-        })
-    }
-
-    pub fn new(
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        let base_url = base_url.into();
-        let api_key = api_key.into();
-        let model = model.into();
-        let auth = if api_key.trim().is_empty() {
-            AuthKind::None
-        } else {
-            AuthKind::Bearer
-        };
-        Self::with_connection(Connection {
-            profile: ProviderProfile::openai_chat(base_url, model, auth),
-            credential: api_key,
         })
     }
 
@@ -245,14 +101,6 @@ impl ProviderClient {
         }
     }
 
-    /// Where to look up the keys saved for a server. With more than one, a key
-    /// that fails rests and the next takes over. Asked each time, so a key
-    /// added while a chat is open is used by it.
-    pub fn with_keys(self, source: impl Fn(&str) -> Vec<String> + Send + Sync + 'static) -> Self {
-        *self.keys.lock().unwrap() = Some(Box::new(source));
-        self
-    }
-
     /// The connection to use for a server: the shared one, or one that also
     /// trusts the certificate file its model was saved with. Built once per file.
     fn http_for(&self, profile: &ProviderProfile) -> Result<reqwest::Client, ProviderError> {
@@ -271,24 +119,6 @@ impl ProviderClient {
         }
         trusting.insert(key, built.clone());
         Ok(built)
-    }
-
-    /// The keys saved for the server in use now, in the order they are tried.
-    fn saved_keys(&self) -> Vec<String> {
-        let server = self.connection.lock().unwrap().profile.base_url.clone();
-        let keys = self.keys.lock().unwrap();
-        keys.as_ref()
-            .map_or_else(Vec::new, |source| source(&server))
-    }
-
-    /// Where to look up the models that stand in, in order, when this one cannot
-    /// be used. It is asked each time, so a list changed since is the one used.
-    pub fn with_fallbacks(
-        self,
-        source: impl Fn() -> Vec<(ProviderProfile, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.fallbacks.lock().unwrap().source = Some(Box::new(source));
-        self
     }
 
     /// The start of the system prompt that every chat shares; a caching server
@@ -313,9 +143,7 @@ impl ProviderClient {
         )
     }
 
-    /// What the profile's resolved metadata says about image input. Missing
-    /// metadata stays `Unknown` so a custom endpoint is attempted rather than
-    /// diverted to a described substitute it never needed.
+    /// Missing metadata stays `Unknown`, so a custom server is tried rather than sent a description.
     fn profile_image_support(profile: &ProviderProfile) -> ImageSupport {
         if !profile.protocol.carries_images() {
             return ImageSupport::Unsupported;
@@ -342,39 +170,13 @@ impl ProviderClient {
         profile: ProviderProfile,
         credential: impl Into<String>,
     ) -> Result<Self, ProviderError> {
-        profile.validate().map_err(ProviderError::Decode)?;
-        if !protocol_is_implemented(profile.protocol) {
-            return Err(ProviderError::Decode(format!(
-                "ProviderClient does not implement {}",
-                profile.protocol.as_str()
-            )));
-        }
         let credential = credential.into();
         kernel::redact::remember(&credential);
-        if profile.auth.requires_credential() && credential.trim().is_empty() {
-            return Err(ProviderError::Decode(format!(
-                "{} authentication requires a credential",
-                profile.protocol.as_str()
-            )));
-        }
+        check_profile(&profile, &credential)?;
         Ok(Self::with_connection(Connection {
             profile,
             credential,
         }))
-    }
-
-    /// Set the known context window (from discovery, config, or `medha.lock`).
-    pub fn with_max_ctx(mut self, tokens: u32) -> Self {
-        self.caps.max_ctx = Some(tokens);
-        self.connection.lock().unwrap().profile.max_ctx = Some(tokens);
-        self
-    }
-
-    /// Set the initial reasoning config (from `medha.lock`), before wrapping
-    /// in `Arc`. Equivalent to `set_reasoning` but chainable at construction.
-    pub fn with_reasoning(self, config: ReasoningConfig) -> Result<Self, ProviderError> {
-        self.set_reasoning(config)?;
-        Ok(self)
     }
 
     /// Switch between turns; a running stream keeps the connection it snapshotted.
@@ -383,26 +185,9 @@ impl ProviderClient {
         profile: ProviderProfile,
         credential: impl Into<String>,
     ) -> Result<(), ProviderError> {
-        profile.validate().map_err(ProviderError::Decode)?;
-        if !protocol_is_implemented(profile.protocol) {
-            return Err(ProviderError::Decode(format!(
-                "ProviderClient does not implement {}",
-                profile.protocol.as_str()
-            )));
-        }
         let credential = credential.into();
-        if profile.auth.requires_credential() && credential.trim().is_empty() {
-            return Err(ProviderError::Decode(format!(
-                "{} authentication requires a credential",
-                profile.protocol.as_str()
-            )));
-        }
-        // A model switch carries the session's reasoning setting into the new
-        // profile. When that carried setting is meaningless for the target
-        // protocol (e.g. Gemini's "on, no explicit effort" reaching open-ai-chat,
-        // which needs a concrete level), fall back to "untouched" — the server's
-        // own default — rather than failing the switch. We never fabricate an
-        // effort, so cost/latency semantics are never silently changed.
+        check_profile(&profile, &credential)?;
+        // A carried setting the new model cannot take falls back to the server's default, never a guessed effort.
         let reasoning = reconcile_reasoning_for_switch(&profile, self.reasoning());
         validate_reasoning(&profile, &reasoning)?;
         *self.reasoning.lock().unwrap() = reasoning;
@@ -417,9 +202,7 @@ impl ProviderClient {
         self.connection.lock().unwrap().profile.model.clone()
     }
 
-    /// Portable OpenAI Chat reasoning control. Template kwargs are deliberately
-    /// absent: model-template extensions belong to an explicit custom profile,
-    /// never the generic compatible route.
+    /// Only the portable `reasoning_effort`; template kwargs never go on the generic route.
     fn reasoning_effort_value(&self) -> Option<&'static str> {
         if self.reasoning_support() == ReasoningSupport::Unsupported {
             return None;
@@ -565,69 +348,6 @@ impl ProviderClient {
         };
         Ok(stream.boxed())
     }
-
-    async fn count_vllm(
-        &self,
-        request: &PreparedModelRequest,
-    ) -> Result<InputTokenCount, TokenCountError> {
-        let connection = self.connection.lock().unwrap().clone();
-        let url = vllm_tokenize_url(&connection.profile.base_url);
-        let body = vllm_tokenize_body_from_prepared(request);
-        let client = self
-            .http_for(&connection.profile)
-            .map_err(|error| TokenCountError::Transport(error.to_string()))?;
-        let http_request = http::with_profile(
-            client.post(&url),
-            &connection.profile,
-            &connection.credential,
-        )
-        .map_err(|error| TokenCountError::Decode(error.to_string()))?;
-        let resp = http_request
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|error| TokenCountError::Transport(error.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = http::read_error_body(resp).await;
-            return Err(TokenCountError::Status(status, body));
-        }
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|error| TokenCountError::Decode(error.to_string()))?;
-        let tokens = value
-            .get("count")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| TokenCountError::Decode("missing integer `count`".into()))?;
-        Ok(InputTokenCount {
-            tokens,
-            quality: TokenCountQuality::Authoritative,
-            request_fingerprint: request.request_fingerprint.clone(),
-        })
-    }
-}
-
-/// vLLM's `/tokenize` lives at the server root, a sibling of `/v1` — not under
-/// it. Derive the root from the (usually `…/v1`) chat base URL.
-fn vllm_tokenize_url(base_url: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(base_url) else {
-        return format!("{}/tokenize", base_url.trim_end_matches('/'));
-    };
-    let path = url.path().trim_end_matches('/');
-    let api_root = path.strip_suffix("/chat/completions").unwrap_or(path);
-    let server_root = api_root.strip_suffix("/v1").unwrap_or(api_root);
-    url.set_path(&format!("{server_root}/tokenize"));
-    url.to_string()
-}
-
-/// vLLM `/tokenize` body: messages rendered through the model's chat template.
-/// Keeps every role (system/tool/assistant) and mirrors the same system-hoist
-/// as `build_chat_messages`, so the count matches what the chat endpoint would
-/// actually send — and a strict template can't reject a mid-array `system`.
-fn vllm_tokenize_body_from_prepared(request: &PreparedModelRequest) -> serde_json::Value {
-    openai_chat::vllm_tokenize_body(request)
 }
 
 #[async_trait]
@@ -686,9 +406,7 @@ impl Provider for ProviderClient {
         let connection = self.connection.lock().unwrap();
         ModelLimits {
             max_input_tokens: None,
-            // The profile stores a per-request allowance, not evidence of the
-            // model's physical output ceiling. requested_output_tokens carries
-            // that policy independently, including for chat preflight.
+            // The profile's cap is a per-request allowance, not the model's ceiling.
             max_output_tokens: None,
             max_combined_tokens: connection.profile.max_ctx.map(u64::from),
         }
@@ -737,32 +455,27 @@ impl Provider for ProviderClient {
     }
 
     fn fall_back(&self, failed: &str, rest: kernel::recovery::Rest) -> Option<(String, String)> {
-        let mut fallbacks = self.fallbacks.lock().unwrap();
-        let was = self.active_model();
-        // Another caller already left the model that failed: the one standing
-        // in has not failed, and is not passed over for the next.
-        if fallbacks.own.is_some() && !failed.is_empty() && failed != was {
-            return Some((failed.to_owned(), was));
-        }
-        fallbacks.read(self);
-        // One that cannot be switched to is passed over for the next.
-        while let Some(next) = fallbacks.listed.get(fallbacks.next).cloned() {
-            fallbacks.next += 1;
-            let before = (self.connection.lock().unwrap().clone(), self.reasoning());
-            if self
-                .switch_provider_profile(next.profile, next.credential)
-                .is_ok()
-            {
-                // Only the user's own model is rested: a stand-in that fails is passed.
-                if let (None, kernel::recovery::Rest::Limited(wait)) = (&fallbacks.own, rest) {
-                    let until = tokio::time::Instant::now() + wait.unwrap_or(REST);
-                    fallbacks.rested_until = Some(until);
-                }
-                fallbacks.own.get_or_insert(before);
-                return Some((was, self.active_model()));
-            }
-        }
-        None
+        self.stand_in_for(failed, rest)
+    }
+
+    fn standing_in(&self) -> Option<(String, String)> {
+        self.stand_in_now()
+    }
+
+    fn stand_in_left(&self) -> bool {
+        self.has_stand_in_left()
+    }
+
+    fn restore_primary(&self) -> Option<(String, String)> {
+        self.return_to_own()
+    }
+
+    fn another_key(&self) -> bool {
+        self.has_another_key()
+    }
+
+    fn next_key(&self, status: u16, asked: Option<std::time::Duration>) -> Option<(usize, usize)> {
+        self.turn_to_next_key(status, asked)
     }
 
     fn with_plain_schemas(
@@ -783,12 +496,6 @@ impl Provider for ProviderClient {
         profile.protocol == Protocol::OpenAiChat && crate::reasoning_echo::expected(&profile)
     }
 
-    fn standing_in(&self) -> Option<(String, String)> {
-        let fallbacks = self.fallbacks.lock().unwrap();
-        let (own, _) = fallbacks.own.as_ref()?;
-        Some((own.profile.model.clone(), self.active_model()))
-    }
-
     fn list_price(&self) -> Option<kernel::Pricing> {
         let profile = self.connection.lock().unwrap().profile.clone();
         let (input, output, cached, written) = crate::models_dev::list_price(&profile)?;
@@ -799,61 +506,6 @@ impl Provider for ProviderClient {
             cache_write_per_mtok: written,
             indicative: true,
         })
-    }
-
-    fn stand_in_left(&self) -> bool {
-        let mut fallbacks = self.fallbacks.lock().unwrap();
-        fallbacks.read(self);
-        fallbacks.next < fallbacks.listed.len()
-    }
-
-    fn restore_primary(&self) -> Option<(String, String)> {
-        let mut fallbacks = self.fallbacks.lock().unwrap();
-        let resting = fallbacks
-            .rested_until
-            .is_some_and(|until| tokio::time::Instant::now() < until);
-        if let (true, Some((own, _))) = (resting, &fallbacks.own) {
-            return Some((own.profile.model.clone(), self.active_model()));
-        }
-        fallbacks.next = 0;
-        fallbacks.rested_until = None;
-        if let Some((own, reasoning)) = fallbacks.own.take() {
-            *self.reasoning.lock().unwrap() = reasoning;
-            *self.connection.lock().unwrap() = own;
-        }
-        drop(fallbacks);
-        // Each message starts from the first saved key that is not resting.
-        let keys = self.saved_keys();
-        if let (true, Some((_, key))) = (keys.len() > 1, crate::key_rotation::first_ready(&keys)) {
-            self.connection.lock().unwrap().credential = key.clone();
-        }
-        None
-    }
-
-    fn another_key(&self) -> bool {
-        if self.fallbacks.lock().unwrap().own.is_some() {
-            return false;
-        }
-        let current = self.connection.lock().unwrap().credential.clone();
-        let keys = self.saved_keys();
-        keys.iter()
-            .any(|key| *key != current && !crate::key_rotation::resting(key))
-    }
-
-    fn next_key(&self, status: u16, asked: Option<std::time::Duration>) -> Option<(usize, usize)> {
-        // Only the chat's own model has keys of its own to turn to.
-        if self.fallbacks.lock().unwrap().own.is_some() {
-            return None;
-        }
-        let keys = self.saved_keys();
-        if keys.len() < 2 {
-            return None;
-        }
-        let current = self.connection.lock().unwrap().credential.clone();
-        crate::key_rotation::rest_key(&current, crate::key_rotation::rest(status, asked));
-        let (at, key) = crate::key_rotation::first_ready(&keys)?;
-        self.connection.lock().unwrap().credential = key.clone();
-        Some((at, keys.len()))
     }
 
     fn prepare_request(

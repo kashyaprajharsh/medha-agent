@@ -1,11 +1,12 @@
-//! Google Gemini Interactions API v1 wire contract.
-//!
-//! This adapter is stateless (`store: false`): Medha sends complete ordered
-//! history and must therefore replay every Gemini thought signature unchanged.
+//! Google Gemini Interactions API v1. Stateless (`store: false`): the whole history
+//! is sent each time, so every thought signature must be replayed unchanged.
 
+use super::{Reply, Settings, Wire};
+use crate::ProviderProfile;
 use crate::protocol::openai_chat::{wire_name_map, wire_tool_name};
 use crate::transport::sse::SseEvent;
-use crate::transport::stream::StreamDecoder;
+use crate::transport::stream::{self, StreamDecoder};
+use futures::future::BoxFuture;
 use kernel::{
     Block, CompiledContext, ContentPart, ModelMessage, Protocol, ProviderError, ProviderState,
     ReasoningConfig, ReasoningEffort, Role, ToolIntent, Usage,
@@ -16,8 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 
 const THOUGHT_SIGNATURE: &str = "thought_signature";
 
-/// Verified offline defaults, also used when catalogue metadata is unavailable.
-/// Unknown model IDs need the server default or an explicit profile override.
+/// Verified levels for when the catalogue has none; unknown models get the server default.
 /// https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
 pub(crate) fn known_reasoning_efforts(model: &str) -> Option<&'static [ReasoningEffort]> {
     use ReasoningEffort::{High, Low, Medium, Minimal};
@@ -167,9 +167,7 @@ fn lower_messages(
 ) -> Result<(Option<String>, Vec<Value>), ProviderError> {
     let mut system = String::new();
     let mut steps = Vec::new();
-    // Stateless Gemini replay requires a function result to identify both the
-    // original call and its function. Canonical tool-result messages carry the
-    // call id, so retain the wire name while lowering the preceding call.
+    // A replayed result must name its function, but ours carry only the call id.
     let mut function_names = HashMap::new();
     for message in messages {
         if message.role == Role::System {
@@ -214,9 +212,7 @@ fn lower_messages(
                             }));
                         }
                         ContentPart::ToolCall(part) => {
-                            // In Interactions v1, signatures belong to dedicated
-                            // thought steps (or built-in tool steps), never a
-                            // standard function_call.
+                            // v1 signatures belong to thought or built-in tool steps, never a function call.
                             reject_gemini_state(&part.provider_state, "standard function call")?;
                             let name = canonical_to_wire
                                 .get(part.tool.as_str())
@@ -451,9 +447,8 @@ fn usage_block(usage: UsageRaw) -> Block {
     let prompt_tokens = usage.input.unwrap_or_default();
     Block::Usage(Usage {
         prompt_tokens,
-        // Interactions separates output and thoughts. Google bills both at
-        // the output rate; total_tokens already includes them. Normalize once,
-        // after merging cumulative reports, so repeated thoughts are not added.
+        // Thoughts bill at the output rate and total_tokens holds them; added once,
+        // after cumulative reports merge, so a repeated report is not counted twice.
         completion_tokens: usage
             .output
             .unwrap_or_default()
@@ -938,10 +933,8 @@ impl StreamDecoder for ResponseDecoder {
         }
         let value: Value = serde_json::from_str(data)
             .map_err(|error| ProviderError::Stream(format!("Gemini SSE JSON: {error}")))?;
-        // Stable v1 permits cumulative usage in `metadata.total_usage` on any
-        // streamed event, while terminal lifecycle events may carry it under
-        // `interaction.usage`. Retain the newest report so neither shape loses
-        // accounting when the terminal payload omits usage.
+        // Usage arrives on any event or only at the end; the newest report is kept
+        // so a terminal event without usage loses nothing.
         if let Some(usage) = usage_from(&value) {
             // Usage fields are optional and reports cumulative. Keep the last
             // known value of each field without adding successive snapshots.
@@ -990,6 +983,88 @@ impl StreamDecoder for ResponseDecoder {
                 "Gemini stream ended before a terminal interaction event".into(),
             ))
         }
+    }
+}
+
+pub(crate) struct Interactions;
+
+impl Wire for Interactions {
+    fn prepare(
+        &self,
+        context: &CompiledContext,
+        settings: &Settings<'_>,
+    ) -> Result<(Value, Vec<(String, String)>), ProviderError> {
+        let (body, _) = prepare_body(
+            context,
+            settings.model,
+            settings.streaming,
+            settings.reasoning,
+            settings.profile.max_output_tokens,
+        )?;
+        Ok((body, Vec::new()))
+    }
+
+    fn url(&self, base_url: &str) -> Result<String, ProviderError> {
+        Ok(format!("{}/interactions", base_url.trim_end_matches('/')))
+    }
+
+    fn read(
+        &self,
+        response: reqwest::Response,
+        streaming: bool,
+        idle: std::time::Duration,
+        names: HashMap<String, String>,
+    ) -> BoxFuture<'static, Result<Reply, ProviderError>> {
+        Box::pin(stream::read(
+            response,
+            streaming,
+            idle,
+            ResponseDecoder::new(names),
+        ))
+    }
+
+    fn set_output_limit(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        tokens: u64,
+        _profile: &ProviderProfile,
+    ) -> Result<(), ProviderError> {
+        let generation_config = body
+            .entry("generation_config")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ProviderError::Decode("prepared Gemini generation_config is not an object".into())
+            })?;
+        generation_config.insert("max_output_tokens".into(), json!(tokens));
+        Ok(())
+    }
+
+    fn set_reasoning(
+        &self,
+        body: &mut Value,
+        config: &ReasoningConfig,
+    ) -> Result<(), ProviderError> {
+        apply_reasoning(body, config)
+    }
+
+    fn check_reasoning(&self, config: &ReasoningConfig) -> Result<(), ProviderError> {
+        if config.enabled == Some(false) {
+            return Err(ProviderError::Decode(
+                "gemini-interactions v1 has no portable thinking-disable control; use server default instead"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_efforts(&self, model: &str) -> &'static [ReasoningEffort] {
+        known_reasoning_efforts(model).unwrap_or(&[])
+    }
+
+    fn carries(&self, effort: ReasoningEffort) -> bool {
+        use ReasoningEffort::{High, Low, Medium, Minimal};
+        matches!(effort, Minimal | Low | Medium | High)
     }
 }
 

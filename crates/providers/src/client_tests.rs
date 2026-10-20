@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::openai_chat;
 use futures::StreamExt;
 use kernel::{Message, Role};
 
@@ -25,6 +26,17 @@ async fn serve_then_hold(events: &'static str) -> std::net::SocketAddr {
         std::future::pending::<()>().await;
     });
     address
+}
+
+/// The `reasoning_effort` a plain request carries; null when it carries none.
+fn sent_effort(client: &ProviderClient) -> serde_json::Value {
+    let context = CompiledContext {
+        model: String::new(),
+        messages: vec![Message::user("hi")],
+        ordered: None,
+        tools: Vec::new(),
+    };
+    client.prepare_request(&context).unwrap().body["reasoning_effort"].clone()
 }
 
 async fn drain(
@@ -931,7 +943,7 @@ mod reasoning_request_tests {
             effort: Some(ReasoningEffort::High),
         })
         .unwrap();
-        assert_eq!(p.reasoning_effort_value(), Some("high"));
+        assert_eq!(sent_effort(&p), "high");
     }
 
     #[test]
@@ -942,7 +954,7 @@ mod reasoning_request_tests {
             effort: Some(ReasoningEffort::Minimal),
         })
         .unwrap();
-        assert_eq!(p.reasoning_effort_value(), Some("minimal"));
+        assert_eq!(sent_effort(&p), "minimal");
     }
 
     #[test]
@@ -954,7 +966,7 @@ mod reasoning_request_tests {
             effort: None,
         })
         .unwrap();
-        assert_eq!(p.reasoning_effort_value(), Some("none"));
+        assert_eq!(sent_effort(&p), "none");
     }
 
     #[test]
@@ -1211,7 +1223,7 @@ mod reasoning_request_tests {
     #[test]
     fn untouched_reasoning_sends_no_effort_field() {
         let p = chat_client("http://x", "", "m");
-        assert!(p.reasoning_effort_value().is_none());
+        assert!(sent_effort(&p).is_null());
     }
 
     #[test]

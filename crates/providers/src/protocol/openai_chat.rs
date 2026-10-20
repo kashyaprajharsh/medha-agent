@@ -1,14 +1,14 @@
-//! OpenAI Chat Completions request lowering.
-//!
-//! This module owns the protocol's wire JSON. Deployment concerns such as the
-//! base URL, credential, HTTP client, and selected optional counter remain in
-//! the provider client.
+//! OpenAI Chat Completions: request JSON, address and reply decoding; the client owns keys.
 
+use super::{Reply, Settings, Wire, requested_effort};
+use crate::ProviderProfile;
 use crate::transport::sse::SseEvent;
-use crate::transport::stream::StreamDecoder;
+use crate::transport::stream::{self, StreamDecoder};
+use futures::future::BoxFuture;
 use kernel::{
     Block, CompiledContext, ContentPart, ModelMessage, PreparedModelRequest, Protocol,
-    ProviderError, ProviderState, Role, ToolIntent, Usage,
+    ProviderError, ProviderState, ReasoningConfig, ReasoningEffort, ReasoningSupport, Role,
+    ToolIntent, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -185,9 +185,7 @@ pub(crate) fn lower_chat_messages(
     Ok(out)
 }
 
-/// Add an assistant message, folded into the one before it when that is the
-/// assistant's too: its text on a new line, its tool calls after the others.
-/// Strict chat templates refuse two assistant messages in a row as well.
+/// Folds into a preceding assistant message; strict chat templates refuse two in a row.
 fn push_assistant(messages: &mut Vec<ChatMessage>, next: ChatMessage) {
     let before = messages.last_mut().filter(|last| last.role == "assistant");
     let (Some(before), serde_json::Value::String(more)) = (before, &next.content) else {
@@ -488,10 +486,8 @@ pub(crate) fn vllm_tokenize_body(request: &PreparedModelRequest) -> serde_json::
     body
 }
 
-/// Accept an explicitly `null` field as the type's default. `#[serde(default)]`
-/// alone only covers an *absent* key, so a server that serialises its whole
-/// schema and spells empties as `null` (mlx-vlm, some llama.cpp builds) would
-/// otherwise fail the whole response with "invalid type: null".
+/// `null` as the default: `#[serde(default)]` covers only absent keys, and some
+/// local servers spell every empty field `null`.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -560,9 +556,7 @@ struct PromptTokensDetails {
 }
 
 impl UsageRaw {
-    /// Absent unless the route actually reported it. A zero would read as a
-    /// measured miss, so every endpoint that does not report the bucket would
-    /// look like one that never caches.
+    /// Absent unless reported: a zero would make every silent server look like one that never caches.
     fn cached_prompt_tokens(&self) -> Option<u32> {
         self.prompt_tokens_details
             .and_then(|details| details.cached_tokens)
@@ -600,10 +594,8 @@ struct Delta {
     content: Option<String>,
     #[serde(default)]
     refusal: Option<serde_json::Value>,
-    /// Two wire spellings of the same field. Held separately rather than as one
-    /// `alias`, because a server that sends *both* makes `alias` report a
-    /// duplicate field and reject the response. `reasoning_content` wins when
-    /// both carry text: it is the canonical name.
+    /// Two spellings, kept apart because an `alias` rejects a server that sends both;
+    /// `reasoning_content` wins when both carry text.
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -1149,6 +1141,123 @@ impl ThinkTagFilter {
         } else {
             Block::Text(rest)
         })
+    }
+}
+
+pub(crate) struct Chat;
+
+impl Wire for Chat {
+    fn prepare(
+        &self,
+        context: &CompiledContext,
+        settings: &Settings<'_>,
+    ) -> Result<(serde_json::Value, Vec<(String, String)>), ProviderError> {
+        let profile = settings.profile;
+        let effort = (profile.reasoning != ReasoningSupport::Unsupported)
+            .then(|| requested_effort(settings.reasoning))
+            .flatten()
+            .map(ReasoningEffort::as_str);
+        let mut body = prepare_body(
+            context,
+            settings.model,
+            settings.streaming,
+            effort,
+            profile.max_output_tokens,
+            crate::reasoning_echo::expected(profile),
+        )?;
+        if profile.chat_token_limit_field() == "max_completion_tokens"
+            && let Some(cap) = body.as_object_mut().and_then(|o| o.remove("max_tokens"))
+        {
+            body["max_completion_tokens"] = cap;
+        }
+        if settings.plain_schemas {
+            crate::schema_rules::strip(&mut body);
+        }
+        // Last, so the marks sit on the request exactly as it is sent.
+        let headers = crate::prompt_cache::apply(
+            &mut body,
+            crate::prompt_cache::route(profile, settings.model),
+            profile.cache_ttl,
+            settings.scope,
+            settings.stable_system,
+        );
+        Ok((body, headers))
+    }
+
+    fn url(&self, base_url: &str) -> Result<String, ProviderError> {
+        endpoint_url(base_url, "/chat/completions")
+    }
+
+    fn read(
+        &self,
+        response: reqwest::Response,
+        streaming: bool,
+        idle: std::time::Duration,
+        names: HashMap<String, String>,
+    ) -> BoxFuture<'static, Result<Reply, ProviderError>> {
+        Box::pin(stream::read(
+            response,
+            streaming,
+            idle,
+            ResponseDecoder::new(names),
+        ))
+    }
+
+    fn set_output_limit(
+        &self,
+        body: &mut serde_json::Map<String, serde_json::Value>,
+        tokens: u64,
+        profile: &ProviderProfile,
+    ) -> Result<(), ProviderError> {
+        let field = if body.contains_key("max_completion_tokens") {
+            "max_completion_tokens"
+        } else if body.contains_key("max_tokens") {
+            "max_tokens"
+        } else {
+            profile.chat_token_limit_field()
+        };
+        body.insert(field.into(), serde_json::json!(tokens));
+        Ok(())
+    }
+
+    fn set_reasoning(
+        &self,
+        body: &mut serde_json::Value,
+        config: &ReasoningConfig,
+    ) -> Result<(), ProviderError> {
+        let object = body.as_object_mut().ok_or_else(|| {
+            ProviderError::Decode("prepared model request is not an object".into())
+        })?;
+        match requested_effort(config) {
+            Some(effort) => {
+                object.insert(
+                    "reasoning_effort".into(),
+                    serde_json::json!(effort.as_str()),
+                );
+            }
+            None => {
+                object.remove("reasoning_effort");
+            }
+        }
+        Ok(())
+    }
+
+    fn check_reasoning(&self, config: &ReasoningConfig) -> Result<(), ProviderError> {
+        // Turning reasoning off is the `none` effort, so turning it on needs a level.
+        if config.enabled == Some(true) && config.effort.is_none() {
+            return Err(ProviderError::Decode(
+                "open-ai-chat cannot enable reasoning without an explicit effort".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_efforts(&self, _model: &str) -> &'static [ReasoningEffort] {
+        ReasoningEffort::ALL
+    }
+
+    fn replays_reasoning(&self, profile: &ProviderProfile) -> bool {
+        crate::reasoning_echo::expected(profile)
     }
 }
 

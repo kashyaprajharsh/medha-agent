@@ -1,7 +1,7 @@
 //! The one provider client: a saved profile's connection, keys and stand-ins.
 
-use crate::protocol::{gemini_interactions, openai_chat};
-use crate::transport::{http, stream};
+use crate::protocol;
+use crate::transport::http;
 use crate::{AuthKind, ProviderProfile, TokenCounter};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -17,9 +17,7 @@ mod reasoning;
 mod token_count;
 
 use fallback::{Fallbacks, KeySource};
-use reasoning::{
-    profile_reasoning_efforts, reconcile_reasoning_for_switch, requested_effort, validate_reasoning,
-};
+use reasoning::{profile_reasoning_efforts, reconcile_reasoning_for_switch, validate_reasoning};
 
 pub struct ProviderClient {
     /// Swapped only between turns; a stream snapshots it, so one request uses one model and key.
@@ -48,15 +46,7 @@ struct Connection {
 
 fn check_profile(profile: &ProviderProfile, credential: &str) -> Result<(), ProviderError> {
     profile.validate().map_err(ProviderError::Decode)?;
-    if !matches!(
-        profile.protocol,
-        Protocol::OpenAiChat | Protocol::GeminiInteractions
-    ) {
-        return Err(ProviderError::Decode(format!(
-            "ProviderClient does not implement {}",
-            profile.protocol.as_str()
-        )));
-    }
+    protocol::wire(profile.protocol)?;
     if profile.auth.requires_credential() && credential.trim().is_empty() {
         return Err(ProviderError::Decode(format!(
             "{} authentication requires a credential",
@@ -203,14 +193,6 @@ impl ProviderClient {
     pub fn active_model(&self) -> String {
         self.connection.lock().unwrap().profile.model.clone()
     }
-
-    /// Only the portable `reasoning_effort`; template kwargs never go on the generic route.
-    fn reasoning_effort_value(&self) -> Option<&'static str> {
-        if self.reasoning_support() == ReasoningSupport::Unsupported {
-            return None;
-        }
-        requested_effort(&self.reasoning.lock().unwrap()).map(ReasoningEffort::as_str)
-    }
 }
 
 #[async_trait]
@@ -349,7 +331,7 @@ impl Provider for ProviderClient {
 
     fn replays_reasoning(&self) -> bool {
         let profile = self.connection.lock().unwrap().profile.clone();
-        profile.protocol == Protocol::OpenAiChat && crate::reasoning_echo::expected(&profile)
+        protocol::wire(profile.protocol).is_ok_and(|wire| wire.replays_reasoning(&profile))
     }
 
     fn list_price(&self) -> Option<kernel::Pricing> {
@@ -402,56 +384,21 @@ impl Provider for ProviderClient {
                     .into(),
             ));
         }
-        let streaming = self.streaming();
-        let mut headers = Vec::new();
-        let body = match connection.profile.protocol {
-            Protocol::OpenAiChat => {
-                let mut body = openai_chat::prepare_body(
-                    ctx,
-                    &model,
-                    streaming,
-                    self.reasoning_effort_value(),
-                    connection.profile.max_output_tokens,
-                    crate::reasoning_echo::expected(&connection.profile),
-                )?;
-                if connection.profile.chat_token_limit_field() == "max_completion_tokens"
-                    && let Some(cap) = body.as_object_mut().and_then(|o| o.remove("max_tokens"))
-                {
-                    body["max_completion_tokens"] = cap;
-                }
-                if self
-                    .plain_schemas
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    crate::schema_rules::strip(&mut body);
-                }
-                // Last, so the marks sit on the request exactly as it is sent.
-                headers = crate::prompt_cache::apply(
-                    &mut body,
-                    crate::prompt_cache::route(&connection.profile, &model),
-                    connection.profile.cache_ttl,
-                    scope,
-                    self.stable_system.lock().unwrap().as_deref(),
-                );
-                body
-            }
-            Protocol::GeminiInteractions => {
-                gemini_interactions::prepare_body(
-                    ctx,
-                    &model,
-                    streaming,
-                    &self.reasoning(),
-                    connection.profile.max_output_tokens,
-                )?
-                .0
-            }
-            protocol => {
-                return Err(ProviderError::Decode(format!(
-                    "ProviderClient does not implement {}",
-                    protocol.as_str()
-                )));
-            }
+        let wire = protocol::wire(connection.profile.protocol)?;
+        let reasoning = self.reasoning();
+        let stable_system = self.stable_system.lock().unwrap();
+        let settings = protocol::Settings {
+            profile: &connection.profile,
+            model: &model,
+            streaming: self.streaming(),
+            reasoning: &reasoning,
+            plain_schemas: self
+                .plain_schemas
+                .load(std::sync::atomic::Ordering::Relaxed),
+            scope,
+            stable_system: stable_system.as_deref(),
         };
+        let (body, headers) = wire.prepare(ctx, &settings)?;
         let mut prepared =
             PreparedModelRequest::new(connection.profile.protocol, model, body, ctx.clone());
         prepared.headers = headers;
@@ -478,45 +425,11 @@ impl Provider for ProviderClient {
         let object = body.as_object_mut().ok_or_else(|| {
             ProviderError::Decode("prepared model request is not an object".into())
         })?;
-        match request.protocol {
-            Protocol::OpenAiChat => {
-                let field = if object.contains_key("max_completion_tokens") {
-                    "max_completion_tokens"
-                } else if object.contains_key("max_tokens") {
-                    "max_tokens"
-                } else {
-                    self.connection
-                        .lock()
-                        .unwrap()
-                        .profile
-                        .chat_token_limit_field()
-                };
-                object.insert(field.into(), serde_json::json!(max_output_tokens));
-            }
-            Protocol::GeminiInteractions => {
-                let generation_config = object
-                    .entry("generation_config")
-                    .or_insert_with(|| serde_json::json!({}));
-                let generation_config = generation_config.as_object_mut().ok_or_else(|| {
-                    ProviderError::Decode(
-                        "prepared Gemini generation_config is not an object".into(),
-                    )
-                })?;
-                generation_config.insert(
-                    "max_output_tokens".into(),
-                    serde_json::json!(max_output_tokens),
-                );
-            }
-            Protocol::OpenAiResponses => {
-                object.insert(
-                    "max_output_tokens".into(),
-                    serde_json::json!(max_output_tokens),
-                );
-            }
-            Protocol::AnthropicMessages => {
-                object.insert("max_tokens".into(), serde_json::json!(max_output_tokens));
-            }
-        }
+        let Ok(wire) = protocol::wire(request.protocol) else {
+            return Ok(None);
+        };
+        let profile = &self.connection.lock().unwrap().profile;
+        wire.set_output_limit(object, max_output_tokens, profile)?;
         Ok(Some(request.with_body(body)))
     }
 
@@ -530,29 +443,11 @@ impl Provider for ProviderClient {
             return Ok(None);
         }
         validate_reasoning(&connection.profile, config)?;
+        let Ok(wire) = protocol::wire(request.protocol) else {
+            return Ok(None);
+        };
         let mut body = request.body.clone();
-        match request.protocol {
-            Protocol::OpenAiChat => {
-                let object = body.as_object_mut().ok_or_else(|| {
-                    ProviderError::Decode("prepared model request is not an object".into())
-                })?;
-                match requested_effort(config) {
-                    Some(effort) => {
-                        object.insert(
-                            "reasoning_effort".into(),
-                            serde_json::json!(effort.as_str()),
-                        );
-                    }
-                    None => {
-                        object.remove("reasoning_effort");
-                    }
-                }
-            }
-            Protocol::GeminiInteractions => {
-                gemini_interactions::apply_reasoning(&mut body, config)?
-            }
-            Protocol::OpenAiResponses | Protocol::AnthropicMessages => return Ok(None),
-        }
+        wire.set_reasoning(&mut body, config)?;
         Ok(Some(request.with_body(body)))
     }
 
@@ -568,22 +463,19 @@ impl Provider for ProviderClient {
         &self,
         request: &PreparedModelRequest,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        if !matches!(
-            request.protocol,
-            Protocol::OpenAiChat | Protocol::GeminiInteractions
-        ) {
+        let Ok(wire) = protocol::wire(request.protocol) else {
             return Err(ProviderError::Decode(format!(
                 "ProviderClient cannot send {}",
                 request.protocol.as_str()
             )));
-        }
+        };
         let tools: Vec<_> = request
             .context
             .tools
             .iter()
             .map(|tool| tool.name.clone())
             .collect();
-        let names = openai_chat::wire_name_map(&tools);
+        let names = kernel::portable_tool_name_map(&tools);
         let connection = self.connection.lock().unwrap().clone();
         if connection.profile.protocol != request.protocol {
             return Err(ProviderError::Decode(format!(
@@ -597,13 +489,7 @@ impl Provider for ProviderClient {
             .get("stream")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        let chat = request.protocol == Protocol::OpenAiChat;
-        let base_url = &connection.profile.base_url;
-        let url = if chat {
-            openai_chat::endpoint_url(base_url, "/chat/completions")?
-        } else {
-            format!("{}/interactions", base_url.trim_end_matches('/'))
-        };
+        let url = wire.url(&connection.profile.base_url)?;
         // MEDHA_DEBUG_HTTP=1 prints the exact JSON sent.
         http::debug_json_request("POST", &url, &request.body);
 
@@ -615,13 +501,7 @@ impl Provider for ProviderClient {
             .json(&request.body);
         let response = http::require_success(http::send_model_request(outgoing).await?).await?;
         let idle = http::stream_idle(&connection.profile);
-        if chat {
-            let decoder = openai_chat::ResponseDecoder::new(names);
-            stream::read(response, streaming, idle, decoder).await
-        } else {
-            let decoder = gemini_interactions::ResponseDecoder::new(names);
-            stream::read(response, streaming, idle, decoder).await
-        }
+        wire.read(response, streaming, idle, names).await
     }
 }
 

@@ -287,10 +287,7 @@ fn tool(name: &str) -> ToolSpec {
     }
 }
 
-/// Servers that serialise their whole schema (mlx-vlm, some llama.cpp
-/// builds) send every field, empties spelled as `null`, and both reasoning
-/// spellings at once. Absent-only defaults reject that; a `reasoning` alias
-/// would call it a duplicate field and drop the entire turn.
+/// Some local servers send every field, empties as `null`, and both reasoning spellings at once.
 #[test]
 fn completion_accepts_null_fields_and_both_reasoning_spellings() {
     let body = r#"{
@@ -433,9 +430,7 @@ fn build_chat_hoists_and_merges_system_to_the_front() {
     assert_eq!(built[3].role, "tool");
 }
 
-/// A strict chat template answers 400 to two user messages in a row, which
-/// Medha's history holds after feedback or a report. They go as one, in
-/// order; a turn from the model between them keeps them apart.
+/// Strict chat templates answer 400 to two user messages in a row, so they go as one.
 #[test]
 fn user_messages_in_a_row_are_sent_as_one() {
     let history = vec![
@@ -464,9 +459,8 @@ fn user_messages_in_a_row_are_sent_as_one() {
     );
 }
 
-/// Where a server requires a model's thinking back, every assistant turn
-/// carries it: its own, or a single space when it had none. Any other
-/// server is sent none of it. A turn that was thinking only goes to neither.
+/// Thinking goes back on every turn (a space when none) only where the server requires it;
+/// a turn that was thinking only goes to neither.
 #[test]
 fn thinking_goes_back_only_where_a_server_requires_it() {
     use kernel::{ReasoningPart, TextPart};

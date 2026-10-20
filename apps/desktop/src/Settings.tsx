@@ -11,6 +11,7 @@ import { useWorkspace } from "./Workspace";
 import { profileFor, providerKey, type ConnectionOptions, type UnavailableProvider, type Provider as Preset, type Protocol as ModelProtocol, type ModelTestResult } from "./modelSetup";
 import { ModelTest, ProviderFields, UnavailableProviders } from "./ProviderSetup";
 import { Spinner } from "./Spinner";
+import { ChatGptAccounts, ChatGptSheet, ContinueWithChatGpt } from "./ChatGpt";
 type Model = {
   name: string;
   profile: Record<string, unknown> & ConnectionOptions & {
@@ -46,9 +47,11 @@ const hostOf = (url: string) => {
 const keyOf = (model: Model) =>
   model.key_present
     ? { label: "Key saved", missing: false }
-    : model.profile.auth === "none"
-      ? { label: "No key required", missing: false }
-      : { label: "No saved key", missing: true };
+    : model.profile.auth === "chatgpt-plan"
+      ? { label: "Uses your ChatGPT plan", missing: false }
+      : model.profile.auth === "none"
+        ? { label: "No key required", missing: false }
+        : { label: "No saved key", missing: true };
 // The instruction files that follow the person into every project.
 const EVERYWHERE = ["persona", "global"];
 const fileOf = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
@@ -92,6 +95,9 @@ export function Settings({
   const [refresh, setRefresh] = useState(0);
   const [confirm, setConfirm] = useState<{ model: Model; key: boolean }>();
   const [opened, setOpened] = useState("");
+  // A ChatGPT sign-in in progress (`again` names a registered account), and the accounts sheet.
+  const [chatgpt, setChatgpt] = useState<{ again?: string }>();
+  const [chatgptAccounts, setChatgptAccounts] = useState(false);
   const open = tab === "models" && editing === undefined ? models.find((model) => model.name === opened) : undefined;
   // What follows is asked or done on the page, so the sheet steps aside for it.
   const aside = (then: () => void) => {
@@ -194,12 +200,41 @@ export function Settings({
               order, when a chat's model cannot answer.
             </PageTop>
             <ViewBar>
+              <button type="button" className="cg-link" onClick={() => setChatgptAccounts(true)}>
+                ChatGPT accounts
+              </button>
+              <ContinueWithChatGpt onClick={() => setChatgpt({})} />
               <Add
                 label="Add model"
                 open={editing === null}
                 onClick={() => protocols.length && setEditing(editing === null ? undefined : null)}
               />
             </ViewBar>
+            {chatgpt && (
+              <ChatGptSheet
+                again={chatgpt.again}
+                onClose={() => setChatgpt(undefined)}
+                onUseKey={() => {
+                  setChatgpt(undefined);
+                  setEditing(null);
+                }}
+                onSaved={(name) => {
+                  setChatgpt(undefined);
+                  setNotice("Saved");
+                  setRefresh((value) => value + 1);
+                  window.dispatchEvent(new CustomEvent("medha-preferences", { detail: { profile: name } }));
+                }}
+              />
+            )}
+            {chatgptAccounts && (
+              <ChatGptAccounts
+                onClose={() => setChatgptAccounts(false)}
+                onSignIn={(again) => {
+                  setChatgptAccounts(false);
+                  setChatgpt({ again });
+                }}
+              />
+            )}
             {editing !== undefined ? (
               <ModelForm
                 key={editing?.name || "new"}

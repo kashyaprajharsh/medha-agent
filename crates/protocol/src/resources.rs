@@ -117,6 +117,9 @@ pub struct ModelDraft {
     pub model: String,
     pub context_limit: Option<u32>,
     pub key: Option<Secret>,
+    /// The user chose to use a key that looks like another provider's.
+    #[serde(default)]
+    pub allow_other_provider: bool,
 }
 impl std::fmt::Debug for ModelDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -130,6 +133,7 @@ impl std::fmt::Debug for ModelDraft {
             .field("context_limit", &self.context_limit)
             .field("connection", &self.connection)
             .field("key", &self.key)
+            .field("allow_other_provider", &self.allow_other_provider)
             .finish()
     }
 }
@@ -451,11 +455,15 @@ pub enum ChangeResource {
     UpdateModelKey {
         name: String,
         key: Secret,
+        #[serde(default)]
+        allow_other_provider: bool,
     },
     /// Another key for the model's server, tried after the ones already saved.
     AddModelKey {
         name: String,
         key: Secret,
+        #[serde(default)]
+        allow_other_provider: bool,
     },
     /// Forget one of the extra keys saved for the model's server.
     RemoveModelKey {
@@ -570,6 +578,8 @@ pub struct DiscoverModels {
     pub protocol: ModelProtocol,
     pub base_url: String,
     pub key: Secret,
+    #[serde(default)]
+    pub allow_other_provider: bool,
 }
 impl Command for DiscoverModels {
     const METHOD: &'static str = "application.models.discover";

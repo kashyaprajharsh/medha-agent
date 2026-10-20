@@ -1468,6 +1468,10 @@ enum ModelSetupStep {
     EndpointParameter,
     Resolving,
     ApiKey,
+    /// The backend reads the typed key's opening letters; nothing is sent to the provider.
+    CheckingKey,
+    /// The key looks like another provider's: the user insists or types another.
+    OtherProviderKey,
     /// The path of a certificate file to trust for the server; shown as typed.
     Certificate,
     /// `/v1/models` is being queried in the background; Enter is inert until
@@ -1506,6 +1510,10 @@ struct ModelSetup {
     parameter: usize,
     /// The key being typed is another one for the server, not a replacement.
     extra_key: bool,
+    /// Why the typed key was held back, while the user decides.
+    held_back: Option<String>,
+    /// The user chose to use a key that looks like another provider's.
+    allow_other_provider: bool,
 }
 
 struct McpCredential {
@@ -1543,6 +1551,8 @@ impl ModelSetup {
             parameters: BTreeMap::new(),
             parameter: 0,
             extra_key: false,
+            held_back: None,
+            allow_other_provider: false,
         }
     }
 
@@ -1582,10 +1592,17 @@ impl ModelSetup {
             parameters: BTreeMap::new(),
             parameter: 0,
             extra_key: false,
+            held_back: None,
+            allow_other_provider: false,
         }
     }
 
     fn prompt(&self) -> String {
+        if let (ModelSetupStep::OtherProviderKey, Some(reason)) = (&self.step, &self.held_back) {
+            return format!(
+                "{reason} Type use to send it anyway, or leave blank to enter another key:"
+            );
+        }
         if matches!(self.step, ModelSetupStep::EndpointParameter) {
             return format!(
                 "{} (endpoint parameter, not an API key):",
@@ -1619,6 +1636,10 @@ impl ModelSetup {
                     "New API key (stored securely, never in config.toml):"
                 }
             },
+            ModelSetupStep::CheckingKey => "Checking which provider this key belongs to… (Esc cancels)",
+            ModelSetupStep::OtherProviderKey => {
+                "Type use to send this key anyway, or leave blank to enter another key:"
+            }
             ModelSetupStep::Certificate => {
                 "Full path of a .pem certificate file to trust for this server (blank removes it):"
             }

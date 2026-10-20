@@ -164,7 +164,10 @@ fn a_key_for_another_provider_is_neither_sent_nor_saved_unless_the_user_insists(
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&home).unwrap();
     let mut bridge = Bridge::start(&workspace, &home);
-    let profile = json!({"protocol": "open-ai-responses", "base_url": "https://api.openai.com/v1", "model": "gpt-x", "auth": "bearer"});
+    const HELD: &str =
+        "This key looks like it belongs to OpenRouter, so it was not sent to OpenAI.";
+    const OPENAI: &str = "https://api.openai.com/v1";
+    let profile = json!({"protocol": "open-ai-responses", "base_url": OPENAI, "model": "gpt-x", "auth": "bearer"});
     let form = json!({"name": "mine", "profile": profile, "key": "sk-or-v1-abc"});
 
     // Each answer comes before any request: a sent key would fail on the network or with 401 instead.
@@ -174,12 +177,19 @@ fn a_key_for_another_provider_is_neither_sent_nor_saved_unless_the_user_insists(
         "settings.model.save",
     ] {
         let reply = bridge.call(method, form.clone());
-        assert_eq!(
-            reply["error"],
-            "This key looks like it belongs to OpenRouter, so it was not sent to OpenAI.",
-            "{method}: {reply}"
-        );
+        assert_eq!(reply["error"], HELD, "{method}: {reply}");
     }
+    // The terminal reads a key before using it, and shows the same words.
+    let checked = bridge.ok(
+        "application.models.check_key",
+        json!({"base_url": OPENAI, "key": "sk-or-v1-abc"}),
+    );
+    assert_eq!(checked, json!({"held_back": HELD, "warning": null}));
+    let admin = bridge.ok(
+        "application.models.check_key",
+        json!({"base_url": OPENAI, "key": "sk-admin-abc"}),
+    );
+    assert!(admin["held_back"].is_null() && admin["warning"].is_string());
     assert_eq!(bridge.ok("settings.list", json!({}))["models"], json!([]));
 
     let mut insisted = form;
@@ -190,6 +200,45 @@ fn a_key_for_another_provider_is_neither_sent_nor_saved_unless_the_user_insists(
         (&saved["name"], &saved["key_present"]),
         (&json!("mine"), &json!(true))
     );
+
+    // Replacing the key or adding one more is held back the same way, from either surface.
+    let routes = |allow: bool| {
+        let key = |n: u8| protocol::Secret(format!("sk-or-v1-{n}{allow}"));
+        [
+            (
+                "application.resources.change",
+                json!(protocol::ChangeResource::UpdateModelKey {
+                    name: "mine".into(),
+                    key: key(1),
+                    allow_other_provider: allow
+                }),
+            ),
+            (
+                "application.resources.change",
+                json!(protocol::ChangeResource::AddModelKey {
+                    name: "mine".into(),
+                    key: key(2),
+                    allow_other_provider: allow
+                }),
+            ),
+            (
+                "settings.keys.set",
+                json!({"group": "model", "id": OPENAI, "key": key(3), "allow_other_provider": allow}),
+            ),
+            (
+                "settings.keys.set",
+                json!({"group": "model", "id": OPENAI, "key": key(4), "add": true, "allow_other_provider": allow}),
+            ),
+        ]
+    };
+    for (method, params) in routes(false) {
+        let reply = bridge.call(method, params);
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(error.contains(HELD), "{method}: {reply}");
+    }
+    for (method, params) in routes(true) {
+        bridge.ok(method, params);
+    }
 }
 
 #[test]

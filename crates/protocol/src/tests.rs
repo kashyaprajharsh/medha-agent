@@ -179,6 +179,7 @@ fn resource_commands_refuse_invented_actions_and_redact_secret_debugging() {
     let key = ChangeResource::UpdateModelKey {
         name: "saved".into(),
         key: Secret("sk-private".into()),
+        allow_other_provider: false,
     };
     assert!(!format!("{key:?}").contains("sk-private"));
     assert!(Call::new(Scope::Service, &ReadResource::Models).is_err());

@@ -138,6 +138,7 @@ pub(super) enum Effect {
     Abort,
     Agent(protocol::AgentCommand, Option<String>),
     Discover(protocol::DiscoverModels),
+    CheckKey(protocol::CheckModelKey),
     RefreshProviders,
     ResolveDeployment(protocol::ResolveDeployment),
     TestModel(protocol::TestModel),
@@ -279,6 +280,7 @@ pub(super) fn request(model: &mut Model, effect: Effect) -> bool {
     let form = matches!(
         &effect,
         Effect::Discover(_)
+            | Effect::CheckKey(_)
             | Effect::RefreshProviders
             | Effect::ResolveDeployment(_)
             | Effect::TestModel(_)
@@ -322,6 +324,7 @@ enum Answer {
     Accepted(protocol::Accepted),
     Cancelled(protocol::Cancelled),
     Discovered(Vec<protocol::DiscoveredModel>),
+    KeyChecked(protocol::ModelKeyCheck),
     Providers(protocol::ProviderCatalogue),
     Deployment(protocol::ModelDeployment),
     Tested(protocol::ModelTestResult),
@@ -562,6 +565,10 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             .call_async(protocol::Scope::Folder(&folder), p)
             .await
             .map(Answer::Discovered),
+        Effect::CheckKey(p) => connection
+            .call_async(protocol::Scope::Folder(&folder), p)
+            .await
+            .map(Answer::KeyChecked),
         Effect::RefreshProviders => connection
             .call_async(
                 protocol::Scope::Folder(&folder),
@@ -1726,6 +1733,11 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                         setup.step = ModelSetupStep::ConfirmTest;
                     }
                 }
+                Effect::CheckKey(_) => {
+                    if let Some(setup) = &mut model.model_setup {
+                        setup.step = ModelSetupStep::ApiKey;
+                    }
+                }
                 _ => {}
             }
             if done.form.is_some() {
@@ -1874,6 +1886,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                     }));
                 }
             }
+            Answer::KeyChecked(check) => backend_features::key_checked(model, check),
             Answer::Providers(catalogue) => {
                 peer.models.providers = catalogue.providers;
                 peer.models.revision = catalogue.revision;

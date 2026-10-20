@@ -1665,20 +1665,30 @@ pub fn setup_credential(
     allow_other_provider: bool,
 ) -> Result<String> {
     let credential = deployment_credential(profile, supplied)?;
-    let typed = supplied.is_some_and(|value| !value.trim().is_empty());
-    if typed && !allow_other_provider {
-        let catalogue = providers::catalogue::snapshot();
-        if let Some((here, owner)) =
-            providers::keys::owner_elsewhere(&credential, &profile.base_url, &catalogue.providers)
-        {
-            anyhow::bail!(
-                "This key looks like it belongs to {}, so it was not sent to {}.",
-                owner.name,
-                here.name
-            );
-        }
+    if supplied.is_some_and(|value| !value.trim().is_empty()) {
+        check_model_key(&profile.base_url, &credential, allow_other_provider)?;
     }
     Ok(credential)
+}
+
+/// Every route that takes a model key refuses one that surely belongs to another provider, unless the user insists.
+pub fn check_model_key(server: &str, key: &str, allow_other_provider: bool) -> Result<()> {
+    match key_for_other_provider(server, key) {
+        Some(reason) if !allow_other_provider => anyhow::bail!(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Why a key would be held back at this server, in the words every surface shows.
+pub fn key_for_other_provider(server: &str, key: &str) -> Option<String> {
+    let catalogue = providers::catalogue::snapshot();
+    let key = normalize_api_key(key);
+    providers::keys::owner_elsewhere(&key, server, &catalogue.providers).map(|(here, owner)| {
+        format!(
+            "This key looks like it belongs to {}, so it was not sent to {}.",
+            owner.name, here.name
+        )
+    })
 }
 
 pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {

@@ -104,3 +104,22 @@ impl Command for TestModel {
     const SCOPE: ScopeKind = ScopeKind::Folder;
     type Output = ModelTestResult;
 }
+
+/// Read a key's opening letters before it is used at `base_url`; nothing is sent or kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckModelKey {
+    pub base_url: String,
+    pub key: crate::Secret,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelKeyCheck {
+    /// Why the key would be held back: it looks like another provider's.
+    pub held_back: Option<String>,
+    /// Shown, but the key may still be used (an organisation admin key).
+    pub warning: Option<String>,
+}
+impl Command for CheckModelKey {
+    const METHOD: &'static str = "application.models.check_key";
+    const SCOPE: ScopeKind = ScopeKind::Folder;
+    type Output = ModelKeyCheck;
+}

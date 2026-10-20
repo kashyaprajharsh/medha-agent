@@ -119,6 +119,14 @@ async fn provider_setup_searches_pasted_text_resolves_parameters_and_keeps_secre
     );
     input::handle_paste(&mut f.model, "dummy-secret".into());
     setup_enter(&mut f.model);
+    // The typed key is read first, for the address it will be used at.
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::CheckKey(check) if check.key.0 == "dummy-secret" && check.base_url.ends_with("my-account/ai/v1"))
+    );
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::KeyChecked(protocol::ModelKeyCheck::default())),
+    );
     assert!(
         matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::Discover(discover) if discover.key.0 == "dummy-secret" && discover.auth == Some(protocol::ModelAuth::Bearer))
     );
@@ -913,6 +921,76 @@ async fn returned_text_never_changes_an_open_secret_form() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_held_back_goes_out_only_after_the_user_types_use() {
+    let mut f = fixture().await;
+    let mut setup = ModelSetup::new();
+    setup.base_url = "https://api.openai.com/v1".into();
+    setup.auth = Some(protocol::ModelAuth::Bearer);
+    setup.step = ModelSetupStep::ApiKey;
+    f.model.model_setup = Some(setup);
+    let reason = "This key looks like it belongs to OpenRouter, so it was not sent to OpenAI.";
+    let held = |f: &mut Fixture| {
+        input::handle_paste(&mut f.model, "sk-or-v1-abc".into());
+        setup_enter(&mut f.model);
+        let check = protocol::ModelKeyCheck {
+            held_back: Some(reason.into()),
+            warning: None,
+        };
+        finish_setup_request(f, Ok(Answer::KeyChecked(check)));
+    };
+    let sent = |f: &Fixture| {
+        f.model
+            .remote
+            .as_ref()
+            .unwrap()
+            .pending
+            .iter()
+            .any(|pending| matches!(pending.effect, Effect::Discover(_) | Effect::Change(..)))
+    };
+
+    held(&mut f);
+    assert!(
+        f.model
+            .model_setup
+            .as_ref()
+            .unwrap()
+            .prompt()
+            .starts_with(reason)
+    );
+    assert!(!sent(&f), "a held-back key went out");
+    setup_enter(&mut f.model);
+    let form = f.model.model_setup.as_ref().unwrap();
+    assert!(matches!(form.step, ModelSetupStep::ApiKey) && form.api_key.is_empty());
+
+    held(&mut f);
+    input::handle_paste(&mut f.model, "use".into());
+    setup_enter(&mut f.model);
+    let pending = &mut f.model.remote.as_mut().unwrap().pending;
+    let Some(Pending {
+        effect: Effect::Discover(found),
+        ..
+    }) = pending.pop_back()
+    else {
+        panic!("the key was not used after use");
+    };
+    assert_eq!(
+        (found.key.0.as_str(), found.allow_other_provider),
+        ("sk-or-v1-abc", true)
+    );
+    // The choice is the user's for this form: the save carries it too.
+    backend_features::finish_model_setup(&mut f.model);
+    let pending = &mut f.model.remote.as_mut().unwrap().pending;
+    let Some(Pending {
+        effect: Effect::Change(protocol::ChangeResource::SaveModel(draft), _),
+        ..
+    }) = pending.pop_back()
+    else {
+        panic!("the model was not saved");
+    };
+    assert!(draft.allow_other_provider);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_a_form_before_its_save_finishes_cannot_activate_that_profile() {
     let mut f = fixture().await;
     f.model.model_setup = Some(ModelSetup::new());
@@ -928,6 +1006,7 @@ async fn closing_a_form_before_its_save_finishes_cannot_activate_that_profile() 
             model: "m".into(),
             context_limit: None,
             key: None,
+            allow_other_provider: false,
         }),
         After::Models,
     );
@@ -1105,9 +1184,22 @@ async fn the_key_list_adds_one_more_key_or_forgets_the_one_chosen() {
     assert_eq!(form.base_url, "https://a.example/v1");
     input::handle_paste(&mut f.model, "dummy-second-key".into());
     setup_enter(&mut f.model);
+    // The key is read first; a clean read sends it on as one more key.
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::KeyChecked(protocol::ModelKeyCheck::default())),
+    );
     let pending = &mut f.model.remote.as_mut().unwrap().pending;
     let Some(Pending {
-        effect: Effect::Change(protocol::ChangeResource::AddModelKey { name, key }, _),
+        effect:
+            Effect::Change(
+                protocol::ChangeResource::AddModelKey {
+                    name,
+                    key,
+                    allow_other_provider: false,
+                },
+                _,
+            ),
         ..
     }) = pending.pop_back()
     else {

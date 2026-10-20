@@ -137,7 +137,7 @@ async fn test_model(draft: protocol::ModelDraft) -> Result<Value, String> {
     let credential = config::setup_credential(
         &profile,
         draft.key.as_ref().map(|key| key.0.as_str()),
-        false,
+        draft.allow_other_provider,
     )
     .map_err(|error| error.to_string())?;
     encoded(providers::model_test::test(&profile, &credential).await)
@@ -552,7 +552,7 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
             let value = preferences(
                 workspace,
                 "settings.model.save",
-                json!({"name": draft.name, "profile": profile, "key": draft.key}),
+                json!({"name": draft.name, "profile": profile, "key": draft.key, "allow_other_provider": draft.allow_other_provider}),
             )
             .await?;
             return Ok(Reply::ModelSaved {
@@ -566,12 +566,17 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
         Change::SetDefaultModel { name } => ("settings.model.default", json!({"name": name})),
         Change::RemoveModel { name } => ("settings.model.remove", json!({"name": name})),
         Change::SetFallback { names } => ("settings.fallback.save", json!({"names": names})),
-        Change::UpdateModelKey { name, key } => {
+        Change::UpdateModelKey {
+            name,
+            key,
+            allow_other_provider,
+        } => {
             config::edit(|cfg| {
                 let profile = cfg
                     .models
                     .get_mut(&name)
                     .ok_or_else(|| anyhow::anyhow!("No saved model named {name}"))?;
+                config::check_model_key(&profile.base_url, &key.0, allow_other_provider)?;
                 config::store_key(&profile.base_url, &key.0)?;
                 if !profile.auth.requires_credential() {
                     profile.auth = providers::AuthKind::for_protocol(profile.protocol);
@@ -585,9 +590,13 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
             });
         }
         // Extra keys go through the same settings methods the desktop's Keys page uses.
-        Change::AddModelKey { name, key } => (
+        Change::AddModelKey {
+            name,
+            key,
+            allow_other_provider,
+        } => (
             "settings.keys.set",
-            json!({"group": "model", "id": server_of(&name)?, "key": key, "add": true}),
+            json!({"group": "model", "id": server_of(&name)?, "key": key, "add": true, "allow_other_provider": allow_other_provider}),
         ),
         Change::RemoveModelKey { name, slot } => (
             "settings.keys.remove",
@@ -778,6 +787,21 @@ pub(crate) async fn folder<L: EventLog>(
             Ok(request) => test_model(request.draft).await,
             Err(error) => Err(error),
         },
+        "application.models.check_key" => match decoded::<protocol::CheckModelKey>(params) {
+            Ok(request) => {
+                let key = config::normalize_api_key(&request.key.0);
+                let catalogue = providers::catalogue::snapshot();
+                let admin = matches!(
+                    providers::keys::recognise(&key, &catalogue.providers),
+                    providers::keys::Recognised::Admin(_)
+                );
+                encoded(protocol::ModelKeyCheck {
+                    held_back: config::key_for_other_provider(&request.base_url, &key),
+                    warning: admin.then(|| providers::keys::ADMIN_WARNING.to_owned()),
+                })
+            }
+            Err(error) => Err(error),
+        },
         "application.image" => match decoded::<protocol::ReadWorkspaceImage>(params) {
             Ok(request) => {
                 crate::chat_history::read_image(artifacts, request.hash, request.thumbnail)
@@ -808,11 +832,13 @@ pub(crate) async fn folder<L: EventLog>(
                     model: "discovery".into(),
                     context_limit: None,
                     key: Some(request.key.clone()),
+                    allow_other_provider: request.allow_other_provider,
                 });
+                let allow = request.allow_other_provider;
                 match profile {
                     Ok(profile) => {
                         let credential =
-                            match config::setup_credential(&profile, Some(&request.key.0), false) {
+                            match config::setup_credential(&profile, Some(&request.key.0), allow) {
                                 Ok(key) => key,
                                 Err(error) => return Some(Err(error.to_string())),
                             };

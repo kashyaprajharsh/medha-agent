@@ -641,12 +641,6 @@ fn advance_model_setup(model: &mut Model) {
             let name = profile.clone();
             Some(Change::SetModelCertificate { name, file })
         }
-        (ModelSetupMode::UpdateKey { profile }, ModelSetupStep::ApiKey)
-            if setup.extra_key && !value.is_empty() =>
-        {
-            let (name, key) = (profile.clone(), protocol::Secret(value.clone()));
-            Some(Change::AddModelKey { name, key })
-        }
         _ => None,
     };
     if let Some(change) = aside {
@@ -678,18 +672,11 @@ fn advance_model_setup(model: &mut Model) {
             None
         }
         ModelSetupStep::ApiKey => {
-            if let ModelSetupMode::UpdateKey { profile } = &setup.mode {
+            if matches!(setup.mode, ModelSetupMode::UpdateKey { .. }) {
                 if value.is_empty() {
                     model.push_notice("An API key is required.");
                     return;
                 }
-                Some(Effect::Change(
-                    Change::UpdateModelKey {
-                        name: profile.clone(),
-                        key: protocol::Secret(value),
-                    },
-                    After::KeySaved(profile.clone()),
-                ))
             } else {
                 let key_saved = model.remote.as_ref().is_some_and(|peer| {
                     peer.models
@@ -707,17 +694,41 @@ fn advance_model_setup(model: &mut Model) {
                     model.push_notice("An API key is required for this provider.");
                     return;
                 }
-                setup.api_key = value;
-                setup.step = ModelSetupStep::Discovering;
-                Some(Effect::Discover(protocol::DiscoverModels {
-                    provider_id: setup.provider_id.clone(),
-                    auth: setup.auth,
-                    connection: setup.connection.clone(),
-                    protocol: model_protocol(setup.protocol),
-                    base_url: setup.base_url.clone(),
-                    key: protocol::Secret(setup.api_key.clone()),
-                }))
             }
+            setup.api_key = value;
+            // A blank key uses the saved one or none; a typed one is read before it is used.
+            if setup.api_key.is_empty() {
+                use_key(model);
+                return;
+            }
+            setup.step = ModelSetupStep::CheckingKey;
+            let check = protocol::CheckModelKey {
+                base_url: setup.base_url.clone(),
+                key: protocol::Secret(setup.api_key.clone()),
+            };
+            if !request(model, Effect::CheckKey(check))
+                && let Some(setup) = &mut model.model_setup
+            {
+                setup.step = ModelSetupStep::ApiKey;
+            }
+            return;
+        }
+        ModelSetupStep::OtherProviderKey if value.eq_ignore_ascii_case("use") => {
+            setup.allow_other_provider = true;
+            use_key(model);
+            return;
+        }
+        ModelSetupStep::OtherProviderKey if value.is_empty() => {
+            setup.api_key.clear();
+            setup.held_back = None;
+            setup.step = ModelSetupStep::ApiKey;
+            return;
+        }
+        ModelSetupStep::OtherProviderKey => {
+            model.push_notice(
+                "Type use to send this key anyway, or leave blank to enter another key.",
+            );
+            return;
         }
         ModelSetupStep::ModelId if !value.is_empty() => {
             setup.model = value;
@@ -760,6 +771,7 @@ fn advance_model_setup(model: &mut Model) {
             return;
         }
         ModelSetupStep::Discovering
+        | ModelSetupStep::CheckingKey
         | ModelSetupStep::Saving
         | ModelSetupStep::Activating
         | ModelSetupStep::Resolving
@@ -792,6 +804,82 @@ fn advance_model_setup(model: &mut Model) {
         model.clear_edited();
     }
 }
+/// The backend has read the typed key: ask when it looks like another provider's, else use it.
+pub(super) fn key_checked(model: &mut Model, check: protocol::ModelKeyCheck) {
+    if !model
+        .model_setup
+        .as_ref()
+        .is_some_and(|setup| matches!(setup.step, ModelSetupStep::CheckingKey))
+    {
+        return;
+    }
+    if let Some(warning) = check.warning {
+        model.push_notice(warning);
+    }
+    let setup = model.model_setup.as_mut().expect("setup");
+    match check.held_back {
+        Some(reason) => {
+            setup.held_back = Some(reason);
+            setup.step = ModelSetupStep::OtherProviderKey;
+            model.clear_edited();
+        }
+        None => use_key(model),
+    }
+}
+/// Send the key where this form was going: discovery, a replaced key, or one more key.
+fn use_key(model: &mut Model) {
+    let Some(setup) = model.model_setup.as_mut() else {
+        return;
+    };
+    let allow_other_provider = setup.allow_other_provider;
+    let key = protocol::Secret(setup.api_key.clone());
+    let effect = match &setup.mode {
+        ModelSetupMode::UpdateKey { profile } if setup.extra_key => {
+            let name = profile.clone();
+            let change = Change::AddModelKey {
+                name,
+                key,
+                allow_other_provider,
+            };
+            if request(model, Effect::Change(change, After::Models)) {
+                model.model_setup = None;
+            } else if let Some(setup) = &mut model.model_setup {
+                setup.step = ModelSetupStep::ApiKey;
+            }
+            return;
+        }
+        ModelSetupMode::UpdateKey { profile } => {
+            let name = profile.clone();
+            setup.step = ModelSetupStep::Saving;
+            let change = Change::UpdateModelKey {
+                name: name.clone(),
+                key,
+                allow_other_provider,
+            };
+            Effect::Change(change, After::KeySaved(name))
+        }
+        _ => {
+            setup.step = ModelSetupStep::Discovering;
+            Effect::Discover(protocol::DiscoverModels {
+                provider_id: setup.provider_id.clone(),
+                auth: setup.auth,
+                connection: setup.connection.clone(),
+                protocol: model_protocol(setup.protocol),
+                base_url: setup.base_url.clone(),
+                key,
+                allow_other_provider,
+            })
+        }
+    };
+    let saving_key = matches!(setup.step, ModelSetupStep::Saving);
+    if !request(model, effect) {
+        if let Some(setup) = &mut model.model_setup {
+            setup.step = ModelSetupStep::ApiKey;
+        }
+    } else if !saving_key {
+        model.clear_edited();
+    }
+}
 pub(super) fn finish_model_setup(model: &mut Model) {
     let Some(setup) = model.model_setup.as_ref() else {
         return;
@@ -821,6 +909,7 @@ fn setup_draft(setup: &ModelSetup) -> protocol::ModelDraft {
         model: setup.model.clone(),
         context_limit: setup.max_ctx,
         key: (!setup.api_key.is_empty()).then(|| protocol::Secret(setup.api_key.clone())),
+        allow_other_provider: setup.allow_other_provider,
     }
 }
 pub(super) fn model_protocol(protocol: kernel::Protocol) -> protocol::ModelProtocol {

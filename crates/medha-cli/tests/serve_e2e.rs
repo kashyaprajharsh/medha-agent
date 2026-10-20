@@ -1365,6 +1365,7 @@ async fn typed_application_resources_preserve_credentials_and_reject_stale_grant
         model: "test-model".into(),
         context_limit: Some(128000),
         key: Some(protocol::Secret("sk-zz-saved".into())),
+        allow_other_provider: false,
     });
     let reply = client
         .about(
@@ -1713,6 +1714,7 @@ async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_bef
         model: "fixture-model".into(),
         context_limit: Some(8000),
         key: None,
+        allow_other_provider: false,
     };
     let missing_key = client
         .about(

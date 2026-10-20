@@ -87,12 +87,19 @@ pub(crate) fn set(cfg: &config::Config, params: &Value) -> Result<()> {
     if key.is_empty() {
         bail!("Paste the key first");
     }
+    let allow = params["allow_other_provider"] == true;
     match params["group"].as_str() {
         // Another key for the same server, tried after the ones already saved.
         Some("model") if params["add"] == true => {
-            runtime::key_pool::add(endpoint(cfg, id)?, key).map(|_| ())
+            let server = endpoint(cfg, id)?;
+            config::check_model_key(server, key, allow)?;
+            runtime::key_pool::add(server, key).map(|_| ())
         }
-        Some("model") => config::store_key(endpoint(cfg, id)?, key),
+        Some("model") => {
+            let server = endpoint(cfg, id)?;
+            config::check_model_key(server, key, allow)?;
+            config::store_key(server, key)
+        }
         Some("search") => config::store_key(search_id(id)?, key),
         Some("mcp") => {
             let server = cfg

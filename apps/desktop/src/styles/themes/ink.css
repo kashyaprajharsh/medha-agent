@@ -16,6 +16,9 @@
   --gold: #dfb46c;
   --gold-hi: #efcd90;
   --gold-ink: #16171b;
+  /* OpenAI's Continue with ChatGPT button: light on a dark theme. */
+  --plan-bg: #f4f4f2;
+  --plan-ink: #0d0d0d;
   --gold-wash: rgba(223, 180, 108, 0.12);
   --glint: rgba(239, 205, 144, 0.5);
   --code: #dbc090;

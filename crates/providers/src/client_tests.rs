@@ -271,31 +271,36 @@ mod count_tokens_tests {
         );
     }
 
-    /// Text the think-tag filter still holds reaches the reader before the stall error.
+    /// Text the think-tag filter still holds reaches the reader before the error,
+    /// whether the server goes quiet or closes mid-reply.
     #[tokio::test]
-    async fn a_stall_delivers_held_back_text_before_the_error() {
-        let address = serve_then_hold(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"},\"finish_reason\":null}]}\n\n",
-        )
-        .await;
-        let provider = chat_client(format!("http://{address}/v1"), "key", "m");
-        provider
-            .connection
-            .lock()
-            .unwrap()
-            .profile
-            .stream_idle_seconds = Some(1);
-        let context = CompiledContext {
-            model: "m".into(),
-            messages: vec![Message::user("hi")],
-            ordered: None,
-            tools: Vec::new(),
-        };
-        let mut items = drain(provider.stream(&context).await.unwrap()).await;
-        let error = items.pop().unwrap().unwrap_err();
-        assert!(error.is_stream_stall(), "{error:?}");
-        let blocks: Vec<_> = items.into_iter().map(Result::unwrap).collect();
-        assert_eq!(spoken(&blocks), "<thi");
+    async fn held_back_text_arrives_before_a_stall_or_cut_off_error() {
+        const HELD: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"},\"finish_reason\":null}]}\n\n";
+        let closing =
+            crate::test_http::Server::scripted(vec![crate::test_http::Response::sse(HELD)]);
+        let quiet = format!("http://{}", serve_then_hold(HELD).await);
+        let closing = closing.await;
+        for (url, stalls) in [(quiet, true), (closing.url.clone(), false)] {
+            let provider = chat_client(format!("{url}/v1"), "key", "m");
+            provider
+                .connection
+                .lock()
+                .unwrap()
+                .profile
+                .stream_idle_seconds = Some(1);
+            let context = CompiledContext {
+                model: "m".into(),
+                messages: vec![Message::user("hi")],
+                ordered: None,
+                tools: Vec::new(),
+            };
+            let mut items = drain(provider.stream(&context).await.unwrap()).await;
+            let error = items.pop().unwrap().unwrap_err();
+            assert_eq!(error.is_stream_stall(), stalls, "{error:?}");
+            let blocks: Vec<_> = items.into_iter().map(Result::unwrap).collect();
+            assert_eq!(spoken(&blocks), "<thi", "stalls: {stalls}");
+        }
     }
 
     /// A deployment that ignores `stream: true` and answers with one ordinary

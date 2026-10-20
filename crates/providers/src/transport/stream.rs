@@ -101,6 +101,9 @@ pub(crate) async fn read<D: StreamDecoder>(
             }
             return;
         }
+        if let Some(block) = decoder.flush_pending() {
+            yield Ok(block);
+        }
         match decoder.finish() {
             Ok(blocks) => for block in blocks { yield Ok(block); },
             Err(error) => yield Err(error),

@@ -1658,6 +1658,29 @@ pub fn deployment_credential(
     Ok(credential)
 }
 
+/// A key typed during setup is refused before any request when it surely belongs to another known provider.
+pub fn setup_credential(
+    profile: &providers::ProviderProfile,
+    supplied: Option<&str>,
+    allow_other_provider: bool,
+) -> Result<String> {
+    let credential = deployment_credential(profile, supplied)?;
+    let typed = supplied.is_some_and(|value| !value.trim().is_empty());
+    if typed && !allow_other_provider {
+        let catalogue = providers::catalogue::snapshot();
+        if let Some((here, owner)) =
+            providers::keys::owner_elsewhere(&credential, &profile.base_url, &catalogue.providers)
+        {
+            anyhow::bail!(
+                "This key looks like it belongs to {}, so it was not sent to {}.",
+                owner.name,
+                here.name
+            );
+        }
+    }
+    Ok(credential)
+}
+
 pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
     resolve_keyed(cfg, name, api_key, false)
 }

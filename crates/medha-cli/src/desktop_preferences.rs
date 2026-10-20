@@ -264,6 +264,13 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
                 serde_json::from_value(params["profile"].clone())?;
             profile.validate().map_err(anyhow::Error::msg)?;
             let key = params["key"].as_str().filter(|key| !key.trim().is_empty());
+            if let Some(key) = key {
+                config::setup_credential(
+                    &profile,
+                    Some(key),
+                    params["allow_other_provider"] == true,
+                )?;
+            }
             let given = params["name"]
                 .as_str()
                 .filter(|name| !name.trim().is_empty());
@@ -720,7 +727,8 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
         "settings.model.discover" => {
             let profile: config::ProviderConfig =
                 serde_json::from_value(params["profile"].clone())?;
-            let credential = config::deployment_credential(&profile, params["key"].as_str())?;
+            let allow = params["allow_other_provider"] == true;
+            let credential = config::setup_credential(&profile, params["key"].as_str(), allow)?;
             let models =
                 providers::discovery::list_models_for_profile(&profile, &credential).await?;
             Ok(
@@ -748,7 +756,8 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             let profile: config::ProviderConfig =
                 serde_json::from_value(params["profile"].clone())?;
             profile.validate().map_err(anyhow::Error::msg)?;
-            let credential = config::deployment_credential(&profile, params["key"].as_str())?;
+            let allow = params["allow_other_provider"] == true;
+            let credential = config::setup_credential(&profile, params["key"].as_str(), allow)?;
             Ok(serde_json::to_value(
                 providers::model_test::test(&profile, &credential).await,
             )?)

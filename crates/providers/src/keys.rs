@@ -58,6 +58,35 @@ pub fn recognise<'a>(key: &str, providers: &'a [ProviderRecord]) -> Recognised<'
     }
 }
 
+/// When `address` is a known provider's own and the key surely belongs to another: (here, owner).
+pub fn owner_elsewhere<'a>(
+    key: &str,
+    address: &str,
+    providers: &'a [ProviderRecord],
+) -> Option<(&'a ProviderRecord, &'a ProviderRecord)> {
+    let (Recognised::One(owner) | Recognised::Admin(owner)) = recognise(key, providers) else {
+        return None;
+    };
+    let address = comparable(address);
+    let here: Vec<_> = providers
+        .iter()
+        .filter(|provider| {
+            provider
+                .url
+                .as_deref()
+                .is_some_and(|url| comparable(url) == address)
+        })
+        .collect();
+    if here.iter().any(|provider| provider.id == owner.id) {
+        return None;
+    }
+    here.first().map(|first| (*first, owner))
+}
+
+fn comparable(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
 #[cfg(test)]
 #[path = "keys_tests.rs"]
 mod tests;

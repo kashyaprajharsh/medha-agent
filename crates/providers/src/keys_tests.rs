@@ -52,6 +52,31 @@ fn a_key_is_never_offered_to_a_provider_that_does_not_own_its_opening() {
 }
 
 #[test]
+fn a_key_is_held_back_only_at_another_known_providers_own_address() {
+    let providers = shipped();
+    let held = |key, address| {
+        owner_elsewhere(key, address, &providers)
+            .map(|(here, owner)| format!("{}<-{}", here.id, owner.id))
+    };
+    assert_eq!(
+        held("sk-or-v1-abc", " HTTPS://api.openai.com/v1/"),
+        Some("openai<-openrouter".into())
+    );
+    assert_eq!(
+        held("sk-admin-abc", "https://api.deepseek.com"),
+        Some("deepseek<-openai".into())
+    );
+    for (key, address) in [
+        ("sk-or-v1-abc", "https://openrouter.ai/api/v1"),
+        ("sk-or-v1-abc", "https://proxy.example/v1"),
+        ("sk-abc", "https://api.deepseek.com"),
+        ("a1b2c3", "https://api.openai.com/v1"),
+    ] {
+        assert_eq!(held(key, address), None, "{key} at {address}");
+    }
+}
+
+#[test]
 fn every_provider_in_the_table_is_in_the_shipped_catalogue() {
     let providers = shipped();
     for (prefix, owners) in PREFIXES {

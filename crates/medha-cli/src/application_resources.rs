@@ -134,9 +134,12 @@ fn draft_profile(draft: &protocol::ModelDraft) -> Result<providers::ProviderProf
 
 async fn test_model(draft: protocol::ModelDraft) -> Result<Value, String> {
     let profile = draft_profile(&draft)?;
-    let credential =
-        config::deployment_credential(&profile, draft.key.as_ref().map(|key| key.0.as_str()))
-            .map_err(|error| error.to_string())?;
+    let credential = config::setup_credential(
+        &profile,
+        draft.key.as_ref().map(|key| key.0.as_str()),
+        false,
+    )
+    .map_err(|error| error.to_string())?;
     encoded(providers::model_test::test(&profile, &credential).await)
 }
 
@@ -809,7 +812,7 @@ pub(crate) async fn folder<L: EventLog>(
                 match profile {
                     Ok(profile) => {
                         let credential =
-                            match config::deployment_credential(&profile, Some(&request.key.0)) {
+                            match config::setup_credential(&profile, Some(&request.key.0), false) {
                                 Ok(key) => key,
                                 Err(error) => return Some(Err(error.to_string())),
                             };

@@ -157,6 +157,42 @@ fn of_several_saves_made_from_the_same_text_one_is_kept_and_the_rest_are_told() 
 }
 
 #[test]
+fn a_key_for_another_provider_is_neither_sent_nor_saved_unless_the_user_insists() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut bridge = Bridge::start(&workspace, &home);
+    let profile = json!({"protocol": "open-ai-responses", "base_url": "https://api.openai.com/v1", "model": "gpt-x", "auth": "bearer"});
+    let form = json!({"name": "mine", "profile": profile, "key": "sk-or-v1-abc"});
+
+    // Each answer comes before any request: a sent key would fail on the network or with 401 instead.
+    for method in [
+        "settings.model.discover",
+        "settings.model.test",
+        "settings.model.save",
+    ] {
+        let reply = bridge.call(method, form.clone());
+        assert_eq!(
+            reply["error"],
+            "This key looks like it belongs to OpenRouter, so it was not sent to OpenAI.",
+            "{method}: {reply}"
+        );
+    }
+    assert_eq!(bridge.ok("settings.list", json!({}))["models"], json!([]));
+
+    let mut insisted = form;
+    insisted["allow_other_provider"] = json!(true);
+    bridge.ok("settings.model.save", insisted);
+    let saved = &bridge.ok("settings.list", json!({}))["models"][0];
+    assert_eq!(
+        (&saved["name"], &saved["key_present"]),
+        (&json!("mine"), &json!(true))
+    );
+}
+
+#[test]
 fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("project");

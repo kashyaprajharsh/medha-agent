@@ -138,10 +138,19 @@ impl std::fmt::Debug for ModelDraft {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoveredModel {
     pub id: String,
     pub context_length: Option<u32>,
+    /// What the catalogue knows of it: display name, list price per million tokens, tool use.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub input_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub output_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

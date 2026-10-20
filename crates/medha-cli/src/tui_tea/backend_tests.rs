@@ -405,6 +405,7 @@ async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth
         Ok(Answer::Discovered(vec![protocol::DiscoveredModel {
             id: "new".into(),
             context_length: Some(16000),
+            ..Default::default()
         }])),
     );
     setup_enter(&mut f.model);

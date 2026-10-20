@@ -845,17 +845,7 @@ pub(crate) async fn folder<L: EventLog>(
                         providers::discovery::list_models_for_profile(&profile, &credential)
                             .await
                             .map_err(|e| e.to_string())
-                            .and_then(|models| {
-                                encoded(
-                                    models
-                                        .into_iter()
-                                        .map(|model| protocol::DiscoveredModel {
-                                            id: model.id,
-                                            context_length: model.context_length,
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                            })
+                            .and_then(|models| encoded(listed(&profile, &models)))
                     }
                     Err(error) => Err(error),
                 }
@@ -876,6 +866,42 @@ pub(crate) async fn folder<L: EventLog>(
         _ => return None,
     };
     Some(result)
+}
+
+/// Found models with what the catalogue knows of them: display name, list price and tool use.
+/// Every surface's discovery answers with these rows.
+pub(crate) fn listed(
+    profile: &config::ProviderConfig,
+    models: &[providers::discovery::ModelInfo],
+) -> Vec<protocol::DiscoveredModel> {
+    let catalogue = providers::catalogue::snapshot();
+    let record = profile
+        .provider_id
+        .as_deref()
+        .and_then(|id| catalogue.providers.iter().find(|record| record.id == id));
+    models
+        .iter()
+        .map(|model| {
+            let mut probe = profile.clone();
+            probe.model = model.id.clone();
+            let meta = catalogue
+                .entries
+                .get(&probe.catalogue_model_id().to_lowercase());
+            let name = record
+                .and_then(|record| record.models.iter().find(|listed| listed.id == model.id))
+                .map(|listed| listed.name.clone());
+            protocol::DiscoveredModel {
+                id: model.id.clone(),
+                context_length: model.context_length.or(meta.and_then(|meta| meta.context)),
+                name,
+                input_per_mtok: meta.and_then(|meta| meta.input_per_mtok),
+                output_per_mtok: meta.and_then(|meta| meta.output_per_mtok),
+                tools: meta
+                    .and_then(|meta| meta.capabilities.as_ref())
+                    .and_then(|caps| caps.tool_calls),
+            }
+        })
+        .collect()
 }
 
 /// A pasted key's provider, read from its opening letters; every surface asks this one function.

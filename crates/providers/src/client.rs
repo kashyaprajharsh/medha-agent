@@ -1,8 +1,8 @@
-//! OpenAI-compatible Chat Completions adapter over canonical kernel blocks.
+//! The one provider client: a saved profile's connection, keys and stand-ins.
 
 use crate::protocol::{gemini_interactions, openai_chat};
 use crate::transport::http;
-use crate::{AuthKind, ProviderProfile};
+use crate::{AuthKind, ProviderProfile, TokenCounter};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -12,11 +12,7 @@ use kernel::{
     ReasoningEffort, ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality,
     ToolCallStrategy,
 };
-use serde::Deserialize;
 use std::sync::Mutex;
-
-/// Compatibility export retained for existing configuration code.
-pub use crate::profile::TokenCounter as OpenAiTokenCounter;
 
 pub struct ProviderClient {
     /// Active connection is mutable between turns so an interactive surface can
@@ -42,10 +38,6 @@ pub struct ProviderClient {
 
 /// Every key saved for the server at this address, first to last.
 type KeySource = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
-
-/// Compatibility name retained while callers migrate to the protocol/profile
-/// client introduced by the provider refactor.
-pub type OpenAiCompat = ProviderClient;
 
 #[derive(Clone)]
 struct Connection {
@@ -378,28 +370,6 @@ impl ProviderClient {
         self
     }
 
-    pub fn with_max_output_tokens(self, tokens: u64) -> Self {
-        self.connection.lock().unwrap().profile.max_output_tokens = Some(tokens);
-        self
-    }
-
-    pub fn with_token_counter(self, counter: OpenAiTokenCounter) -> Self {
-        self.connection.lock().unwrap().profile.token_counter = counter;
-        self
-    }
-
-    pub fn with_token_accounting(self, mode: TokenAccountingMode) -> Self {
-        self.connection.lock().unwrap().profile.token_accounting = mode;
-        self
-    }
-
-    /// Pin the initial tool-calling strategy (from discovery or config) for
-    /// endpoints whose capability is known ahead of time.
-    pub fn with_tool_calls(mut self, strategy: ToolCallStrategy) -> Self {
-        self.caps.tool_calls = strategy;
-        self
-    }
-
     /// Set the initial reasoning config (from `medha.lock`), before wrapping
     /// in `Arc`. Equivalent to `set_reasoning` but chainable at construction.
     pub fn with_reasoning(self, config: ReasoningConfig) -> Result<Self, ProviderError> {
@@ -407,69 +377,7 @@ impl ProviderClient {
         Ok(self)
     }
 
-    /// Switch the active OpenAI-compatible connection. Safe callers invoke
-    /// this only between turns; [`Provider::stream`] snapshots the connection
-    /// before I/O so an already-running request is never retargeted midstream.
-    pub fn switch_connection(
-        &self,
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-    ) {
-        self.switch_connection_with_context(base_url, api_key, model, None);
-    }
-
-    /// Same as [`Self::switch_connection`], with the context limit discovered
-    /// or configured for the selected profile. This value feeds the kernel's
-    /// context compiler on the very next turn.
-    pub fn switch_connection_with_context(
-        &self,
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-        max_ctx: Option<u32>,
-    ) {
-        self.switch_connection_profile(
-            base_url,
-            api_key,
-            model,
-            max_ctx,
-            None,
-            OpenAiTokenCounter::None,
-            TokenAccountingMode::Adaptive,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn switch_connection_profile(
-        &self,
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-        max_ctx: Option<u32>,
-        max_output_tokens: Option<u64>,
-        token_counter: OpenAiTokenCounter,
-        accounting_mode: TokenAccountingMode,
-    ) {
-        let api_key = api_key.into();
-        let auth = if api_key.trim().is_empty() {
-            AuthKind::None
-        } else {
-            AuthKind::Bearer
-        };
-        let mut profile = ProviderProfile::openai_chat(base_url, model, auth);
-        profile.max_ctx = max_ctx;
-        profile.max_output_tokens = max_output_tokens;
-        profile.token_counter = token_counter;
-        profile.token_accounting = accounting_mode;
-        // Compatibility API retains its infallible signature. Values supplied
-        // through current callers are already validated by config resolution.
-        *self.connection.lock().unwrap() = Connection {
-            profile,
-            credential: api_key,
-        };
-    }
-
+    /// Switch between turns; a running stream keeps the connection it snapshotted.
     pub fn switch_provider_profile(
         &self,
         profile: ProviderProfile,
@@ -699,297 +607,6 @@ impl ProviderClient {
             request_fingerprint: request.request_fingerprint.clone(),
         })
     }
-}
-
-/// A model advertised by an endpoint, with whatever capability metadata the
-/// server chose to expose. `context_length` is `None` when the endpoint doesn't
-/// report it; it is never guessed.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    pub id: String,
-    pub context_length: Option<u32>,
-}
-
-/// Build a sibling OpenAI-compatible endpoint from either an API root
-/// (`…/v1`) or the full chat-completions URL copied from provider examples.
-/// Exact `/chat/completions` tails are removed before selecting a sibling such
-/// as `/models`, preventing duplicated paths like
-/// `/chat/completions/chat/completions`.
-fn openai_endpoint_url(base_url: &str, endpoint: &str) -> Result<String, ProviderError> {
-    let mut url = reqwest::Url::parse(base_url)
-        .map_err(|error| ProviderError::Decode(format!("invalid provider base URL: {error}")))?;
-    let original = url.path().trim_end_matches('/');
-    let root = original
-        .strip_suffix("/chat/completions")
-        .unwrap_or(original);
-    let path = if endpoint == "/chat/completions" && root != original {
-        original.to_string()
-    } else {
-        format!("{}{}", root.trim_end_matches('/'), endpoint)
-    };
-    url.set_path(&path);
-    Ok(url.to_string())
-}
-
-/// Discover the models an OpenAI-compatible endpoint serves via `GET /v1/models`.
-/// Accepts common spellings of the optional context-window field. Errors if the
-/// endpoint does not implement `/models` so callers can fall back to manual entry.
-pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, ProviderError> {
-    let auth = if api_key.trim().is_empty() {
-        AuthKind::None
-    } else {
-        AuthKind::Bearer
-    };
-    let profile = ProviderProfile::openai_chat(base_url, "model-discovery", auth);
-    list_models_for_profile(&profile, api_key).await
-}
-
-pub async fn list_models_for_profile(
-    profile: &ProviderProfile,
-    credential: &str,
-) -> Result<Vec<ModelInfo>, ProviderError> {
-    profile.validate().map_err(ProviderError::Decode)?;
-    if !matches!(
-        profile.protocol,
-        Protocol::OpenAiChat | Protocol::GeminiInteractions
-    ) {
-        return Err(ProviderError::Decode(format!(
-            "model discovery is not implemented for {}",
-            profile.protocol.as_str()
-        )));
-    }
-    if profile.auth.requires_credential() && credential.trim().is_empty() {
-        return Err(ProviderError::Decode(
-            "model discovery authentication requires a credential".into(),
-        ));
-    }
-    let url = match profile.protocol {
-        Protocol::OpenAiChat => openai_endpoint_url(&profile.base_url, "/models")?,
-        Protocol::GeminiInteractions => {
-            format!("{}/models", profile.base_url.trim_end_matches('/'))
-        }
-        Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
-    };
-    // Bounded timeout: this runs at startup before the UI paints, so a slow or
-    // unreachable endpoint must not hang the launch (it falls back gracefully).
-    let client = reqwest::Client::builder()
-        .user_agent(http::USER_AGENT)
-        .timeout(std::time::Duration::from_secs(6))
-        // Model discovery carries the credential too — see transport::http::client.
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-    let client = http::configured(client, profile)?;
-    let client = client
-        .build()
-        .map_err(|e| ProviderError::Transport(e.to_string()))?;
-    let discovery = async {
-        match profile.protocol {
-            Protocol::OpenAiChat => {
-                list_openai_chat_models(&client, &url, profile, credential).await
-            }
-            Protocol::GeminiInteractions => {
-                list_gemini_models(&client, &url, profile, credential).await
-            }
-            Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
-        }
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(15), discovery)
-        .await
-        .map_err(|_| ProviderError::ProgressTimeout { waited_secs: 15 })?
-}
-
-#[cfg(test)]
-#[path = "discovery_tests.rs"]
-mod discovery_tests;
-
-const DISCOVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
-const DISCOVERY_MAX_MODELS: usize = 10_000;
-const DISCOVERY_MAX_PAGES: usize = 16;
-
-async fn list_openai_chat_models(
-    client: &reqwest::Client,
-    url: &str,
-    profile: &ProviderProfile,
-    credential: &str,
-) -> Result<Vec<ModelInfo>, ProviderError> {
-    #[derive(Deserialize)]
-    struct ModelsResp {
-        data: Vec<ModelEntry>,
-    }
-    // Servers spell the context window differently, and some (e.g. Groq) report
-    // MORE than one of these keys at once. A serde field with `alias`es treats
-    // them as one field and errors on "duplicate field" when several are present,
-    // so read each independently and coalesce.
-    #[derive(Deserialize)]
-    struct ModelEntry {
-        id: String,
-        #[serde(default)]
-        context_length: Option<u32>,
-        #[serde(default)]
-        context_window: Option<u32>,
-        #[serde(default)]
-        max_model_len: Option<u32>,
-    }
-
-    let resp = http::with_profile(client.get(url), profile, credential)?
-        .send()
-        .await
-        .map_err(crate::transport::http::connection_failed)?;
-    let body = http::bounded_body(http::require_success(resp).await?, DISCOVERY_MAX_BYTES).await?;
-    let parsed: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
-        ProviderError::Decode(
-            "The server returned an invalid model list; enter a model ID manually.".into(),
-        )
-    })?;
-    if parsed.data.len() > DISCOVERY_MAX_MODELS {
-        return Err(ProviderError::Decode(
-            "model discovery returned too many models".into(),
-        ));
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut models = Vec::new();
-    for model in parsed.data {
-        validate_discovered_id(&model.id)?;
-        if seen.insert(model.id.clone()) {
-            models.push(ModelInfo {
-                id: model.id,
-                context_length: model
-                    .context_length
-                    .or(model.context_window)
-                    .or(model.max_model_len)
-                    .filter(|limit| *limit > 0),
-            });
-        }
-    }
-    Ok(models)
-}
-
-fn validate_discovered_id(id: &str) -> Result<(), ProviderError> {
-    if id.trim().is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
-        return Err(ProviderError::Decode(
-            "The server returned an invalid model ID; enter one manually.".into(),
-        ));
-    }
-    Ok(())
-}
-
-async fn list_gemini_models(
-    client: &reqwest::Client,
-    url: &str,
-    profile: &ProviderProfile,
-    credential: &str,
-) -> Result<Vec<ModelInfo>, ProviderError> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct ModelsResp {
-        #[serde(default)]
-        models: Vec<ModelEntry>,
-        next_page_token: Option<String>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct ModelEntry {
-        name: String,
-        base_model_id: Option<String>,
-        input_token_limit: Option<u32>,
-        #[serde(default)]
-        supported_generation_methods: Vec<String>,
-    }
-
-    let mut page_token: Option<String> = None;
-    let mut models = std::collections::BTreeMap::<String, Option<u32>>::new();
-    // Google currently permits up to 1000 entries per page. Keep pagination
-    // bounded and reject a repeated token instead of looping on a malformed
-    // upstream response.
-    let mut seen_tokens = std::collections::HashSet::new();
-    let mut pages = 0;
-    let mut remaining = DISCOVERY_MAX_BYTES;
-    let mut received_models = 0usize;
-    loop {
-        pages += 1;
-        if pages > DISCOVERY_MAX_PAGES {
-            return Err(ProviderError::Decode(
-                "Gemini model discovery exceeded 16 pages".into(),
-            ));
-        }
-        let mut request = client.get(url).query(&[("pageSize", "1000")]);
-        if let Some(token) = page_token.as_deref() {
-            request = request.query(&[("pageToken", token)]);
-        }
-        let resp = http::with_profile(request, profile, credential)?
-            .send()
-            .await
-            .map_err(crate::transport::http::connection_failed)?;
-        let body = http::bounded_body(http::require_success(resp).await?, remaining).await?;
-        remaining -= body.len();
-        let page: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
-            ProviderError::Decode("The server returned an invalid Gemini model list.".into())
-        })?;
-        received_models = received_models.saturating_add(page.models.len());
-        if received_models > DISCOVERY_MAX_MODELS {
-            return Err(ProviderError::Decode(
-                "Gemini model discovery returned too many models".into(),
-            ));
-        }
-
-        for model in page.models {
-            // The Models API also returns embedding-only models. When methods
-            // are advertised, exclude entries that have no generative action.
-            // An empty methods list remains visible because absence is unknown,
-            // not proof that Interactions is unsupported.
-            let generative = model.supported_generation_methods.is_empty()
-                || model.supported_generation_methods.iter().any(|method| {
-                    matches!(
-                        method.to_ascii_lowercase().as_str(),
-                        "generatecontent" | "predict" | "interactions" | "createinteraction"
-                    )
-                });
-            if !generative {
-                continue;
-            }
-            let id = model
-                .base_model_id
-                .filter(|id| !id.trim().is_empty())
-                .unwrap_or_else(|| {
-                    model
-                        .name
-                        .strip_prefix("models/")
-                        .unwrap_or(&model.name)
-                        .to_string()
-                });
-            if !id.is_empty() {
-                validate_discovered_id(&id)?;
-                models
-                    .entry(id)
-                    .and_modify(|limit| {
-                        if limit.is_none() {
-                            *limit = model.input_token_limit.filter(|limit| *limit > 0);
-                        }
-                    })
-                    .or_insert(model.input_token_limit.filter(|limit| *limit > 0));
-            }
-        }
-
-        let Some(token) = page.next_page_token.filter(|token| !token.is_empty()) else {
-            break;
-        };
-        if token.len() > 4096 {
-            return Err(ProviderError::Decode(
-                "Gemini model discovery returned an oversized page token".into(),
-            ));
-        }
-        if !seen_tokens.insert(token.clone()) {
-            return Err(ProviderError::Decode(
-                "Gemini model discovery returned a repeated page token".into(),
-            ));
-        }
-        page_token = Some(token);
-    }
-
-    Ok(models
-        .into_iter()
-        .map(|(id, context_length)| ModelInfo { id, context_length })
-        .collect())
 }
 
 /// vLLM's `/tokenize` lives at the server root, a sibling of `/v1` — not under
@@ -1339,8 +956,8 @@ impl Provider for ProviderClient {
     ) -> Result<Option<InputTokenCount>, TokenCountError> {
         let counter = self.connection.lock().unwrap().profile.token_counter;
         match counter {
-            OpenAiTokenCounter::None => Ok(None),
-            OpenAiTokenCounter::Vllm => self.count_vllm(request).await.map(Some),
+            TokenCounter::None => Ok(None),
+            TokenCounter::Vllm => self.count_vllm(request).await.map(Some),
         }
     }
 
@@ -1478,7 +1095,7 @@ impl Provider for ProviderClient {
             .get("stream")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        let url = openai_endpoint_url(&connection.profile.base_url, "/chat/completions")?;
+        let url = openai_chat::endpoint_url(&connection.profile.base_url, "/chat/completions")?;
 
         // Direct proof of what actually goes over the wire — no guessing, no
         // separate curl experiment needed. Set MEDHA_DEBUG_HTTP=1 to see the
@@ -1615,5 +1232,5 @@ fn wire_name_map(canonical: &[String]) -> std::collections::HashMap<String, Stri
 }
 
 #[cfg(test)]
-#[path = "openai_compat_tests.rs"]
+#[path = "client_tests.rs"]
 mod tests;

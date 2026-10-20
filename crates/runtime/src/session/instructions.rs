@@ -10,7 +10,7 @@ pub(super) struct Discovered {
 
 pub(super) async fn discover(
     setup: &Setup<'_>,
-    provider: &Arc<OpenAiCompat>,
+    provider: &Arc<ProviderClient>,
     workspace: &Arc<WorkspaceSandbox>,
 ) -> Result<Discovered> {
     let Setup {

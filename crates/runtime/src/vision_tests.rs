@@ -53,7 +53,7 @@ async fn endpoint(replies: usize) -> (String, tokio::task::JoinHandle<Vec<serde_
 }
 
 fn auxiliary(address: &str) -> AuxiliaryVision {
-    let provider = providers::OpenAiCompat::new(address, "aux-key", "local/vision-model");
+    let provider = providers::ProviderClient::new(address, "aux-key", "local/vision-model");
     provider.set_streaming(false);
     AuxiliaryVision::new(provider)
 }

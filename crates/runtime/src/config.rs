@@ -1579,10 +1579,10 @@ fn auth_label(auth: providers::AuthKind) -> &'static str {
     auth.as_str()
 }
 
-fn parse_token_counter(value: &str) -> Result<providers::openai_compat::OpenAiTokenCounter> {
+fn parse_token_counter(value: &str) -> Result<providers::TokenCounter> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "vllm" => Ok(providers::openai_compat::OpenAiTokenCounter::Vllm),
-        "none" | "off" => Ok(providers::openai_compat::OpenAiTokenCounter::None),
+        "vllm" => Ok(providers::TokenCounter::Vllm),
+        "none" | "off" => Ok(providers::TokenCounter::None),
         other => anyhow::bail!("invalid MEDHA_TOKEN_COUNTER '{other}'; expected 'none' or 'vllm'"),
     }
 }
@@ -2336,7 +2336,7 @@ mod tests {
             headers: BTreeMap::new(),
             max_ctx: Some(16_384),
             max_output_tokens: None,
-            token_counter: providers::openai_compat::OpenAiTokenCounter::None,
+            token_counter: providers::TokenCounter::None,
             token_accounting: kernel::TokenAccountingMode::Adaptive,
             reasoning: kernel::ReasoningSupport::Unknown,
             reasoning_efforts: None,
@@ -2580,7 +2580,7 @@ mod tests {
         assert!(parse_headers("not-json").is_err());
         assert_eq!(
             parse_token_counter("vllm").unwrap(),
-            providers::openai_compat::OpenAiTokenCounter::Vllm
+            providers::TokenCounter::Vllm
         );
         assert!(parse_token_counter("guess").is_err());
         assert_eq!(

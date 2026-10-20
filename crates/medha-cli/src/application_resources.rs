@@ -816,7 +816,7 @@ pub(crate) async fn folder<L: EventLog>(
                                 Ok(key) => key,
                                 Err(error) => return Some(Err(error.to_string())),
                             };
-                        providers::openai_compat::list_models_for_profile(&profile, &credential)
+                        providers::discovery::list_models_for_profile(&profile, &credential)
                             .await
                             .map_err(|e| e.to_string())
                             .and_then(|models| {

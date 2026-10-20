@@ -721,7 +721,7 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
                 serde_json::from_value(params["profile"].clone())?;
             let credential = config::deployment_credential(&profile, params["key"].as_str())?;
             let models =
-                providers::openai_compat::list_models_for_profile(&profile, &credential).await?;
+                providers::discovery::list_models_for_profile(&profile, &credential).await?;
             Ok(
                 json!({"models": models.iter().map(|model| json!({"id": model.id, "context_length": model.context_length})).collect::<Vec<_>>() }),
             )

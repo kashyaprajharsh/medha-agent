@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct Input<'a> {
-    pub kernel: &'a Kernel<OpenAiCompat, store::SqliteLog>,
+    pub kernel: &'a Kernel<ProviderClient, store::SqliteLog>,
     pub session: &'a mut Session,
     pub model_profiles: &'a Arc<std::sync::Mutex<config::Config>>,
     pub known_tools: &'a std::collections::HashSet<String>,

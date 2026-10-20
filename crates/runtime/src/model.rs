@@ -5,11 +5,11 @@ use crate::reasoning::normalize_reasoning_on;
 use crate::{Notices, SessionOptions};
 use anyhow::Result;
 use kernel::Provider;
-use providers::OpenAiCompat;
+use providers::ProviderClient;
 use std::sync::Arc;
 
 pub struct Model {
-    pub provider: Arc<OpenAiCompat>,
+    pub provider: Arc<ProviderClient>,
     pub name: String,
     pub catalogue_pricing: Option<(f64, f64, Option<f64>, Option<f64>)>,
     pub profiles: Arc<std::sync::Mutex<config::Config>>,
@@ -33,8 +33,7 @@ pub async fn context_window(
             profile.protocol,
             kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
         )
-        && let Ok(models) =
-            providers::openai_compat::list_models_for_profile(profile, credential).await
+        && let Ok(models) = providers::discovery::list_models_for_profile(profile, credential).await
         && let Some(limit) = models
             .iter()
             .find(|model| model.id == profile.model)
@@ -198,9 +197,9 @@ pub async fn resolve(
     let credential = Some(resolved.credential.to_string()).filter(|key| !key.is_empty());
     let provider = if open_setup && runtime_profile.base_url.is_empty() {
         // Keep empty endpoints out of normal profile validation.
-        OpenAiCompat::unconfigured()
+        ProviderClient::unconfigured()
     } else {
-        OpenAiCompat::from_profile(runtime_profile, resolved.credential)
+        ProviderClient::from_profile(runtime_profile, resolved.credential)
             .map_err(|error| anyhow::anyhow!(error))?
     };
     // What servers show about their models is kept between sessions.

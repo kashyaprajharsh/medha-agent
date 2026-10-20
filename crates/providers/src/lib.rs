@@ -1,15 +1,16 @@
-//! Provider adapters; `openai_compat` is the baseline.
+//! Provider adapters; `client` sends any implemented protocol for a saved profile.
 
 pub mod catalogue;
 #[cfg(test)]
 mod certificate_tests;
+pub mod client;
+pub mod discovery;
 #[cfg(test)]
 mod fallback_tests;
 mod key_rotation;
 mod learned;
 pub mod model_test;
 pub mod models_dev;
-pub mod openai_compat;
 pub mod profile;
 pub mod prompt_cache;
 pub(crate) mod protocol;
@@ -21,8 +22,8 @@ mod schema_rules;
 mod test_http;
 pub(crate) mod transport;
 
+pub use client::ProviderClient;
 pub use models_dev::{
     CapabilityResolution, CapabilitySource, CapabilityState, ModalitySet, ModelCapabilities,
 };
-pub use openai_compat::{OpenAiCompat, ProviderClient};
 pub use profile::{AuthKind, ProviderProfile, TokenCounter};

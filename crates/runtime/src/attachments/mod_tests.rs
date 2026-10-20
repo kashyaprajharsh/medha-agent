@@ -192,7 +192,7 @@ async fn custom_chat_endpoint_receives_image_after_compaction_and_restart() {
     let log = Arc::new(kernel::InMemoryLog::new());
     let session = kernel::Session::new();
     let runtime = || {
-        let provider = providers::OpenAiCompat::new(
+        let provider = providers::ProviderClient::new(
             format!("http://{address}/custom/v1"),
             "fixture-key",
             "local/custom-vision-model",

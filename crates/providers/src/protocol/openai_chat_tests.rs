@@ -1192,3 +1192,27 @@ mod wire_tool_name_tests {
         );
     }
 }
+
+#[test]
+fn endpoint_accepts_api_root_or_full_chat_url() {
+    assert_eq!(
+        endpoint_url("https://integrate.api.nvidia.com/v1", "/chat/completions").unwrap(),
+        "https://integrate.api.nvidia.com/v1/chat/completions"
+    );
+    assert_eq!(
+        endpoint_url(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            "/chat/completions",
+        )
+        .unwrap(),
+        "https://integrate.api.nvidia.com/v1/chat/completions"
+    );
+    assert_eq!(
+        endpoint_url(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            "/models",
+        )
+        .unwrap(),
+        "https://integrate.api.nvidia.com/v1/models"
+    );
+}

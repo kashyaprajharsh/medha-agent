@@ -809,7 +809,7 @@ enum PickerKind {
     /// Models the endpoint reported during setup — pick one instead of typing
     /// an id blind. A trailing row keeps manual entry available.
     ModelDiscovery {
-        models: Vec<providers::openai_compat::ModelInfo>,
+        models: Vec<providers::discovery::ModelInfo>,
         query: String,
     },
     /// Saved provider/model profiles. Switching is available only while idle,
@@ -1678,9 +1678,9 @@ fn saved_deployment_matches<'a>(
 }
 
 fn discovered_matches<'a>(
-    models: &'a [providers::openai_compat::ModelInfo],
+    models: &'a [providers::discovery::ModelInfo],
     query: &str,
-) -> Vec<&'a providers::openai_compat::ModelInfo> {
+) -> Vec<&'a providers::discovery::ModelInfo> {
     let wanted = query.to_lowercase();
     models
         .iter()

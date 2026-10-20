@@ -445,6 +445,23 @@ fn lower_tool_results(parts: &[ContentPart]) -> Result<Vec<ChatMessage>, Provide
     Ok(messages)
 }
 
+/// A sibling route from an API root (`…/v1`) or a full `…/chat/completions` address.
+pub(crate) fn endpoint_url(base_url: &str, endpoint: &str) -> Result<String, ProviderError> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|error| ProviderError::Decode(format!("invalid provider base URL: {error}")))?;
+    let original = url.path().trim_end_matches('/');
+    let root = original
+        .strip_suffix("/chat/completions")
+        .unwrap_or(original);
+    let path = if endpoint == "/chat/completions" && root != original {
+        original.to_string()
+    } else {
+        format!("{}{}", root.trim_end_matches('/'), endpoint)
+    };
+    url.set_path(&path);
+    Ok(url.to_string())
+}
+
 pub(crate) fn wire_tool_name(name: &str) -> String {
     kernel::portable_tool_name(name)
 }

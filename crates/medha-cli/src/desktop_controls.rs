@@ -9,7 +9,7 @@ pub(crate) trait ProfileProvider: Provider {
     fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String>;
 }
 
-impl ProfileProvider for providers::OpenAiCompat {
+impl ProfileProvider for providers::ProviderClient {
     fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String> {
         self.switch_provider_profile(profile.provider.clone(), profile.credential.clone())
             .map_err(|error| error.to_string())

@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use kernel::{EventLog, Kernel, Message, Session};
-use providers::OpenAiCompat;
+use providers::ProviderClient;
 use sandbox::WorkspaceSandbox;
 use std::path::Path;
 use std::sync::Arc;
@@ -414,7 +414,7 @@ pub async fn start(
 
 /// One chat, built and ready for a surface to drive.
 pub struct Started {
-    pub kernel: Arc<Kernel<OpenAiCompat, store::SqliteLog>>,
+    pub kernel: Arc<Kernel<ProviderClient, store::SqliteLog>>,
     pub session: Session,
     pub system: String,
     pub resumed: Vec<Message>,

@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// An error whose words say nothing, wrapping the cause that does.

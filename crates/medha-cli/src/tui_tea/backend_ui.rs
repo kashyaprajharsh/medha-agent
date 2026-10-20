@@ -1703,7 +1703,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                                 models: provider
                                     .models
                                     .iter()
-                                    .map(|m| providers::openai_compat::ModelInfo {
+                                    .map(|m| providers::discovery::ModelInfo {
                                         id: m.id.clone(),
                                         context_length: m.context_length,
                                     })
@@ -1862,7 +1862,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
             Answer::Discovered(models) => {
                 let rows = models
                     .into_iter()
-                    .map(|model| providers::openai_compat::ModelInfo {
+                    .map(|model| providers::discovery::ModelInfo {
                         id: model.id,
                         context_length: model.context_length,
                     })

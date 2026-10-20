@@ -42,38 +42,13 @@ mod count_tokens_tests {
     }
 
     #[test]
-    fn openai_endpoint_accepts_api_root_or_full_chat_url() {
-        assert_eq!(
-            openai_endpoint_url("https://integrate.api.nvidia.com/v1", "/chat/completions")
-                .unwrap(),
-            "https://integrate.api.nvidia.com/v1/chat/completions"
-        );
-        assert_eq!(
-            openai_endpoint_url(
-                "https://integrate.api.nvidia.com/v1/chat/completions",
-                "/chat/completions",
-            )
-            .unwrap(),
-            "https://integrate.api.nvidia.com/v1/chat/completions"
-        );
-        assert_eq!(
-            openai_endpoint_url(
-                "https://integrate.api.nvidia.com/v1/chat/completions",
-                "/models",
-            )
-            .unwrap(),
-            "https://integrate.api.nvidia.com/v1/models"
-        );
-    }
-
-    #[test]
     fn vllm_body_is_derived_from_the_complete_prepared_chat_request() {
         let msgs = vec![
             Message::system("s"),
             Message::user("u"),
             Message::tool_result("c1", "t"),
         ];
-        let provider = OpenAiCompat::new("http://x/v1", "", "m");
+        let provider = ProviderClient::new("http://x/v1", "", "m");
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -100,7 +75,7 @@ mod count_tokens_tests {
             Message::system("earlier summary"), // mid-array (compaction)
             Message::new(Role::Assistant, "ok"),
         ];
-        let provider = OpenAiCompat::new("http://x/v1", "", "m");
+        let provider = ProviderClient::new("http://x/v1", "", "m");
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -120,7 +95,7 @@ mod count_tokens_tests {
 
     #[test]
     fn generic_openai_chat_does_not_probe_a_vendor_count_route() {
-        let provider = OpenAiCompat::new("http://127.0.0.1:1/v1", "", "m");
+        let provider = ProviderClient::new("http://127.0.0.1:1/v1", "", "m");
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -135,7 +110,7 @@ mod count_tokens_tests {
 
     #[test]
     fn fingerprint_changes_when_the_prepared_tool_schema_changes() {
-        let provider = OpenAiCompat::new("http://x/v1", "", "m");
+        let provider = ProviderClient::new("http://x/v1", "", "m");
         let make = |tools| {
             provider
                 .prepare_request(&CompiledContext {
@@ -354,8 +329,10 @@ mod count_tokens_tests {
                 .unwrap();
         });
 
-        let provider = OpenAiCompat::new(format!("http://{address}/v1"), "", "m")
-            .with_token_counter(OpenAiTokenCounter::Vllm);
+        let mut profile =
+            ProviderProfile::openai_chat(format!("http://{address}/v1"), "m", AuthKind::None);
+        profile.token_counter = TokenCounter::Vllm;
+        let provider = ProviderClient::from_profile(profile, "").unwrap();
         let prepared = provider
             .prepare_request(&CompiledContext {
                 model: String::new(),
@@ -387,135 +364,6 @@ mod gemini_client_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
-
-    #[tokio::test]
-    async fn native_model_discovery_uses_v1_google_auth_and_normalizes_ids() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let read = socket.read(&mut chunk).await.unwrap();
-                assert!(read > 0, "client closed before headers");
-                bytes.extend_from_slice(&chunk[..read]);
-                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let headers = String::from_utf8_lossy(&bytes);
-            assert!(
-                headers.starts_with("GET /v1/models?pageSize=1000 HTTP/1.1"),
-                "{headers}"
-            );
-            assert!(
-                headers
-                    .lines()
-                    .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: discovery-secret")),
-                "{headers}"
-            );
-            assert!(
-                headers
-                    .lines()
-                    .any(|line| line
-                        .eq_ignore_ascii_case(&format!("user-agent: {}", http::USER_AGENT))),
-                "{headers}"
-            );
-            let body = serde_json::json!({
-                "models": [
-                    {
-                        "name": "models/gemini-3.5-flash",
-                        "baseModelId": "gemini-3.5-flash",
-                        "inputTokenLimit": 1_048_576,
-                        "supportedGenerationMethods": ["generateContent", "countTokens"]
-                    },
-                    {
-                        "name": "models/text-embedding-004",
-                        "baseModelId": "text-embedding-004",
-                        "inputTokenLimit": 2_048,
-                        "supportedGenerationMethods": ["embedContent"]
-                    }
-                ]
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        let mut profile = ProviderProfile::openai_chat(
-            format!("http://{address}/v1"),
-            "model-discovery",
-            AuthKind::XGoogApiKey,
-        );
-        profile.protocol = Protocol::GeminiInteractions;
-        let models = list_models_for_profile(&profile, "discovery-secret")
-            .await
-            .unwrap();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "gemini-3.5-flash");
-        assert_eq!(models[0].context_length, Some(1_048_576));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn openai_chat_discovery_handles_groq_dual_context_keys() {
-        // Groq reports BOTH `context_length` and `context_window` on each model.
-        // Aliasing them to one field made serde raise "duplicate field" and the
-        // whole discovery failed with an opaque decode error. It must now parse,
-        // preferring `context_length`.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let read = socket.read(&mut chunk).await.unwrap();
-                assert!(read > 0, "client closed before headers");
-                bytes.extend_from_slice(&chunk[..read]);
-                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            assert!(String::from_utf8_lossy(&bytes).lines().any(|line| {
-                line.eq_ignore_ascii_case(&format!("user-agent: {}", http::USER_AGENT))
-            }));
-            let body = serde_json::json!({
-                "object": "list",
-                "data": [
-                    {
-                        "id": "openai/gpt-oss-120b",
-                        "object": "model",
-                        "owned_by": "OpenAI",
-                        "active": true,
-                        "context_window": 131_072,
-                        "context_length": 131_072,
-                        "max_completion_tokens": 8_192
-                    }
-                ]
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        let models = list_models(&format!("http://{address}/openai/v1"), "gsk_test")
-            .await
-            .unwrap();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "openai/gpt-oss-120b");
-        assert_eq!(models[0].context_length, Some(131_072));
-        server.await.unwrap();
-    }
 
     #[tokio::test]
     async fn native_stream_posts_v1_interactions_with_google_auth_and_decodes_state() {
@@ -826,7 +674,7 @@ mod gemini_client_tests {
 
     #[test]
     fn gemini_profile_switch_is_atomic_and_output_retry_rewrites_generation_config() {
-        let provider = OpenAiCompat::new("http://chat.test/v1", "", "chat-model");
+        let provider = ProviderClient::new("http://chat.test/v1", "", "chat-model");
         let mut profile = ProviderProfile::openai_chat(
             "https://generativelanguage.googleapis.com/v1",
             "gemini-model",
@@ -936,11 +784,10 @@ mod reasoning_request_tests {
 
     #[test]
     fn reading_model_limits_never_relocks_the_connection() {
-        let provider = std::sync::Arc::new(
-            OpenAiCompat::new("http://x", "", "m")
-                .with_max_ctx(32_768)
-                .with_max_output_tokens(4_096),
-        );
+        let mut profile = ProviderProfile::openai_chat("http://x", "m", AuthKind::None);
+        profile.max_ctx = Some(32_768);
+        profile.max_output_tokens = Some(4_096);
+        let provider = std::sync::Arc::new(ProviderClient::from_profile(profile, "").unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(provider.model_limits()).unwrap());
 
@@ -954,7 +801,7 @@ mod reasoning_request_tests {
 
     #[test]
     fn server_default_output_keeps_context_protection_without_inventing_a_wire_cap() {
-        let provider = OpenAiCompat::new("http://x", "", "m").with_max_ctx(128_000);
+        let provider = ProviderClient::new("http://x", "", "m").with_max_ctx(128_000);
         assert_eq!(
             provider
                 .model_limits()
@@ -975,7 +822,7 @@ mod reasoning_request_tests {
 
     #[test]
     fn effort_uses_the_portable_top_level_openai_field() {
-        let p = OpenAiCompat::new("http://x", "", "m")
+        let p = ProviderClient::new("http://x", "", "m")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::High),
@@ -986,7 +833,7 @@ mod reasoning_request_tests {
 
     #[test]
     fn minimal_is_not_silently_raised_on_the_compatible_route() {
-        let p = OpenAiCompat::new("http://x", "", "m")
+        let p = ProviderClient::new("http://x", "", "m")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Minimal),
@@ -998,7 +845,7 @@ mod reasoning_request_tests {
     #[test]
     fn explicit_off_sends_none_not_a_silent_omit() {
         // Compatible servers disable thinking via reasoning_effort:"none".
-        let p = OpenAiCompat::new("http://x", "", "m")
+        let p = ProviderClient::new("http://x", "", "m")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(false),
                 effort: None,
@@ -1009,7 +856,7 @@ mod reasoning_request_tests {
 
     #[test]
     fn profile_switch_resets_carried_effort_for_an_unsupported_model() {
-        let provider = OpenAiCompat::new("http://one", "", "model")
+        let provider = ProviderClient::new("http://one", "", "model")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Low),
@@ -1215,9 +1062,11 @@ mod reasoning_request_tests {
 
     #[test]
     fn auxiliary_reasoning_override_does_not_change_chat_setting_or_original_request() {
-        let p = OpenAiCompat::new("http://x", "", "m")
-            .with_max_ctx(128_000)
-            .with_max_output_tokens(512)
+        let mut profile = ProviderProfile::openai_chat("http://x", "m", AuthKind::None);
+        profile.max_ctx = Some(128_000);
+        profile.max_output_tokens = Some(512);
+        let p = ProviderClient::from_profile(profile, "")
+            .unwrap()
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Medium),
@@ -1258,17 +1107,19 @@ mod reasoning_request_tests {
 
     #[test]
     fn untouched_reasoning_sends_no_effort_field() {
-        let p = OpenAiCompat::new("http://x", "", "m");
+        let p = ProviderClient::new("http://x", "", "m");
         assert!(p.reasoning_effort_value().is_none());
     }
 
     #[test]
     fn switching_connection_updates_model_and_context_for_the_next_turn() {
-        let p = OpenAiCompat::new("http://one", "", "first").with_max_ctx(8_192);
+        let p = ProviderClient::new("http://one", "", "first").with_max_ctx(8_192);
         assert_eq!(p.active_model(), "first");
         assert_eq!(p.context_window(), Some(8_192));
 
-        p.switch_connection_with_context("http://two", "secret", "second", Some(32_768));
+        let mut second = ProviderProfile::openai_chat("http://two", "second", AuthKind::Bearer);
+        second.max_ctx = Some(32_768);
+        p.switch_provider_profile(second, "secret").unwrap();
         assert_eq!(p.active_model(), "second");
         assert_eq!(p.context_window(), Some(32_768));
     }
@@ -1297,7 +1148,7 @@ mod reasoning_request_tests {
 
     #[test]
     fn full_request_json_actually_contains_the_field() {
-        let p = OpenAiCompat::new("http://x", "", "m")
+        let p = ProviderClient::new("http://x", "", "m")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Medium),

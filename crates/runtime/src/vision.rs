@@ -14,7 +14,7 @@ const PROMPT: &str = "Describe this image for an assistant that cannot see it. R
 const MAX_DESCRIPTION_CHARS: usize = 4_000;
 
 pub struct AuxiliaryVision {
-    provider: providers::OpenAiCompat,
+    provider: providers::ProviderClient,
     model: String,
     /// Keyed by artifact hash: the same screenshot across many turns costs one
     /// call. Process-scoped; a restart pays for the first look again.
@@ -22,7 +22,7 @@ pub struct AuxiliaryVision {
 }
 
 impl AuxiliaryVision {
-    pub fn new(provider: providers::OpenAiCompat) -> Self {
+    pub fn new(provider: providers::ProviderClient) -> Self {
         Self {
             model: provider.active_model(),
             provider,
@@ -105,9 +105,9 @@ pub fn connect(
     config: &crate::config::Config,
     name: &str,
     env: Option<&crate::config::ModelEnv>,
-) -> Result<providers::OpenAiCompat> {
+) -> Result<providers::ProviderClient> {
     let resolved = crate::config::resolve_model_as(config, name, env)?;
-    Ok(providers::OpenAiCompat::from_profile(
+    Ok(providers::ProviderClient::from_profile(
         resolved.provider,
         resolved.credential,
     )?)

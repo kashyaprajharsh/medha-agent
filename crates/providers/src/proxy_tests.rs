@@ -40,7 +40,7 @@ async fn explicit_proxy_carries_generation_counting_and_discovery_for_one_profil
         block.unwrap();
     }
     assert_eq!(
-        crate::openai_compat::list_models_for_profile(&profile, "explicit-proxy-test-key")
+        crate::discovery::list_models_for_profile(&profile, "explicit-proxy-test-key")
             .await
             .unwrap()[0]
             .id,

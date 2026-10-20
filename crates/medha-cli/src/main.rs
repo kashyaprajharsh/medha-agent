@@ -2381,7 +2381,7 @@ mod reasoning_cli_tests {
 
     #[test]
     fn saved_reasoning_on_selects_a_supported_effort() {
-        let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "test");
+        let provider = providers::ProviderClient::new("http://localhost/v1", "", "test");
         let saved = lockfile::MedhaLock::parse("[reasoning]\nenabled = true").unwrap();
         let config = normalize_reasoning_on(&provider, saved.reasoning.to_config().unwrap());
         assert_eq!(config.effort, Some(kernel::ReasoningEffort::Medium));

@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn build(
     setup: &Setup<'_>,
     model_profiles: &Arc<std::sync::Mutex<config::Config>>,
-    provider: &Arc<OpenAiCompat>,
+    provider: &Arc<ProviderClient>,
     live_context: Arc<crate::project_session::LiveContext>,
     memory_store: Arc<memory::MemoryProjection>,
     artifacts: Arc<dyn kernel::ArtifactStore>,
@@ -24,7 +24,7 @@ pub(super) fn build(
         Some((name, configured)) => {
             let auxiliary = config::resolve_model_as(&configured, &name, Some(&options.model_env))
                 .and_then(|resolved| {
-                    providers::OpenAiCompat::from_profile(resolved.provider, resolved.credential)
+                    providers::ProviderClient::from_profile(resolved.provider, resolved.credential)
                         .map_err(anyhow::Error::from)
                 });
             match auxiliary {

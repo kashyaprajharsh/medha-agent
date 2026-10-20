@@ -5,6 +5,7 @@
 //! the provider client.
 
 use crate::transport::sse::SseEvent;
+use crate::transport::stream::StreamDecoder;
 use kernel::{
     Block, CompiledContext, ContentPart, ModelMessage, PreparedModelRequest, Protocol,
     ProviderError, ProviderState, Role, ToolIntent, Usage,
@@ -689,8 +690,10 @@ impl ResponseDecoder {
             completed: false,
         }
     }
+}
 
-    pub(crate) fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
+impl StreamDecoder for ResponseDecoder {
+    fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
         let blocks = process_sse_event(
             event,
             &mut self.accum,
@@ -707,17 +710,23 @@ impl ResponseDecoder {
         Ok(blocks)
     }
 
-    pub(crate) fn completed(&self) -> bool {
+    fn completed(&self) -> bool {
         self.completed
     }
 
-    /// Preserve visible text that the inline-thinking filter held while
-    /// waiting to see whether a partial tag would complete.
-    pub(crate) fn flush_pending(&mut self) -> Option<Block> {
+    fn ends_stream(&self, event: &SseEvent) -> bool {
+        event.data.trim() == "[DONE]"
+    }
+
+    fn flush_pending(&mut self) -> Option<Block> {
         self.think_filter.flush()
     }
 
-    pub(crate) fn finish(mut self) -> Result<Vec<Block>, ProviderError> {
+    fn parse_whole(&self, body: &str) -> Result<Vec<Block>, ProviderError> {
+        parse_completion(body, &self.names)
+    }
+
+    fn finish(mut self) -> Result<Vec<Block>, ProviderError> {
         let mut blocks = Vec::new();
         if let Some(block) = self.think_filter.flush() {
             blocks.push(block);

@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt;
 use kernel::{Message, Role};
 
 fn chat_client(base_url: impl Into<String>, key: &str, model: &str) -> ProviderClient {
@@ -8,6 +9,28 @@ fn chat_client(base_url: impl Into<String>, key: &str, model: &str) -> ProviderC
         AuthKind::Bearer
     };
     ProviderClient::from_profile(ProviderProfile::openai_chat(base_url, model, auth), key).unwrap()
+}
+
+/// Streams `events`, then keeps the connection open without another byte.
+async fn serve_then_hold(events: &'static str) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = socket.read(&mut [0u8; 8192]).await.unwrap();
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+        let chunk = format!("{head}{:X}\r\n{events}\r\n", events.len());
+        socket.write_all(chunk.as_bytes()).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    address
+}
+
+async fn drain(
+    stream: BoxStream<'static, Result<Block, ProviderError>>,
+) -> Vec<Result<Block, ProviderError>> {
+    stream.collect().await
 }
 
 mod count_tokens_tests {
@@ -246,6 +269,33 @@ mod count_tokens_tests {
             matches!(&first, Block::Text(text) if text.starts_with("Hello there")),
             "{first:?}"
         );
+    }
+
+    /// Text the think-tag filter still holds reaches the reader before the stall error.
+    #[tokio::test]
+    async fn a_stall_delivers_held_back_text_before_the_error() {
+        let address = serve_then_hold(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"},\"finish_reason\":null}]}\n\n",
+        )
+        .await;
+        let provider = chat_client(format!("http://{address}/v1"), "key", "m");
+        provider
+            .connection
+            .lock()
+            .unwrap()
+            .profile
+            .stream_idle_seconds = Some(1);
+        let context = CompiledContext {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        let mut items = drain(provider.stream(&context).await.unwrap()).await;
+        let error = items.pop().unwrap().unwrap_err();
+        assert!(error.is_stream_stall(), "{error:?}");
+        let blocks: Vec<_> = items.into_iter().map(Result::unwrap).collect();
+        assert_eq!(spoken(&blocks), "<thi");
     }
 
     /// A deployment that ignores `stream: true` and answers with one ordinary
@@ -680,6 +730,42 @@ mod gemini_client_tests {
                 }
             }
         }
+    }
+
+    /// The reply ends at its terminal event, not when the server closes or the stall timer fires.
+    #[tokio::test]
+    async fn the_reply_ends_at_its_terminal_event_on_a_connection_left_open() {
+        let address = serve_then_hold(concat!(
+            "data: {\"event_type\":\"step.start\",\"index\":0,\"step\":{\"type\":\"model_output\",\"content\":[]}}\n\n",
+            "data: {\"event_type\":\"step.delta\",\"index\":0,\"delta\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n",
+            "data: {\"event_type\":\"step.stop\",\"index\":0}\n\n",
+            "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"status\":\"completed\"}}\n\n",
+        ))
+        .await;
+        let mut profile = ProviderProfile::openai_chat(
+            format!("http://{address}/v1"),
+            "gemini-3.5-flash",
+            AuthKind::XGoogApiKey,
+        );
+        profile.protocol = Protocol::GeminiInteractions;
+        let provider = ProviderClient::from_profile(profile, "key").unwrap();
+        let context = CompiledContext {
+            model: String::new(),
+            messages: vec![Message::user("hi")],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        let stream = provider.stream(&context).await.unwrap();
+        let items = tokio::time::timeout(std::time::Duration::from_secs(5), drain(stream))
+            .await
+            .expect("the reply must end at interaction.completed");
+        let blocks: Vec<_> = items.into_iter().map(Result::unwrap).collect();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text(t) if t == "hi")),
+            "{blocks:?}"
+        );
     }
 
     #[test]

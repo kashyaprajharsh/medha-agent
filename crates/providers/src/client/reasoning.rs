@@ -16,12 +16,7 @@ pub(super) fn validate_reasoning(
             "reasoning controls are disabled by this model profile".into(),
         ));
     }
-    let effort = if config.enabled == Some(false) {
-        Some(ReasoningEffort::None)
-    } else {
-        config.effort
-    };
-    if let Some(effort) = effort
+    if let Some(effort) = requested_effort(config)
         && !profile_reasoning_efforts(profile).contains(&effort)
     {
         return Err(ProviderError::Decode(format!(
@@ -54,6 +49,15 @@ pub(super) fn validate_reasoning(
         Protocol::OpenAiResponses | Protocol::AnthropicMessages => {}
     }
     Ok(())
+}
+
+/// The effort a setting asks for; turning reasoning off is the `none` effort.
+pub(super) fn requested_effort(config: &ReasoningConfig) -> Option<ReasoningEffort> {
+    if config.enabled == Some(false) {
+        Some(ReasoningEffort::None)
+    } else {
+        config.effort
+    }
 }
 
 pub(super) fn profile_reasoning_efforts(profile: &ProviderProfile) -> Vec<ReasoningEffort> {

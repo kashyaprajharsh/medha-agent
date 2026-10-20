@@ -1,10 +1,9 @@
 //! The one provider client: a saved profile's connection, keys and stand-ins.
 
 use crate::protocol::{gemini_interactions, openai_chat};
-use crate::transport::http;
+use crate::transport::{http, stream};
 use crate::{AuthKind, ProviderProfile, TokenCounter};
 use async_trait::async_trait;
-use futures::StreamExt;
 use futures::stream::BoxStream;
 use kernel::{
     Block, CompiledContext, ImageInputMode, ImageSupport, InputTokenCount, ModelLimits,
@@ -18,7 +17,9 @@ mod reasoning;
 mod token_count;
 
 use fallback::{Fallbacks, KeySource};
-use reasoning::{profile_reasoning_efforts, reconcile_reasoning_for_switch, validate_reasoning};
+use reasoning::{
+    profile_reasoning_efforts, reconcile_reasoning_for_switch, requested_effort, validate_reasoning,
+};
 
 pub struct ProviderClient {
     /// Swapped only between turns; a stream snapshots it, so one request uses one model and key.
@@ -134,7 +135,8 @@ impl ProviderClient {
         self
     }
 
-    fn image_identity(profile: &ProviderProfile) -> String {
+    /// One served model: what was learned about it and its context are keyed by this.
+    fn identity(profile: &ProviderProfile) -> String {
         format!(
             "{}:{}:{}",
             profile.protocol.as_str(),
@@ -207,146 +209,7 @@ impl ProviderClient {
         if self.reasoning_support() == ReasoningSupport::Unsupported {
             return None;
         }
-        let cfg = self.reasoning.lock().unwrap();
-        if cfg.enabled == Some(false) {
-            return Some("none"); // explicit disable for compatible servers
-        }
-        cfg.effort.map(ReasoningEffort::as_str)
-    }
-
-    async fn stream_gemini_prepared(
-        &self,
-        request: &PreparedModelRequest,
-    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        let names = wire_name_map(
-            &request
-                .context
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect::<Vec<_>>(),
-        );
-        let connection = self.connection.lock().unwrap().clone();
-        if connection.profile.protocol != request.protocol {
-            return Err(ProviderError::Decode(format!(
-                "prepared {} request cannot be sent through the active {} profile",
-                request.protocol.as_str(),
-                connection.profile.protocol.as_str()
-            )));
-        }
-        let streaming = request
-            .body
-            .get("stream")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        let url = format!(
-            "{}/interactions",
-            connection.profile.base_url.trim_end_matches('/')
-        );
-        http::debug_json_request("POST", &url, &request.body);
-
-        let mut post = self.http_for(&connection.profile)?.post(&url);
-        for (name, value) in &request.headers {
-            post = post.header(name, value);
-        }
-        let outgoing = http::with_profile(post, &connection.profile, &connection.credential)?
-            .json(&request.body);
-        let resp = http::send_model_request(outgoing).await?;
-        let resp = http::require_success(resp).await?;
-
-        if !streaming {
-            let body = http::response_text(resp).await?;
-            let blocks = gemini_interactions::parse_interaction(&body, &names)?;
-            return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
-        }
-
-        let byte_stream = resp.bytes_stream();
-        let idle = http::stream_idle(&connection.profile);
-        let stream = async_stream::stream! {
-            let mut sse = crate::transport::sse::SseDecoder::default();
-            let mut decoder = gemini_interactions::ResponseDecoder::new(names.clone());
-            // Dropped as soon as anything decodes; see the chat path for why
-            // this is a buffer rather than a content-type check.
-            let mut unread = Some(Vec::new());
-
-            futures::pin_mut!(byte_stream);
-            let mut progress_deadline = tokio::time::Instant::now() + idle;
-            'chunks: loop {
-                let next = tokio::time::timeout_at(progress_deadline, byte_stream.next()).await;
-                let chunk = match next {
-                    Err(_) if decoder.completed() => break,
-                    Err(_) => {
-                        yield Err(http::stalled_stream(idle));
-                        return;
-                    }
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk,
-                };
-                match chunk {
-                    Err(error) => {
-                        yield Err(http::stream_read_failed(error));
-                        return;
-                    }
-                    Ok(bytes) => {
-                        if let Some(buffer) = unread.as_mut() {
-                            if buffer.len() + bytes.len() <= http::MAX_RESPONSE_BODY_BYTES {
-                                buffer.extend_from_slice(&bytes);
-                            } else {
-                                unread = None;
-                            }
-                        }
-                        let events = match sse.push(&bytes) {
-                            Ok(events) => events,
-                            Err(error) => { yield Err(error); return; }
-                        };
-                        for event in events {
-                            if event.is_delivery() {
-                                progress_deadline = tokio::time::Instant::now() + idle;
-                            }
-                            match decoder.push(&event) {
-                                Ok(blocks) => {
-                                    for block in blocks {
-                                        unread = None;
-                                        yield Ok(block);
-                                    }
-                                }
-                                Err(error) => {
-                                    yield Err(error);
-                                    return;
-                                }
-                            }
-                            if decoder.completed() { break 'chunks; }
-                        }
-                    }
-                }
-            }
-
-            if let Some(event) = sse.finish() {
-                match decoder.push(&event) {
-                    Ok(blocks) => {
-                        for block in blocks {
-                            unread = None;
-                            yield Ok(block);
-                        }
-                    }
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                }
-            }
-
-            if let Some(buffer) = unread.filter(|buffer| read_whole_body(buffer)) {
-                let body = String::from_utf8_lossy(&buffer);
-                match gemini_interactions::parse_interaction(&body, &names) {
-                    Ok(blocks) => for block in blocks { yield Ok(block); },
-                    Err(error) => yield Err(error),
-                }
-                return;
-            }
-            if let Err(error) = decoder.finish() { yield Err(error); }
-        };
-        Ok(stream.boxed())
+        requested_effort(&self.reasoning.lock().unwrap()).map(ReasoningEffort::as_str)
     }
 }
 
@@ -370,7 +233,7 @@ impl Provider for ProviderClient {
         // What this server showed outranks what a catalogue says of the model:
         // a vision model can be served with images turned off.
         self.learned
-            .images(&Self::image_identity(&profile))
+            .images(&Self::identity(&profile))
             .unwrap_or(declared)
     }
 
@@ -383,18 +246,11 @@ impl Provider for ProviderClient {
         if profile.image_input != ImageInputMode::Auto {
             return;
         }
-        self.learned
-            .set_images(&Self::image_identity(&profile), support);
+        self.learned.set_images(&Self::identity(&profile), support);
     }
 
     fn context_identity(&self) -> String {
-        let connection = self.connection.lock().unwrap();
-        format!(
-            "{}:{}:{}",
-            connection.profile.protocol.as_str(),
-            connection.profile.base_url,
-            connection.profile.model
-        )
+        Self::identity(&self.connection.lock().unwrap().profile)
     }
 
     fn protocol(&self) -> Protocol {
@@ -680,12 +536,7 @@ impl Provider for ProviderClient {
                 let object = body.as_object_mut().ok_or_else(|| {
                     ProviderError::Decode("prepared model request is not an object".into())
                 })?;
-                let effort = if config.enabled == Some(false) {
-                    Some(ReasoningEffort::None)
-                } else {
-                    config.effort
-                };
-                match effort {
+                match requested_effort(config) {
                     Some(effort) => {
                         object.insert(
                             "reasoning_effort".into(),
@@ -717,23 +568,22 @@ impl Provider for ProviderClient {
         &self,
         request: &PreparedModelRequest,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        if request.protocol == Protocol::GeminiInteractions {
-            return self.stream_gemini_prepared(request).await;
-        }
-        if request.protocol != Protocol::OpenAiChat {
+        if !matches!(
+            request.protocol,
+            Protocol::OpenAiChat | Protocol::GeminiInteractions
+        ) {
             return Err(ProviderError::Decode(format!(
                 "ProviderClient cannot send {}",
                 request.protocol.as_str()
             )));
         }
-        let names = wire_name_map(
-            &request
-                .context
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect::<Vec<_>>(),
-        );
+        let tools: Vec<_> = request
+            .context
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let names = openai_chat::wire_name_map(&tools);
         let connection = self.connection.lock().unwrap().clone();
         if connection.profile.protocol != request.protocol {
             return Err(ProviderError::Decode(format!(
@@ -747,11 +597,14 @@ impl Provider for ProviderClient {
             .get("stream")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        let url = openai_chat::endpoint_url(&connection.profile.base_url, "/chat/completions")?;
-
-        // Direct proof of what actually goes over the wire — no guessing, no
-        // separate curl experiment needed. Set MEDHA_DEBUG_HTTP=1 to see the
-        // exact prepared JSON for every call.
+        let chat = request.protocol == Protocol::OpenAiChat;
+        let base_url = &connection.profile.base_url;
+        let url = if chat {
+            openai_chat::endpoint_url(base_url, "/chat/completions")?
+        } else {
+            format!("{}/interactions", base_url.trim_end_matches('/'))
+        };
+        // MEDHA_DEBUG_HTTP=1 prints the exact JSON sent.
         http::debug_json_request("POST", &url, &request.body);
 
         let mut post = self.http_for(&connection.profile)?.post(&url);
@@ -760,127 +613,16 @@ impl Provider for ProviderClient {
         }
         let outgoing = http::with_profile(post, &connection.profile, &connection.credential)?
             .json(&request.body);
-        let resp = http::send_model_request(outgoing).await?;
-        let resp = http::require_success(resp).await?;
-
-        // Non-streaming: one blocking body, parsed and yielded as a single batch
-        // of blocks (reasoning → text → tool intents → usage). The kernel loop
-        // is identical; only the arrival shape differs.
-        if !streaming {
-            let body = http::response_text(resp).await?;
-            let blocks = openai_chat::parse_completion(&body, &names)?;
-            return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
-        }
-
-        let byte_stream = resp.bytes_stream();
+        let response = http::require_success(http::send_model_request(outgoing).await?).await?;
         let idle = http::stream_idle(&connection.profile);
-        let s = async_stream::stream! {
-            let mut sse = crate::transport::sse::SseDecoder::default();
-            let mut decoder = openai_chat::ResponseDecoder::new(names.clone());
-            // Held only until the first block is produced. An endpoint that
-            // ignored `stream` and answered with one completion decodes to
-            // nothing as an event stream, and this is what it is read from.
-            // Deciding by content type instead would make every unlabelled
-            // stream wait for its last byte before showing its first word.
-            let mut unread = Some(Vec::new());
-
-            futures::pin_mut!(byte_stream);
-            let mut progress_deadline = tokio::time::Instant::now() + idle;
-            'chunks: loop {
-                let next = tokio::time::timeout_at(progress_deadline, byte_stream.next()).await;
-                let chunk = match next {
-                    Err(_) if decoder.completed() => break,
-                    Err(_) => {
-                        if let Some(b) = decoder.flush_pending() {
-                            yield Ok(b);
-                        }
-                        yield Err(http::stalled_stream(idle));
-                        return;
-                    }
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk,
-                };
-                match chunk {
-                    Err(e) => {
-                        // Surface what the filter is still holding before the
-                        // error — otherwise the reply's tail silently vanishes.
-                        if let Some(b) = decoder.flush_pending() {
-                            yield Ok(b);
-                        }
-                        yield Err(http::stream_read_failed(e));
-                        return;
-                    }
-                    Ok(bytes) => {
-                        if let Some(buffer) = unread.as_mut() {
-                            if buffer.len() + bytes.len() <= http::MAX_RESPONSE_BODY_BYTES {
-                                buffer.extend_from_slice(&bytes);
-                            } else {
-                                unread = None;
-                            }
-                        }
-                        let events = match sse.push(&bytes) {
-                            Ok(events) => events,
-                            Err(error) => { yield Err(error); return; }
-                        };
-                        for event in events {
-                            if event.is_delivery() {
-                                progress_deadline = tokio::time::Instant::now() + idle;
-                            }
-                            match decoder.push(&event) {
-                                Ok(blocks) => {
-                                    for b in blocks { unread = None; yield Ok(b); }
-                                },
-                                Err(e) => { yield Err(e); return; }
-                            }
-                            if event.data.trim() == "[DONE]" { break 'chunks; }
-                        }
-                    },
-                }
-            }
-
-            // Preserve tolerant handling for servers that close without the
-            // final SSE blank line.
-            if let Some(event) = sse.finish() {
-                match decoder.push(&event) {
-                    Ok(blocks) => for b in blocks { unread = None; yield Ok(b); },
-                    Err(e) => { yield Err(e); return; }
-                }
-            }
-
-            if let Some(buffer) = unread.filter(|buffer| read_whole_body(buffer)) {
-                let body = String::from_utf8_lossy(&buffer);
-                match openai_chat::parse_completion(&body, &names) {
-                    Ok(blocks) => for block in blocks { yield Ok(block); },
-                    Err(error) => yield Err(error),
-                }
-                return;
-            }
-            match decoder.finish() {
-                Ok(blocks) => for block in blocks { yield Ok(block); },
-                Err(error) => yield Err(error),
-            }
-        };
-
-        Ok(s.boxed())
+        if chat {
+            let decoder = openai_chat::ResponseDecoder::new(names);
+            stream::read(response, streaming, idle, decoder).await
+        } else {
+            let decoder = gemini_interactions::ResponseDecoder::new(names);
+            stream::read(response, streaming, idle, decoder).await
+        }
     }
-}
-
-/// Read a non-stream reply whole so its parse error is reported.
-fn read_whole_body(buffer: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(buffer);
-    match text.trim_start().chars().next() {
-        Some('{') => true,
-        Some(_) => !text
-            .lines()
-            .any(|line| line.starts_with("data:") || line.starts_with("event:")),
-        None => false,
-    }
-}
-
-/// Wire→canonical map for the tool names exposed this request. Collisions get a
-/// trailing `_` so two canonical names can never share a wire name.
-fn wire_name_map(canonical: &[String]) -> std::collections::HashMap<String, String> {
-    openai_chat::wire_name_map(canonical)
 }
 
 #[cfg(test)]

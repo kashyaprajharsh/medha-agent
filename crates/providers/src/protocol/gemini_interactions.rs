@@ -5,6 +5,7 @@
 
 use crate::protocol::openai_chat::{wire_name_map, wire_tool_name};
 use crate::transport::sse::SseEvent;
+use crate::transport::stream::StreamDecoder;
 use kernel::{
     Block, CompiledContext, ContentPart, ModelMessage, Protocol, ProviderError, ProviderState,
     ReasoningConfig, ReasoningEffort, Role, ToolIntent, Usage,
@@ -669,54 +670,6 @@ impl ResponseDecoder {
         }
     }
 
-    pub(crate) fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
-        let data = event.data.trim();
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-        if data == "[DONE]" {
-            return if event.event.as_deref() == Some("done") {
-                Ok(Vec::new())
-            } else {
-                Err(ProviderError::Stream(
-                    "Gemini [DONE] sentinel arrived outside the done event".into(),
-                ))
-            };
-        }
-        let value: Value = serde_json::from_str(data)
-            .map_err(|error| ProviderError::Stream(format!("Gemini SSE JSON: {error}")))?;
-        // Stable v1 permits cumulative usage in `metadata.total_usage` on any
-        // streamed event, while terminal lifecycle events may carry it under
-        // `interaction.usage`. Retain the newest report so neither shape loses
-        // accounting when the terminal payload omits usage.
-        if let Some(usage) = usage_from(&value) {
-            // Usage fields are optional and reports cumulative. Keep the last
-            // known value of each field without adding successive snapshots.
-            self.usage
-                .get_or_insert_with(UsageRaw::default)
-                .merge(usage);
-        }
-        let kind = value
-            .get("event_type")
-            .or_else(|| value.get("type"))
-            .and_then(Value::as_str)
-            .or(event.event.as_deref())
-            .unwrap_or_default();
-        match kind {
-            "step.start" => self.start_step(&value),
-            "step.delta" => self.delta_step(&value),
-            "step.stop" => self.stop_step(&value),
-            "interaction.completed" | "interaction.requires_action" => self.complete(&value),
-            "error" | "interaction.failed" => Err(ProviderError::Response(
-                value
-                    .get("error")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "Gemini interaction failed".into()),
-            )),
-            _ => Ok(Vec::new()),
-        }
-    }
-
     fn index(value: &Value) -> Result<u32, ProviderError> {
         value
             .get("index")
@@ -966,14 +919,72 @@ impl ResponseDecoder {
         self.terminal = true;
         Ok(blocks)
     }
+}
 
-    pub(crate) fn completed(&self) -> bool {
+impl StreamDecoder for ResponseDecoder {
+    fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
+        let data = event.data.trim();
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        if data == "[DONE]" {
+            return if event.event.as_deref() == Some("done") {
+                Ok(Vec::new())
+            } else {
+                Err(ProviderError::Stream(
+                    "Gemini [DONE] sentinel arrived outside the done event".into(),
+                ))
+            };
+        }
+        let value: Value = serde_json::from_str(data)
+            .map_err(|error| ProviderError::Stream(format!("Gemini SSE JSON: {error}")))?;
+        // Stable v1 permits cumulative usage in `metadata.total_usage` on any
+        // streamed event, while terminal lifecycle events may carry it under
+        // `interaction.usage`. Retain the newest report so neither shape loses
+        // accounting when the terminal payload omits usage.
+        if let Some(usage) = usage_from(&value) {
+            // Usage fields are optional and reports cumulative. Keep the last
+            // known value of each field without adding successive snapshots.
+            self.usage
+                .get_or_insert_with(UsageRaw::default)
+                .merge(usage);
+        }
+        let kind = value
+            .get("event_type")
+            .or_else(|| value.get("type"))
+            .and_then(Value::as_str)
+            .or(event.event.as_deref())
+            .unwrap_or_default();
+        match kind {
+            "step.start" => self.start_step(&value),
+            "step.delta" => self.delta_step(&value),
+            "step.stop" => self.stop_step(&value),
+            "interaction.completed" | "interaction.requires_action" => self.complete(&value),
+            "error" | "interaction.failed" => Err(ProviderError::Response(
+                value
+                    .get("error")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "Gemini interaction failed".into()),
+            )),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn completed(&self) -> bool {
         self.terminal
     }
 
-    pub(crate) fn finish(self) -> Result<(), ProviderError> {
+    fn ends_stream(&self, _event: &SseEvent) -> bool {
+        self.terminal
+    }
+
+    fn parse_whole(&self, body: &str) -> Result<Vec<Block>, ProviderError> {
+        parse_interaction(body, &self.names)
+    }
+
+    fn finish(self) -> Result<Vec<Block>, ProviderError> {
         if self.terminal {
-            Ok(())
+            Ok(Vec::new())
         } else {
             Err(ProviderError::Stream(
                 "Gemini stream ended before a terminal interaction event".into(),

@@ -1186,16 +1186,12 @@ impl PickerKind {
             ],
             PickerKind::ModelProtocol => MODEL_PROTOCOLS
                 .iter()
-                .map(|(label, available, _)| {
-                    format!(
-                        "{label} — {}",
-                        if *available {
-                            "available"
-                        } else {
-                            "coming soon"
-                        }
-                    )
-                })
+                .map(
+                    |(label, protocol)| match providers::implemented(*protocol) {
+                        true => format!("{label}: available"),
+                        false => format!("{label}: coming soon"),
+                    },
+                )
                 .collect(),
             PickerKind::ProviderPreset {
                 saved,

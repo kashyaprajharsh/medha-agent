@@ -222,11 +222,29 @@ fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
             .iter()
             .all(|row| !row["name"].as_str().unwrap().contains("Ollama"))
     );
-    for value in ["anthropic-messages", "open-ai-responses"] {
-        let option = protocols.iter().find(|row| row["value"] == value).unwrap();
-        assert_eq!(option["available"], false);
-        assert_eq!(option["discovery"], false);
-    }
+    let anthropic = protocols
+        .iter()
+        .find(|row| row["value"] == "anthropic-messages")
+        .unwrap();
+    assert_eq!(
+        (&anthropic["available"], &anthropic["discovery"]),
+        (&json!(false), &json!(false))
+    );
+    // New OpenAI setups use Responses; it lists models like Chat.
+    let responses = protocols
+        .iter()
+        .find(|row| row["value"] == "open-ai-responses")
+        .unwrap();
+    assert_eq!(
+        (&responses["available"], &responses["discovery"]),
+        (&json!(true), &json!(true))
+    );
+    let openai = responses["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "openai");
+    assert_eq!(openai.unwrap()["url"], "https://api.openai.com/v1");
 
     // Exercise discovery over the real desktop bridge using its picker value.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

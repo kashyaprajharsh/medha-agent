@@ -185,7 +185,8 @@ fn settings(cfg: &config::Config) -> Value {
     // Keep protocol availability and wire values identical to the TUI picker.
     let protocols: Vec<Value> = crate::application_catalog::MODEL_PROTOCOLS
         .iter()
-        .map(|(label, available, protocol)| {
+        .map(|(label, protocol)| {
+            let available = providers::implemented(*protocol);
             let auth = providers::AuthKind::for_protocol(*protocol).as_str();
             let presets: Vec<Value> = catalogue
                 .providers

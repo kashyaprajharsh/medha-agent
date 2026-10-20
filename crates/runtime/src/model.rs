@@ -181,11 +181,7 @@ pub async fn resolve(
         )),
     }
 
-    if !resolved.provider.base_url.is_empty()
-        && !matches!(
-            resolved.provider.protocol,
-            kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
-        )
+    if !resolved.provider.base_url.is_empty() && !providers::implemented(resolved.provider.protocol)
     {
         anyhow::bail!(
             "protocol '{}' is configured but its native adapter is not implemented yet",

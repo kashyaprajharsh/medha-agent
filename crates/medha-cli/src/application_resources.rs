@@ -126,10 +126,7 @@ fn draft_profile(draft: &protocol::ModelDraft) -> Result<providers::ProviderProf
     profile.proxy = draft.connection.proxy.clone();
     profile.max_ctx = draft.context_limit;
     profile.validate()?;
-    if !matches!(
-        protocol,
-        kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
-    ) {
+    if !providers::implemented(protocol) {
         return Err("This model protocol is not implemented yet.".into());
     }
     Ok(profile)

@@ -23,6 +23,11 @@ mod test_http;
 pub(crate) mod transport;
 
 pub use client::ProviderClient;
+
+/// Whether Medha can send this wire format today; every surface asks this one place.
+pub fn implemented(protocol: kernel::Protocol) -> bool {
+    protocol::wire(protocol).is_ok()
+}
 pub use models_dev::{
     CapabilityResolution, CapabilitySource, CapabilityState, ModalitySet, ModelCapabilities,
 };

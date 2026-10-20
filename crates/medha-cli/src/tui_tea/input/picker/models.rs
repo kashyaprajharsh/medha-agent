@@ -6,12 +6,12 @@ pub(super) fn activate(model: &mut Model) -> bool {
     };
     if matches!(picker.kind, PickerKind::ModelProtocol) {
         // Resolve through the same table that produced the rows.
-        let Some(&(label, available, protocol)) = MODEL_PROTOCOLS.get(picker.selected) else {
+        let Some(&(label, protocol)) = MODEL_PROTOCOLS.get(picker.selected) else {
             return true;
         };
-        if !available {
+        if !providers::implemented(protocol) {
             model.push_notice(format!(
-                "{label} is not wired up yet — pick an available protocol for now"
+                "{label} is not available yet. Pick an available protocol for now."
             ));
             return true;
         }

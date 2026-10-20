@@ -187,8 +187,9 @@ impl ProviderRecord {
         // Packages classify metadata. Only mapped protocols become selectable;
         // native SDKs and subscription routes require their own access policy.
         let (protocol, endpoint) = match id {
+            // Responses carries reasoning between turns; saved Chat profiles keep Chat.
             "openai" => (
-                Some(Protocol::OpenAiChat),
+                Some(Protocol::OpenAiResponses),
                 Some("https://api.openai.com/v1"),
             ),
             "google" => (
@@ -240,10 +241,7 @@ impl ProviderRecord {
             models: Vec::new(),
         };
         let validation = (|| {
-            if !matches!(
-                protocol,
-                Some(Protocol::OpenAiChat | Protocol::GeminiInteractions)
-            ) {
+            if !protocol.is_some_and(crate::implemented) {
                 return Err(
                     "This provider needs a protocol or sign-in method not yet supported by Medha."
                         .into(),

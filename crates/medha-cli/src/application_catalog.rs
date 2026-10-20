@@ -85,17 +85,13 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit (also Ctrl-D)"),
 ];
 
-pub(crate) const MODEL_PROTOCOLS: &[(&str, bool, kernel::Protocol)] = &[
-    ("OpenAI-compatible Chat", true, kernel::Protocol::OpenAiChat),
+/// Whether each one can be picked comes from `providers::implemented`.
+pub(crate) const MODEL_PROTOCOLS: &[(&str, kernel::Protocol)] = &[
+    ("OpenAI-compatible Chat", kernel::Protocol::OpenAiChat),
+    ("OpenAI Responses", kernel::Protocol::OpenAiResponses),
     (
         "Gemini Interactions v1",
-        true,
         kernel::Protocol::GeminiInteractions,
     ),
-    (
-        "Anthropic Messages",
-        false,
-        kernel::Protocol::AnthropicMessages,
-    ),
-    ("OpenAI Responses", false, kernel::Protocol::OpenAiResponses),
+    ("Anthropic Messages", kernel::Protocol::AnthropicMessages),
 ];

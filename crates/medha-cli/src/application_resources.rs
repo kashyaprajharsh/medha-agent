@@ -862,7 +862,50 @@ pub(crate) async fn folder<L: EventLog>(
             }
             Err(error) => Err(error),
         },
+        "application.models.recognise_key" => match decoded::<protocol::RecogniseKey>(params) {
+            Ok(request) => encoded(recognise_key(&request.key.0)),
+            Err(error) => Err(error),
+        },
+        // The same sign-in calls the desktop makes as `settings.chatgpt.*`.
+        chatgpt if chatgpt.starts_with("application.chatgpt.") => {
+            match crate::chatgpt_signin::handle(chatgpt, &params).await {
+                Some(answer) => answer.map_err(|error| error.to_string()),
+                None => return None,
+            }
+        }
         _ => return None,
     };
     Some(result)
+}
+
+/// A pasted key's provider, read from its opening letters; every surface asks this one function.
+pub(crate) fn recognise_key(key: &str) -> protocol::RecognisedKey {
+    use providers::keys::{ADMIN_WARNING, Recognised, recognise};
+    let key = config::normalize_api_key(key);
+    let catalogue = providers::catalogue::snapshot();
+    let owner = |p: &providers::catalogue::ProviderRecord| protocol::KeyOwner {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        available: p.available,
+        reason: p.unavailable_reason.clone(),
+    };
+    let (matched, providers, warning) = match recognise(&key, &catalogue.providers) {
+        Recognised::One(p) => (protocol::KeyMatch::One, vec![owner(p)], None),
+        Recognised::Admin(p) => (
+            protocol::KeyMatch::One,
+            vec![owner(p)],
+            Some(ADMIN_WARNING.to_owned()),
+        ),
+        Recognised::Several(list) => (
+            protocol::KeyMatch::Several,
+            list.into_iter().map(owner).collect(),
+            None,
+        ),
+        Recognised::Unknown => (protocol::KeyMatch::Unknown, Vec::new(), None),
+    };
+    protocol::RecognisedKey {
+        matched,
+        providers,
+        warning,
+    }
 }

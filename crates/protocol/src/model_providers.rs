@@ -12,6 +12,9 @@ pub enum ModelAuth {
     Bearer,
     XApiKey,
     XGoogApiKey,
+    /// A signed-in ChatGPT account's plan; no key is kept for the model.
+    #[serde(rename = "chatgpt-plan")]
+    ChatGptPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

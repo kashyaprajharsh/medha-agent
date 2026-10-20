@@ -1,5 +1,6 @@
-//! Settings calls for ChatGPT sign-in, shared by every surface. Only a person's settings screen
-//! reaches them; the surface opens the returned link, and no answer carries a token.
+//! ChatGPT sign-in for every surface: the desktop's `settings.chatgpt.*` and the terminal's
+//! `application.chatgpt.*` are two names for these same calls. The surface opens the returned
+//! link, and no answer carries a token.
 
 use anyhow::{Result, anyhow};
 use runtime::chatgpt_accounts::{Accounts, Reauthorize, SignIn};
@@ -37,24 +38,27 @@ pub(crate) async fn handle(method: &str, params: &Value) -> Option<Result<Value>
             .ok_or_else(|| anyhow!("Choose a ChatGPT account"))
     };
     let id = params["id"].as_u64();
-    Some(match method {
-        "settings.chatgpt.accounts" => accounts
+    let call = method
+        .strip_prefix("settings.chatgpt.")
+        .or_else(|| method.strip_prefix("application.chatgpt."))?;
+    Some(match call {
+        "accounts" => accounts
             .list()
             .map(|accounts| json!({ "accounts": accounts })),
-        "settings.chatgpt.begin" => {
+        "begin" => {
             let again = params["client_id"].as_str().filter(|id| !id.is_empty());
             let consent = params["consent"] == true;
             begin(|| accounts.begin(again, consent), false).await
         }
-        "settings.chatgpt.finish" => finish(id).await,
-        "settings.chatgpt.cancel" => {
+        "finish" => finish(id).await,
+        "cancel" => {
             cancel(id.unwrap_or(EVERY));
             Ok(json!({ "cancelled": true }))
         }
-        "settings.chatgpt.switch" => client_id()
+        "switch" => client_id()
             .and_then(|id| accounts.switch(id))
             .map(|()| json!({ "switched": true })),
-        "settings.chatgpt.sign_out" => match client_id() {
+        "sign_out" => match client_id() {
             Ok(id) => accounts
                 .sign_out(id)
                 .await

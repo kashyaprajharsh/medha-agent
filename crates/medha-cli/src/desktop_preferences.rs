@@ -767,22 +767,9 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             Ok(json!({ "models": listed(&profile, &models) }))
         }
         // Read only from the key's opening letters: no request, and the key is not kept.
-        "settings.model.recognise_key" => {
-            use providers::keys::{ADMIN_WARNING, Recognised, recognise};
-            let key = config::normalize_api_key(params["key"].as_str().unwrap_or_default());
-            let catalogue = providers::catalogue::snapshot();
-            let row = |p: &providers::catalogue::ProviderRecord| json!({"id": p.id, "name": p.name, "available": p.available, "reason": p.unavailable_reason});
-            Ok(match recognise(&key, &catalogue.providers) {
-                Recognised::One(p) => json!({"match": "one", "providers": [row(p)]}),
-                Recognised::Admin(p) => {
-                    json!({"match": "one", "providers": [row(p)], "warning": ADMIN_WARNING})
-                }
-                Recognised::Several(list) => {
-                    json!({"match": "several", "providers": list.into_iter().map(row).collect::<Vec<_>>()})
-                }
-                Recognised::Unknown => json!({"match": "unknown", "providers": []}),
-            })
-        }
+        "settings.model.recognise_key" => Ok(serde_json::to_value(
+            crate::application_resources::recognise_key(params["key"].as_str().unwrap_or_default()),
+        )?),
         "settings.model.test" => {
             let profile: config::ProviderConfig =
                 serde_json::from_value(params["profile"].clone())?;

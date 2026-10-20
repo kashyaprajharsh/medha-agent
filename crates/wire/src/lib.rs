@@ -47,6 +47,7 @@ pub fn slow_request(method: &str) -> bool {
         "session.create"
             | "settings.model.discover"
             | "settings.chatgpt.finish"
+            | "application.chatgpt.finish"
             | "settings.model.test"
             | "settings.model.context"
             | "extensions.install"

@@ -952,6 +952,7 @@ fn profiles(catalogue: &protocol::ModelCatalogue) -> Vec<config::ModelProfile> {
                 Some(protocol::ModelAuth::Bearer) => providers::AuthKind::Bearer,
                 Some(protocol::ModelAuth::XApiKey) => providers::AuthKind::XApiKey,
                 Some(protocol::ModelAuth::XGoogApiKey) => providers::AuthKind::XGoogApiKey,
+                Some(protocol::ModelAuth::ChatGptPlan) => providers::AuthKind::ChatGptPlan,
                 None if profile.requires_key => {
                     providers::AuthKind::for_protocol(provider.protocol)
                 }

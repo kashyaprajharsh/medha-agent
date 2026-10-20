@@ -319,6 +319,17 @@ fn a_chatgpt_sign_in_through_the_backend_lists_plan_models_and_never_hands_out_a
     assert_eq!(out["revoked"], true);
     let after = bridge.ok("settings.chatgpt.accounts", json!({}));
     assert_eq!(after["accounts"][0]["signed_in"], false);
+
+    // The terminal's names reach the same backend calls and get the same answers.
+    assert_eq!(bridge.ok("application.chatgpt.accounts", json!({})), after);
+    for key in ["sk-ant-api03-abc", "sk-abc123", "nothing-known"] {
+        let asked = json!({ "key": key });
+        assert_eq!(
+            bridge.ok("application.models.recognise_key", asked.clone()),
+            bridge.ok("settings.model.recognise_key", asked),
+            "{key}"
+        );
+    }
     drop(server);
 }
 

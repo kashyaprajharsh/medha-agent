@@ -13,6 +13,8 @@ mod resources;
 pub use resources::*;
 mod model_providers;
 pub use model_providers::*;
+mod chatgpt;
+pub use chatgpt::*;
 mod session_features;
 pub use session_features::*;
 mod editor;

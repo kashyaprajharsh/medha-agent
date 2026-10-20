@@ -2071,7 +2071,7 @@ fn mcp_server_with(id: &str, server: &McpServer, key: Option<String>) -> mcp::Se
 }
 
 /// Normalize pasted bearer authorization values to their token.
-fn normalize_api_key(value: &str) -> String {
+pub fn normalize_api_key(value: &str) -> String {
     let value = value.trim();
     if value.eq_ignore_ascii_case("bearer") {
         return String::new();

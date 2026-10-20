@@ -8,6 +8,7 @@ pub mod discovery;
 #[cfg(test)]
 mod fallback_tests;
 mod key_rotation;
+pub mod keys;
 mod learned;
 pub mod model_test;
 pub mod models_dev;

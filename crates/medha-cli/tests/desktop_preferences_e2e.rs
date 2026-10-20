@@ -230,6 +230,26 @@ fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
         (&anthropic["available"], &anthropic["discovery"]),
         (&json!(false), &json!(false))
     );
+    // A pasted key is read as it would be saved; a known but unsupported provider says why.
+    let pasted = bridge.ok(
+        "settings.model.recognise_key",
+        json!({"key": "Bearer sk-ant-api03-abc"}),
+    );
+    assert_eq!(pasted["match"], "one");
+    assert_eq!(
+        (
+            &pasted["providers"][0]["id"],
+            &pasted["providers"][0]["available"]
+        ),
+        (&json!("anthropic"), &json!(false))
+    );
+    assert!(pasted["providers"][0]["reason"].is_string());
+    let admin = bridge.ok(
+        "settings.model.recognise_key",
+        json!({"key": "sk-admin-abc"}),
+    );
+    assert_eq!(admin["providers"][0]["id"], "openai");
+    assert!(admin["warning"].is_string());
     // New OpenAI setups use Responses; it lists models like Chat.
     let responses = protocols
         .iter()

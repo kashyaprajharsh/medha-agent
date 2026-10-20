@@ -679,6 +679,7 @@ async fn settings_request(
         "settings.model.save",
         "settings.model.discover",
         "settings.model.test",
+        "settings.model.recognise_key",
         "application.providers",
         "application.providers.refresh",
         "application.providers.resolve",

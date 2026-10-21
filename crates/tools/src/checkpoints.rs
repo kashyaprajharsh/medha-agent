@@ -1,31 +1,34 @@
-//! Checkpoints use Git only for the tracked/nonignored inventory. Backup and
-//! conditional restore use the same sandbox capabilities as structured writes.
+//! Before a shell command that may write, the workspace is backed up so undo can restore it.
+//! Git gives the tracked and nonignored inventory; copies use the sandbox's capabilities.
+//! A file that cannot be copied is named in a note and never stops the command.
 
 use super::*;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
-fn inventory(root: &Path, targets: &[String]) -> Result<Vec<PathBuf>, String> {
+/// How long a command waits for another process's backup before going without one.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
     if !root
         .ancestors()
         .any(|folder| std::fs::symlink_metadata(folder.join(".git")).is_ok())
     {
-        return folder_inventory(root, targets);
+        return folder_inventory(root);
     }
-    let mut args = vec![
-        "ls-files".into(),
-        "-z".into(),
-        "--cached".into(),
-        "--others".into(),
-        "--exclude-standard".into(),
-        "--".into(),
-    ];
-    args.extend_from_slice(targets);
+    let args = [
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]
+    .map(String::from);
     let mut args = git_safety::raw_arguments(root, &args)?;
     args.insert(0, "--literal-pathspecs".into());
     let mut command = tokio::process::Command::new("git");
@@ -42,9 +45,7 @@ fn inventory(root: &Path, targets: &[String]) -> Result<Vec<PathBuf>, String> {
     )
     .map_err(|e| e.to_string())?;
     if output.status != Some(0) || output.timed_out || output.stdout_truncated {
-        return Err(
-            "Cannot enumerate tracked and nonignored files for a complete checkpoint".into(),
-        );
+        return Err("the workspace's files could not be listed".into());
     }
     let mut paths = std::collections::BTreeSet::new();
     for bytes in output
@@ -53,21 +54,20 @@ fn inventory(root: &Path, targets: &[String]) -> Result<Vec<PathBuf>, String> {
         .filter(|part| !part.is_empty())
     {
         let path = Path::new(
-            std::str::from_utf8(bytes)
-                .map_err(|_| "Checkpoint filenames must be UTF-8 on this platform")?,
+            std::str::from_utf8(bytes).map_err(|_| "a file name is not UTF-8 on this platform")?,
         );
         if path
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
         {
-            return Err("Checkpoint path escaped its workspace".into());
+            return Err("a listed file escaped the workspace".into());
         }
         paths.insert(root.join(path));
     }
     Ok(paths.into_iter().collect())
 }
 
-fn folder_inventory(root: &Path, targets: &[String]) -> Result<Vec<PathBuf>, String> {
+fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -82,34 +82,52 @@ fn folder_inventory(root: &Path, targets: &[String]) -> Result<Vec<PathBuf>, Str
         if entry.file_type().is_some_and(|kind| kind.is_dir()) {
             continue;
         }
-        if targets.is_empty()
-            || targets
-                .iter()
-                .any(|target| entry.path().starts_with(root.join(target)))
-        {
-            paths.push(entry.into_path());
-        }
+        paths.push(entry.into_path());
         if paths.len() > 100_000 {
-            return Err("Checkpoint inventory exceeds 100,000 files; command was not run".into());
+            return Err("the workspace has more than 100,000 files".into());
         }
     }
     Ok(paths)
 }
 
-fn regular(root: &Path, path: &Path) -> Result<(), String> {
-    let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
+/// A regular file reached through real folders only; a link is never followed for undo.
+fn regular(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
     let mut current = root.to_owned();
     for component in relative.components() {
         current.push(component);
-        let meta = std::fs::symlink_metadata(&current).map_err(|e| e.to_string())?;
-        if meta.file_type().is_symlink() {
-            return Err("Checkpoint cannot safely back up a symlink; command was not run".into());
+        if std::fs::symlink_metadata(&current).map_or(true, |meta| meta.file_type().is_symlink()) {
+            return false;
         }
     }
-    if !path.is_file() {
-        return Err("Checkpoint source is not a regular file; command was not run".into());
+    path.is_file()
+}
+
+/// Size, change times and file id: equal values mean the bytes were not rewritten.
+fn stamp(meta: &std::fs::Metadata) -> Value {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        json!([
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+            meta.ino()
+        ])
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_nanos().to_string());
+        json!([meta.len(), modified])
+    }
 }
 
 fn save(directory: &Path, value: &Value) -> Result<(), String> {
@@ -142,49 +160,42 @@ fn save(directory: &Path, value: &Value) -> Result<(), String> {
     result
 }
 
-fn remove(sandbox: &WorkspaceSandbox, directory: &Path, manifest: &Value) -> Result<(), String> {
-    for row in manifest["files"].as_array().into_iter().flatten() {
-        if let Some(id) = row["snapshot"].as_str() {
-            sandbox
-                .discard_snapshot(id)
-                .map_err(|error| error.to_string())?;
+/// Every manifest, oldest first by its ULID name.
+fn manifests(sandbox: &WorkspaceSandbox) -> Result<Vec<(PathBuf, Value)>, String> {
+    let directory = sandbox.command_snapshots_dir().join("commands");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let manifest = entry.path().join("manifest.json");
+        let value = std::fs::read(&manifest)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        match value {
+            Some(value) => found.push((entry.path(), value)),
+            // A manifest never written belongs to a backup that did not finish.
+            None => std::fs::remove_dir_all(entry.path()).map_err(|e| e.to_string())?,
         }
     }
-    std::fs::remove_dir_all(directory).map_err(|error| error.to_string())
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
 }
 
+/// Deletes copies no kept manifest names; copies are shared between backups of unchanged files.
 fn clean_orphans(sandbox: &WorkspaceSandbox) -> Result<(), String> {
     if sandbox.command_snapshots_dir() == sandbox.snapshots_dir() {
         return Ok(());
     }
-    let mut referenced = std::collections::HashSet::new();
-    let manifests = sandbox.command_snapshots_dir().join("commands");
-    if manifests.is_dir() {
-        for entry in std::fs::read_dir(manifests).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            if !entry
-                .file_type()
-                .map_err(|error| error.to_string())?
-                .is_dir()
-            {
-                continue;
-            }
-            let manifest = entry.path().join("manifest.json");
-            if !manifest.exists() {
-                std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
-                continue;
-            }
-            let value: Value = serde_json::from_slice(
-                &std::fs::read(manifest).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-            for row in value["files"].as_array().into_iter().flatten() {
-                if let Some(id) = row["snapshot"].as_str() {
-                    referenced.insert(id.to_owned());
-                }
-            }
-        }
-    }
+    let referenced: HashSet<String> = manifests(sandbox)?
+        .iter()
+        .flat_map(|(_, value)| value["files"].as_array().cloned().unwrap_or_default())
+        .filter_map(|row| row["snapshot"].as_str().map(str::to_owned))
+        .collect();
     for entry in
         std::fs::read_dir(sandbox.command_snapshots_dir()).map_err(|error| error.to_string())?
     {
@@ -208,36 +219,19 @@ fn clean_orphans(sandbox: &WorkspaceSandbox) -> Result<(), String> {
     Ok(())
 }
 
+/// Drops the oldest manifests past the count or byte allowance; their unshared copies go with them.
 fn retain(
     sandbox: &WorkspaceSandbox,
     incoming: usize,
     limits: &kernel::mutations::Settings,
 ) -> Result<(), String> {
-    let directory = sandbox.command_snapshots_dir().join("commands");
-    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    let mut manifests = Vec::new();
-    for entry in std::fs::read_dir(&directory).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            continue;
-        }
-        let value: Value = serde_json::from_slice(
-            &std::fs::read(entry.path().join("manifest.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        manifests.push((entry.file_name(), entry.path(), value));
-    }
-    manifests.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut total: usize = manifests
+    let kept = manifests(sandbox)?;
+    let mut total: usize = kept
         .iter()
-        .map(|(_, _, value)| {
-            value["bytes"]
-                .as_u64()
-                .unwrap_or(limits.checkpoint_bytes as u64) as usize
-        })
+        .map(|(_, value)| value["bytes"].as_u64().unwrap_or(0) as usize)
         .fold(0, usize::saturating_add);
-    let mut count = manifests.len();
-    for (_, path, value) in manifests {
+    let mut count = kept.len();
+    for (path, value) in kept {
         if count < limits.checkpoint_count
             && total.saturating_add(incoming) <= limits.checkpoint_bytes
         {
@@ -245,16 +239,25 @@ fn retain(
         }
         total = total.saturating_sub(value["bytes"].as_u64().unwrap_or(0) as usize);
         count -= 1;
-        remove(sandbox, &path, &value)?;
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
-fn blocked(guard: &kernel::mutations::Guard, command: &str, reason: String) -> Value {
-    let id = guard
-        .refuse(command.as_bytes(), "shell checkpoint", &reason, command)
-        .ok();
-    json!({"error":reason,"changed":false,"command":command,"mutation":{"id":id}})
+fn lock(sandbox: &WorkspaceSandbox) -> Result<fd_lock::RwLock<std::fs::File>, String> {
+    let lockfile = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(sandbox.command_snapshots_dir().join(".checkpoint.lock"))
+        .map_err(|error| error.to_string())?;
+    Ok(fd_lock::RwLock::new(lockfile))
+}
+
+/// The note a command carries when undo cannot cover all of what it changes.
+fn note(text: String) -> Value {
+    json!({ "_checkpoint_note": text })
 }
 
 pub(crate) async fn prepare(sandbox: &Arc<WorkspaceSandbox>, args: &Value) -> Result<Value, Value> {
@@ -262,153 +265,196 @@ pub(crate) async fn prepare(sandbox: &Arc<WorkspaceSandbox>, args: &Value) -> Re
         return Ok(Value::Null);
     };
     let command = args["command"].as_str().unwrap_or_default();
-    let limits = guard.settings();
-    let result = async {
-        let targets = policy::checkpoint_targets(command).map_err(str::to_owned)?;
-        let outside = |target: &str| {
-            let path = Path::new(target);
-            (path.is_absolute() && !path.starts_with(sandbox.root()))
-                || path.components().any(|part| matches!(part, Component::ParentDir))
-        };
-        let outside_target = targets.as_ref().is_some_and(|targets| {
-            targets.iter().any(|target| outside(target))
-        });
-        let outside_operand = targets.is_some()
-            && policy::plain_commands(command).is_some_and(|commands| {
-                commands.iter().flatten().any(|word| outside(word))
-            });
-        if outside_target || outside_operand {
-            return Err("Destructive command was not run: its outside-workspace target has no complete checkpoint".into());
-        }
-        let external = sandbox.exec_backend_label() == "ssh"
-            || args["outside_sandbox"] == true
-            || args["write_paths"].as_array().is_some_and(|paths| !paths.is_empty());
-        if targets.is_some() && external {
-            return Err("Destructive command was not run: a complete checkpoint of its actual external or SSH target is unavailable".into());
-        }
-        if external {
-            return Ok(Value::Null);
-        }
-        if let Some(targets) = &targets {
-            let plan = ShellPlan::parse(args, sandbox).map_err(|error| error.to_string())?;
-            if plan.workdir != sandbox.root() {
-                return Err("Destructive command was not run: checkpointing this alternate working directory is unavailable".into());
-            }
-            let root = sandbox.root().to_owned();
-            let targets = targets.clone();
-            let eligible = tokio::task::spawn_blocking(move || inventory(&root, &targets))
-                .await.map_err(|error| error.to_string())??;
-            // Ignored-only deletion has no snapshot allocation, comparison or notice.
-            if eligible.is_empty() {
-                return Ok(Value::Null);
-            }
-        }
-        if let Some(value) = guard.checkpoint(sandbox.root())
-            && value["checkpoint"].as_str().is_some_and(|id| {
-                sandbox.command_snapshots_dir().join("commands").join(id).join("manifest.json").is_file()
-            })
+    if shell_reader::read(command).reads_only() {
+        return Ok(Value::Null);
+    }
+    if sandbox.exec_backend_label() == "ssh" {
+        return Ok(note(
+            "No backup was made: the command runs on the SSH host, so undo cannot restore what it changes.".into(),
+        ));
+    }
+    let outside = args["outside_sandbox"] == true
+        || args["write_paths"]
+            .as_array()
+            .is_some_and(|paths| !paths.is_empty());
+    let mut prepared = match guard.checkpoint(sandbox.root()) {
+        Some(value)
+            if value["_checkpoint_manifest"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).is_file()) =>
         {
-            return Ok(value);
+            json!({ "checkpoint": value["checkpoint"], "_checkpoint_manifest": value["_checkpoint_manifest"] })
         }
-        if targets.is_none() {
-            return Ok(Value::Null);
-        }
-        let root = sandbox.root().to_owned();
-        let paths = tokio::task::spawn_blocking(move || inventory(&root, &[]))
-            .await.map_err(|error| error.to_string())??;
-        std::fs::create_dir_all(sandbox.command_snapshots_dir()).map_err(|error| error.to_string())?;
-        let lockfile = std::fs::OpenOptions::new().create(true).truncate(false)
-            .read(true).write(true).open(sandbox.command_snapshots_dir().join(".checkpoint.lock"))
-            .map_err(|error| error.to_string())?;
-        let mut process_lock = fd_lock::RwLock::new(lockfile);
-        let _exclusive = process_lock.try_write()
-            .map_err(|_| "Another process is making a checkpoint; command was not run".to_owned())?;
-        clean_orphans(sandbox)?;
-        let mut rows = Vec::new();
-        let mut bytes = 0;
-        let captured = async {
-            // Sizes set each file's share of the byte allowance, so copies can run together.
-            let mut planned = Vec::new();
-            let mut sized = 0usize;
-            for path in paths {
-                if path.starts_with(sandbox.snapshots_dir()) || path.starts_with(sandbox.command_snapshots_dir()) {
-                    continue;
+        _ => match capture(sandbox, command, &guard.settings()).await {
+            Ok((full, skipped)) => {
+                guard.remember_checkpoint(sandbox.root(), full.clone());
+                let mut prepared = json!({ "checkpoint": full["checkpoint"], "_checkpoint_manifest": full["_checkpoint_manifest"] });
+                if !skipped.is_empty() {
+                    prepared["_checkpoint_note"] = json!(format!(
+                        "Not backed up, so undo cannot restore them: {}.",
+                        skipped.join(", ")
+                    ));
                 }
-                let meta = match std::fs::symlink_metadata(&path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        rows.push(json!({"path":path,"snapshot":null,"before":"missing","expected":"unknown"}));
-                        continue;
-                    }
-                    meta => meta.map_err(|error| error.to_string())?,
+                prepared
+            }
+            Err(reason) => note(format!(
+                "No backup was made before this command ({reason}), so undo cannot restore what it changes."
+            )),
+        },
+    };
+    if outside {
+        let joined = [
+            prepared["_checkpoint_note"].as_str().unwrap_or_default(),
+            "Folders outside the workspace are not backed up; undo restores workspace files only.",
+        ]
+        .join(" ");
+        prepared["_checkpoint_note"] = json!(joined.trim());
+    }
+    Ok(prepared)
+}
+
+/// Copies every file that changed since the last backup and reuses the rest.
+async fn capture(
+    sandbox: &Arc<WorkspaceSandbox>,
+    command: &str,
+    limits: &kernel::mutations::Settings,
+) -> Result<(Value, Vec<String>), String> {
+    let root = sandbox.root().to_owned();
+    let paths = tokio::task::spawn_blocking(move || inventory(&root))
+        .await
+        .map_err(|error| error.to_string())??;
+    std::fs::create_dir_all(sandbox.command_snapshots_dir()).map_err(|error| error.to_string())?;
+    let mut process_lock = lock(sandbox)?;
+    // Another process's backup is waited for, not a reason to refuse.
+    let started = std::time::Instant::now();
+    let _exclusive = loop {
+        match process_lock.try_write() {
+            Ok(held) => break held,
+            Err(_) if started.elapsed() < LOCK_WAIT => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(_) => {
+                return Err(
+                    "another backup of this workspace did not finish within 30 seconds".into(),
+                );
+            }
+        }
+    };
+    clean_orphans(sandbox)?;
+    let previous: BTreeMap<String, Value> = manifests(sandbox)?
+        .pop()
+        .and_then(|(_, value)| value["files"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| Some((row["path"].as_str()?.to_owned(), row)))
+        .collect();
+    let (mut rows, planned, mut skipped) = plan(sandbox, paths, &previous, limits);
+    let copied = copy(sandbox, planned).await;
+    let mut bytes = 0;
+    for (path, stamp, result) in copied {
+        match result {
+            Ok((id, digest, size)) => {
+                bytes += size;
+                rows.push(json!({"path":path,"snapshot":id,"before":digest,"expected":"unknown","stat":stamp}));
+            }
+            Err(_) => skipped.push(display(sandbox, &path)),
+        }
+    }
+    sandbox
+        .seal_command_snapshots()
+        .map_err(|error| error.to_string())?;
+    retain(sandbox, bytes, limits)?;
+    let id = ulid::Ulid::new().to_string();
+    let directory = sandbox.command_snapshots_dir().join("commands").join(&id);
+    let manifest = directory.join("manifest.json");
+    if let Err(error) = save(
+        &directory,
+        &json!({"id":id,"bytes":bytes,"files":rows,"command":command}),
+    ) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    clean_orphans(sandbox)?;
+    let full = json!({"checkpoint":id,"_checkpoint_manifest":manifest,"_checkpoint_files":rows});
+    Ok((full, skipped))
+}
+
+type Planned = Vec<(PathBuf, Value, usize)>;
+
+/// Rows reused from the last backup, files to copy with their share of the allowance, and files left out.
+fn plan(
+    sandbox: &WorkspaceSandbox,
+    paths: Vec<PathBuf>,
+    previous: &BTreeMap<String, Value>,
+    limits: &kernel::mutations::Settings,
+) -> (Vec<Value>, Planned, Vec<String>) {
+    let (mut rows, mut planned, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    let mut sized = 0usize;
+    for path in paths {
+        if path.starts_with(sandbox.snapshots_dir())
+            || path.starts_with(sandbox.command_snapshots_dir())
+        {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !regular(sandbox.root(), &path) {
+            skipped.push(display(sandbox, &path));
+            continue;
+        }
+        let stamp = stamp(&meta);
+        let key = path.to_string_lossy().into_owned();
+        if let Some(row) = previous.get(&key)
+            && row["stat"] == stamp
+            && row["snapshot"]
+                .as_str()
+                .is_some_and(|id| sandbox.snapshot_exists(id))
+        {
+            rows.push(row.clone());
+            continue;
+        }
+        let len = meta.len() as usize;
+        match limits.checkpoint_bytes.checked_sub(sized) {
+            Some(remaining) if len <= remaining => {
+                sized += len;
+                planned.push((path, stamp, remaining));
+            }
+            _ => skipped.push(display(sandbox, &path)),
+        }
+    }
+    (rows, planned, skipped)
+}
+
+/// Copies run eight at a time; a file that fails is left out, not the backup.
+async fn copy(
+    sandbox: &Arc<WorkspaceSandbox>,
+    planned: Planned,
+) -> Vec<(PathBuf, Value, Result<(String, String, usize), String>)> {
+    futures::stream::iter(planned)
+        .map(|(path, stamp, remaining)| {
+            let sandbox = Arc::clone(sandbox);
+            async move {
+                let copied = match path.to_str() {
+                    Some(name) => sandbox
+                        .checkpoint_file(name, remaining)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => Err("unsupported path".to_owned()),
                 };
-                regular(sandbox.root(), &path)?;
-                let remaining = limits.checkpoint_bytes.checked_sub(sized)
-                    .ok_or("checkpoint exceeds its byte allowance")?;
-                sized = sized.saturating_add(meta.len() as usize);
-                planned.push((path, remaining));
+                (path, stamp, copied)
             }
-            let copies: Vec<_> = futures::stream::iter(planned)
-                .map(|(path, remaining)| {
-                    let sandbox = Arc::clone(sandbox);
-                    tokio::spawn(async move {
-                        let copied = match path.to_str() {
-                            Some(name) => sandbox.checkpoint_file(name, remaining).await.map_err(|error| error.to_string()),
-                            None => Err("Unsupported checkpoint path".to_owned()),
-                        };
-                        (path, copied)
-                    })
-                })
-                .buffered(8)
-                .collect()
-                .await;
-            let mut failure = None;
-            for copy in copies {
-                let (path, copied) = match copy {
-                    Ok(copy) => copy,
-                    Err(error) => {
-                        failure.get_or_insert(error.to_string());
-                        continue;
-                    }
-                };
-                match copied {
-                    Ok((id, digest, size)) => {
-                        bytes += size;
-                        rows.push(json!({"path":path,"snapshot":id,"before":digest,"expected":"unknown"}));
-                    }
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                    }
-                }
-            }
-            if let Some(error) = failure {
-                return Err(error);
-            }
-            if bytes > limits.checkpoint_bytes {
-                return Err("checkpoint exceeds its byte allowance".into());
-            }
-            sandbox.seal_command_snapshots().map_err(|error| error.to_string())?;
-            retain(sandbox, bytes, &limits)?;
-            let id = ulid::Ulid::new().to_string();
-            let directory = sandbox.command_snapshots_dir().join("commands").join(&id);
-            let value = json!({"id":id,"bytes":bytes,"files":rows,"command":command});
-            if let Err(error) = save(&directory, &value) {
-                let _ = std::fs::remove_dir_all(&directory);
-                return Err(error);
-            }
-            let prepared = json!({"checkpoint":id,"_checkpoint_files":rows});
-            guard.remember_checkpoint(sandbox.root(), prepared.clone());
-            Ok(prepared)
-        }.await;
-        if captured.is_err() {
-            for row in rows {
-                if let Some(id) = row["snapshot"].as_str() {
-                    let _ = sandbox.discard_snapshot(id);
-                }
-            }
-        }
-        captured
-    }.await;
-    result.map_err(|reason| blocked(&guard, command, reason))
+        })
+        .buffered(8)
+        .collect()
+        .await
+}
+
+fn display(sandbox: &WorkspaceSandbox, path: &Path) -> String {
+    path.strip_prefix(sandbox.root())
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 fn digest(path: &Path) -> Result<String, String> {
@@ -429,6 +475,7 @@ fn digest(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Records what the command changed relative to the backup; untouched files are not re-read.
 pub(crate) async fn finish(sandbox: &WorkspaceSandbox, observation: &mut Observation) {
     let Some((guard, _)) = kernel::egress::mutation_context() else {
         return;
@@ -436,60 +483,71 @@ pub(crate) async fn finish(sandbox: &WorkspaceSandbox, observation: &mut Observa
     let Some(prepared) = guard.checkpoint(sandbox.root()) else {
         return;
     };
-    let result = (|| -> Result<Value, String> {
-        let mut rows = BTreeMap::<String, Value>::new();
-        for row in prepared["_checkpoint_files"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if let Some(path) = row["path"].as_str() {
-                rows.insert(path.to_owned(), row.clone());
-            }
+    let mut rows: BTreeMap<String, Value> = prepared["_checkpoint_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row["path"].as_str()?.to_owned(), row.clone())))
+        .collect();
+    match changed(sandbox, &mut rows) {
+        Ok(changed) => observation.payload["_checkpoint_files"] = json!(changed),
+        Err(error) => {
+            observation.payload["_checkpoint_note"] = json!(format!(
+                "The backup is kept, but undo cannot confirm what this command changed: {error}"
+            ));
         }
-        for path in inventory(sandbox.root(), &[])? {
-            if path.starts_with(sandbox.snapshots_dir())
-                || path.starts_with(sandbox.command_snapshots_dir())
-            {
-                continue;
-            }
-            if matches!(std::fs::symlink_metadata(&path),Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-            {
-                continue;
-            }
-            regular(sandbox.root(), &path)?;
-            let key = path
-                .to_str()
-                .ok_or("Unsupported checkpoint path")?
-                .to_owned();
-            rows.entry(key)
-                .or_insert_with(|| json!({"path":path,"snapshot":null,"before":"missing"}));
-        }
-        let before_rows: Vec<_> = rows.values().cloned().collect();
-        guard.remember_checkpoint(
-            sandbox.root(),
-            json!({"checkpoint":prepared["checkpoint"],"_checkpoint_files":before_rows}),
-        );
-        for (path, row) in &mut rows {
-            // A changed link or unsupported target is never followed for undo.
-            let path = Path::new(path);
-            row["expected"] = json!(if path.exists() {
-                regular(sandbox.root(), path)
-                    .and_then(|_| digest(path))
-                    .unwrap_or_else(|_| "unknown".into())
-            } else {
-                "missing".into()
-            });
-        }
-        Ok(json!(rows.into_values().collect::<Vec<_>>()))
-    })();
+    }
     observation.payload["checkpoint"] = prepared["checkpoint"].clone();
-    observation.payload["_checkpoint_files"] = result.unwrap_or_else(|error| {
-        observation.payload["checkpoint_warning"] = json!(format!(
-            "Backup retained; automatic restore cannot prove the final revision: {error}"
-        ));
-        prepared["_checkpoint_files"].clone()
-    });
+    let mut remembered = prepared;
+    remembered["_checkpoint_files"] = json!(rows.into_values().collect::<Vec<_>>());
+    guard.remember_checkpoint(sandbox.root(), remembered);
+}
+
+/// Rows whose current bytes differ from the backup; files new since it are added as missing before.
+fn changed(
+    sandbox: &WorkspaceSandbox,
+    rows: &mut BTreeMap<String, Value>,
+) -> Result<Vec<Value>, String> {
+    let mut changed = Vec::new();
+    let mut present = HashSet::new();
+    for path in inventory(sandbox.root())? {
+        if path.starts_with(sandbox.snapshots_dir())
+            || path.starts_with(sandbox.command_snapshots_dir())
+        {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !regular(sandbox.root(), &path) {
+            continue;
+        }
+        let key = path.to_string_lossy().into_owned();
+        present.insert(key.clone());
+        let row = rows
+            .entry(key)
+            .or_insert_with(|| json!({"path":path,"snapshot":null,"before":"missing","stat":null}));
+        if row["stat"] == stamp(&meta) {
+            continue;
+        }
+        let expected = digest(&path)?;
+        if row["before"] == expected.as_str() {
+            // Touched but not changed: later commands need not read it again.
+            row["stat"] = stamp(&meta);
+        } else {
+            let mut row = row.clone();
+            row["expected"] = json!(expected);
+            changed.push(row);
+        }
+    }
+    for (key, row) in rows.iter() {
+        if !present.contains(key) && row["before"] != "missing" {
+            let mut row = row.clone();
+            row["expected"] = json!("missing");
+            changed.push(row);
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]

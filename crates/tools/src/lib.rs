@@ -1167,11 +1167,32 @@ impl Executor for ToolRegistry {
         preparation: &Value,
         observation: &mut Observation,
     ) {
-        if intent.tool == "shell.exec"
-            && preparation["checkpoint"].is_string()
+        if intent.tool != "shell.exec" {
+            return;
+        }
+        if preparation["checkpoint"].is_string()
             && let Some(sandbox) = &self.sandbox
         {
             checkpoints::finish(sandbox, observation).await;
+        }
+        // What undo cannot restore is said where the model and the person both read it.
+        let notes = [
+            &preparation["_checkpoint_note"],
+            &observation.payload["_checkpoint_note"],
+        ];
+        let note = notes
+            .iter()
+            .filter_map(|note| note.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !note.is_empty() {
+            observation.payload["backup_note"] = json!(note);
+            if let Some(text) = &mut observation.model_text {
+                text.push_str(&format!("\n\nBackup: {note}"));
+            }
+        }
+        if let Some(payload) = observation.payload.as_object_mut() {
+            payload.remove("_checkpoint_note");
         }
     }
     async fn tool_inventory(

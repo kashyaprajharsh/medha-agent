@@ -11,65 +11,67 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+fn repo(scratch: &tempfile::TempDir) -> (PathBuf, Arc<WorkspaceSandbox>) {
+    let base = scratch.path().canonicalize().unwrap();
+    let root = base.join("repo");
+    std::fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    let sandbox = Arc::new(
+        WorkspaceSandbox::new_jailed(&root)
+            .unwrap()
+            .with_snapshots_dir(base.join("state/snapshots"))
+            .with_command_snapshots_dir(base.join("state/commands")),
+    );
+    (root, sandbox)
+}
+
+async fn prepared(
+    guard: &Arc<kernel::egress::Guard>,
+    sandbox: &Arc<WorkspaceSandbox>,
+    command: &str,
+) -> Value {
+    let (result, _) = kernel::egress::scope(
+        guard.clone(),
+        false,
+        prepare(sandbox, &json!({"command":command,"network":false})),
+    )
+    .await;
+    result.expect("a backup never refuses the command")
+}
+
+fn rows(guard: &kernel::egress::Guard, sandbox: &WorkspaceSandbox) -> Vec<Value> {
+    guard.mutations.checkpoint(sandbox.root()).unwrap()["_checkpoint_files"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// A backup covers tracked and untracked work, skips ignored files, and undo restores
+/// it without overwriting what the person changed afterwards.
 #[tokio::test]
 async fn backups_include_untracked_exclude_ignored_and_preserve_later_human_work() {
     let scratch = tempfile::tempdir().unwrap();
-    let root = scratch.path().join("repo");
-    std::fs::create_dir(&root).unwrap();
-    git(&root, &["init", "-q"]);
+    let (root, sandbox) = repo(&scratch);
     std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
     std::fs::write(root.join("tracked"), "original").unwrap();
     git(&root, &["add", "--", "tracked", ".gitignore"]);
     std::fs::write(root.join("untracked"), "unsaved work").unwrap();
     std::fs::create_dir(root.join("target")).unwrap();
     std::fs::write(root.join("target/cache"), "ignored").unwrap();
-    let sandbox = Arc::new(
-        WorkspaceSandbox::new_jailed(&root)
-            .unwrap()
-            .with_snapshots_dir(
-                scratch
-                    .path()
-                    .canonicalize()
-                    .unwrap()
-                    .join("state/snapshots"),
-            ),
-    );
     let guard = Arc::new(kernel::egress::Guard::default());
-    let (ignored, _) = kernel::egress::scope(
-        guard.clone(),
-        true,
-        prepare(
-            &sandbox,
-            &json!({"command":"rm -rf target","network":false}),
-        ),
-    )
-    .await;
-    assert!(ignored.unwrap().is_null());
-    for command in ["cat < tracked", "cargo test 2>/dev/null", "rm --version"] {
-        let (plain, _) = kernel::egress::scope(
-            guard.clone(),
-            false,
-            prepare(&sandbox, &json!({"command":command,"network":false})),
-        )
-        .await;
+    for read in ["cat < tracked", "rg -n x tracked 2>/dev/null", "git status"] {
         assert!(
-            plain.unwrap().is_null(),
-            "{command} creates no needed backup"
+            prepared(&guard, &sandbox, read).await.is_null(),
+            "{read} only reads"
         );
     }
-    assert!(!sandbox.snapshots_dir().exists());
-    assert!(guard.mutations.notices().is_empty());
-    let (prepared, _) = kernel::egress::scope(
-        guard.clone(),
-        true,
-        prepare(
-            &sandbox,
-            &json!({"command":"rm tracked untracked","network":false}),
-        ),
-    )
-    .await;
-    let prepared = prepared.unwrap();
-    assert_eq!(prepared["_checkpoint_files"].as_array().unwrap().len(), 3);
+    let first = prepared(&guard, &sandbox, "rm tracked untracked").await;
+    assert!(first["checkpoint"].is_string());
+    assert_eq!(
+        rows(&guard, &sandbox).len(),
+        3,
+        "ignored files are not copied"
+    );
     let registry = orchestrator::NarrowedExecutor::new(
         Arc::new(ToolRegistry::with_workspace(
             sandbox.clone(),
@@ -77,52 +79,34 @@ async fn backups_include_untracked_exclude_ignored_and_preserve_later_human_work
         )),
         None,
     );
-    let ignored = ToolIntent {
-        id: "ignored-after-checkpoint".into(),
-        tool: "shell.exec".into(),
-        args: json!({"command":"rm -rf target","network":false}),
-    };
-    let (ignored_result, _) = kernel::egress::scope(guard.clone(), false, async {
-        let preparation = registry.prepare_effect(&ignored).await.unwrap();
-        assert!(preparation.is_null());
-        let mut observation = registry.execute(&ignored).await;
-        registry
-            .finish_effect(&ignored, &preparation, &mut observation)
-            .await;
-        observation
-    })
-    .await;
-    assert_eq!(ignored_result.payload["exit_code"], 0);
-    assert!(ignored_result.payload.get("checkpoint").is_none());
-    assert!(!root.join("target").exists());
-    assert!(guard.mutations.notices().is_empty());
     std::fs::remove_file(root.join("tracked")).unwrap();
     std::fs::remove_file(root.join("untracked")).unwrap();
     std::fs::write(root.join("created"), "command output").unwrap();
-    let mut observation = Observation::ok(
-        "command",
-        json!({"command":"rm tracked untracked","exit_code":0}),
-    );
-    let destructive = ToolIntent {
+    let mut observation = Observation::ok("command", json!({"exit_code":0}));
+    let command = ToolIntent {
         id: "command".into(),
         tool: "shell.exec".into(),
         args: json!({"command":"rm tracked untracked","network":false}),
     };
     kernel::egress::scope(guard.clone(), true, async {
-        let child_preparation = registry.prepare_effect(&destructive).await.unwrap();
-        assert_eq!(child_preparation["checkpoint"], prepared["checkpoint"]);
+        let again = registry.prepare_effect(&command).await.unwrap();
+        assert_eq!(
+            again["checkpoint"], first["checkpoint"],
+            "one backup per message"
+        );
         registry
-            .finish_effect(&destructive, &child_preparation, &mut observation)
+            .finish_effect(&command, &again, &mut observation)
             .await;
     })
     .await;
-    let rows = observation.payload["_checkpoint_files"].as_array().unwrap();
-    let files: Vec<_> = rows
+    let changed = observation.payload["_checkpoint_files"].as_array().unwrap();
+    assert_eq!(
+        changed.len(),
+        3,
+        "only what changed is recorded: {changed:?}"
+    );
+    let files: Vec<_> = changed
         .iter()
-        .filter(|row| {
-            row["path"].as_str().unwrap().ends_with("tracked")
-                || row["path"].as_str().unwrap().ends_with("created")
-        })
         .map(|row| kernel::events::FileRollback {
             path: row["path"].as_str().unwrap().into(),
             snapshot: row["snapshot"].as_str().map(str::to_owned),
@@ -140,125 +124,128 @@ async fn backups_include_untracked_exclude_ignored_and_preserve_later_human_work
     );
     assert!(!root.join("created").exists());
     std::fs::write(root.join("tracked"), "human later").unwrap();
-    assert!(
-        sandbox
-            .restore_revision(
-                files
-                    .iter()
-                    .find(|file| Path::new(&file.path).ends_with("tracked"))
-                    .unwrap()
-            )
-            .await
-            .is_err()
-    );
+    let tracked = files
+        .iter()
+        .find(|file| file.path.ends_with("/tracked"))
+        .unwrap();
+    assert!(sandbox.restore_revision(tracked).await.is_err());
     assert_eq!(
         std::fs::read_to_string(root.join("tracked")).unwrap(),
         "human later"
     );
-    let (again, _) = kernel::egress::scope(
-        guard.clone(),
-        false,
-        prepare(&sandbox, &json!({"command":"rm untracked","network":false})),
-    )
-    .await;
-    assert_eq!(again.unwrap()["checkpoint"], prepared["checkpoint"]);
 }
 
-#[cfg(unix)]
+/// The commands the 2026-10-20 chat was refused for now run with a backup.
 #[tokio::test]
-async fn git_pathspec_magic_cannot_hide_a_literal_destructive_target() {
+async fn commands_once_refused_run_with_a_backup() {
     let scratch = tempfile::tempdir().unwrap();
-    let root = scratch.path().join("repo");
-    std::fs::create_dir(&root).unwrap();
-    git(&root, &["init", "-q"]);
-    std::fs::write(root.join(":(exclude)*"), "must be backed up").unwrap();
-    git(&root, &["--literal-pathspecs", "add", "--", ":(exclude)*"]);
-    let sandbox = Arc::new(
-        WorkspaceSandbox::new_jailed(&root)
-            .unwrap()
-            .with_snapshots_dir(scratch.path().canonicalize().unwrap().join("snapshots")),
-    );
-    let guard = Arc::new(kernel::egress::Guard::default());
-    let (prepared, _) = kernel::egress::scope(
-        guard,
-        false,
-        prepare(
-            &sandbox,
-            &json!({"command":"rm -- ':(exclude)*'","network":false}),
-        ),
-    )
-    .await;
-    let prepared = prepared.unwrap();
-    assert!(prepared["checkpoint"].is_string());
-    assert_eq!(
-        prepared["_checkpoint_files"][0]["path"],
-        root.canonicalize()
-            .unwrap()
-            .join(":(exclude)*")
-            .to_string_lossy()
-            .as_ref()
-    );
-    for flag in ["-t../outside", "-it../outside", "--target-directory=.."] {
+    let (root, sandbox) = repo(&scratch);
+    std::fs::create_dir(root.join("work")).unwrap();
+    std::fs::write(root.join("work/f.txt"), "filter").unwrap();
+    for command in [
+        "cd work && ffmpeg -y -i a.gif m.mp4 2>err.log; echo \"exit=$?\"; head -40 err.log",
+        "for f in *.png; do cp \"$f\" out/; rm -rf \"$f\"; done",
+        "git -Csub reset --hard",
+        "printf x > work/f.txt && ffmpeg -y out.mp4 2>&1 | tail -6; echo \"${PIPESTATUS[0]}\"",
+    ] {
         let guard = Arc::new(kernel::egress::Guard::default());
-        let (refused, _) = kernel::egress::scope(
-            guard.clone(),
-            false,
-            prepare(
-                &sandbox,
-                &json!({"command":format!("mv {flag} -- ':(exclude)*'"),"network":false}),
-            ),
-        )
-        .await;
-        assert!(refused.is_err(), "outside target {flag} has no backup");
-        assert_eq!(guard.mutations.notices().len(), 1);
-        assert!(root.join(":(exclude)*").exists());
+        let result = prepared(&guard, &sandbox, command).await;
+        assert!(result["checkpoint"].is_string(), "{command}: {result}");
+        assert!(
+            result.get("_checkpoint_note").is_none(),
+            "{command}: {result}"
+        );
     }
 }
 
+/// A link is never copied or followed for undo; it is named and the command still runs.
 #[cfg(unix)]
 #[tokio::test]
-async fn an_unbackable_link_blocks_the_command_with_one_quiet_notice() {
+async fn a_link_is_named_and_never_followed() {
     let scratch = tempfile::tempdir().unwrap();
-    let root = scratch.path().join("repo");
-    std::fs::create_dir(&root).unwrap();
-    git(&root, &["init", "-q"]);
+    let (root, sandbox) = repo(&scratch);
     std::fs::write(scratch.path().join("secret"), "private").unwrap();
     std::os::unix::fs::symlink(scratch.path().join("secret"), root.join("link")).unwrap();
-    let sandbox = Arc::new(
-        WorkspaceSandbox::new_jailed(&root)
-            .unwrap()
-            .with_snapshots_dir(scratch.path().canonicalize().unwrap().join("snapshots")),
-    );
+    std::fs::write(root.join("note"), "kept").unwrap();
     let guard = Arc::new(kernel::egress::Guard::default());
-    let (result, _) = kernel::egress::scope(
-        guard.clone(),
-        true,
-        prepare(&sandbox, &json!({"command":"rm link","network":false})),
-    )
-    .await;
-    assert!(result.is_err());
-    assert_eq!(guard.mutations.notices().len(), 1);
-    assert!(guard.mutations.notices().is_empty());
+    let result = prepared(&guard, &sandbox, "rm link note").await;
+    assert!(result["checkpoint"].is_string());
+    assert!(
+        result["_checkpoint_note"]
+            .as_str()
+            .unwrap()
+            .contains("link")
+    );
+    let rows = rows(&guard, &sandbox);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["path"].as_str().unwrap().ends_with("/note"));
     assert_eq!(
         std::fs::read_to_string(scratch.path().join("secret")).unwrap(),
         "private"
     );
 }
 
+/// A later backup reuses the copy of every file that did not change.
 #[tokio::test]
-async fn checkout_store_retention_expires_old_backups_and_byte_failure_is_quiet() {
+async fn unchanged_files_reuse_their_last_copy() {
     let scratch = tempfile::tempdir().unwrap();
-    let base = scratch.path().canonicalize().unwrap();
-    let root = base.join("repo");
-    std::fs::create_dir(&root).unwrap();
-    git(&root, &["init", "-q"]);
-    std::fs::write(root.join("note"), "first").unwrap();
-    let sandbox = Arc::new(
-        WorkspaceSandbox::new_jailed(&root)
+    let (root, sandbox) = repo(&scratch);
+    std::fs::write(root.join("same"), "same").unwrap();
+    std::fs::write(root.join("edited"), "before").unwrap();
+    let guard = Arc::new(kernel::egress::Guard::default());
+    prepared(&guard, &sandbox, "make").await;
+    let first = rows(&guard, &sandbox);
+    guard.mutations.begin_message();
+    std::fs::write(root.join("edited"), "after, longer").unwrap();
+    prepared(&guard, &sandbox, "make").await;
+    let second = rows(&guard, &sandbox);
+    let id = |rows: &[Value], name: &str| {
+        rows.iter()
+            .find(|row| row["path"].as_str().unwrap().ends_with(name))
+            .map(|row| row["snapshot"].clone())
             .unwrap()
-            .with_snapshots_dir(base.join("legacy"))
-            .with_command_snapshots_dir(base.join("checkout-store")),
+    };
+    assert_eq!(id(&first, "/same"), id(&second, "/same"));
+    assert_ne!(id(&first, "/edited"), id(&second, "/edited"));
+    let copies = std::fs::read_dir(sandbox.command_snapshots_dir())
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_file())
+        .filter(|entry| {
+            ulid::Ulid::from_string(entry.as_ref().unwrap().file_name().to_str().unwrap()).is_ok()
+        })
+        .count();
+    assert_eq!(
+        copies, 3,
+        "two first copies plus one new copy of the edited file"
     );
+}
+
+/// A backup still being made elsewhere is waited for, not a refusal.
+#[tokio::test]
+async fn a_backup_in_progress_is_waited_for() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (root, sandbox) = repo(&scratch);
+    std::fs::write(root.join("note"), "x").unwrap();
+    std::fs::create_dir_all(sandbox.command_snapshots_dir()).unwrap();
+    let mut other = lock(&sandbox).unwrap();
+    let held = other.try_write().unwrap();
+    let guard = Arc::new(kernel::egress::Guard::default());
+    let waiting = {
+        let (guard, sandbox) = (guard.clone(), sandbox.clone());
+        tokio::spawn(async move { prepared(&guard, &sandbox, "rm note").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished());
+    drop(held);
+    assert!(waiting.await.unwrap()["checkpoint"].is_string());
+}
+
+/// Retention drops old backups; a file past the byte allowance is named and the command runs.
+#[tokio::test]
+async fn retention_expires_old_backups_and_an_oversized_file_is_named() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (root, sandbox) = repo(&scratch);
+    std::fs::write(root.join("note"), "first").unwrap();
     let guard = Arc::new(kernel::egress::Guard::default());
     guard
         .mutations
@@ -268,43 +255,19 @@ async fn checkout_store_retention_expires_old_backups_and_byte_failure_is_quiet(
             ..Default::default()
         })
         .unwrap();
-    let (first, _) = kernel::egress::scope(
-        guard.clone(),
-        false,
-        prepare(&sandbox, &json!({"command":"rm note","network":false})),
-    )
-    .await;
-    let first = first.unwrap();
-    let snapshot = first["_checkpoint_files"][0]["snapshot"].as_str().unwrap();
-    assert!(snapshot.starts_with("command:"));
+    prepared(&guard, &sandbox, "rm note").await;
+    let snapshot = rows(&guard, &sandbox)[0]["snapshot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     guard.mutations.begin_message();
     std::fs::write(root.join("note"), "second").unwrap();
-    let (second, _) = kernel::egress::scope(
-        guard.clone(),
-        false,
-        prepare(&sandbox, &json!({"command":"rm note","network":false})),
-    )
-    .await;
-    assert!(second.is_ok());
-    assert_eq!(
-        std::fs::read_dir(sandbox.command_snapshots_dir().join("commands"))
-            .unwrap()
-            .count(),
-        1
-    );
+    prepared(&guard, &sandbox, "rm note").await;
+    let kept = std::fs::read_dir(sandbox.command_snapshots_dir().join("commands")).unwrap();
+    assert_eq!(kept.count(), 1);
     assert!(
-        sandbox
-            .restore_plan(&[kernel::events::FileRollback {
-                path: root.join("note").to_string_lossy().into_owned(),
-                snapshot: Some(snapshot.into()),
-                expected: None
-            }])
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("note")).unwrap(),
-        "second"
+        !sandbox.snapshot_exists(&snapshot),
+        "an expired backup's copy is deleted"
     );
     guard.mutations.begin_message();
     guard
@@ -314,14 +277,14 @@ async fn checkout_store_retention_expires_old_backups_and_byte_failure_is_quiet(
             ..Default::default()
         })
         .unwrap();
-    let (failed, _) = kernel::egress::scope(
-        guard.clone(),
-        false,
-        prepare(&sandbox, &json!({"command":"rm note","network":false})),
-    )
-    .await;
-    assert!(failed.is_err());
-    assert_eq!(guard.mutations.notices().len(), 1);
+    std::fs::write(root.join("note"), "third").unwrap();
+    let oversized = prepared(&guard, &sandbox, "rm note").await;
+    assert!(
+        oversized["_checkpoint_note"]
+            .as_str()
+            .unwrap()
+            .contains("note")
+    );
     assert!(root.join("note").exists());
 }
 
@@ -337,60 +300,29 @@ fn release_checkpoint_cost() {
         .canonicalize()
         .unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        WorkspaceSandbox::new_jailed(&root)
+            .unwrap()
+            .with_snapshots_dir(state.path().canonicalize().unwrap().join("snapshots")),
+    );
     for label in ["cold", "warm"] {
-        let state = tempfile::tempdir().unwrap();
-        let sandbox = Arc::new(
-            WorkspaceSandbox::new_jailed(&root)
-                .unwrap()
-                .with_snapshots_dir(state.path().canonicalize().unwrap().join("snapshots")),
-        );
         let guard = Arc::new(kernel::egress::Guard::default());
         let started = std::time::Instant::now();
-        let (result, _) = runtime.block_on(kernel::egress::scope(
-            guard.clone(),
-            false,
-            prepare(
-                &sandbox,
-                &json!({"command":"git reset --hard","network":false}),
-            ),
-        ));
+        let result = runtime.block_on(prepared(&guard, &sandbox, "git reset --hard"));
         let prepared_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let mut observation = kernel::Observation {
-            intent_id: "measure".into(),
-            status: kernel::ObsStatus::Ok,
-            payload: json!({}),
-            media: vec![],
-            relayed_trust: None,
-            net_denied: false,
-            model_text: None,
-        };
+        let mut observation = kernel::Observation::ok("measure", json!({}));
         let started = std::time::Instant::now();
         runtime.block_on(kernel::egress::scope(
-            guard,
+            guard.clone(),
             false,
             finish(&sandbox, &mut observation),
         ));
         println!(
-            "checkpoint finish {label}: elapsed_ms={:.3}",
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-        let prepared = result.unwrap();
-        let manifest: Value = serde_json::from_slice(
-            &std::fs::read(
-                sandbox
-                    .snapshots_dir()
-                    .join("commands")
-                    .join(prepared["checkpoint"].as_str().unwrap())
-                    .join("manifest.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        println!(
-            "checkpoint {label}: files={}, bytes={}, elapsed_ms={:.3}",
-            prepared["_checkpoint_files"].as_array().unwrap().len(),
-            manifest["bytes"],
-            prepared_ms
+            "checkpoint {label}: files={}, prepare_ms={prepared_ms:.3}, finish_ms={:.3}, note={}",
+            rows(&guard, &sandbox).len(),
+            started.elapsed().as_secs_f64() * 1000.0,
+            result["_checkpoint_note"]
         );
     }
 }

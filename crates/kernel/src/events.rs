@@ -948,6 +948,12 @@ pub fn rollback_plan(events: &[Event], at_event: Ulid) -> Vec<FileRollback> {
     rollback_plan_in(events, at_event, &workspace_root)
 }
 
+/// The rows a shell backup kept on disk, for a command that never reported what it changed.
+fn manifest_rows(path: &str) -> Option<Vec<Value>> {
+    let manifest: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    manifest["files"].as_array().cloned()
+}
+
 /// Compute a rollback plan relative to the execution workspace.
 pub fn rollback_plan_in(
     events: &[Event],
@@ -993,7 +999,9 @@ pub fn rollback_plan_in(
         let rows: Vec<_> = result
             .get("_checkpoint_files")
             .and_then(Value::as_array)
-            .map_or_else(|| vec![Value::Object(result.clone())], Clone::clone);
+            .cloned()
+            .or_else(|| manifest_rows(result.get("_checkpoint_manifest")?.as_str()?))
+            .unwrap_or_else(|| vec![Value::Object(result.clone())]);
         for row in rows {
             let Some(result) = row.as_object() else {
                 continue;
@@ -2778,6 +2786,33 @@ mod tests {
         );
         // Cut not found → nothing to roll back.
         assert!(rollback_plan(&events, Ulid::new()).is_empty());
+    }
+
+    /// A command interrupted before it reported is undone from its backup's manifest,
+    /// which the log points at instead of copying every row.
+    #[test]
+    fn an_interrupted_command_is_undone_from_its_backup_manifest() {
+        let s = Session::new();
+        let manifest = std::env::temp_dir().join(format!("medha-manifest-{}.json", Ulid::new()));
+        std::fs::write(
+            &manifest,
+            json!({"files": [{"path": "/w/a.txt", "snapshot": "command:SNAP", "before": "h1", "expected": "unknown"}]})
+                .to_string(),
+        )
+        .unwrap();
+        let intent = ToolIntent {
+            id: "cut-short".into(),
+            tool: "shell.exec".into(),
+            args: json!({"command": "rm a.txt"}),
+        };
+        let mut prepared = Event::tool_effect_prepared(&s, &intent, "state:*");
+        prepared.payload["_checkpoint_manifest"] = json!(manifest);
+        let cut = Event::user_message(&s, "undo");
+        let cut_id = cut.id;
+        let plan = rollback_plan_in(&[cut, prepared], cut_id, Path::new("/w"));
+        std::fs::remove_file(&manifest).ok();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].snapshot.as_deref(), Some("command:SNAP"));
     }
 
     #[test]

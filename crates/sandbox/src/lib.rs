@@ -3020,6 +3020,11 @@ impl WorkspaceSandbox {
         }
     }
 
+    /// Whether the copy a snapshot id names is still kept.
+    pub fn snapshot_exists(&self, id: &str) -> bool {
+        self.snapshot_path(id).is_ok_and(|path| path.is_file())
+    }
+
     /// Snapshot ids are ULIDs (Crockford base32); reject anything else so a
     /// restore can never read a path outside the snapshots directory.
     fn snapshot_path(&self, id: &str) -> Result<PathBuf, SandboxError> {

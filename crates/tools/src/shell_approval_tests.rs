@@ -229,50 +229,26 @@ async fn run_with_sink(
     log.events(session.id).await
 }
 
+/// An approved write outside the workspace runs once approved; the result says undo cannot restore it.
 #[tokio::test]
-async fn an_external_overwrite_without_a_real_backup_is_unrun_with_one_quiet_notice() {
+async fn an_approved_outside_write_runs_and_says_it_has_no_backup() {
     let fixture = Fixture::new(vec![kernel::NetworkDecision::Once]);
     let path = fixture.outside.join("installed.txt");
     std::fs::write(&path, "original outside work").unwrap();
-    struct Notices(Mutex<Vec<String>>);
-    impl kernel::StreamSink for Notices {
-        fn notice(&self, text: &str) {
-            self.0.lock().unwrap().push(text.into());
-        }
-    }
-    let sink = Notices(Mutex::new(Vec::new()));
     let mut args = fixture.args();
     args["command"] = json!("printf changed > installed.txt");
-    let events = run_with_sink(&fixture, args, false, &sink).await;
-    assert_eq!(
-        std::fs::read_to_string(path).unwrap(),
-        "original outside work"
-    );
-    assert!(fixture.requests.lock().unwrap().is_empty());
+    let events = run(&fixture, args, false).await;
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "changed");
     assert_eq!(fixture.gate.cards.lock().unwrap().len(), 1);
     assert_eq!(fixture.gate.standard.load(Ordering::SeqCst), 0);
     let observation = events
         .iter()
         .find(|event| event.kind == kernel::EventKind::ToolObs)
         .unwrap();
-    assert_eq!(observation.payload["payload"]["changed"], false);
-    assert_eq!(
-        observation.payload["payload"]["mutations"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        sink.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|text| text.starts_with("Protected change held:"))
-            .count(),
-        1
-    );
-    assert!(!fixture.base.join("workspace/.medha/snapshots").exists());
+    let note = observation.payload["payload"]["backup_note"]
+        .as_str()
+        .unwrap();
+    assert!(note.contains("outside the workspace"), "{note}");
 }
 
 #[tokio::test]

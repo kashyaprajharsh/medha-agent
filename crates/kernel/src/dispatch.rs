@@ -48,8 +48,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         };
         if let Some(mutation_key) = self.executor.mutation_key(intent) {
             let mut event = Event::tool_effect_prepared(session, intent, &mutation_key);
-            if let Some(rows) = preparation.get("_checkpoint_files") {
-                event.payload["_checkpoint_files"] = rows.clone();
+            // The backup's rows stay in its manifest; the log only points at it.
+            if let Some(manifest) = preparation.get("_checkpoint_manifest") {
+                event.payload["_checkpoint_manifest"] = manifest.clone();
             }
             if let Err(error) = self.log.append(event).await {
                 return Observation::error(

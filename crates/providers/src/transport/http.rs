@@ -333,6 +333,9 @@ pub(crate) async fn require_success(
         .flatten();
     let status = status.as_u16();
     let body = read_error_body(response).await;
+    // The provider's own reason, already bounded and redacted, so a failed request can be explained later.
+    let logged: String = body.chars().take(2000).collect();
+    tracing::warn!(status, body = %logged, "model HTTP request returned an error");
     match retry_after {
         Some(retry_after) => Err(ProviderError::Throttled {
             status,

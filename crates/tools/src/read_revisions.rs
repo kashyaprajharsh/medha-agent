@@ -8,8 +8,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const FILES: usize = 64;
-const BYTES: usize = 8 * 1024 * 1024;
+/// Files one chat can have read, counted per chat so another chat cannot push them out.
+const FILES: usize = 1000;
+/// Every chat's records together, so many chats cannot grow memory without bound.
+const ALL_FILES: usize = 16_000;
+/// Page text kept so a changed file needs only its changed pages read again.
+const BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Default)]
 pub(crate) struct Revisions(Arc<Mutex<VecDeque<Entry>>>);
@@ -111,15 +115,7 @@ impl Revisions {
             path: path.into(),
             revision,
         });
-        while files.len() > FILES
-            || files
-                .iter()
-                .map(|entry| entry.revision.bytes())
-                .sum::<usize>()
-                > BYTES
-        {
-            files.pop_front();
-        }
+        evict(&mut files, owner);
     }
 
     pub fn permits(&self, path: &Path, state: &GuardedFileState) -> bool {
@@ -152,9 +148,24 @@ impl Revisions {
                 ..Revision::default()
             },
         });
-        while files.len() > FILES {
-            files.pop_front();
-        }
+        evict(&mut files, owner);
+    }
+}
+
+/// Drops the oldest records: this chat's past its own count, any past the shared bounds.
+fn evict(files: &mut VecDeque<Entry>, owner: Option<ulid::Ulid>) {
+    while files.iter().filter(|entry| entry.session == owner).count() > FILES {
+        let oldest = files.iter().position(|entry| entry.session == owner);
+        files.remove(oldest.unwrap_or(0));
+    }
+    while files.len() > ALL_FILES
+        || files
+            .iter()
+            .map(|entry| entry.revision.bytes())
+            .sum::<usize>()
+            > BYTES
+    {
+        files.pop_front();
     }
 }
 

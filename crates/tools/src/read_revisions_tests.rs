@@ -37,6 +37,69 @@ fn own_verified_write_advances_knowledge_and_eviction_only_requires_a_reread() {
     assert!(ledger.permits(Path::new("first"), &state("saved")));
 }
 
+/// One chat reading many files cannot push another chat's knowledge out.
+#[tokio::test]
+async fn another_chats_reads_do_not_evict_this_chats_record() {
+    let ledger = Revisions::default();
+    let (mine, other) = (ulid::Ulid::new(), ulid::Ulid::new());
+    kernel::egress::session_scope(mine, async { ledger.written(Path::new("kept"), "saved") }).await;
+    kernel::egress::session_scope(other, async {
+        for index in 0..FILES + 10 {
+            ledger.written(Path::new(&index.to_string()), "x");
+        }
+    })
+    .await;
+    let known = kernel::egress::session_scope(mine, async {
+        ledger.permits(Path::new("kept"), &state("saved"))
+    })
+    .await;
+    assert!(known);
+}
+
+/// Write, edit, write: the chat knew the whole file, so its own edit keeps it known.
+/// An edit made without knowing the file still needs a read before a whole replacement.
+#[tokio::test]
+async fn an_edit_of_a_known_file_keeps_it_known_and_a_blind_edit_does_not() {
+    use crate::ToolRegistry;
+    use kernel::{Executor, ObsStatus, ToolIntent};
+    use serde_json::json;
+    let root = test_support::scratch("edit-keeps-known");
+    std::fs::write(root.join("unseen.txt"), "one\ntwo\n").unwrap();
+    let workspace = std::sync::Arc::new(sandbox::WorkspaceSandbox::new_jailed(&root).unwrap());
+    let artifacts =
+        std::sync::Arc::new(store::FileArtifactStore::open(root.join("artifacts")).unwrap());
+    let registry = ToolRegistry::with_workspace(workspace, artifacts);
+    let call = |tool: &str, args: serde_json::Value| ToolIntent {
+        id: tool.into(),
+        tool: tool.into(),
+        args,
+    };
+    for (path, status) in [
+        ("filter.txt", ObsStatus::Ok),
+        ("unseen.txt", ObsStatus::Error),
+    ] {
+        if path == "filter.txt" {
+            let first = call("write", json!({"path": path, "content": "# note\na\n"}));
+            assert_eq!(registry.execute(&first).await.status, ObsStatus::Ok);
+        }
+        let edit = call(
+            "edit",
+            json!({"path": path, "old_string": "a", "new_string": "b"}),
+        );
+        let edit = if path == "unseen.txt" {
+            call(
+                "edit",
+                json!({"path": path, "old_string": "one", "new_string": "uno"}),
+            )
+        } else {
+            edit
+        };
+        assert_eq!(registry.execute(&edit).await.status, ObsStatus::Ok);
+        let replace = call("write", json!({"path": path, "content": "rewritten\n"}));
+        assert_eq!(registry.execute(&replace).await.status, status, "{path}");
+    }
+}
+
 #[tokio::test]
 async fn previews_redacted_results_and_another_chat_cannot_authorize_a_whole_replacement() {
     use crate::{ToolRegistry, model_view};

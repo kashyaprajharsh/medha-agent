@@ -1045,13 +1045,14 @@ impl ToolRegistry {
                 pins: Default::default(),
                 lsp: r.lsp.clone(),
                 artifacts: artifacts.clone(),
-                shown,
+                shown: shown.clone(),
             },
             many: MultiEdit {
                 sbx: sandbox.clone(),
                 pins: Default::default(),
                 lsp: r.lsp.clone(),
                 artifacts: artifacts.clone(),
+                shown,
             },
         }));
         r.register(Arc::new(Ls {
@@ -2021,6 +2022,9 @@ impl Tool for FsWrite {
         "Create a file, or replace a whole file, with `content` (UTF-8 text). Creates \
          parent directories, snapshots any prior version and returns a diff. To change \
          part of an existing file, use `edit` instead: a smaller diff to review. \
+         Replacing an existing file needs its current content known to this chat: read \
+         all of it, or have written or edited it here since your last full read; a file \
+         changed by a command or by the person must be read again. \
          Supports paths outside the workspace with permission."
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -2368,7 +2372,15 @@ impl Tool for FsEdit {
         let updated = done.text;
         protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &updated)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
+        let known = self
+            .shown
+            .revisions
+            .permits(guard.resolved(), &inspection.state);
         let snapshot = file_checks::commit(&self.sbx, &guard, &updated, &inspection.state).await?;
+        // The chat knew every byte before, so it knows every byte now; a blind edit earns no such credit.
+        if known {
+            self.shown.revisions.written(guard.resolved(), &updated);
+        }
         let diff = make_diff(&path, &content, &updated);
         let mut out = json!({
             "path": path,
@@ -5032,7 +5044,10 @@ impl ShellPlan {
         let command = arg_str(args, "command")?;
         if args.get("background").and_then(Value::as_bool) == Some(true) {
             return Err(ToolError::Args(
-                "background shell execution is disabled: run a bounded foreground command".into(),
+                "background commands cannot keep running after this call returns. Run it in the foreground \
+                 with timeout_s up to 600; for a server or watcher, bound it, for example \
+                 `timeout 60 npm run dev`"
+                    .into(),
             ));
         }
         let timeout_s = args
@@ -5117,7 +5132,7 @@ impl ShellPlan {
 
 /// Default and maximum foreground deadlines. On expiry the whole process tree
 /// is killed and awaited before the tool returns an error; it is never detached.
-const SHELL_TIMEOUT_SECS: u64 = 50;
+const SHELL_TIMEOUT_SECS: u64 = 300;
 const SHELL_TIMEOUT_MAX_SECS: u64 = 600;
 /// How often a running command is checked for a resolver failure. Short enough
 /// that the grant card arrives while the user is still watching the command.
@@ -5740,9 +5755,16 @@ impl Tool for ShellExec {
          for dependency installs, downloads, or other commands needing the network: \
          Medha requests access before running if the sandbox denies it. Keep error \
          output visible; tail and curl -s can hide failures and prevent automatic retry. \
-         For access outside the workspace, request absolute directory paths with \
-         read_paths or write_paths; approval is scoped to this command unless persisted. \
-         To see a web page use read with render: true, never a browser from here."
+         A pipeline's exit status is its last command's: to keep a failing command's \
+         status, send its output to a file and read that, rather than piping it into \
+         tail or head. For access outside the workspace, request absolute directory \
+         paths with read_paths or write_paths; approval is scoped to this command unless \
+         persisted. Before a command that may write, the workspace is backed up so undo \
+         can restore it; the result names anything left out. \
+         To see a web page use read with render: true, never a browser from here. \
+         On macOS and Linux the line runs with sh -c, which is not always bash: avoid \
+         bash-only syntax such as ${PIPESTATUS[0]} or [[ ]]. On Windows it runs in Git \
+         Bash when installed, otherwise PowerShell or cmd."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal
@@ -5792,7 +5814,7 @@ impl Tool for ShellExec {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": SHELL_TIMEOUT_MAX_SECS,
-                    "description": "Hard foreground deadline in seconds (default 50, maximum 600). Expiry kills the whole process tree and returns an error."
+                    "description": "Hard foreground deadline in seconds (default 300, maximum 600). Expiry kills the whole process tree and returns an error."
                 }
             },
             "required": ["command", "network"]
@@ -6128,6 +6150,7 @@ struct MultiEdit {
     pins: PreviewPins,
     lsp: LspHandle,
     artifacts: Arc<dyn kernel::ArtifactStore>,
+    shown: shown::ShownPages,
 }
 
 /// Apply a sequence of exact-substring replacements to `content`, in order (each
@@ -6281,7 +6304,14 @@ impl Tool for MultiEdit {
         let (updated, loose) = apply_edits(&content, edits)?;
         protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &updated)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
+        let known = self
+            .shown
+            .revisions
+            .permits(guard.resolved(), &inspection.state);
         let snapshot = file_checks::commit(&self.sbx, &guard, &updated, &inspection.state).await?;
+        if known {
+            self.shown.revisions.written(guard.resolved(), &updated);
+        }
         let diff = make_diff(&path, &content, &updated);
         let mut out = json!({
             "path": path,

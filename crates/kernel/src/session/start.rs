@@ -299,6 +299,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 image_route_reported,
                 new_image_submission,
                 hook_continuations,
+                refusals: Default::default(),
             },
         }))
     }

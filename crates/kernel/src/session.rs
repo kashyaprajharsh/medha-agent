@@ -58,6 +58,7 @@ struct RunState {
     image_route_reported: bool,
     new_image_submission: bool,
     hook_continuations: u8,
+    refusals: crate::refusals::Refusals,
 }
 
 struct RequestState {

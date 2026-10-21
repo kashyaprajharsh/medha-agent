@@ -114,8 +114,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             cx.sink,
                         )
                         .await;
-                    for (id, tool, obs, discovered) in settled {
+                    for (id, tool, mut obs, discovered) in settled {
                         modified_files |= self.executor.changed_files(&tool, &obs);
+                        if let Some(notice) = state.refusals.note(&tool, &mut obs) {
+                            cx.sink.notice(&notice);
+                        }
                         self.persist_admitted(
                             cx.session,
                             id,
@@ -142,7 +145,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     deadline: dispatch_wall_deadline,
                     held: Default::default(),
                 };
-                let (id, tool, obs, discovered) = self
+                let (id, tool, mut obs, discovered) = self
                     .execute_admitted(
                         cx.session,
                         intent,
@@ -155,6 +158,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     )
                     .await;
                 modified_files |= self.executor.changed_files(&tool, &obs);
+                if let Some(notice) = state.refusals.note(&tool, &mut obs) {
+                    cx.sink.notice(&notice);
+                }
                 self.persist_admitted(
                     cx.session,
                     id,
@@ -189,8 +195,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     cx.sink,
                 )
                 .await;
-            for (id, tool, obs, discovered) in settled {
+            for (id, tool, mut obs, discovered) in settled {
                 modified_files |= self.executor.changed_files(&tool, &obs);
+                if let Some(notice) = state.refusals.note(&tool, &mut obs) {
+                    cx.sink.notice(&notice);
+                }
                 self.persist_admitted(
                     cx.session,
                     id,

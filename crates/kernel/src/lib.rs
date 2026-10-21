@@ -27,6 +27,7 @@ pub mod provenance;
 pub mod provider;
 pub mod recovery;
 pub mod redact;
+mod refusals;
 mod rejections;
 mod repetition;
 pub mod request_images;

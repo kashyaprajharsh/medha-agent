@@ -1225,7 +1225,7 @@ impl Observation {
         Self {
             intent_id: intent_id.into(),
             status: ObsStatus::Denied,
-            payload: serde_json::json!({ "reason": reason.into() }),
+            payload: serde_json::json!({ "reason": reason.into(), "ran": false }),
             media: Vec::new(),
             relayed_trust: None,
             net_denied: false,

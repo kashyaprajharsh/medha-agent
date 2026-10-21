@@ -254,7 +254,10 @@ fn scan_command(
     let jailed = jail == Jail::Active;
     if let Some(reason) = admission::danger(&reading, workspace, jailed) {
         return Decision::Deny {
-            reason: format!("blocked dangerous command: {reason}"),
+            reason: format!(
+                "blocked dangerous command: {reason}. This never runs at any autonomy level; \
+                 if it is really needed, ask the person to run it themselves"
+            ),
         };
     }
     // Deleting your files outside the workspace asks, as an outside write does.

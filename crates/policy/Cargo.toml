@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 kernel.workspace = true
 regex = "1"
+shell-reader = { path = "../shell-reader" }
 
 [dev-dependencies]
 serde_json.workspace = true

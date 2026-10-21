@@ -3171,6 +3171,7 @@ dependencies = [
  "kernel",
  "regex",
  "serde_json",
+ "shell-reader",
 ]
 
 [[package]]
@@ -4000,6 +4001,7 @@ dependencies = [
  "permissions",
  "serde_json",
  "sha2",
+ "shell-reader",
  "test-support",
  "thiserror 2.0.18",
  "tokio",
@@ -4154,6 +4156,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -4241,6 +4244,14 @@ checksum = "5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11"
 dependencies = [
  "lazy_static",
  "libc",
+]
+
+[[package]]
+name = "shell-reader"
+version = "0.1.10"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-bash",
 ]
 
 [[package]]
@@ -4389,6 +4400,12 @@ dependencies = [
  "tokio",
  "ulid",
 ]
+
+[[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
 name = "string_cache"
@@ -4944,6 +4961,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2",
+ "shell-reader",
  "similar",
  "store",
  "tempfile",
@@ -5084,6 +5102,36 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
+
+[[package]]
+name = "tree-sitter"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
+dependencies = [
+ "cc",
+ "regex",
+ "regex-syntax",
+ "serde_json",
+ "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-bash"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
 
 [[package]]
 name = "try-lock"

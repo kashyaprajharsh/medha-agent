@@ -148,15 +148,8 @@ fn only_reads(intent: &ToolIntent) -> bool {
         .args
         .get("command")
         .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_lowercase();
-    parse_shell_syntax(&command).is_ok_and(|syntax| {
-        !syntax.commands.is_empty()
-            && syntax.commands.iter().all(|command| {
-                effective_program(&command.words)
-                    .is_some_and(|(at, program)| reads_only(program, &command.words[at + 1..]))
-            })
-    })
+        .unwrap_or_default();
+    shell_reader::read(command).reads_only()
 }
 
 impl Policy for DefaultPolicy {
@@ -644,40 +637,6 @@ fn rm_is_recursive(args: &[String]) -> bool {
                     .strip_prefix('-')
                     .is_some_and(|flags| !flags.starts_with('-') && flags.contains('r')))
     })
-}
-
-/// An inspection tool used in a way that cannot write a file or start a program.
-fn reads_only(program: &str, args: &[String]) -> bool {
-    inspects(program, args) && !writes_or_runs(program, args)
-}
-
-/// Options that turn an inspection tool into a writer or a launcher; `args` are lowercased.
-fn writes_or_runs(program: &str, args: &[String]) -> bool {
-    // Long options may be abbreviated to any unique prefix.
-    let long = |prefixes: &[&str]| {
-        args.iter()
-            .any(|arg| prefixes.iter().any(|prefix| arg.starts_with(prefix)))
-    };
-    // A cluster such as `-uo` carries the same flag as `-o`.
-    let short = |flags: &str| {
-        args.iter().any(|arg| {
-            arg.strip_prefix('-').is_some_and(|rest| {
-                !rest.starts_with('-') && rest.contains(|flag| flags.contains(flag))
-            })
-        })
-    };
-    match program {
-        "sort" => short("o") || long(&["--o", "--co"]),
-        "uniq" => args.iter().filter(|arg| !arg.starts_with('-')).count() > 1,
-        "tree" => short("or"),
-        "file" => short("c") || long(&["--c"]),
-        "rg" => short("z") || long(&["--pre", "--hostname-bin", "--search-zip"]),
-        "find" => args
-            .iter()
-            .any(|arg| arg.starts_with("-fprint") || arg == "-fls"),
-        "git" => long(&["--out", "--ext", "--textc", "--show-sig"]),
-        _ => false,
-    }
 }
 
 /// Shell primitives and source inspection: nothing here runs code from the workspace.

@@ -1423,23 +1423,6 @@ fn command_name(program: &str) -> &str {
         .unwrap_or(program)
 }
 
-/// Whether `program`, named bare, is one that only reads.
-pub fn reads_only(program: &str, args: &[String]) -> bool {
-    is_read_only_command(program, args)
-}
-
-fn is_read_only_command(command: &str, args: &[String]) -> bool {
-    match command {
-        "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "file" | "readlink"
-        | "realpath" | "ls" | "rg" | "grep" | "egrep" | "fgrep" | "diff" | "cmp" | "comm"
-        | "read" | "pwd" | "which" | "whereis" | "type" | "echo" | "printf" | "true" | "false"
-        | "test" | "[" => true,
-        // `sed` is a filter unless an in-place flag is present.
-        "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
-        _ => false,
-    }
-}
-
 fn resolve_prospective(path: &Path) -> Option<PathBuf> {
     let mut ancestor = path;
     let mut missing = Vec::new();
@@ -1504,7 +1487,7 @@ fn candidate_matches_operand(candidate: &Path, operand: &str, cwd: &Path) -> boo
 /// Classify the denied root, not the executable: `cp` reads its source and writes
 /// its destination, so a program-name grant would turn a read into an overwrite.
 fn command_intent(command: &str, args: &[String], cwd: &Path, candidate: &Path) -> ExecIntent {
-    if is_read_only_command(command, args) {
+    if shell_reader::program_reads_only(command, args) {
         return ExecIntent::ReadOnly;
     }
     let operands = operand_names(args);
@@ -1575,131 +1558,54 @@ fn shell_command(req: &ExecRequest) -> Option<&str> {
         .flatten()
 }
 
-/// Extract command-position words from a shell line. This is intentionally a
-/// small classifier, not a shell parser: unrecognized compound syntax remains
-/// `Unknown` and therefore starts with Read rather than being over-privileged.
-fn shell_segments(command: &str) -> Vec<Vec<String>> {
-    command
-        .split([';', '|', '&', '\n'])
-        .filter_map(|segment| {
-            let words: Vec<String> = segment
-                .split_whitespace()
-                .map(|word| word.trim_matches(['(', ')']).to_string())
-                .collect();
-            (!words.is_empty()).then_some(words)
-        })
-        .collect()
-}
-
-/// Redirection targets are the one case where a read-only executable (`rg … >
-/// out`) needs write access. Returns their canonical parent roots so the grant
-/// applies only to the output root, not to inputs of the same command.
-fn shell_redirection_roots(command: &str, cwd: &Path) -> Vec<PathBuf> {
-    let bytes = command.as_bytes();
-    let mut roots = Vec::new();
-    let mut index = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if byte == b'\\' && quote != Some(b'\'') {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            if quote == Some(byte) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(byte);
-            }
-            index += 1;
-            continue;
-        }
-        if byte != b'>' || quote.is_some() {
-            index += 1;
-            continue;
-        }
-
-        // Consume >, >>, or >|, then the following shell word. Descriptor
-        // duplication (`2>&1`) is not a filesystem target.
-        index += 1;
-        if index < bytes.len() && matches!(bytes[index], b'>' | b'|') {
-            index += 1;
-        }
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] == b'&' {
-            continue;
-        }
-        let start = index;
-        let mut target_quote = None;
-        while index < bytes.len() {
-            let current = bytes[index];
-            if matches!(current, b'\'' | b'"') {
-                if target_quote == Some(current) {
-                    target_quote = None;
-                } else if target_quote.is_none() {
-                    target_quote = Some(current);
-                }
-                index += 1;
-                continue;
-            }
-            if target_quote.is_none()
-                && (current.is_ascii_whitespace() || matches!(current, b';' | b'|' | b'&'))
-            {
-                break;
-            }
-            index += 1;
-        }
-        let target = command[start..index].trim_matches(['\'', '"']);
-        if target.is_empty() || target.contains(['$', '`']) {
-            continue;
-        }
-        let path = Path::new(target);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
-        let mut root = path;
-        if !root.is_dir()
-            && let Some(parent) = root.parent()
-        {
-            root = parent.to_path_buf();
-        }
-        if let Some(root) = resolve_prospective(&root) {
-            roots.push(root);
-        }
-    }
-    roots
+/// Where a written redirect lands: the target's folder, so the grant covers only the output.
+fn redirection_root(target: &str, cwd: &Path) -> Option<PathBuf> {
+    let path = cwd.join(target);
+    let root = if path.is_dir() {
+        path
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    resolve_prospective(&root)
 }
 
 fn exec_denial_intent(req: &ExecRequest, candidate: &Path) -> ExecIntent {
     let Some(shell) = shell_command(req) else {
         return command_intent(command_name(&req.program), &req.args, &req.cwd, candidate);
     };
-
-    if shell_redirection_roots(shell, &req.cwd)
+    let reading = shell_reader::read(shell);
+    let redirected = reading
+        .commands
         .iter()
-        .any(|root| root == candidate)
-    {
+        .flat_map(|command| &command.redirects)
+        .any(|redirect| {
+            redirect.writes()
+                && redirect
+                    .target
+                    .literal_text()
+                    .and_then(|target| redirection_root(target, &req.cwd))
+                    .is_some_and(|root| root == candidate)
+        });
+    if redirected {
         return ExecIntent::Write;
     }
-    let segments = shell_segments(shell);
-    let intents: Vec<ExecIntent> = segments
+    let intents: Vec<ExecIntent> = reading
+        .commands
         .iter()
-        .map(|words| command_intent(command_name(&words[0]), &words[1..], &req.cwd, candidate))
+        .map(|command| match command.program() {
+            Some(program) => {
+                let args: Vec<String> = program.args.iter().map(|arg| arg.text.clone()).collect();
+                command_intent(&program.name, &args, &req.cwd, candidate)
+            }
+            None => ExecIntent::Unknown,
+        })
         .collect();
     if intents.contains(&ExecIntent::Write) {
         ExecIntent::Write
-    } else if !intents.is_empty() && intents.iter().all(|intent| *intent == ExecIntent::ReadOnly) {
+    } else if reading.complete
+        && !intents.is_empty()
+        && intents.iter().all(|intent| *intent == ExecIntent::ReadOnly)
+    {
         ExecIntent::ReadOnly
     } else {
         ExecIntent::Unknown

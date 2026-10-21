@@ -19,6 +19,7 @@ mcp = { path = "../mcp" }
 orchestrator = { path = "../orchestrator" }
 sandbox = { path = "../sandbox" }
 policy = { path = "../policy" }
+shell-reader = { path = "../shell-reader" }
 memory = { path = "../memory" }
 store = { path = "../store" }
 ulid = "1"

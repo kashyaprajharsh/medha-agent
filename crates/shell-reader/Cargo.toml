@@ -1,0 +1,14 @@
+[lints]
+workspace = true
+
+[package]
+name = "shell-reader"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"

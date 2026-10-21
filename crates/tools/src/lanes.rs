@@ -46,23 +46,9 @@ pub(crate) fn file(root: &Path, path: Option<&str>) -> String {
     .map_or(WHOLE.into(), |path| path_key(&path))
 }
 
-/// Whether a shell command only reads: every program in it is a known reader,
-/// and nothing in its text is left for the shell to work out.
+/// Whether a shell command only reads: nothing in it writes a file or runs a program that might.
 pub(crate) fn shell_only_reads(command: &str) -> bool {
-    policy::plain_commands(command).is_some_and(|commands| {
-        commands.iter().all(|words| match words.split_first() {
-            Some((program, args)) if program == "git" => git_reads(args),
-            Some((program, args)) => sandbox::reads_only(program, args),
-            None => false,
-        })
-    })
-}
-
-/// `git <reader> ...` with nothing before the subcommand and no file to write.
-fn git_reads(args: &[String]) -> bool {
-    args.first()
-        .is_some_and(|sub| GIT_READS.contains(&sub.as_str()))
-        && !args.iter().any(|arg| arg.starts_with("--output"))
+    shell_reader::read(command).reads_only()
 }
 
 #[cfg(test)]

@@ -12,6 +12,8 @@ fn only_plain_known_readers_count_as_reading() {
         "git diff --stat HEAD~1",
         "git log --oneline -5; git show HEAD",
         "sed -n 1,20p src/main.rs",
+        "(ls)",
+        "rg -n todo src 2>/dev/null; echo \"exit=$?\"",
     ] {
         assert!(shell_only_reads(reads), "{reads}");
     }
@@ -27,9 +29,12 @@ fn only_plain_known_readers_count_as_reading() {
         "cat $(make-something)",
         "cat `whoami`",
         "ls &",
-        "(ls)",
         "/tmp/cat notes",
         "FOO=1 cat notes",
+        "env PAGER=x git log",
+        "rg --pre ./rewrite.sh x",
+        "git diff --ext-diff",
+        "sed 'e touch x' notes",
         "cat 'unclosed",
         "",
     ] {

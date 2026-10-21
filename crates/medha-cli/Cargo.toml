@@ -31,6 +31,7 @@ orchestrator = { path = "../orchestrator" }
 extensions = { path = "../extensions" }
 gate = { path = "../gate" }
 runtime = { path = "../runtime" }
+loopback = { path = "../loopback" }
 backend = { path = "../backend" }
 medha-client = { path = "../medha-client" }
 protocol = { package = "medha-protocol", path = "../protocol" }

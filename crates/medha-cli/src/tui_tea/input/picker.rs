@@ -1,7 +1,7 @@
 use super::*;
 
 mod connections;
-mod models;
+pub(in crate::tui_tea) mod models;
 mod saved_models;
 mod sessions;
 mod settings;
@@ -9,36 +9,6 @@ mod skills;
 
 pub(super) fn handle(model: &mut Model, key: KeyEvent) -> bool {
     if let Some(picker) = model.picker.as_mut() {
-        if matches!(picker.kind, PickerKind::ProviderPreset { .. })
-            && key.code == KeyCode::Char('r')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            backend_ui::request(model, backend_ui::Effect::RefreshProviders);
-            return true;
-        }
-        if let PickerKind::ProviderPreset { query, .. } | PickerKind::ModelDiscovery { query, .. } =
-            &mut picker.kind
-        {
-            match key.code {
-                KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    if query.len() + ch.len_utf8() <= 256 && !ch.is_control() {
-                        query.push(ch);
-                        picker.selected = 0;
-                    }
-                    return true;
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    picker.selected = 0;
-                    return true;
-                }
-                _ => {}
-            }
-        }
         let labels = picker.kind.labels();
         match key.code {
             KeyCode::Up => {
@@ -188,12 +158,7 @@ pub(super) fn handle(model: &mut Model, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Esc | KeyCode::Left => {
-                if matches!(
-                    picker.kind,
-                    PickerKind::ModelProtocol
-                        | PickerKind::ProviderPreset { .. }
-                        | PickerKind::ModelDiscovery { .. }
-                ) {
+                if matches!(picker.kind, PickerKind::ModelProtocol) {
                     // Back out of "add model" to the model menu, not to nothing —
                     // ← behaves like a menu's back button. On a fresh install
                     // there is no menu to go back to (the menu would immediately

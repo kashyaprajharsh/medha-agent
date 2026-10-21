@@ -129,6 +129,8 @@ pub(super) fn submit(model: &mut Model) {
     if line.is_empty() && model.images.is_empty() {
         return;
     }
+    // Sending again answers the pause, whichever model is now in use.
+    model.plan_limit = None;
     if line.starts_with('/') {
         let name = line.split_whitespace().next().unwrap_or("");
         let plugin = model.remote.as_ref().is_some_and(|peer| {
@@ -451,6 +453,14 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::Tree => show_agent_tree(model),
         A::Usage => {
             request(model, Effect::Inspect(Inspect::Usage, After::Notice));
+            if connect::on_plan(model) {
+                model.push_notice("Using your ChatGPT plan. /usage manage opens Manage usage in ChatGPT settings.");
+            }
+        }
+        A::ChatGptAccounts => connect::open_accounts(model),
+        A::ManageUsage => {
+            model.pending_link = Some(connect::MANAGE_USAGE.into());
+            model.push_notice("Opening Manage usage in ChatGPT settings.");
         }
         A::Memory(args) => memory_command(model, &args),
         A::SkillPicker => open_skill_picker(model),
@@ -480,7 +490,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
     }
 }
 
-fn boundary_allowed(model: &mut Model) -> bool {
+pub(super) fn boundary_allowed(model: &mut Model) -> bool {
     if model.foreground_owned()
         || model.has_active_agents()
         || model.bg_running() > 0
@@ -537,11 +547,7 @@ pub(super) fn handle_model_setup_key(model: &mut Model, key: KeyEvent) -> bool {
     if model.model_setup.is_none()
         || matches!(
             model.picker.as_ref().map(|picker| &picker.kind),
-            Some(
-                PickerKind::ModelProtocol
-                    | PickerKind::ProviderPreset { .. }
-                    | PickerKind::ModelDiscovery { .. }
-            )
+            Some(PickerKind::ModelProtocol)
         )
     {
         return false;
@@ -582,21 +588,7 @@ pub(super) fn begin_model_setup(model: &mut Model) {
     model.search_setup = None;
     model.mcp_credential = None;
     model.model_setup = Some(ModelSetup::new());
-    let saved = model
-        .remote
-        .as_ref()
-        .map(|peer| peer.models.profiles.clone())
-        .unwrap_or_default();
-    let providers = model
-        .remote
-        .as_ref()
-        .map(|peer| peer.models.providers.clone())
-        .unwrap_or_default();
-    model.picker = Some(Picker::new(PickerKind::ProviderPreset {
-        saved,
-        providers,
-        query: String::new(),
-    }));
+    connect::open(model);
 }
 pub(super) fn begin_model_key_update(model: &mut Model, profile: config::ModelProfile) {
     if !boundary_allowed(model) {
@@ -628,7 +620,7 @@ pub(super) fn discover_setup_if_ready(model: &mut Model) {
         advance_model_setup(model);
     }
 }
-fn advance_model_setup(model: &mut Model) {
+pub(super) fn advance_model_setup(model: &mut Model) {
     let value = model.edited().0.trim().to_string();
     let Some(setup) = model.model_setup.as_mut() else {
         return;
@@ -898,7 +890,7 @@ pub(super) fn finish_model_setup(model: &mut Model) {
         model.model_setup.as_mut().expect("setup").step = ModelSetupStep::Saving;
     }
 }
-fn setup_draft(setup: &ModelSetup) -> protocol::ModelDraft {
+pub(super) fn setup_draft(setup: &ModelSetup) -> protocol::ModelDraft {
     protocol::ModelDraft {
         provider_id: setup.provider_id.clone(),
         auth: setup.auth,

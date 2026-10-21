@@ -1782,7 +1782,7 @@ async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_bef
     );
     draft.key = None;
     let discovery = json!({"protocol":"open-ai-chat","base_url":draft.base_url,"auth":"bearer","key":"","headers":draft.connection.headers,"ca_cert_file":draft.connection.ca_cert_file,"proxy":draft.connection.proxy});
-    let discovered: Vec<protocol::DiscoveredModel> = serde_json::from_value(
+    let discovered: protocol::ModelListing = serde_json::from_value(
         client
             .about(
                 &folder,
@@ -1793,9 +1793,10 @@ async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_bef
     )
     .unwrap();
     assert_eq!(
-        discovered[0].id, "test-model",
+        discovered.models[0].id, "test-model",
         "the exact saved deployment key is reusable"
     );
+    assert_eq!(discovered.unverified, None, "the server itself listed it");
     let mut invalid = discovery.clone();
     invalid["ca_cert_file"] = json!(folder.join("missing.pem"));
     assert!(

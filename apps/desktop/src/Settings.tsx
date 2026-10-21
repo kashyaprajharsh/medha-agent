@@ -659,7 +659,7 @@ export function ModelForm({
     if (start.key) {
       setKey(start.key);
       const chosen = start.provider;
-      void discover(profileFor({ ...chosen, protocol: chosen.protocol, auth: chosen.auth, provider_id: chosen.id }), start.key, chosen.models ?? []);
+      void discover(profileFor({ ...chosen, protocol: chosen.protocol, auth: chosen.auth, provider_id: chosen.id }), start.key);
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   // A whole key typed in is the go-ahead to list its models, unless it looks like another provider's.
@@ -722,7 +722,7 @@ export function ModelForm({
     setProxy(selected?.proxy ?? "");
     // Reuse only the selected address's saved key, never another provider's.
     if (selected && availableProtocols.find((p) => p.value === nextProtocol)?.discovery && !selected.parameters?.length && keySavedAt(selected.url))
-      void discover(profileFor({ ...selected, protocol: nextProtocol, auth: nextAuth, provider_id: selected.id }), "", selected.models ?? []);
+      void discover(profileFor({ ...selected, protocol: nextProtocol, auth: nextAuth, provider_id: selected.id }), "");
   }
   function profile() {
     return {
@@ -749,7 +749,7 @@ export function ModelForm({
       ),
     };
   }
-  async function discover(from: object = profile(), secret = key, fallback = provider?.models ?? []) {
+  async function discover(from: object = profile(), secret = key) {
     const version = ++discoveryVersion.current;
     setDiscovering(true);
     setDiscovered([]);
@@ -763,6 +763,11 @@ export function ModelForm({
       if (version !== discoveryVersion.current) return;
       const rows = result.models as typeof discovered;
       setDiscovered(rows);
+      // The server would not list: the backend sent the catalogue's models and why.
+      if (result.unverified) {
+        setDiscoveryError(`${reasonFor(result.unverified, url)} Showing catalogue models; account availability is unverified.`);
+        return;
+      }
       // The first found model is ticked, as the list shows it, unless one is already chosen.
       if (rows[0]) {
         setId((chosen) => chosen || rows[0].id);
@@ -778,10 +783,7 @@ export function ModelForm({
         );
     } catch (cause) {
       if (version !== discoveryVersion.current) return;
-      setDiscoveryError(
-        `${reasonFor(cause, url)} ${fallback.length ? "Showing catalogue models; account availability is unverified." : "You can enter the model ID manually."}`,
-      );
-      setDiscovered(fallback);
+      setDiscoveryError(`${reasonFor(cause, url)} You can enter the model ID manually.`);
     } finally {
       if (version === discoveryVersion.current) setDiscovering(false);
     }

@@ -3,7 +3,7 @@ use super::backend_ui::*;
 use super::*;
 
 mod composer;
-mod picker;
+pub(super) mod picker;
 
 pub(super) fn handle_mouse(model: &mut Model, event: MouseEvent) {
     const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(450);
@@ -332,6 +332,12 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
         return;
     }
 
+    if connect::plan_limit_key(model, key) {
+        return;
+    }
+    if connect::handle_key(model, key) {
+        return;
+    }
     if handle_model_setup_key(model, key) {
         return;
     }
@@ -654,6 +660,10 @@ pub(super) enum SlashAction {
     Connect(String),
     /// `/usage` — tokens and cost for this session and the last week.
     Usage,
+    /// Open the ChatGPT plan's usage settings in the browser.
+    ManageUsage,
+    /// The signed-in ChatGPT accounts: use one, sign out, or add another.
+    ChatGptAccounts,
     Memory(String),
     SkillPicker,
     LoadSkill(String),
@@ -767,6 +777,8 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
             SlashAction::McpAdd(c.strip_prefix("mcp add").unwrap_or("").trim().to_string())
         }
         "usage" => SlashAction::Usage,
+        "usage manage" => SlashAction::ManageUsage,
+        "chatgpt" => SlashAction::ChatGptAccounts,
         c if c.strip_prefix("connect").is_some_and(is_cmd_boundary) => {
             SlashAction::Connect(c.strip_prefix("connect").unwrap_or("").trim().to_string())
         }
@@ -899,20 +911,7 @@ pub(super) fn message_for(model: &Model, line: &str, attached: &[std::path::Path
 }
 
 pub(super) fn handle_paste(model: &mut Model, data: String) {
-    if let Some(picker) = &mut model.picker
-        && let PickerKind::ProviderPreset { query, .. } | PickerKind::ModelDiscovery { query, .. } =
-            &mut picker.kind
-    {
-        for ch in strip_paste_markers(&data)
-            .chars()
-            .filter(|ch| !ch.is_control())
-        {
-            if query.len() + ch.len_utf8() > 256 {
-                break;
-            }
-            query.push(ch);
-        }
-        picker.selected = 0;
+    if connect::paste(model, &strip_paste_markers(&data)) {
         model.dirty = true;
         return;
     }

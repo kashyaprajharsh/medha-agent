@@ -2420,6 +2420,7 @@ dependencies = [
  "kernel",
  "libc",
  "lockfile",
+ "loopback",
  "lsp",
  "mcp",
  "medha-client",

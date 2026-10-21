@@ -590,10 +590,18 @@ pub struct DiscoverModels {
     #[serde(default)]
     pub allow_other_provider: bool,
 }
+/// What a server lists; when it would not list, the catalogue's models and the reason.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelListing {
+    pub models: Vec<DiscoveredModel>,
+    /// Why these come from the catalogue: the server's own answer was refused or failed.
+    #[serde(default)]
+    pub unverified: Option<String>,
+}
 impl Command for DiscoverModels {
     const METHOD: &'static str = "application.models.discover";
     const SCOPE: ScopeKind = ScopeKind::Folder;
-    type Output = Vec<DiscoveredModel>;
+    type Output = ModelListing;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

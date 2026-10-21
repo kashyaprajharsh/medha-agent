@@ -138,6 +138,13 @@ pub(super) enum Effect {
     Abort,
     Agent(protocol::AgentCommand, Option<String>),
     Discover(protocol::DiscoverModels),
+    /// Look for a server on this computer; it not answering is not an error.
+    Probe {
+        url: String,
+        probe: protocol::DiscoverModels,
+    },
+    Recognise(protocol::RecogniseKey),
+    ChatGpt(ChatGptCall),
     CheckKey(protocol::CheckModelKey),
     RefreshProviders,
     ResolveDeployment(protocol::ResolveDeployment),
@@ -152,6 +159,30 @@ pub(super) enum Effect {
     Images {
         generation: u64,
         source: input::ImageSource,
+    },
+}
+
+/// The backend's ChatGPT sign-in calls, shared with the desktop.
+pub(super) enum ChatGptCall {
+    Begin(protocol::BeginChatGptSignIn),
+    Finish(protocol::FinishChatGptSignIn),
+    Cancel(protocol::CancelChatGptSignIn),
+    Accounts,
+    Switch(protocol::SwitchChatGptAccount),
+    SignOut(protocol::SignOutChatGpt),
+}
+pub(super) enum ChatGptAnswer {
+    Begun(protocol::ChatGptSignIn),
+    Finished {
+        id: u64,
+        outcome: protocol::ChatGptSignInOutcome,
+    },
+    Cancelled,
+    Accounts(Vec<protocol::ChatGptAccount>),
+    Switched,
+    /// Signed out here; `revoked` says whether OpenAI confirmed the session ended.
+    SignedOut {
+        revoked: bool,
     },
 }
 
@@ -323,7 +354,16 @@ enum Answer {
     Expanded(protocol::ExpandedCommand),
     Accepted(protocol::Accepted),
     Cancelled(protocol::Cancelled),
-    Discovered(Vec<protocol::DiscoveredModel>),
+    Discovered(protocol::ModelListing),
+    Probed {
+        url: String,
+        count: Option<usize>,
+    },
+    Recognised {
+        key: String,
+        found: protocol::RecognisedKey,
+    },
+    ChatGpt(ChatGptAnswer),
     KeyChecked(protocol::ModelKeyCheck),
     Providers(protocol::ProviderCatalogue),
     Deployment(protocol::ModelDeployment),
@@ -565,6 +605,58 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             .call_async(protocol::Scope::Folder(&folder), p)
             .await
             .map(Answer::Discovered),
+        Effect::Probe { url, probe } => {
+            let listed = connection
+                .call_async(protocol::Scope::Folder(&folder), probe)
+                .await;
+            // Running means the server itself listed models, not the catalogue standing in.
+            let running = listed.ok().filter(|listing| listing.unverified.is_none());
+            Ok(Answer::Probed {
+                url: url.clone(),
+                count: running.map(|listing| listing.models.len()),
+            })
+        }
+        Effect::Recognise(p) => connection
+            .call_async(protocol::Scope::Folder(&folder), p)
+            .await
+            .map(|found| Answer::Recognised {
+                key: p.key.0.clone(),
+                found,
+            }),
+        Effect::ChatGpt(call) => {
+            let scope = protocol::Scope::Folder(&folder);
+            match call {
+                ChatGptCall::Begin(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(ChatGptAnswer::Begun),
+                ChatGptCall::Finish(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(|outcome| ChatGptAnswer::Finished { id: p.id, outcome }),
+                ChatGptCall::Cancel(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(|_| ChatGptAnswer::Cancelled),
+                ChatGptCall::Accounts => connection
+                    .call_async(scope, &protocol::ChatGptAccounts {})
+                    .await
+                    .map(|list| ChatGptAnswer::Accounts(list.accounts)),
+                ChatGptCall::Switch(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(|_| ChatGptAnswer::Switched),
+                ChatGptCall::SignOut(p) => {
+                    connection
+                        .call_async(scope, p)
+                        .await
+                        .map(|out| ChatGptAnswer::SignedOut {
+                            revoked: out.revoked,
+                        })
+                }
+            }
+            .map(Answer::ChatGpt)
+        }
         Effect::CheckKey(p) => connection
             .call_async(protocol::Scope::Folder(&folder), p)
             .await
@@ -802,6 +894,9 @@ pub(crate) async fn run(
                 },
                 said = stream.recv(), if !paused => { redraw = true; match said { Some(said) => observed(&mut model, said)?, None => ended(&mut model, None) } },
                 _ = ticker.tick() => { redraw |= tick(&mut model); },
+            }
+            if let Some(link) = model.pending_link.take() {
+                loopback::open_browser(&link);
             }
             if let Some(text) = model.pending_clipboard.take() {
                 let status = match tty::copy_to_clipboard(&mut terminal, &text) { Ok(()) => format!("copied {} chars", text.chars().count()), Err(_) => "clipboard unavailable".into() };
@@ -1533,7 +1628,13 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
         }
         E::Error { message } => {
             settled(model);
-            model.push_main_notice(format!("Turn failed: {message}"));
+            // The plan stopped the turn: the chat pauses with its choices rather than switching.
+            if let Some(code) = connect::plan_refusal(&message) {
+                model.plan_limit = Some(code);
+                model.push_main_notice("Your ChatGPT plan's limit for Medha is reached. Medha paused instead of switching models.");
+            } else {
+                model.push_main_notice(format!("Turn failed: {message}"));
+            }
         }
         E::AbortSettled => {
             model.force_aborting = false;
@@ -1700,27 +1801,8 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                         );
                     }
                 }
-                Effect::Discover(_) => {
-                    if let Some(setup) = &mut model.model_setup {
-                        setup.step = ModelSetupStep::ModelId;
-                        if let Some(provider) = &setup.provider
-                            && !provider.models.is_empty()
-                        {
-                            model.picker = Some(Picker::new(PickerKind::ModelDiscovery {
-                                models: provider
-                                    .models
-                                    .iter()
-                                    .map(|m| providers::discovery::ModelInfo {
-                                        id: m.id.clone(),
-                                        context_length: m.context_length,
-                                    })
-                                    .collect(),
-                                query: String::new(),
-                            }));
-                        }
-                    }
-                    model.push_notice("Live discovery failed. Catalogue models can still be chosen; availability for this account is unverified. A manual ID is also accepted.");
-                }
+                // Nothing listed and nothing in the catalogue: the model ID is typed.
+                Effect::Discover(_) => connect::discovery_failed(model, &error),
                 Effect::ResolveDeployment(_) => {
                     if let Some(setup) = &mut model.model_setup {
                         setup.parameter = 0;
@@ -1738,6 +1820,13 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                         setup.step = ModelSetupStep::ApiKey;
                     }
                 }
+                // A server that is not running, or a key nobody recognises, says nothing.
+                Effect::Probe { .. } | Effect::Recognise(_) => return,
+                Effect::ChatGpt(call) => {
+                    connect::chatgpt_failed(model, call, &error);
+                    model.dirty = true;
+                    return;
+                }
                 _ => {}
             }
             if done.form.is_some() {
@@ -1754,6 +1843,9 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                 {
                     setup.step = if matches!(setup.mode, ModelSetupMode::UpdateKey { .. }) {
                         ModelSetupStep::ApiKey
+                    } else if setup.screen.is_some() {
+                        // Back to the list the model was chosen from.
+                        ModelSetupStep::ModelId
                     } else {
                         ModelSetupStep::ContextWindow
                     };
@@ -1871,33 +1963,15 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                     model.cancelling = false;
                 }
             }
-            Answer::Discovered(models) => {
-                let rows = models
-                    .into_iter()
-                    .map(|model| providers::discovery::ModelInfo {
-                        id: model.id,
-                        context_length: model.context_length,
-                    })
-                    .collect();
-                if model.model_setup.is_some() {
-                    model.picker = Some(Picker::new(PickerKind::ModelDiscovery {
-                        models: rows,
-                        query: String::new(),
-                    }));
-                }
-            }
+            Answer::Probed { url, count } => connect::probed(model, url, count),
+            Answer::Recognised { key, found } => connect::recognised(model, key, found),
+            Answer::ChatGpt(answer) => connect::chatgpt(model, answer),
+            Answer::Discovered(listing) => connect::discovered(model, listing),
             Answer::KeyChecked(check) => backend_features::key_checked(model, check),
             Answer::Providers(catalogue) => {
                 peer.models.providers = catalogue.providers;
                 peer.models.revision = catalogue.revision;
-                if let Some(Picker {
-                    kind: PickerKind::ProviderPreset { providers, .. },
-                    selected,
-                }) = &mut model.picker
-                {
-                    *providers = peer.models.providers.clone();
-                    *selected = 0;
-                }
+                // The connect list reads the catalogue as it draws, so it shows the new one at once.
                 model.push_notice(
                     "Provider catalogue refreshed; saved endpoints and keys unchanged.",
                 );
@@ -1909,8 +1983,13 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                     model.clear_edited();
                 }
                 backend_features::discover_setup_if_ready(model);
+                connect::settle(model);
             }
             Answer::Tested(result) => {
+                if connect::tested(model, result.clone()) {
+                    model.dirty = true;
+                    return;
+                }
                 for (name, check) in [
                     ("Text", result.text),
                     ("Streaming", result.streaming),
@@ -2038,6 +2117,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
 
 fn tick(model: &mut Model) -> bool {
     backend_plugins::review_startup(model);
+    connect::tick(model);
     let expired = model
         .clipboard_status
         .as_ref()

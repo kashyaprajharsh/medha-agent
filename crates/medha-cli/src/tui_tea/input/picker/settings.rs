@@ -44,40 +44,5 @@ pub(super) fn activate(model: &mut Model) -> bool {
         }
         return true;
     }
-    // Server-reported context can complete setup without another field.
-    if let PickerKind::ModelDiscovery { models, query } = &picker.kind {
-        let choice = discovered_matches(models, query)
-            .get(picker.selected)
-            .map(|model| (*model).clone());
-        model.picker = None;
-        if model.model_setup.is_none() {
-            return true;
-        }
-        match choice {
-            Some(m) => {
-                let ctx_known = m.context_length.is_some();
-                if let Some(setup) = model.model_setup.as_mut() {
-                    setup.model = m.id;
-                    setup.max_ctx = m.context_length;
-                    setup.step = if ctx_known {
-                        ModelSetupStep::ConfirmTest
-                    } else {
-                        ModelSetupStep::ContextWindow
-                    };
-                }
-                if !ctx_known {
-                    model.push_notice(
-                        "the server didn't report a context window — enter it in tokens (blank = unknown)",
-                    );
-                }
-            }
-            None => {
-                if let Some(setup) = model.model_setup.as_mut() {
-                    setup.step = ModelSetupStep::ModelId;
-                }
-            }
-        }
-        return true;
-    }
     false
 }

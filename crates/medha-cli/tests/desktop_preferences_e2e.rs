@@ -419,6 +419,44 @@ fn a_key_for_another_provider_is_neither_sent_nor_saved_unless_the_user_insists(
 }
 
 #[test]
+fn a_server_that_will_not_list_stands_in_only_its_own_catalogue_for_both_surfaces() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut bridge = Bridge::start(&workspace, &home);
+    // Nothing listens on port 9, so the live listing fails at once.
+    let closed = "http://127.0.0.1:9/v1";
+    let named = json!({"protocol":"open-ai-chat","base_url":closed,"model":"discovery","auth":"none","provider_id":"deepseek"});
+    let desktop = bridge.ok("settings.model.discover", json!({"profile": named}));
+    assert!(
+        !desktop["models"].as_array().unwrap().is_empty(),
+        "the provider's catalogue stands in"
+    );
+    assert!(
+        desktop["unverified"]
+            .as_str()
+            .is_some_and(|why| !why.is_empty()),
+        "and says why"
+    );
+    let terminal = bridge.ok(
+        "application.models.discover",
+        json!({"protocol":"open-ai-chat","base_url":closed,"auth":"none","key":"","provider_id":"deepseek"}),
+    );
+    assert_eq!(
+        terminal["models"], desktop["models"],
+        "both surfaces get the same rows"
+    );
+
+    // A server of one's own has no catalogue: the failure is the answer, never another provider's list.
+    let own =
+        json!({"protocol":"open-ai-chat","base_url":closed,"model":"discovery","auth":"none"});
+    let refused = bridge.call("settings.model.discover", json!({"profile": own}));
+    assert!(refused["error"].is_string(), "{refused}");
+}
+
+#[test]
 fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("project");

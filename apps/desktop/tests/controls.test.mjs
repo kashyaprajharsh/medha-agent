@@ -2397,14 +2397,21 @@ test("model setup distinguishes a timeout from a rejected model and keeps saving
   assert.equal(writes.length, 1);
 });
 
+/** The backend's answer when a server will not list: the named provider's catalogue and why, or the error. */
+function standIn(params, providers, reason) {
+  const provider = providers.find((p) => p.id === params?.profile?.provider_id);
+  if (provider?.models?.length) return { models: provider.models, unverified: reason };
+  throw new Error(reason);
+}
+
 test("switching to a saved custom server never offers the previous provider's catalogue on discovery failure", async () => {
   const saved = [
     { name: "public", default: true, key_present: true, profile: { protocol: "open-ai-chat", model: "old", base_url: providerFixture.url, auth: "bearer" } },
     { name: "private", default: false, key_present: true, profile: { protocol: "open-ai-chat", model: "old-private", base_url: "https://private-gateway.test/v1", auth: "bearer" } },
   ];
-  await providerForm(async (method = "settings.list") => {
+  await providerForm(async (method = "settings.list", params) => {
     if (method === "settings.list") return providerSettings([providerFixture], saved);
-    if (method === "settings.model.discover") throw new Error("Discovery unavailable");
+    if (method === "settings.model.discover") return standIn(params, [providerFixture], "Discovery unavailable");
     assert.fail(method);
   });
   await click(providerRow(providerFixture.name));
@@ -2423,7 +2430,7 @@ test("failed discovery offers catalogue models, clears stale context and permits
   await providerForm(async (method = "settings.list", params) => {
     calls.push({ method, params });
     if (method === "settings.list") return providerSettings([provider]);
-    if (method === "settings.model.discover") throw new Error("403: access not granted to this account");
+    if (method === "settings.model.discover") return standIn(params, [provider], "403: access not granted to this account");
     if (method === "settings.model.test") return new Promise((resolve) => { finishTest = resolve; });
     if (method === "settings.model.save") return { saved: true };
     assert.fail(method);
@@ -2471,7 +2478,7 @@ test("first-run setup filters providers and keeps unsupported providers visible 
   const other = { ...providerFixture, id: "other", name: "Other Provider" };
   globalThis.__medhaControlsTest.api = { settings: async (method = "settings.list", params) => {
     if (method === "settings.list") return providerSettings([providerFixture, other]);
-    if (method === "settings.model.discover") throw new Error("Discovery is unavailable");
+    if (method === "settings.model.discover") return standIn(params, [providerFixture, other], "Discovery is unavailable");
     if (method === "settings.model.save") { writes.push(params); return { saved: true }; }
     if (method === "settings.model.context") return { published: null };
     assert.fail("No model test should run automatically: " + method);

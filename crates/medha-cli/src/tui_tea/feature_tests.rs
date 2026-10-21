@@ -114,8 +114,8 @@ async fn startup_hook_review_waits_for_forms_and_escape_leaves_hooks_disabled() 
         After::Startup,
     );
     assert!(!matches!(
-        &f.model.picker.as_ref().unwrap().kind,
-        PickerKind::BackendPlugins(_)
+        f.model.picker.as_ref().map(|picker| &picker.kind),
+        Some(PickerKind::BackendPlugins(_))
     ));
     assert!(
         f.model

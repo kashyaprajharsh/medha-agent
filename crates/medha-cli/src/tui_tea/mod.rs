@@ -14,13 +14,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 #[cfg(test)]
 use sandbox::WorkspaceSandbox;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod backend_features;
 mod backend_plugins;
 pub(crate) mod backend_ui;
+mod connect;
+mod connect_view;
 mod input;
 mod markdown;
 mod spin;
@@ -800,18 +802,6 @@ enum PickerKind {
     EnableSkill(String),
     /// Custom deployments choose their protocol explicitly.
     ModelProtocol,
-    /// Saved deployments first, then public providers and a custom endpoint.
-    ProviderPreset {
-        saved: Vec<protocol::ModelProfile>,
-        providers: Vec<protocol::ModelProvider>,
-        query: String,
-    },
-    /// Models the endpoint reported during setup — pick one instead of typing
-    /// an id blind. A trailing row keeps manual entry available.
-    ModelDiscovery {
-        models: Vec<providers::discovery::ModelInfo>,
-        query: String,
-    },
     /// Saved provider/model profiles. Switching is available only while idle,
     /// so a stream can never be retargeted midway through a response.
     /// `active` is the profile driving THIS session (may differ from the
@@ -1007,18 +997,8 @@ impl PickerKind {
             PickerKind::EnableSkill(name) => {
                 format!(" switch on '{name}'? · ↑↓ move · Enter confirm · Esc back ")
             }
-            PickerKind::ProviderPreset { query, .. } => {
-                format!(
-                    " choose provider · search: {query} · ↑↓ move · Enter select · Ctrl-R refresh · Esc back "
-                )
-            }
             PickerKind::ModelProtocol => {
                 " choose model protocol — ↑↓ move · Enter/→ continue · Esc/← back ".into()
-            }
-            PickerKind::ModelDiscovery { query, .. } => {
-                format!(
-                    " choose a model · search: {query} · ↑↓ move · Enter/→ select · Esc/← back "
-                )
             }
             PickerKind::Model { .. } => {
                 " model — ↑↓ move · Enter/→ switch or open · Esc close ".into()
@@ -1192,44 +1172,6 @@ impl PickerKind {
                         false => format!("{label}: coming soon"),
                     },
                 )
-                .collect(),
-            PickerKind::ProviderPreset {
-                saved,
-                providers,
-                query,
-            } => saved_deployment_matches(saved, query)
-                .into_iter()
-                .map(|profile| format!("Saved — {}", profile.base_url))
-                .chain(
-                    provider_matches(providers, query)
-                        .into_iter()
-                        .map(|provider| {
-                            if !provider.available {
-                                return format!(
-                                    "{} — unavailable: {}",
-                                    provider.name,
-                                    provider
-                                        .unavailable_reason
-                                        .as_deref()
-                                        .unwrap_or("protocol/access not implemented")
-                                );
-                            }
-                            format!(
-                                "{} — {}",
-                                provider.name,
-                                provider.url.as_deref().unwrap_or("endpoint needed")
-                            )
-                        }),
-                )
-                .chain(std::iter::once("Custom — enter your own base URL".into()))
-                .collect(),
-            PickerKind::ModelDiscovery { models, query } => discovered_matches(models, query)
-                .into_iter()
-                .map(|m| match m.context_length {
-                    Some(c) => format!("{} · {c} ctx", m.id),
-                    None => m.id.clone(),
-                })
-                .chain(std::iter::once("Type a model id manually…".to_string()))
                 .collect(),
             PickerKind::Model { profiles, active } => {
                 // Models first (Enter switches immediately — the common case,
@@ -1514,6 +1456,8 @@ struct ModelSetup {
     held_back: Option<String>,
     /// The user chose to use a key that looks like another provider's.
     allow_other_provider: bool,
+    /// The connect screens drawn over these steps when adding a model; `None` for one-line edits.
+    screen: Option<connect::Screen>,
 }
 
 struct McpCredential {
@@ -1553,6 +1497,7 @@ impl ModelSetup {
             extra_key: false,
             held_back: None,
             allow_other_provider: false,
+            screen: None,
         }
     }
 
@@ -1594,6 +1539,7 @@ impl ModelSetup {
             extra_key: false,
             held_back: None,
             allow_other_provider: false,
+            screen: None,
         }
     }
 
@@ -1661,48 +1607,6 @@ impl ModelSetup {
     fn is_secret(&self) -> bool {
         matches!(self.step, ModelSetupStep::ApiKey)
     }
-}
-
-fn provider_matches<'a>(
-    providers: &'a [protocol::ModelProvider],
-    query: &str,
-) -> Vec<&'a protocol::ModelProvider> {
-    let wanted = query.to_lowercase();
-    providers
-        .iter()
-        .filter(|p| p.name.to_lowercase().contains(&wanted) || p.id.contains(&wanted))
-        .collect()
-}
-
-fn saved_deployment_matches<'a>(
-    profiles: &'a [protocol::ModelProfile],
-    query: &str,
-) -> Vec<&'a protocol::ModelProfile> {
-    let wanted = query.to_lowercase();
-    let mut seen = BTreeSet::new();
-    profiles
-        .iter()
-        .filter(|profile| {
-            (profile.base_url.to_lowercase().contains(&wanted)
-                || profile.name.to_lowercase().contains(&wanted)
-                || profile
-                    .provider_id
-                    .as_deref()
-                    .is_some_and(|id| id.contains(&wanted)))
-                && seen.insert(format!("{:?}:{}", profile.protocol, profile.base_url))
-        })
-        .collect()
-}
-
-fn discovered_matches<'a>(
-    models: &'a [providers::discovery::ModelInfo],
-    query: &str,
-) -> Vec<&'a providers::discovery::ModelInfo> {
-    let wanted = query.to_lowercase();
-    models
-        .iter()
-        .filter(|model| model.id.to_lowercase().contains(&wanted))
-        .collect()
 }
 
 /// Guided search setup keeps API keys out of history and the transcript.
@@ -1832,6 +1736,10 @@ struct Model {
     last_click: Option<LastClick>,
     /// Text waiting for the event loop to send to the terminal clipboard.
     pending_clipboard: Option<String>,
+    /// A link waiting for the event loop to open in the browser; screens never open one themselves.
+    pending_link: Option<String>,
+    /// The ChatGPT plan refused the last turn, with OpenAI's code; the chat waits instead of switching.
+    plan_limit: Option<String>,
     /// Brief copy result shown without mutating the transcript.
     clipboard_status: Option<(String, Instant)>,
     /// The pending approval card has been rendered at least once, so its options
@@ -2185,6 +2093,8 @@ impl Model {
             mouse_selecting: false,
             last_click: None,
             pending_clipboard: None,
+            pending_link: None,
+            plan_limit: None,
             clipboard_status: None,
             approval_ready: false,
             context_pressure: None,

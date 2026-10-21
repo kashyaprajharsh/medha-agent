@@ -1,5 +1,7 @@
 use super::*;
 use serde_json::json;
+#[path = "connect_tests.rs"]
+mod connect_screens;
 #[path = "feature_tests.rs"]
 mod parity;
 
@@ -33,6 +35,31 @@ fn finish_setup_request(f: &mut Fixture, answer: Result<Answer, String>) {
 }
 fn setup_enter(model: &mut Model) {
     input::handle_key(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+}
+/// The names the connect list shows now, in order.
+fn listed(model: &Model) -> Vec<String> {
+    let Some(connect::Screen::List(list)) =
+        model.model_setup.as_ref().and_then(|s| s.screen.as_ref())
+    else {
+        panic!("the connect list is not open");
+    };
+    connect::rows(model, list)
+        .iter()
+        .map(connect::Row::name)
+        .collect()
+}
+/// Highlight the list row showing `name`, then press Enter on it.
+fn choose_listed(model: &mut Model, name: &str) {
+    let at = listed(model)
+        .iter()
+        .position(|shown| shown == name)
+        .unwrap_or_else(|| panic!("{name} is not listed: {:?}", listed(model)));
+    if let Some(connect::Screen::List(list)) =
+        model.model_setup.as_mut().and_then(|s| s.screen.as_mut())
+    {
+        list.selected = at;
+    }
+    setup_enter(model);
 }
 
 /// A message typed while startup reads hold every request slot is sent when
@@ -95,8 +122,9 @@ async fn provider_setup_searches_pasted_text_resolves_parameters_and_keeps_secre
     begin_model_setup(&mut f.model);
     input::handle_paste(&mut f.model, "Cloudflare\n".into());
     assert!(
-        matches!(&f.model.picker.as_ref().unwrap().kind, PickerKind::ProviderPreset { query, .. } if query == "Cloudflare")
+        matches!(&f.model.model_setup.as_ref().unwrap().screen, Some(connect::Screen::List(list)) if list.query == "Cloudflare")
     );
+    assert!(listed(&f.model).contains(&"Cloudflare Workers AI".to_owned()));
     assert!(f.model.input.is_empty());
     setup_enter(&mut f.model);
     assert!(matches!(
@@ -130,20 +158,27 @@ async fn provider_setup_searches_pasted_text_resolves_parameters_and_keeps_secre
     assert!(
         matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::Discover(discover) if discover.key.0 == "dummy-secret" && discover.auth == Some(protocol::ModelAuth::Bearer))
     );
+    // The server would not list; the backend stands the catalogue's models in and says why.
     finish_setup_request(
         &mut f,
-        Err("Discovery unavailable; use catalogue or enter manually".into()),
+        Ok(Answer::Discovered(protocol::ModelListing {
+            models: vec![protocol::DiscoveredModel {
+                id: "fixture-model".into(),
+                context_length: Some(8000),
+                ..Default::default()
+            }],
+            unverified: Some("Discovery unavailable".into()),
+        })),
+    );
+    input::handle_key(
+        &mut f.model,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
     );
     input::handle_paste(&mut f.model, "fixture".into());
     assert!(
-        matches!(&f.model.picker.as_ref().unwrap().kind, PickerKind::ModelDiscovery { query, .. } if query == "fixture")
+        matches!(&f.model.model_setup.as_ref().unwrap().screen, Some(connect::Screen::Provider(p)) if p.filter.as_deref() == Some("fixture"))
     );
-    setup_enter(&mut f.model);
-    assert!(matches!(
-        f.model.model_setup.as_ref().unwrap().step,
-        ModelSetupStep::ConfirmTest
-    ));
-    setup_enter(&mut f.model); // blank -> Save, not Test
+    setup_enter(&mut f.model); // The highlighted model is saved; checking it is asked for with c.
     assert!(
         matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::Change(protocol::ChangeResource::SaveModel(draft), _) if draft.provider_id.as_deref() == Some("cloudflare-workers-ai") && draft.base_url.ends_with("my-account/ai/v1") && draft.model == "fixture-model")
     );
@@ -263,6 +298,11 @@ async fn catalogue_refresh_preserves_provider_search_and_the_current_chat() {
         &mut f.model,
         KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
     );
+    assert_eq!(
+        f.model.remote.as_ref().unwrap().pending.len(),
+        1,
+        "Ctrl-R refreshes; it does not type"
+    );
     assert!(matches!(
         f.model
             .remote
@@ -283,7 +323,11 @@ async fn catalogue_refresh_preserves_provider_search_and_the_current_chat() {
         })),
     );
     assert!(
-        matches!(&f.model.picker.as_ref().unwrap().kind, PickerKind::ProviderPreset { query, .. } if query == "cloud")
+        matches!(&f.model.model_setup.as_ref().unwrap().screen, Some(connect::Screen::List(list)) if list.query == "cloud")
+    );
+    assert!(
+        listed(&f.model).contains(&"Cloudflare Workers AI".to_owned()),
+        "the refreshed catalogue is listed at once"
     );
     assert_eq!(f.model.remote.as_ref().unwrap().conversation, conversation);
     assert_eq!(f.model.remote.as_ref().unwrap().models.revision, "new");
@@ -305,39 +349,51 @@ async fn provider_selection_chooses_its_protocol_and_only_custom_setup_asks_for_
     unavailable.unavailable_reason = Some("Native protocol not implemented".into());
     f.model.remote.as_mut().unwrap().models.providers = vec![unavailable, gemini];
     begin_model_setup(&mut f.model);
-    assert!(matches!(
-        f.model.picker.as_ref().unwrap().kind,
-        PickerKind::ProviderPreset { .. }
-    ));
-    setup_enter(&mut f.model);
-    assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
-    assert!(matches!(
-        f.model.picker.as_ref().unwrap().kind,
-        PickerKind::ProviderPreset { .. }
-    ));
-    assert!(
-        f.model
-            .picker
-            .as_ref()
-            .unwrap()
-            .kind
-            .labels()
+    // An unavailable provider is never offered to choose; ? shows it with the reason.
+    assert_eq!(
+        listed(&f.model)
             .iter()
-            .any(|label| label.contains("Native protocol not implemented"))
+            .filter(|name| *name == "Google Gemini")
+            .count(),
+        1,
+        "only the available one"
     );
     input::handle_key(
         &mut f.model,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
     );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    terminal
+        .draw(|frame| connect_view::draw(frame, &f.model, Rect::new(0, 18, 100, 2)))
+        .unwrap();
+    let shown: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(shown.contains("Native protocol not implemented"), "{shown}");
     setup_enter(&mut f.model);
+    assert!(
+        f.model.remote.as_ref().unwrap().pending.is_empty(),
+        "nothing starts from that list"
+    );
+    input::handle_key(
+        &mut f.model,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    choose_listed(&mut f.model, "Google Gemini");
     let setup = f.model.model_setup.as_ref().unwrap();
     assert_eq!(setup.protocol, kernel::Protocol::GeminiInteractions);
     assert!(matches!(setup.step, ModelSetupStep::ApiKey));
-    assert!(f.model.picker.is_none());
+    assert!(
+        f.model.picker.is_none(),
+        "a named provider never asks for a protocol"
+    );
 
     begin_model_setup(&mut f.model);
-    f.model.picker.as_mut().unwrap().selected = 2; // Custom follows both records.
-    setup_enter(&mut f.model);
+    choose_listed(&mut f.model, "Another server");
     assert!(matches!(
         f.model.picker.as_ref().unwrap().kind,
         PickerKind::ModelProtocol
@@ -368,16 +424,15 @@ async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth
     peer.models.profiles = vec![profile, duplicate];
     peer.models.providers = vec![setup_provider()];
     begin_model_setup(&mut f.model);
-    let labels = f.model.picker.as_ref().unwrap().kind.labels();
-    assert_eq!(labels[0], "Saved — https://gateway.test/tenant-a/v1");
+    // Two saved models on one server: the server is offered once, by its address.
     assert_eq!(
-        labels
+        listed(&f.model)
             .iter()
-            .filter(|label| label.starts_with("Saved"))
+            .filter(|name| *name == "gateway.test")
             .count(),
         1
     );
-    setup_enter(&mut f.model);
+    choose_listed(&mut f.model, "gateway.test");
     let Effect::Discover(discovery) = &f
         .model
         .remote
@@ -402,13 +457,15 @@ async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth
     );
     finish_setup_request(
         &mut f,
-        Ok(Answer::Discovered(vec![protocol::DiscoveredModel {
-            id: "new".into(),
-            context_length: Some(16000),
-            ..Default::default()
-        }])),
+        Ok(Answer::Discovered(protocol::ModelListing {
+            models: vec![protocol::DiscoveredModel {
+                id: "new".into(),
+                context_length: Some(16000),
+                ..Default::default()
+            }],
+            unverified: None,
+        })),
     );
-    setup_enter(&mut f.model);
     setup_enter(&mut f.model);
     let Effect::Change(protocol::ChangeResource::SaveModel(draft), _) = &f
         .model
@@ -439,7 +496,19 @@ async fn a_local_provider_needs_no_key_and_a_different_tenant_cannot_reuse_a_sav
     provider.auth = protocol::ModelAuth::None;
     f.model.remote.as_mut().unwrap().models.providers = vec![provider.clone()];
     begin_model_setup(&mut f.model);
-    setup_enter(&mut f.model);
+    // The list first looks for the server unasked, with no key.
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
+        Effect::Probe { probe, .. } if probe.auth == Some(protocol::ModelAuth::None) && probe.key.0.is_empty())
+    );
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::Probed {
+            url: "http://localhost:11434/v1".into(),
+            count: None,
+        }),
+    );
+    choose_listed(&mut f.model, &provider.name);
     assert!(
         matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
         Effect::Discover(request) if request.auth == Some(protocol::ModelAuth::None) && request.key.0.is_empty())
@@ -459,8 +528,7 @@ async fn a_local_provider_needs_no_key_and_a_different_tenant_cannot_reuse_a_sav
         .unwrap(),
     ];
     begin_model_setup(&mut f.model);
-    f.model.picker.as_mut().unwrap().selected = 1; // Provider follows the saved deployment.
-    setup_enter(&mut f.model);
+    choose_listed(&mut f.model, "Cloudflare Workers AI");
     setup_enter(&mut f.model); // A blank key must be refused for tenant-b.
     assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
     assert!(matches!(

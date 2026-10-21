@@ -732,10 +732,10 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
                 serde_json::from_value(params["profile"].clone())?;
             let allow = params["allow_other_provider"] == true;
             let credential = config::setup_credential(&profile, params["key"].as_str(), allow)?;
-            let models =
-                providers::discovery::list_models_for_profile(&profile, &credential).await?;
-            let listed = crate::application_resources::listed(&profile, &models);
-            Ok(json!({ "models": listed }))
+            let listing = crate::application_resources::discover(&profile, &credential)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            Ok(serde_json::to_value(listing)?)
         }
         // Read only from the key's opening letters: no request, and the key is not kept.
         "settings.model.recognise_key" => Ok(serde_json::to_value(

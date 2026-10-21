@@ -842,10 +842,7 @@ pub(crate) async fn folder<L: EventLog>(
                                 Ok(key) => key,
                                 Err(error) => return Some(Err(error.to_string())),
                             };
-                        providers::discovery::list_models_for_profile(&profile, &credential)
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|models| encoded(listed(&profile, &models)))
+                        discover(&profile, &credential).await.and_then(encoded)
                     }
                     Err(error) => Err(error),
                 }
@@ -866,6 +863,46 @@ pub(crate) async fn folder<L: EventLog>(
         _ => return None,
     };
     Some(result)
+}
+
+/// What a provider's server lists, for every surface. When the server will not list, the
+/// catalogue's models for that provider, marked with why they are unverified for this account.
+pub(crate) async fn discover(
+    profile: &config::ProviderConfig,
+    credential: &str,
+) -> Result<protocol::ModelListing, String> {
+    let error = match providers::discovery::list_models_for_profile(profile, credential).await {
+        Ok(models) => {
+            let models = listed(profile, &models);
+            return Ok(protocol::ModelListing {
+                models,
+                unverified: None,
+            });
+        }
+        Err(error) => error.to_string(),
+    };
+    let catalogue = providers::catalogue::snapshot();
+    let known: Vec<providers::discovery::ModelInfo> = profile
+        .provider_id
+        .as_deref()
+        .and_then(|id| catalogue.providers.iter().find(|record| record.id == id))
+        .map(|record| {
+            let models = record.models.iter();
+            models
+                .map(|m| providers::discovery::ModelInfo {
+                    id: m.id.clone(),
+                    context_length: m.context_length,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if known.is_empty() {
+        return Err(error);
+    }
+    Ok(protocol::ModelListing {
+        models: listed(profile, &known),
+        unverified: Some(error),
+    })
 }
 
 /// Found models with what the catalogue knows of them: display name, list price and tool use.

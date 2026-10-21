@@ -1471,6 +1471,13 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
             Style::default().fg(theme::dim()),
         ),
     ];
+    // OpenAI asks plan use to be shown where the model is: "Using ChatGPT plan · Manage usage".
+    if super::connect::on_plan(model) {
+        left.push(Span::styled(
+            " · Using ChatGPT plan · /usage manage",
+            Style::default().fg(theme::faint()),
+        ));
+    }
     // Autonomy badge — always visible so the user knows how much runs without
     // asking. yolo is loud (bold WARN) since it auto-runs edits + shell.
     let (mode_txt, mode_style) = match model.autonomy {
@@ -1780,11 +1787,8 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
     }
     if input.is_empty() && !model.running {
         if let Some(setup) = &model.model_setup {
-            let prompt = if matches!(
-                model.picker.as_ref().map(|p| &p.kind),
-                Some(PickerKind::ProviderPreset { .. })
-            ) {
-                "Choose a provider from the list above".to_owned()
+            let prompt = if setup.screen.is_some() {
+                "Connecting a model: the card above takes your keys".to_owned()
             } else {
                 setup.prompt()
             };
@@ -2341,8 +2345,17 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     {
         draw_autocomplete(f, model, pad_h(chunks[3]));
     }
-    if !gate_open && let Some(picker) = &model.picker {
+    let connecting = model
+        .model_setup
+        .as_ref()
+        .is_some_and(|setup| setup.screen.is_some());
+    if !gate_open && connecting {
+        // The card draws its own choices, the protocol for a server of one's own included.
+        super::connect_view::draw(f, model, pad_h(chunks[3]));
+    } else if !gate_open && let Some(picker) = &model.picker {
         draw_picker(f, picker, pad_h(chunks[3]));
+    } else if !gate_open && model.plan_limit.is_some() {
+        super::connect_view::draw_plan_limit(f, model, pad_h(chunks[3]));
     }
     // The clarify form owns the overlay space while it's up (like the approval card).
     if let Some(state) = &model.clarify {

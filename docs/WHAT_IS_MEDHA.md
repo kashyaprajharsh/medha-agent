@@ -609,7 +609,7 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 | Mode | What the dial escalates |
 |------|-------------------------|
 | `careful` (default) | Every tool in the approve set |
-| `normal` | The approve set **minus** `edit` — so edits run freely |
+| `normal` | The approve set **minus** `edit` — so edits run freely; inside an OS jail, `shell.exec` runs freely too |
 | `yolo` | Nothing from the approve set |
 
 > **`yolo` is not "no approval prompts."** It switches off the approve-set
@@ -618,10 +618,12 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 > - `diagnostics` and every `External` tool (`mcp__*`, `lsp.start`, `mcp.start`)
 >   remain human-gated
 > - `shell.exec` is the deliberate tool-specific exception: hard-dangerous
->   commands are denied, ambiguous commands are human-gated, and statically
->   safe commands start at `Allow`. The approve-set gates that last class in
->   `careful`/`normal`; `yolo` may run it without a prompt, still inside the
->   configured sandbox and its network policy
+>   commands are denied, and without an OS jail ambiguous commands are
+>   human-gated. Everything else starts at `Allow`. The approve-set gates that
+>   class in `careful`, and in `normal` when there is no jail;
+>   `yolo` may run it without a prompt, still inside the configured sandbox and its network policy.
+>   Access a command lacks (network, outside paths, running outside the
+>   sandbox) gets its own card in every mode
 > - `skill.save` — always `Human`, unconditionally
 > - `agent.apply` — always `Human`; reviewing a sub-agent's diff *is* the feature
 > - `git add` / `git commit` — gated per subcommand, while reads stay free
@@ -635,32 +637,38 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 ### Shell Command Scanner
 
 `shell.exec` is the one tool that can do anything, so it does not ride its blast
-radius — it goes through a deterministic scanner that returns **one of three
+radius. Its line is read once with a bash grammar (`crates/shell-reader`), the same
+reading the lanes and the sandbox use, and the scanner returns **one of three
 outcomes**, not a yes/no.
 
 ```
 scan_command(command)
      │
-     ├─ hard_dangerous?  → DENY   (never runs, at any autonomy level)
+     ├─ a real danger?   → DENY   (never runs, at any autonomy level)
      ├─ recursive rm outside the workspace? → HUMAN
-     ├─ needs_review?    → HUMAN  (legitimate uses, but unreadable statically)
+     ├─ no OS jail and the text cannot show what runs? → HUMAN
      └─ otherwise        → ALLOW
 ```
 
+Inside an OS jail the jail is the boundary, as it is for any program the command
+starts: what the command lacks (network, a path outside the workspace, running
+outside the sandbox) gets its own card when it asks for it, so globs, variables,
+redirects, loops, `cd`, comments and interpreters are not reasons to ask.
+
 #### Tier 1 — Hard deny
 
-Refused outright. `yolo` does not reach these; the dial can only tighten.
+Refused outright. `yolo` does not reach these; the dial can only tighten. Each is
+judged by the program that runs and the files it really names, so a search
+pattern, a quoted sentence or a heredoc mentioning one is never refused.
 
-| Class | Patterns |
+| Class | What is refused |
 |---|---|
-| Destruction | `:(){ ` (fork bomb), `mkfs`, `dd if=`, `> /dev/sd`, `of=/dev/sd` |
-| Credential theft | `/etc/shadow`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `.aws/credentials`, `.git-credentials`, `/.netrc`, `.docker/config.json`, `.kube/config` |
-| Privilege / ownership | `sudo `, `chmod -r 777 /`, `chown -r` |
+| Destruction | a fork bomb; `mkfs`; `dd of=` or a redirect into a disk device |
+| Credential theft | a path naming `/etc/shadow`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `.aws/credentials`, `.git-credentials`, `/.netrc`, `.docker/config.json`, `.kube/config` |
+| Privilege / ownership | running `sudo` or `doas`; a recursive `chmod`/`chown`/`chgrp` of a system folder |
 | Recursive delete of a system or home path | see the three tiers below |
-| Remote-code execution | a **download or decoded blob piped into a shell** — `curl`/`wget`, or `base64 -d`/`xxd -r`/`openssl enc -d`, combined with `\| sh`, `\| bash`, `\| zsh`, `\| eval`, `\| python`, `\| perl`, `\| ruby` |
-
-That last one is the `curl … \| sh` class, and it is denied only when *both* halves
-are present — fetching alone is fine, piping alone is fine.
+| Encoded PowerShell | `powershell`/`pwsh` with `-EncodedCommand` |
+| Remote-code execution, without a jail | data piped into a shell or interpreter, the `curl … \| sh` class. Inside a jail the interpreter is contained and the download needs network approval |
 
 #### Recursive delete is three-way, not binary
 
@@ -673,28 +681,31 @@ A recursive `rm` is classified by the riskiest target it names:
 | Filesystem root, home root, or a system directory | **Deny** |
 
 `$HOME` and `${HOME}` are resolved and treated exactly like `~`. Any *other*
-unexpanded variable cannot be resolved statically, so it can never be classified
-safe — it falls to out-of-workspace approval rather than being assumed benign.
+unexpanded variable cannot be resolved statically: without a jail it falls to
+out-of-workspace approval, and inside one the jail decides where it may delete.
+A `..` part in a rooted path is refused, since the kernel resolves it through links.
 
 #### Tier 2 — Needs review
 
-Constructs a static scan cannot see through. These have legitimate uses, so they are
-not denied — they route to the human gate. **Under a no-human policy (`AutoDeny`,
-headless) that gate resolves to deny, so they fail closed rather than open.**
+Applies only without an OS jail, where nothing contains the command. These have
+legitimate uses, so they are not denied — they route to the human gate. **Under a
+no-human policy (`AutoDeny`, headless) that gate resolves to deny, so they fail
+closed rather than open.**
 
 | Class | Trigger |
 |---|---|
-| Opaque execution | `$(…)`, backticks, `<(…)`, `>(…)` — the output could be a command the scan never inspected |
-| Evasion | any backslash, because escaping defeats literal matching (`r\m -rf /`) |
-| Data exfiltration | `curl`/`wget` with `-d`, `--data*`, `-F/--form`, `-T/--upload-file` |
-| Raw sockets | `/dev/tcp/`, `/dev/udp/` |
-| File transfer | `scp`, `sftp`, `rsync`, `nc`, `ncat`, `telnet` |
-| Environment dump | `printenv`, `declare -x`, `export -p` — could reveal whatever the env allowlist let through |
+| Unreadable | syntax the grammar cannot parse, or a program name decided only when it runs |
+| Opaque values | a variable, substitution or glob in a word (`$?` and other status numbers excepted) |
+| Files and sockets | redirection to or from a file, `/dev/tcp/`, `/dev/udp/` |
+| Network and transfer | `curl`, `wget`, `scp`, `sftp`, `rsync`, `nc`, `ncat`, `telnet`, `ssh` |
+| Interpreters, wrappers, paths | a shell or interpreter, a wrapper such as `env` or `xargs`, a program run by path |
+| Environment | an assignment, or a dump such as `printenv`, `declare -x`, `export -p` |
+| Unknown programs | anything other than known readers and build entry points (`cargo`, `make`, `go`, …) |
+| Outside paths | an argument outside the workspace and Medha's scratch folder |
 
-> **The scanner is a floor, not the whole defense.** It is deterministic and
-> literal, so it can be evaded by a sufficiently creative construction — which is
-> why evasion-shaped input (escaping, substitution) is itself a review trigger, and
-> why the sandbox, the env allowlist and trust-flow escalation all sit behind it.
+> **The scanner is a floor, not the whole defense.** Behind it sit the OS jail,
+> the env allowlist and trust-flow escalation; the jail is what bounds a command
+> whose text cannot show everything it will do.
 
 ---
 
@@ -1033,7 +1044,7 @@ spawn is, which is why the two share one name.
 - **Examples:** `shell.exec`, `diagnostics`
 - **Base verdict:** `diagnostics` is `Human` at every autonomy level.
   `shell.exec` is a tool-specific scanner exception: hard-dangerous shapes are
-  `Deny`, ambiguous shapes are `Human`, and statically safe commands are
+  `Deny`, ambiguous shapes are `Human` when there is no OS jail, and the rest are
   `Allow` before the autonomy approve-set is applied. Thus a safe-scanned shell
   command can run without a prompt in `yolo`, but never outside the configured
   sandbox/network boundary.

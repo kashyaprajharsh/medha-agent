@@ -21,8 +21,11 @@ pub(crate) struct BrowserScreenshot {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Target {
-    /// A file inside the workspace, relative to its root.
-    Workspace(PathBuf),
+    /// A file in the workspace or a folder Medha owns, relative to that folder, which the page may load from.
+    File {
+        root: PathBuf,
+        relative: PathBuf,
+    },
     Url(String),
 }
 
@@ -54,17 +57,28 @@ pub(crate) async fn parse_target(
         .resolve(target)
         .await
         .map_err(|error| ToolError::Args(format!("{target}: {error}")))?;
-    let root = sbx
+    let workspace = sbx
         .root()
         .canonicalize()
         .map_err(|error| ToolError::Failed(error.to_string()))?;
-    let relative = resolved
-        .strip_prefix(&root)
-        .map_err(|_| ToolError::Args(format!("{target} is outside the workspace")))?;
+    // Only the workspace and Medha's own folders are served: a page can read anything beside it.
+    let owned = sbx.permission_manager().approved_roots().owned_roots();
+    let root = std::iter::once(workspace)
+        .chain(owned.into_iter().map(|root| root.canonicalize().unwrap_or(root)))
+        .find(|root| resolved.starts_with(root))
+        .ok_or_else(|| {
+            ToolError::Args(format!(
+                "{target} is outside the workspace and Medha's own folders; copy it into the workspace to render it"
+            ))
+        })?;
     if !resolved.is_file() {
         return Err(ToolError::Args(format!("{target} is not a file")));
     }
-    Ok(Target::Workspace(relative.to_path_buf()))
+    let relative = resolved
+        .strip_prefix(&root)
+        .unwrap_or(&resolved)
+        .to_path_buf();
+    Ok(Target::File { root, relative })
 }
 
 /// The first installed Chromium-family browser, or `MEDHA_BROWSER`.
@@ -411,16 +425,16 @@ impl BrowserScreenshot {
         }
         let scratch = Scratch::new().map_err(|error| ToolError::Failed(error.to_string()))?;
         let server = match &target {
-            Target::Workspace(_) => Some(
-                PageServer::start(self.sbx.root())
+            Target::File { root, .. } => Some(
+                PageServer::start(root)
                     .map_err(|error| ToolError::Failed(format!("page server: {error}")))?,
             ),
             Target::Url(_) => None,
         };
         let url = match (&target, &server) {
-            (Target::Workspace(relative), Some(server)) => server.url(relative),
+            (Target::File { relative, .. }, Some(server)) => server.url(relative),
             (Target::Url(url), _) => url.clone(),
-            _ => unreachable!("a workspace target always has a server"),
+            _ => unreachable!("a file target always has a server"),
         };
         let out = scratch.0.join("screenshot.png");
         let mut command = tokio::process::Command::new(&self.browser);

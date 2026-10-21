@@ -214,15 +214,19 @@ fn scan_text_with_mode(path: &str, text: &str, script: Option<ScriptKind>, out: 
         (Vec::new(), false)
     };
     for (line, raw) in commands {
-        let c = raw.to_lowercase();
-        if let Some(reason) = crate::hard_dangerous(&c, None) {
+        let reading = shell_reader::read(&raw);
+        let danger = crate::admission::danger(&reading, None, false).or_else(|| {
+            embedded_pipe(&raw.to_lowercase())
+                .then(|| "pipes data into a shell or interpreter".into())
+        });
+        if let Some(reason) = danger {
             out.push(Finding {
                 file: path.to_string(),
                 line: Some(line),
                 severity: Severity::Dangerous,
-                reason,
+                reason: format!("blocked dangerous command: {reason}"),
             });
-        } else if !hard_only && let Some(reason) = crate::needs_review(&c, None, None) {
+        } else if !hard_only && let Some(reason) = crate::admission::review(&reading, None, None) {
             out.push(Finding {
                 file: path.to_string(),
                 line: Some(line),
@@ -231,6 +235,20 @@ fn scan_text_with_mode(path: &str, text: &str, script: Option<ScriptKind>, out: 
             });
         }
     }
+}
+
+/// A pipe into a shell inside a source string, such as `os.system("curl ... | sh")`, which
+/// the shell grammar rightly reads as one quoted word but a later interpreter will run.
+fn embedded_pipe(line: &str) -> bool {
+    static EMBEDDED_PIPE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    EMBEDDED_PIPE
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?:^|[^|])\|[ \t]*(?:(?:env|command|nohup)[ \t]+(?:(?:-[^ \t]+|[a-z_][a-z0-9_]*=[^ \t]+)[ \t]+)*)?(?:/[a-z0-9_./-]+/)?(?:sh|dash|bash|zsh|fish|ksh|python[23]?|perl|ruby|node|php|lua)\b",
+            )
+            .expect("static pattern")
+        })
+        .is_match(line)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,7 +734,7 @@ mod tests {
         );
         // Shell scripts still receive command scanning.
         assert_eq!(
-            scan("scripts/run.sh", "grep \\d file").verdict,
+            scan("scripts/run.sh", "curl -o out https://example.test/x").verdict,
             ScanVerdict::Caution
         );
         // Source in another language is reviewed, not parsed as shell.

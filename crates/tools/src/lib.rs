@@ -1565,7 +1565,9 @@ impl Tool for Read {
         }
         let path = arg_str(args, "path")
             .map_err(|_| ToolError::Args("read needs `path` or `hash`".into()))?;
-        if args.get("render").and_then(Value::as_bool) == Some(true) {
+        // An image is already a picture, so `render` on one just views it.
+        let image = media::has_image_extension(std::path::Path::new(&path));
+        if args.get("render").and_then(Value::as_bool) == Some(true) && !image {
             self.no_use_for_images(
                 "Check the page another way: read its source, or run a command that tests it.",
             )?;
@@ -1583,7 +1585,7 @@ impl Tool for Read {
         }
         // The extension only routes the call; `image.view` identifies the bytes
         // and reports a mislabelled file rather than guessing.
-        if media::has_image_extension(std::path::Path::new(&path)) {
+        if image {
             self.no_use_for_images(
                 "Say what you need from the file, or inspect it with a command (its size, \
                  format or metadata).",

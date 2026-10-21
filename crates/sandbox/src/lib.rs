@@ -1939,6 +1939,11 @@ impl WorkspaceSandbox {
     /// Install the execution backend used by shell/build/VCS tools. Defaults to
     /// [`HostBackend`]; the CLI swaps in the OS-native jail per `medha.lock`.
     pub fn with_exec_backend(mut self, backend: Arc<dyn ExecBackend>) -> Self {
+        // What a command writes to its temp folder, the file tools can read back unasked.
+        if let Some(temp) = backend.private_temp() {
+            let temp = temp.canonicalize().unwrap_or(temp);
+            self.permission_manager.approved_roots().allow_owned(temp);
+        }
         self.exec = backend;
         self
     }
@@ -3944,8 +3949,9 @@ mod tests {
             marker.exists(),
             "the approved retry never entered its wait window"
         );
-        assert!(approved.read_roots().is_empty());
-        assert!(approved.write_roots().is_empty());
+        let real = outside.canonicalize().unwrap();
+        assert!(!approved.is_allowed(&real, permissions::PermissionType::Read));
+        assert!(!approved.is_allowed(&real, permissions::PermissionType::Write));
 
         let second = sbx
             .exec(
@@ -3963,8 +3969,8 @@ mod tests {
             "the concurrent command must not inherit the first Once grant"
         );
         assert_eq!(first.await.unwrap().unwrap().status, Some(0));
-        assert!(approved.read_roots().is_empty());
-        assert!(approved.write_roots().is_empty());
+        assert!(!approved.is_allowed(&real, permissions::PermissionType::Read));
+        assert!(!approved.is_allowed(&real, permissions::PermissionType::Write));
         std::fs::remove_dir_all(&base).ok();
     }
 

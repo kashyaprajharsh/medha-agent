@@ -308,6 +308,10 @@ pub trait ExecBackend: Send + Sync {
     fn denies_network(&self, _req: &ExecRequest) -> bool {
         false
     }
+    /// The folder this backend gives commands as `TMPDIR`, when Medha owns it.
+    fn private_temp(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Resolver/routing failure text every runtime on this platform ultimately
@@ -2735,6 +2739,9 @@ impl ExecBackend for SeatbeltBackend {
     fn label(&self) -> &str {
         "native"
     }
+    fn private_temp(&self) -> Option<PathBuf> {
+        Some(self.home.path.join("tmp"))
+    }
     fn containment(&self) -> kernel::Containment {
         // A session/persistent grant opens the network for all later commands, so
         // trust-flow must see it. A one-shot task-local grant is deliberately not
@@ -3087,6 +3094,9 @@ impl ExecBackend for LandlockBackend {
     }
     fn label(&self) -> &str {
         "native"
+    }
+    fn private_temp(&self) -> Option<PathBuf> {
+        Some(self.home.path.join("tmp"))
     }
     fn containment(&self) -> kernel::Containment {
         // Seccomp denies sockets independently of Landlock's network ABI; installation failure aborts exec.

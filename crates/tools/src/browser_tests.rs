@@ -334,13 +334,16 @@ fn only_urls_need_network_and_other_schemes_are_refused() {
     std::fs::write(base.path().join("index.html"), "x").unwrap();
     std::fs::write(base.path().join("../outside-browser-target.html"), "x").ok();
     let state = scratch("state");
+    let owned = scratch("owned");
+    std::fs::write(owned.path().join("chart.html"), "x").unwrap();
     let sbx = sandbox::WorkspaceSandbox::new(
         base.path(),
         state.path().join("trust.lock"),
         state.path().join("audit.log"),
         None,
     )
-    .unwrap();
+    .unwrap()
+    .with_scratch(owned.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -348,7 +351,19 @@ fn only_urls_need_network_and_other_schemes_are_refused() {
     runtime.block_on(async {
         assert_eq!(
             parse_target("index.html", &sbx).await.unwrap(),
-            Target::Workspace(PathBuf::from("index.html"))
+            Target::File {
+                root: base.path().canonicalize().unwrap(),
+                relative: PathBuf::from("index.html")
+            }
+        );
+        // A page Medha made in its own folder renders from that folder.
+        let chart = owned.path().join("chart.html");
+        assert_eq!(
+            parse_target(chart.to_str().unwrap(), &sbx).await.unwrap(),
+            Target::File {
+                root: owned.path().canonicalize().unwrap(),
+                relative: PathBuf::from("chart.html")
+            }
         );
         for bad in [
             "file:///etc/passwd",

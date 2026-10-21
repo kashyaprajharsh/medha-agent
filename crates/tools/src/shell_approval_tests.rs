@@ -443,7 +443,14 @@ async fn native_workdir_read_grant_does_not_expand_workspace_write_access() {
     );
     run(&f, json!({"command": "mkdir allowed", "network": false, "workdir": f.outside, "write_paths": [f.outside]}), false).await;
     assert!(f.outside.join("allowed").is_dir());
-    assert!(f.roots.write_roots().is_empty());
+    let outside = f.outside.canonicalize().unwrap();
+    assert!(
+        !f.roots
+            .write_roots()
+            .iter()
+            .any(|root| outside.starts_with(root)),
+        "a once grant must not be kept"
+    );
     assert_eq!(f.gate.cards.lock().unwrap().len(), 2);
 }
 

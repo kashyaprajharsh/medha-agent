@@ -21,10 +21,10 @@ workflows, and code, in a desktop app or your terminal.*
 </div>
 
 <div align="center">
-  <a href="https://medha.manojavamlabs.com/art/medha-film.mp4"><img src="docs/assets/medha-desktop.gif" alt="Medha asks before using the network, shows a 99% cache hit, draws the architecture in Excalidraw and Mermaid, asks before writing a file, and builds a finished page" width="820"></a>
+  <a href="https://medha.manojavamlabs.com/art/film.mp4"><img src="docs/assets/medha-desktop.gif" alt="Medha asks before using the network, shows a 99% cache hit, draws the architecture in Excalidraw and Mermaid, asks before writing a file, and builds a finished page" width="820"></a>
   <br><sub>The desktop app</sub>
   <br><br>
-  <a href="https://medha.manojavamlabs.com/art/medha-together.mp4"><img src="docs/assets/medha-together.gif" alt="One Medha chat running in the desktop app and the terminal side by side, approved from either" width="820"></a>
+  <a href="https://medha.manojavamlabs.com/art/film-together.mp4"><img src="docs/assets/medha-together.gif" alt="One Medha chat running in the desktop app and the terminal side by side, approved from either" width="820"></a>
   <br><sub>The desktop app and the terminal, one chat</sub>
   <br><br>
   <a href="https://medha.manojavamlabs.com">medha.manojavamlabs.com</a>

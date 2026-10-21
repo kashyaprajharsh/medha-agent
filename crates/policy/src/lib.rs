@@ -230,7 +230,9 @@ fn authorize_git(intent: &ToolIntent) -> Decision {
         "status" | "diff" | "log" | "blame" | "show" => Decision::Allow,
         "add" | "commit" => Decision::Human,
         other => Decision::Deny {
-            reason: format!("git subcommand '{other}' is not permitted"),
+            reason: format!(
+                "the git tool runs status, diff, log, blame, show, add and commit; run `git {other}` with the shell instead"
+            ),
         },
     }
 }

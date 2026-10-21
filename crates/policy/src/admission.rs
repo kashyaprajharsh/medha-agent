@@ -2,7 +2,7 @@
 //! mode, and without an OS jail anything the text cannot show goes to a person.
 
 use crate::{argument_escapes_workspace, home_tail, is_system_path, normalize_rm_path};
-use shell_reader::{Command, Flow, Reading, Value, Word};
+use shell_reader::{Command, Flow, Reading, Value, Word, is_interpreter as interpreter};
 
 /// Credential stores matched in path-like words only, so a search pattern naming one is not a read.
 const CREDENTIALS: &[&str] = &[
@@ -290,36 +290,6 @@ fn dumps_environment(name: &str, args: &[Word]) -> bool {
         "declare" | "typeset" => matches!(first, Some("-x" | "-p")),
         _ => false,
     }
-}
-
-fn interpreter(name: &str) -> bool {
-    matches!(
-        name,
-        "sh" | "dash"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "ksh"
-            | "python"
-            | "python2"
-            | "python3"
-            | "perl"
-            | "ruby"
-            | "node"
-            | "nodejs"
-            | "deno"
-            | "bun"
-            | "php"
-            | "lua"
-            | "tclsh"
-            | "powershell"
-            | "pwsh"
-            | "cmd"
-            | "wscript"
-            | "cscript"
-            | "mshta"
-            | "osascript"
-    )
 }
 
 fn network(name: &str) -> bool {

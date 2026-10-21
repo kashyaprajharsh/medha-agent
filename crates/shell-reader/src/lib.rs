@@ -12,6 +12,87 @@ pub fn read(line: &str) -> Reading {
     parse::read(line)
 }
 
+/// What "always allow" for this line covers: each program and its first plain word, such as
+/// `cargo test`. `None` when a variable, an interpreter, or a path outside the folder is involved,
+/// so a broad approval never reaches what the person did not see.
+pub fn approval_shape(line: &str) -> Option<String> {
+    let reading = read(line);
+    if !reading.complete || reading.self_forking {
+        return None;
+    }
+    let mut shapes: Vec<String> = Vec::new();
+    for command in &reading.commands {
+        let words = command
+            .words
+            .iter()
+            .chain(command.redirects.iter().map(|redirect| &redirect.target));
+        if words
+            .into_iter()
+            .any(|word| word.value == Value::Dynamic || leaves(&word.text))
+        {
+            return None;
+        }
+        let Some(program) = command.program() else {
+            continue;
+        };
+        if is_interpreter(&program.name) || program.at > 0 {
+            return None;
+        }
+        let plain = program.args.first().filter(|arg| {
+            arg.text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+                && !arg.text.starts_with('-')
+        });
+        let shape = match plain {
+            Some(arg) => format!("{} {}", program.name, arg.text),
+            None => program.name.clone(),
+        };
+        if !shapes.contains(&shape) {
+            shapes.push(shape);
+        }
+    }
+    (!shapes.is_empty()).then(|| shapes.join("; "))
+}
+
+/// A path that leaves the folder the line runs in: absolute, home-based, or through `..`.
+fn leaves(text: &str) -> bool {
+    text.starts_with(['/', '\\', '~'])
+        || text.split(['/', '\\']).any(|part| part == "..")
+        || text.as_bytes().get(1) == Some(&b':')
+}
+
+/// Shells and language runtimes: what they run is in their script, not in the line.
+pub fn is_interpreter(name: &str) -> bool {
+    matches!(
+        name,
+        "sh" | "dash"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "ksh"
+            | "python"
+            | "python2"
+            | "python3"
+            | "perl"
+            | "ruby"
+            | "node"
+            | "nodejs"
+            | "deno"
+            | "bun"
+            | "php"
+            | "lua"
+            | "tclsh"
+            | "powershell"
+            | "pwsh"
+            | "cmd"
+            | "wscript"
+            | "cscript"
+            | "mshta"
+            | "osascript"
+    )
+}
+
 /// Whether `program` started directly with `args`, with no shell between, only reads.
 pub fn program_reads_only(program: &str, args: &[String]) -> bool {
     let args: Vec<Word> = args

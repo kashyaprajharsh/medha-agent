@@ -198,7 +198,9 @@ impl HumanGate for AutoDeny {
     }
 
     fn denial_reason(&self) -> &'static str {
-        "this action needs approval and the run is headless, so no one could be asked"
+        "this action needs approval and the run is headless, so no one could be asked; \
+         run medha in a terminal to answer it, or set MEDHA_MODE=yolo so commands inside \
+         the OS jail run unasked"
     }
 }
 

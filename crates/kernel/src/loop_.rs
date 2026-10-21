@@ -68,7 +68,15 @@ fn approval_detail(intent: &ToolIntent) -> String {
 /// salient argument, so "always allow" is scoped to *this* action — approving
 /// `rm -rf build/` doesn't then auto-approve every future `shell.exec`. Falls
 /// back to the bare tool name for tools with no obvious identifying arg.
+/// A shell line that stays in its folder is keyed by its shape, such as `cargo test`.
 fn approval_key(intent: &ToolIntent) -> String {
+    if intent.tool == "shell.exec"
+        && let Some(shape) = intent.args["command"]
+            .as_str()
+            .and_then(shell_reader::approval_shape)
+    {
+        return format!("{}: {shape}", intent.tool);
+    }
     match salient_arg(intent) {
         Some(a) => format!("{}: {a}", intent.tool),
         None => intent.tool.clone(),
@@ -1832,6 +1840,28 @@ mod approval_key_tests {
             approval_key(&intent("update_plan", json!({}))),
             "update_plan"
         );
+    }
+
+    /// "Always" for a line covers the same programs with other arguments in the folder,
+    /// and never a line that reaches outside it, runs an interpreter or uses a variable.
+    #[test]
+    fn always_covers_the_shape_but_never_what_leaves_the_folder() {
+        let key =
+            |command: &str| approval_key(&intent("shell.exec", json!({ "command": command })));
+        assert_eq!(key("cargo test -p policy"), key("cargo test --workspace"));
+        assert_eq!(key("npm run build"), "shell.exec: npm run");
+        assert_eq!(key("rm -rf build/out.o"), "shell.exec: rm");
+        for exact in [
+            "rm -rf ~/Documents/old",
+            "rm -rf /tmp/x",
+            "rm -rf ../sibling",
+            "rm -rf \"$dir\"",
+            "python3 script.py",
+            "env X=1 make",
+            "cat 'unclosed",
+        ] {
+            assert_eq!(key(exact), format!("shell.exec: {exact}"), "{exact}");
+        }
     }
 }
 

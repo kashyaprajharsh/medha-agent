@@ -662,8 +662,6 @@ pub(super) enum SlashAction {
     Usage,
     /// Open the ChatGPT plan's usage settings in the browser.
     ManageUsage,
-    /// The signed-in ChatGPT accounts: use one, sign out, or add another.
-    ChatGptAccounts,
     Memory(String),
     SkillPicker,
     LoadSkill(String),
@@ -778,7 +776,6 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
         }
         "usage" => SlashAction::Usage,
         "usage manage" => SlashAction::ManageUsage,
-        "chatgpt" => SlashAction::ChatGptAccounts,
         c if c.strip_prefix("connect").is_some_and(is_cmd_boundary) => {
             SlashAction::Connect(c.strip_prefix("connect").unwrap_or("").trim().to_string())
         }

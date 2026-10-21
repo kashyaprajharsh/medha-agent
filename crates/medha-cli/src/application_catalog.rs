@@ -13,10 +13,6 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/status", "model, context window, current pressure"),
     (
-        "/chatgpt",
-        "ChatGPT accounts: use one, sign out, or add another",
-    ),
-    (
         "/usage",
         "tokens and cost — this session and the last 7 days by model; /usage manage opens your ChatGPT plan's usage",
     ),

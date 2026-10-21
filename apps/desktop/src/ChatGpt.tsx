@@ -44,13 +44,17 @@ type Step =
   | { at: "failed"; why: string };
 
 /** Sign in, then pick a model on the plan; `again` signs a registered account in again. */
-export function ChatGptSheet({ again, onClose, onSaved, onUseKey, firstRun }: {
+export function ChatGptSheet({ again, another, onClose, onSaved, onUseKey, onAccounts, firstRun }: {
   again?: string;
+  /** Register another account rather than using the one signed in. */
+  another?: boolean;
   /** The first model anyone saves becomes the default. */
   firstRun?: boolean;
   onClose: () => void;
   onSaved: (name: string) => void;
   onUseKey: () => void;
+  /** Switching account opens the accounts list; without one, it adds another account. */
+  onAccounts?: () => void;
 }) {
   const api = useWorkspaceApi();
   const [step, setStep] = useState<Step>();
@@ -61,11 +65,17 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey, firstRun }: {
   const pending = useRef<number | undefined>(undefined);
   const cancel = (id: number) => void api.settings("settings.chatgpt.cancel", { id }).catch(() => undefined);
 
-  async function signIn(clientId?: string, consent = false) {
+  async function signIn(clientId?: string, consent = false, more = false) {
     const mine = ++attempt.current;
     setStep(undefined);
     try {
-      const begun = await api.settings("settings.chatgpt.begin", { client_id: clientId, consent });
+      const begun = await api.settings("settings.chatgpt.begin", { client_id: clientId, consent, another: more });
+      // Already signed in: the plan's models, with no browser and no new registration.
+      if (begun.account) {
+        if (mine !== attempt.current) return;
+        const account = begun.account as ChatGptAccount;
+        return setStep({ at: account.plan_enabled ? "models" : "off", account });
+      }
       const link = begun.link as string;
       const id = begun.id as number;
       // A sign-in this sheet moved on from frees its port at once.
@@ -90,7 +100,7 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey, firstRun }: {
     }
   }
   useEffect(() => {
-    void signIn(again);
+    void signIn(again, false, another);
     return () => {
       attempt.current++;
       if (pending.current !== undefined) cancel(pending.current);
@@ -107,7 +117,7 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey, firstRun }: {
       {step?.at === "waiting" && <Waiting link={step.link} again={step.again} onCancel={onClose} />}
       {step?.at === "failed" && <div className="cg-gap">
         <p role="alert">{step.why}</p>
-        <div className="cg-choice"><button type="button" className="btn-gold" onClick={() => void signIn(again)}>Try again</button></div>
+        <div className="cg-choice"><button type="button" className="btn-gold" onClick={() => void signIn(again, false, another)}>Try again</button></div>
       </div>}
       {step?.at === "off" && <div className="cg-gap">
         <div className="cg-note"><b>Plan use is off for Medha.</b> You signed in, but did not allow Medha to use your ChatGPT plan, so Medha cannot send requests with it yet.</div>
@@ -117,7 +127,7 @@ export function ChatGptSheet({ again, onClose, onSaved, onUseKey, firstRun }: {
         </div>
         <p className="quiet">Allowing it opens ChatGPT once more to ask for that permission.</p>
       </div>}
-      {step?.at === "models" && <PlanModels account={step.account} firstRun={firstRun} onSwitch={() => void signIn()} onSaved={(name) => {
+      {step?.at === "models" && <PlanModels account={step.account} firstRun={firstRun} onSwitch={() => (onAccounts ? onAccounts() : void signIn(undefined, false, true))} onSaved={(name) => {
         added.current = name;
         if (seen()) onSaved(name);
         else setNotice(true);
@@ -246,7 +256,7 @@ export function PlanNotice({ onClose }: { onClose: () => void }) {
 }
 
 /** Settings: every registered account; models on the plan use the active one. */
-export function ChatGptAccounts({ onClose, onSignIn }: { onClose: () => void; onSignIn: (clientId?: string) => void }) {
+export function ChatGptAccounts({ onClose, onSignIn }: { onClose: () => void; onSignIn: (clientId?: string, another?: boolean) => void }) {
   const api = useWorkspaceApi();
   const [accounts, setAccounts] = useState<ChatGptAccount[]>([]);
   const [problem, setProblem] = useState("");
@@ -279,7 +289,7 @@ export function ChatGptAccounts({ onClose, onSignIn }: { onClose: () => void; on
         {!accounts.length && <p className="quiet">No ChatGPT account yet.</p>}
       </div>
       {problem && <p role="alert">{problem}</p>}
-      <div className="cg-choice">{accounts.length ? <button type="button" className="btn-line" onClick={() => onSignIn()}>Add another account</button> : <ContinueWithChatGpt onClick={() => onSignIn()} />}</div>
+      <div className="cg-choice">{accounts.length ? <button type="button" className="btn-line" onClick={() => onSignIn(undefined, true)}>Add another account</button> : <ContinueWithChatGpt onClick={() => onSignIn()} />}</div>
       <div className="cg-foot"><PlanLine /></div>
     </div>
   </Sheet>;

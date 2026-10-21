@@ -300,6 +300,24 @@ fn a_chatgpt_sign_in_through_the_backend_lists_plan_models_and_never_hands_out_a
         );
     }
 
+    // Continuing with ChatGPT again while signed in uses that account: no browser, no new registration.
+    let reused = bridge.ok("settings.chatgpt.begin", json!({}));
+    assert_eq!(reused["account"]["client_id"], "oaiapp_1", "{reused}");
+    assert!(
+        reused.get("link").is_none(),
+        "no sign-in is opened: {reused}"
+    );
+    let listed = bridge.ok("settings.chatgpt.accounts", json!({}));
+    assert_eq!(
+        listed["accounts"].as_array().unwrap().len(),
+        1,
+        "still one registration"
+    );
+    // Only asking for another account registers a new one.
+    let another = bridge.ok("settings.chatgpt.begin", json!({"another": true}));
+    assert_eq!(link_of(&another)["client_id"], "dynamic_agent_client");
+    bridge.ok("settings.chatgpt.cancel", json!({"id": another["id"]}));
+
     // A cancelled sign-in has nothing left to finish.
     bridge.ok("settings.chatgpt.begin", json!({"client_id": "oaiapp_1"}));
     bridge.ok("settings.chatgpt.cancel", json!({}));
@@ -319,6 +337,15 @@ fn a_chatgpt_sign_in_through_the_backend_lists_plan_models_and_never_hands_out_a
     assert_eq!(out["revoked"], true);
     let after = bridge.ok("settings.chatgpt.accounts", json!({}));
     assert_eq!(after["accounts"][0]["signed_in"], false);
+    // Signed out, a plain continue signs that account in again as its own registration.
+    let again = bridge.ok("settings.chatgpt.begin", json!({}));
+    assert_eq!(
+        link_of(&again)["client_id"],
+        "oaiapp_1",
+        "not a new registration"
+    );
+    assert!(!link_of(&again).contains_key("agent_name_hint"));
+    bridge.ok("settings.chatgpt.cancel", json!({"id": again["id"]}));
 
     // The terminal's names reach the same backend calls and get the same answers.
     assert_eq!(bridge.ok("application.chatgpt.accounts", json!({})), after);

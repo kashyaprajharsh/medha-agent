@@ -1208,13 +1208,15 @@ impl PickerKind {
                     })
                     .chain(
                         [
-                            "＋ Add a model (presets or custom URL + API key)".to_string(),
+                            "＋ Add a model (a ChatGPT plan, an API key, or your own server)"
+                                .to_string(),
                             "🔑 Add or update an API key".to_string(),
                             "★ Set the default model".to_string(),
                             remove.to_string(),
                             "↻ Choose stand-in models, for when one cannot answer".to_string(),
                             "🔑 Add or remove extra keys for a model's server".to_string(),
                             "🔒 Trust a certificate file for a model's server".to_string(),
+                            "◉ ChatGPT accounts: use one, sign out, or add another".to_string(),
                         ]
                         .map(|s| format!("  {s}")),
                     )

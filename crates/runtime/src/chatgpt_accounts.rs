@@ -54,6 +54,17 @@ pub struct Status {
     pub plan_enabled: bool,
 }
 
+/// How a plain "Continue with ChatGPT" is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reuse {
+    /// Already signed in: no browser, no new registration.
+    SignedIn(Status),
+    /// A registered account that is signed out: sign it in again as that registration.
+    Again(String),
+    /// No account yet: the first registration.
+    New,
+}
+
 /// The tokens of one account as the credential store holds them.
 #[derive(Serialize, Deserialize)]
 struct Saved {
@@ -226,6 +237,26 @@ impl Accounts {
                 }
             })
             .collect())
+    }
+
+    /// What "Continue with ChatGPT" should do: use a signed-in account, sign a known one in
+    /// again with its saved registration, or register anew only when there is none.
+    pub fn reusable(&self) -> Result<Reuse> {
+        let accounts = self.list()?;
+        let signed_in = accounts.iter().find(|a| a.active && a.signed_in);
+        if let Some(account) = signed_in.or_else(|| accounts.iter().find(|a| a.signed_in)) {
+            if !account.active {
+                self.switch(&account.client_id)?;
+            }
+            let mut account = account.clone();
+            account.active = true;
+            return Ok(Reuse::SignedIn(account));
+        }
+        let known = accounts.iter().find(|a| a.active).or(accounts.last());
+        Ok(match known {
+            Some(account) => Reuse::Again(account.client_id.clone()),
+            None => Reuse::New,
+        })
     }
 
     pub fn switch(&self, client_id: &str) -> Result<()> {

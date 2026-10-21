@@ -132,6 +132,10 @@ pub(super) fn activate(model: &mut Model) -> bool {
                 let choose = PickerKind::ModelCertificate(profiles.clone());
                 model.picker = Some(Picker::new(choose));
             }
+            7 => {
+                model.picker = None;
+                connect::open_accounts(model);
+            }
             _ => {}
         }
         return true;

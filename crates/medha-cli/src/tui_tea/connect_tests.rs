@@ -380,7 +380,16 @@ async fn esc_on_a_provider_returns_to_the_list_and_esc_on_the_list_closes() {
 async fn chatgpt_accounts_sign_out_through_the_backend_and_a_signed_out_one_signs_in_again() {
     let mut f = fixture().await;
     catalogue(&mut f);
-    type_text(&mut f.model, "/chatgpt");
+    // The accounts live in the model menu, as on the desktop's Models page.
+    backend_features::open_model_picker(&mut f.model);
+    let saved = f.model.remote.as_ref().unwrap().models.clone();
+    answer(&mut f, Answer::Resource(Box::new(Resource::Models(saved))));
+    let labels = f.model.picker.as_ref().unwrap().kind.labels();
+    let at = labels
+        .iter()
+        .position(|label| label.contains("ChatGPT accounts"))
+        .expect("a ChatGPT accounts row");
+    f.model.picker.as_mut().unwrap().selected = at;
     press(&mut f.model, KeyCode::Enter);
     assert!(matches!(
         pending(&f)[..],
@@ -441,6 +450,40 @@ async fn chatgpt_accounts_sign_out_through_the_backend_and_a_signed_out_one_sign
         begin,
         Some(Some("oaiapp_2".into())),
         "signing in again keeps that account's registration"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuing_with_chatgpt_when_signed_in_lists_the_plan_models_without_a_browser() {
+    let mut f = fixture().await;
+    catalogue(&mut f);
+    backend_features::begin_model_setup(&mut f.model);
+    no_local_servers(&mut f);
+    press(&mut f.model, KeyCode::Enter);
+    assert!(
+        matches!(pending(&f)[..], [Effect::ChatGpt(ChatGptCall::Begin(p))] if !p.another && p.client_id.is_none()),
+        "a plain continue asks the backend to reuse what is signed in"
+    );
+    let account = protocol::ChatGptAccount {
+        client_id: "oaiapp_1".into(),
+        email: Some("riya@example.com".into()),
+        active: true,
+        signed_in: true,
+        plan_enabled: true,
+    };
+    let begun = protocol::ChatGptBegun {
+        account: Some(account),
+        link: None,
+        id: None,
+    };
+    answer(&mut f, Answer::ChatGpt(ChatGptAnswer::Begun(begun)));
+    assert!(f.model.pending_link.is_none(), "no browser opens");
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().screen,
+        Some(connect::Screen::Plan(_))
+    ));
+    assert!(
+        matches!(&pending(&f)[..], [Effect::Discover(request)] if request.auth == Some(protocol::ModelAuth::ChatGptPlan))
     );
 }
 
@@ -538,7 +581,13 @@ async fn chatgpt_signs_in_through_the_backend_takes_one_more_pass_and_saves_a_pl
         link: format!("https://auth.test/authorize?attempt={id}"),
         id,
     };
-    answer(&mut f, Answer::ChatGpt(ChatGptAnswer::Begun(link(1))));
+    let first = link(1);
+    let begun = protocol::ChatGptBegun {
+        account: None,
+        link: Some(first.link),
+        id: Some(first.id),
+    };
+    answer(&mut f, Answer::ChatGpt(ChatGptAnswer::Begun(begun)));
     assert!(matches!(pending(&f)[..], [Effect::ChatGpt(ChatGptCall::Finish(p))] if p.id == 1));
     let card = drawn(&f.model, 110, 16);
     println!("{}", card.join("\n"));

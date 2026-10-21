@@ -27,7 +27,8 @@ impl Command for ChatGptAccounts {
     type Output = ChatGptAccountList;
 }
 
-/// Open a sign-in: a new account, or `client_id` signing in a registered one again.
+/// "Continue with ChatGPT": an account already signed in is used as it is; otherwise
+/// `client_id` signs a registered one in again, and `another` registers a new account.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeginChatGptSignIn {
@@ -36,6 +37,19 @@ pub struct BeginChatGptSignIn {
     /// Ask again for plan use declined before; never on an ordinary sign-in.
     #[serde(default)]
     pub consent: bool,
+    /// Add another account rather than using the one signed in.
+    #[serde(default)]
+    pub another: bool,
+}
+/// Either the account already signed in, or a sign-in waiting for the browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatGptBegun {
+    #[serde(default)]
+    pub account: Option<ChatGptAccount>,
+    #[serde(default)]
+    pub link: Option<String>,
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 /// Where to send the person, and the number that names this sign-in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +60,7 @@ pub struct ChatGptSignIn {
 impl Command for BeginChatGptSignIn {
     const METHOD: &'static str = "application.chatgpt.begin";
     const SCOPE: ScopeKind = ScopeKind::Folder;
-    type Output = ChatGptSignIn;
+    type Output = ChatGptBegun;
 }
 
 /// Wait for the browser to bring the named sign-in back.

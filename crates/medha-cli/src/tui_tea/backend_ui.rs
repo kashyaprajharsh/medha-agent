@@ -172,7 +172,7 @@ pub(super) enum ChatGptCall {
     SignOut(protocol::SignOutChatGpt),
 }
 pub(super) enum ChatGptAnswer {
-    Begun(protocol::ChatGptSignIn),
+    Begun(protocol::ChatGptBegun),
     Finished {
         id: u64,
         outcome: protocol::ChatGptSignInOutcome,

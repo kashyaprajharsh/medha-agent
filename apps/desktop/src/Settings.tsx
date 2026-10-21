@@ -123,7 +123,7 @@ export function Settings({
     }
   }
   // A ChatGPT sign-in in progress (`again` names a registered account), and the accounts sheet.
-  const [chatgpt, setChatgpt] = useState<{ again?: string }>();
+  const [chatgpt, setChatgpt] = useState<{ again?: string; another?: boolean }>();
   const [chatgptAccounts, setChatgptAccounts] = useState(false);
   const open = tab === "models" && editing === undefined ? models.find((model) => model.name === opened) : undefined;
   // What follows is asked or done on the page, so the sheet steps aside for it.
@@ -240,6 +240,11 @@ export function Settings({
             {chatgpt && (
               <ChatGptSheet
                 again={chatgpt.again}
+                another={chatgpt.another}
+                onAccounts={() => {
+                  setChatgpt(undefined);
+                  setChatgptAccounts(true);
+                }}
                 onClose={() => setChatgpt(undefined)}
                 onUseKey={() => {
                   setChatgpt(undefined);
@@ -256,9 +261,9 @@ export function Settings({
             {chatgptAccounts && (
               <ChatGptAccounts
                 onClose={() => setChatgptAccounts(false)}
-                onSignIn={(again) => {
+                onSignIn={(again, another) => {
                   setChatgptAccounts(false);
-                  setChatgpt({ again });
+                  setChatgpt({ again, another });
                 }}
               />
             )}

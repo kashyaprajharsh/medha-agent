@@ -323,13 +323,13 @@ fn probe_next(model: &mut Model) {
 }
 
 /// Start a ChatGPT sign-in on a fresh setup, without looking for local servers first.
-fn sign_in(model: &mut Model, client_id: Option<String>, consent: bool) {
+fn sign_in(model: &mut Model, client_id: Option<String>, consent: bool, another: bool) {
     model.form_generation = model.form_generation.wrapping_add(1);
     model.picker = None;
     let mut setup = ModelSetup::new();
     setup.screen = Some(Screen::List(List::default()));
     model.model_setup = Some(setup);
-    begin_chatgpt(model, client_id, consent);
+    begin_chatgpt(model, client_id, consent, another);
 }
 
 /// Keys while a connect screen is up; `false` lets the setup's own steps take the key.
@@ -381,13 +381,13 @@ fn accounts_key(model: &mut Model, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Up => *selected = selected.saturating_sub(1),
         KeyCode::Down => *selected = (*selected + 1).min(last),
-        KeyCode::Esc => {
-            model.form_generation = model.form_generation.wrapping_add(1);
-            model.model_setup = None;
-        }
-        KeyCode::Char('n') => sign_in(model, None, false),
+        // Back to the model menu it was opened from.
+        KeyCode::Esc => close(model),
+        KeyCode::Char('n') => sign_in(model, None, false, true),
         KeyCode::Enter => match picked {
-            Some(account) if !account.signed_in => sign_in(model, Some(account.client_id), false),
+            Some(account) if !account.signed_in => {
+                sign_in(model, Some(account.client_id), false, false)
+            }
             Some(account) if !account.active => {
                 *loading = true;
                 let switch = protocol::SwitchChatGptAccount {
@@ -607,7 +607,7 @@ fn choose_row(model: &mut Model) {
         _ => return,
     };
     match choice {
-        Choice::ChatGpt => begin_chatgpt(model, None, false),
+        Choice::ChatGpt => begin_chatgpt(model, None, false, false),
         Choice::Provider(provider) => open_provider(model, Some(provider), carried),
         Choice::Owner(id) => choose_owner(model, &id, carried.unwrap_or_default()),
         Choice::Own(profile) => {
@@ -954,11 +954,21 @@ fn replace_key(model: &mut Model) {
     }
 }
 
-pub(super) fn begin_chatgpt(model: &mut Model, client_id: Option<String>, consent: bool) {
+/// Continue with ChatGPT: an account already signed in is used; `another` registers a new one.
+pub(super) fn begin_chatgpt(
+    model: &mut Model,
+    client_id: Option<String>,
+    consent: bool,
+    another: bool,
+) {
     if let Some(list) = list_mut(model) {
         list.opening = true;
     }
-    let begin = protocol::BeginChatGptSignIn { client_id, consent };
+    let begin = protocol::BeginChatGptSignIn {
+        client_id,
+        consent,
+        another,
+    };
     if !request(model, Effect::ChatGpt(ChatGptCall::Begin(begin)))
         && let Some(list) = list_mut(model)
     {
@@ -992,6 +1002,38 @@ pub(super) fn plan_draft(model: &str, context: Option<u32>) -> protocol::ModelDr
     }
 }
 
+/// An account is signed in: its plan's models, or why plan use is off.
+fn signed_in(model: &mut Model, account: protocol::ChatGptAccount) {
+    let Some(setup) = model.model_setup.as_mut() else {
+        return;
+    };
+    if !account.plan_enabled {
+        setup.screen = Some(Screen::PlanOff { account });
+        return;
+    }
+    setup.screen = Some(Screen::Plan(Plan {
+        account,
+        models: Vec::new(),
+        selected: 0,
+        loading: true,
+        tested: None,
+    }));
+    let plan = plan_draft("discovery", None);
+    setup.step = ModelSetupStep::Discovering;
+    request(
+        model,
+        Effect::Discover(protocol::DiscoverModels {
+            provider_id: plan.provider_id,
+            auth: plan.auth,
+            connection: plan.connection,
+            protocol: plan.protocol,
+            base_url: plan.base_url,
+            key: protocol::Secret(String::new()),
+            allow_other_provider: false,
+        }),
+    );
+}
+
 /// The backend answered a sign-in call.
 pub(super) fn chatgpt(model: &mut Model, answer: ChatGptAnswer) {
     if model
@@ -1016,48 +1058,32 @@ pub(super) fn chatgpt(model: &mut Model, answer: ChatGptAnswer) {
     };
     if !current {
         // An answer for a sign-in this screen moved on from: free its port if it is still open.
-        if let ChatGptAnswer::Begun(sign_in) = answer {
-            let cancel = protocol::CancelChatGptSignIn { id: sign_in.id };
+        if let ChatGptAnswer::Begun(protocol::ChatGptBegun { id: Some(id), .. }) = answer {
+            let cancel = protocol::CancelChatGptSignIn { id };
             request(model, Effect::ChatGpt(ChatGptCall::Cancel(cancel)));
         }
         return;
     }
     match answer {
-        ChatGptAnswer::Begun(sign_in) => wait_for(model, sign_in, false),
+        // Already signed in: straight to the plan's models, with no browser.
+        ChatGptAnswer::Begun(protocol::ChatGptBegun {
+            account: Some(account),
+            ..
+        }) => signed_in(model, account),
+        ChatGptAnswer::Begun(protocol::ChatGptBegun {
+            link: Some(link),
+            id: Some(id),
+            ..
+        }) => wait_for(model, protocol::ChatGptSignIn { link, id }, false),
+        ChatGptAnswer::Begun(_) => {}
         ChatGptAnswer::Finished { outcome, .. } => {
             if let Some(again) = outcome.again {
                 wait_for(model, again, true);
                 return;
             }
-            let Some(account) = outcome.account else {
-                return;
-            };
-            let setup = model.model_setup.as_mut().expect("setup");
-            if !account.plan_enabled {
-                setup.screen = Some(Screen::PlanOff { account });
-                return;
+            if let Some(account) = outcome.account {
+                signed_in(model, account);
             }
-            setup.screen = Some(Screen::Plan(Plan {
-                account,
-                models: Vec::new(),
-                selected: 0,
-                loading: true,
-                tested: None,
-            }));
-            let plan = plan_draft("discovery", None);
-            setup.step = ModelSetupStep::Discovering;
-            request(
-                model,
-                Effect::Discover(protocol::DiscoverModels {
-                    provider_id: plan.provider_id,
-                    auth: plan.auth,
-                    connection: plan.connection,
-                    protocol: plan.protocol,
-                    base_url: plan.base_url,
-                    key: protocol::Secret(String::new()),
-                    allow_other_provider: false,
-                }),
-            );
         }
         ChatGptAnswer::Cancelled => {}
         ChatGptAnswer::Accounts(list) => {
@@ -1139,7 +1165,7 @@ fn plan_off_key(model: &mut Model, key: KeyEvent) -> bool {
     };
     let client = account.client_id.clone();
     match key.code {
-        KeyCode::Enter => sign_in(model, Some(client), true),
+        KeyCode::Enter => sign_in(model, Some(client), true, false),
         KeyCode::Esc => back_to_list(model),
         _ => {}
     }
@@ -1171,9 +1197,8 @@ fn plan_key(model: &mut Model, key: KeyEvent) -> bool {
         KeyCode::Up => plan.selected = plan.selected.saturating_sub(1),
         KeyCode::Down => plan.selected = (plan.selected + 1).min(last),
         KeyCode::Esc => back_to_list(model),
-        KeyCode::Char('s') => {
-            sign_in(model, None, false);
-        }
+        // Switching is choosing among the accounts, or adding one there.
+        KeyCode::Char('s') => open_accounts(model),
         KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('c') if picked.is_some() => {
             let found = picked.expect("picked");
             let setup = model.model_setup.as_mut().expect("setup");

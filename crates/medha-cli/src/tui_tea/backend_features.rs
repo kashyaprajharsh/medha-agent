@@ -457,7 +457,6 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
                 model.push_notice("Using your ChatGPT plan. /usage manage opens Manage usage in ChatGPT settings.");
             }
         }
-        A::ChatGptAccounts => connect::open_accounts(model),
         A::ManageUsage => {
             model.pending_link = Some(connect::MANAGE_USAGE.into());
             model.push_notice("Opening Manage usage in ChatGPT settings.");

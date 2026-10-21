@@ -3,7 +3,7 @@
 //! link, and no answer carries a token.
 
 use anyhow::{Result, anyhow};
-use runtime::chatgpt_accounts::{Accounts, Reauthorize, SignIn};
+use runtime::chatgpt_accounts::{Accounts, Reauthorize, Reuse, SignIn};
 use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,9 +46,24 @@ pub(crate) async fn handle(method: &str, params: &Value) -> Option<Result<Value>
             .list()
             .map(|accounts| json!({ "accounts": accounts })),
         "begin" => {
-            let again = params["client_id"].as_str().filter(|id| !id.is_empty());
+            let named = params["client_id"].as_str().filter(|id| !id.is_empty());
             let consent = params["consent"] == true;
-            begin(|| accounts.begin(again, consent), false).await
+            match (named, params["another"] == true) {
+                (Some(id), _) => begin(|| accounts.begin(Some(id), consent), false).await,
+                (None, true) => begin(|| accounts.begin(None, consent), false).await,
+                // A plain "Continue with ChatGPT": an account already signed in is used as it is.
+                (None, false) => match accounts.reusable() {
+                    Ok(Reuse::SignedIn(account)) => {
+                        cancel(EVERY);
+                        Ok(json!({ "account": account }))
+                    }
+                    Ok(Reuse::Again(id)) => {
+                        begin(|| accounts.begin(Some(&id), consent), false).await
+                    }
+                    Ok(Reuse::New) => begin(|| accounts.begin(None, consent), false).await,
+                    Err(error) => Err(error),
+                },
+            }
         }
         "finish" => finish(id).await,
         "cancel" => {

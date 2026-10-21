@@ -2022,9 +2022,8 @@ impl Tool for FsWrite {
         "Create a file, or replace a whole file, with `content` (UTF-8 text). Creates \
          parent directories, snapshots any prior version and returns a diff. To change \
          part of an existing file, use `edit` instead: a smaller diff to review. \
-         Replacing an existing file needs its current content known to this chat: read \
-         all of it, or have written or edited it here since your last full read; a file \
-         changed by a command or by the person must be read again. \
+         Replacing a file needs its whole current content known to this chat: a full \
+         read, or your own write or edit since; re-read it after a command changes it. \
          Supports paths outside the workspace with permission."
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -5745,26 +5744,16 @@ impl Tool for ShellExec {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Run any shell command in the workspace root and capture stdout/stderr/exit \
-         code — sed, awk, cat, diff, git, curl, build/test commands, pipelines, \
-         anything the shell provides. Commands run only in the foreground; on \
-         timeout or cancellation MEDHA kills and settles the whole process tree \
-         before reporting the result. Prefer edit for exact string-replace edits \
-         (it produces a reviewable diff) and glob/grep for finding files — use this \
-         for everything else, including multi-step shell pipelines. Set network=true \
-         for dependency installs, downloads, or other commands needing the network: \
-         Medha requests access before running if the sandbox denies it. Keep error \
-         output visible; tail and curl -s can hide failures and prevent automatic retry. \
-         A pipeline's exit status is its last command's: to keep a failing command's \
-         status, send its output to a file and read that, rather than piping it into \
-         tail or head. For access outside the workspace, request absolute directory \
-         paths with read_paths or write_paths; approval is scoped to this command unless \
-         persisted. Before a command that may write, the workspace is backed up so undo \
-         can restore it; the result names anything left out. \
-         To see a web page use read with render: true, never a browser from here. \
-         On macOS and Linux the line runs with sh -c, which is not always bash: avoid \
-         bash-only syntax such as ${PIPESTATUS[0]} or [[ ]]. On Windows it runs in Git \
-         Bash when installed, otherwise PowerShell or cmd."
+        "Run a shell command in the workspace and capture stdout, stderr and exit code: \
+         builds, tests, git, pipelines. It runs in the foreground; on timeout or cancel \
+         the whole process tree is killed. Use edit to change files and glob/grep to find \
+         them. Set network=true for installs and downloads; access is requested before it \
+         runs. Outside the workspace, name absolute folders in read_paths or write_paths. \
+         The line runs with sh -c (Git Bash, PowerShell or cmd on Windows): avoid \
+         bash-only syntax such as ${PIPESTATUS[0]}. A pipeline's status is its last \
+         command's, so write output to a file and read it rather than piping into tail. \
+         Writing commands are backed up for undo. To see a web page, use read with \
+         render: true."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal

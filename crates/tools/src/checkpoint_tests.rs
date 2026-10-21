@@ -126,7 +126,7 @@ async fn backups_include_untracked_exclude_ignored_and_preserve_later_human_work
     std::fs::write(root.join("tracked"), "human later").unwrap();
     let tracked = files
         .iter()
-        .find(|file| file.path.ends_with("/tracked"))
+        .find(|file| Path::new(&file.path).ends_with("tracked"))
         .unwrap();
     assert!(sandbox.restore_revision(tracked).await.is_err());
     assert_eq!(
@@ -178,7 +178,7 @@ async fn a_link_is_named_and_never_followed() {
     );
     let rows = rows(&guard, &sandbox);
     assert_eq!(rows.len(), 1);
-    assert!(rows[0]["path"].as_str().unwrap().ends_with("/note"));
+    assert!(Path::new(rows[0]["path"].as_str().unwrap()).ends_with("note"));
     assert_eq!(
         std::fs::read_to_string(scratch.path().join("secret")).unwrap(),
         "private"
@@ -201,12 +201,12 @@ async fn unchanged_files_reuse_their_last_copy() {
     let second = rows(&guard, &sandbox);
     let id = |rows: &[Value], name: &str| {
         rows.iter()
-            .find(|row| row["path"].as_str().unwrap().ends_with(name))
+            .find(|row| Path::new(row["path"].as_str().unwrap()).ends_with(name))
             .map(|row| row["snapshot"].clone())
             .unwrap()
     };
-    assert_eq!(id(&first, "/same"), id(&second, "/same"));
-    assert_ne!(id(&first, "/edited"), id(&second, "/edited"));
+    assert_eq!(id(&first, "same"), id(&second, "same"));
+    assert_ne!(id(&first, "edited"), id(&second, "edited"));
     let copies = std::fs::read_dir(sandbox.command_snapshots_dir())
         .unwrap()
         .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_file())

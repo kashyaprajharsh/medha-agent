@@ -4,7 +4,7 @@ Medha Desktop is the native desktop app for Medha. It brings agent conversations
 files, tool activity, approvals and a terminal into one window, with support for
 local models and hosted providers.
 
-![Medha Desktop](../../docs/assets/medha-desktop.gif)
+[![Medha Desktop](../../docs/assets/medha-desktop.gif)](https://medha.manojavamlabs.com/art/medha-film.mp4)
 
 [Install](../../README.md#desktop-app) · [Develop](#development) ·
 [Build](#build) · [Technical overview](../../docs/WHAT_IS_MEDHA.md)

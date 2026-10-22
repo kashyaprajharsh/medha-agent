@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "file-ops"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "windows-sys 0.60.2",
 ]
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "git-safety"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
 ]
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "medha-client"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "dirs",
  "libc",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "medha-desktop"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "medha-extension-api"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "semver",
  "serde",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "medha-protocol"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "media"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "image",
@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "shell-reader"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
@@ -4109,7 +4109,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -4466,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "transcript-view"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "pulldown-cmark",
  "serde_json",
@@ -5510,7 +5510,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",

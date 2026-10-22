@@ -1550,7 +1550,7 @@ Command snapshots reuse metadata-preserving file-tool storage, under the real ch
 
 ### Tool Categories
 
-**53 tools** ship in the registry, in these families:
+**25 tools** ship in the registry, in these families:
 
 | Category | Tools | Purpose |
 |----------|-------|---------|
@@ -2139,7 +2139,7 @@ portable alias and persist the provider-independent canonical name.
 | `open-ai-chat` | **Shipped** — the baseline adapter |
 | `gemini-interactions` | **Shipped** — native Google Gemini Interactions v1 |
 | `anthropic-messages` | Declared in the `Protocol` enum; adapter not yet written |
-| `open-ai-responses` | Declared in the `Protocol` enum; adapter not yet written |
+| `open-ai-responses` | **Shipped**: OpenAI Responses, used for new OpenAI setups and ChatGPT plans |
 
 The Gemini adapter is stateless (`store: false`): MEDHA sends complete ordered
 history and therefore replays every Gemini **thought signature** unchanged, and maps

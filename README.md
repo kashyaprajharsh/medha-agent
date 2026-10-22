@@ -34,9 +34,9 @@ workflows, and code, in a desktop app or your terminal.*
 
 Most agents ask you to trust the model. MEDHA doesn't.
 
-Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and native OS isolation is used where available. If unavailable, Medha warns and falls back to host execution; the scanner and approval gate still apply. Nothing the model *says* causes an effect; only an authorized tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
+Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied. Shell commands are read with a real bash grammar and run inside native OS isolation where available: work inside your folder runs, anything outside it asks, a command no approval makes safe (deleting your home folder, `sudo`, formatting a disk) is refused, and a command that writes is backed up first so you can undo it. Where no OS sandbox is available, Medha says so and falls back to host execution; the command reader and approval gate still apply. Nothing the model *says* causes an effect; only an authorized tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
 
-It runs on whatever model you have: a local Ollama or vLLM server, a hosted gateway, or Gemini natively.
+It runs on whatever model you have: a local Ollama or vLLM server, any OpenAI-compatible provider, OpenAI's Responses API, your ChatGPT plan through **Continue with ChatGPT**, or Gemini natively.
 
 ## Install
 
@@ -86,7 +86,7 @@ One binary. No Python, no Node, no Docker daemon. SQLite is compiled in and TLS 
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-version=v0.1.8
+version=v0.1.11
 curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$version/install.sh" \
   | MEDHA_VERSION="$version" sh                            # pin installer + binary
 
@@ -184,13 +184,13 @@ than silently proceeding.
 
 ### Connect a model
 
-Just run `medha`. The first launch opens model setup right in the TUI: pick an endpoint or type your own, paste a key if the endpoint needs one, and it's saved. You only do this once. `/model` adds or switches models later.
+Just run `medha`. The first launch opens the connect sheet right in the TUI, the same one the desktop app shows: continue with your ChatGPT plan, pick a provider from the catalogue with its models and prices, point it at a local server, or paste a key. Medha recognises which provider a pasted key belongs to and never sends it to another. You only do this once. `/model` adds or switches models later.
 
 Reasoning controls: `medha --effort xhigh "your task"` or `/reasoning` in the TUI.
 
 Context is checked before each model request, including after tool results and on resume. Set the profile's `max_ctx` to the window your endpoint actually serves; `max_output_tokens`, when set, is reserved from that window. Leaving the output cap unset keeps automatic compaction active, with the server's output default remaining unknown. The context meter uses the compiler's input budget (`~` marks an estimate). Compaction checkpoints preserve resumable history; a request that still exceeds the budget stops instead of repeatedly reaching the provider. LLM summarization has its own token bounds, a 60-second inactivity deadline and a 300-second total deadline. Provider failures preserve history and stop compaction; extractive fallback is reserved for explicit local summarizer unavailability. Unknown context limits are reported explicitly; they cannot provide proactive overflow protection.
 
-Setup suggests Ollama, LM Studio, llama.cpp, vLLM/SGLang, OpenRouter, Together, Groq and OpenAI. **Google Gemini** works through its native Interactions API.
+Setup suggests Ollama, LM Studio, llama.cpp, vLLM/SGLang, OpenRouter, Together, Groq and OpenAI; new OpenAI setups use the Responses API. **Google Gemini** works through its native Interactions API.
 
 Everything lands under `~/.medha/` (or `$MEDHA_HOME`): model profiles in `config.toml`, and **API keys in `credentials.toml` with `0600` permissions** (or your OS keychain), never in a config file you might commit. Per-workspace session state lives under a canonical-path-hashed identity in `~/.medha/projects/`, so different workspaces cannot share trust or history and nothing is written into your repo.
 
@@ -220,15 +220,17 @@ Resolution order is **CLI flag > `MEDHA_*` env > `~/.medha/config.toml` > first-
 
 ## What you get
 
-**Nothing executes on the model's word.** Deny-first policy, a shell danger scanner, and an approval gate that shows a real rendered diff, then pins it, so if the file changes between preview and execution the edit is refused. What you approved is what runs.
+**Nothing executes on the model's word.** Deny-first policy, a command reader that parses every shell line, and an approval gate that shows a real rendered diff, then pins it, so if the file changes between preview and execution the edit is refused. What you approved is what runs.
 
 **A real sandbox on macOS and Linux.** macOS Seatbelt and Linux Landlock by default, with Docker/Podman containers and remote SSH available. Network can be denied outright. `shell.exec` starts from an empty environment, so a leaked key never reaches an arbitrary command. Keys, tokens and local daemon sockets such as Docker's stay closed even after an approval; a command that needs them (`ssh`, `git push`, `docker`) runs outside the sandbox, once, when you approve that run.
 
-**Windows has no OS sandbox yet.** There, commands run with your own rights behind the danger scanner and the approval gate, the terminal shows `[no sandbox]`, and `yolo` still asks before builds and tests.
+**Windows has no OS sandbox yet.** There, commands run with your own rights behind the command reader and the approval gate, the terminal shows `[no sandbox]`, and `yolo` still asks before builds and tests.
 
 Each session gets an empty scratch folder for throwaway files and test repositories. Commands and file tools use it without asking, and it is deleted when the session ends.
 
 Shell commands declare whether they need network access using `network: true` or `false`. For native execution, `workdir` selects the command's directory; `read_paths` and `write_paths` request access to existing absolute directories outside the workspace. Changing `workdir` does not expand the workspace's writable boundary. Missing network and folder permissions appear together before the command runs, with once, session, and project options in the TUI. A denied request runs nothing. Failed shell commands are not automatically replayed, because earlier steps may already have changed files. Trusted skill scripts are readable and executable, while Medha's credentials and session state remain protected.
+
+**Prompt caching that pays.** Each request repeats the chat so far, so Medha marks its unchanging start where a server needs telling and keeps a chat on one cache where a server routes by key or session. The repeated part is billed as a re-read, and the Context panel shows the cache hit rate live.
 
 **Memory the model can't forge.** The *kernel* computes trust and provenance from the turn that produced a fact; those fields are stripped from the model's own arguments. A turn that read a web page can only produce web-trust memory, and confidence is only promoted when a different session corroborates it.
 
@@ -301,7 +303,7 @@ flowchart TB
     CLI --> RUNTIME
     RUNTIME --> K["Kernel<br/>Context → model → authorize → execute → observe → verify"]
     K <--> C["Context engine<br/>Budget, compaction, durable handoff"]
-    K <--> P["Providers<br/>OpenAI-compatible · Gemini"]
+    K <--> P["Providers<br/>OpenAI-compatible · Responses · Gemini"]
     C -. "optional summary request" .-> P
     K --> G["Policy + human approval<br/>Trust checks and hooks"]
     G --> T["Tool registry"]
@@ -329,10 +331,10 @@ The [full architecture](docs/WHAT_IS_MEDHA.md#architecture-at-a-glance) includes
 
 Pre-1.0: interfaces may still change. Each version's changes are on the [releases page](https://github.com/kashyaprajharsh/medha-agent/releases).
 
-**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 25 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation that you can open, watch and steer while they run,
+**Working today:** the kernel loop, OpenAI-compatible, OpenAI Responses (including ChatGPT plans) and native Gemini providers, prompt caching, 25 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation that you can open, watch and steer while they run,
 graceful interrupts, the ACP editor bridge, and the Eval Gate.
 
-**Next:** native Anthropic Messages and OpenAI Responses protocols, cross-vendor adversarial verification, span-level trust taint, and trace→skill distillation.
+**Next:** the native Anthropic Messages protocol, cross-vendor adversarial verification, span-level trust taint, and trace→skill distillation.
 
 ## Contributing
 

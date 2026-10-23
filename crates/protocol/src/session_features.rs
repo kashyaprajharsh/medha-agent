@@ -376,3 +376,72 @@ pub enum McpResult {
     // Tool status payloads belong to the registered MCP tool, not dispatch.
     Status(Value),
 }
+
+/// How far a tool reaches, as a person is told it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    Read,
+    ReversibleLocal,
+    IrreversibleLocal,
+    External,
+}
+
+/// A setting that keeps a tool out of new chats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffReason {
+    /// The preset is Core tools only, which does not include it.
+    Core,
+    ProjectAllow,
+    ProjectDeny,
+    UserAllow,
+    UserDeny,
+    /// Its MCP server's own settings turn it off.
+    ServerDeny,
+}
+
+/// One tool new chats could have; `off` names each setting that keeps it out, empty when it is on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSwitch {
+    pub name: String,
+    pub description: String,
+    pub reach: Reach,
+    pub off: Vec<OffReason>,
+}
+
+/// Which settings a tool switch changes: yours in every project, or this project's medha.lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolScope {
+    User,
+    Project,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "operation",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ToolsCommand {
+    List,
+    Switch {
+        tool: String,
+        on: bool,
+        scope: ToolScope,
+    },
+}
+impl Command for ToolsCommand {
+    const METHOD: &'static str = "session.tools";
+    const SCOPE: ScopeKind = ScopeKind::Chat;
+    type Output = ToolsResult;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", content = "data", rename_all = "snake_case")]
+pub enum ToolsResult {
+    Tools(Vec<ToolSwitch>),
+    Changed,
+}

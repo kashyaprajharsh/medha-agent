@@ -961,6 +961,7 @@ async fn main() -> Result<()> {
         k3_budget_tokens: _,
         stale_after_days: _,
         known_tools: _,
+        all_tools: _,
         search_handle: _,
         lsp_manager,
         mcp_manager,

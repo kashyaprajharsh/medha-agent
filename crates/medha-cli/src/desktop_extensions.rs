@@ -12,6 +12,8 @@ pub(crate) struct Runtime {
     pub flag_model: Option<String>,
     pub flag_base_url: Option<String>,
     pub ui: lockfile::UiConfig,
+    /// The chat's tools before `[tools]` narrowing, listed with why each one is off.
+    pub all_tools: Arc<dyn kernel::Executor>,
     pub workspace: Arc<sandbox::WorkspaceSandbox>,
     pub memory: Option<Arc<memory::MemoryProjection>>,
     pub memory_budget: u32,
@@ -25,7 +27,10 @@ impl Runtime {
         let specs = kernel.executor.specs();
         let known = specs.iter().map(|spec| spec.name.clone()).collect();
         let mut result = self.skills.list(&known);
-        result["tools"] = json!(specs.iter().map(|spec| json!({"name": spec.name, "description": spec.description, "icon": spec.icon, "category": spec.category, "radius": spec.blast_radius})).collect::<Vec<_>>());
+        match runtime::session::tool_switches(self.workspace.root(), self.all_tools.as_ref()) {
+            Ok(tools) => result["tools"] = json!(tools),
+            Err(error) => result["tools_error"] = json!(format!("{error:#}")),
+        }
         result["plugins"] = crate::desktop_preferences::plugins(&self.store)
             .unwrap_or_else(|error| json!({"notices": [error.to_string()]}));
         result["mcp"] = if let Some(manager) = &self.mcp {

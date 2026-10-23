@@ -6,6 +6,10 @@ pub(super) fn language_servers(
     registry: &mut ToolRegistry,
 ) -> Option<Arc<lsp::LspManager>> {
     let Setup { lock, cwd, .. } = *setup;
+    // Switched off means no LSP tools at all, not tools that can never start a server.
+    if !lock.lsp.enabled {
+        return None;
+    }
     let mut lsp_config = lsp::Config {
         enabled: true,
         startup_timeout: std::time::Duration::from_millis(lock.lsp.startup_timeout_ms),

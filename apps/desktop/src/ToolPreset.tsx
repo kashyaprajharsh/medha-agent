@@ -45,7 +45,7 @@ export function ToolPreset({ available, locked }: { available: number; locked: b
     {
       preset: "full",
       title: "All tools",
-      text: `Every tool Medha has${available ? ` (${available} in this chat)` : ""}. Specialised tools are faster and safer for each task.`,
+      text: `Every tool Medha has${available ? ` (${available} switched on)` : ""}. Specialised tools are faster and safer for each task.`,
     },
     {
       preset: "minimal",

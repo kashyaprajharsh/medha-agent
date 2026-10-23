@@ -158,30 +158,8 @@ impl Error {
     }
 }
 
-/// Per-server tool exposure filter. `allow` (when non-empty) whitelists, then
-/// `deny` subtracts. Entries are exact names or a single trailing `*` glob.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolFilter {
-    pub allow: Vec<String>,
-    pub deny: Vec<String>,
-}
-
-impl ToolFilter {
-    fn admits(&self, tool: &str) -> bool {
-        if !self.allow.is_empty() && !self.allow.iter().any(|p| glob(p, tool)) {
-            return false;
-        }
-        !self.deny.iter().any(|p| glob(p, tool))
-    }
-}
-
-/// Exact match, or `prefix*` when the pattern ends in `*`.
-fn glob(pattern: &str, name: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => pattern == name,
-    }
-}
+/// Per-server tool exposure filter, the same rule as `[tools]` in `medha.lock`.
+pub use kernel::tool_pattern::ToolFilter;
 
 /// How Medha reaches a server.
 #[derive(Debug, Clone, PartialEq, Eq)]

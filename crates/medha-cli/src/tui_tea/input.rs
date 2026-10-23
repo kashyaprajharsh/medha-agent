@@ -643,6 +643,8 @@ pub(super) enum SlashAction {
     Hooks(String),
     /// `/mcp` — open the MCP management picker.
     Mcp,
+    /// `/tools` — switch tools on or off for new chats.
+    Tools,
     Agents,
     /// `/agents steer <agent> <text>` — instruct a running agent.
     Steer(String),
@@ -742,6 +744,7 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
             SlashAction::Plugins(c.strip_prefix("plugins").unwrap_or("").trim().to_string())
         }
         "mcp" => SlashAction::Mcp,
+        "tools" => SlashAction::Tools,
         "agents" => SlashAction::Agents,
         "agents tree" => SlashAction::Tree,
         c if c

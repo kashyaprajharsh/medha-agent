@@ -2869,3 +2869,54 @@ test("a second model on a server whose key is saved asks for no key and lists it
   const [, saved] = calls.at(-1);
   assert.deepEqual([saved.profile.model, saved.profile.base_url, saved.profile.auth, saved.key], ["meta/muse-glimmer-30b", nvidia, "bearer", ""]);
 });
+
+// The page's Connectors view bundles its logos through Vite, which this loader has not; it is not under test here.
+const withoutConnectors = new Map([
+  ...modules,
+  ["Connectors", "data:text/javascript," + encodeURIComponent("export function Connectors(){return null}")],
+]);
+const { Extensions } = await import(await moduleUrl("Extensions", withoutConnectors));
+test("a server that is ready again after a settings change has its tools asked for again", async () => {
+  let heard;
+  const asked = [];
+  globalThis.__medhaControlsTest.api = {
+    extensions: async () => ({ plugins: [], skills: [], notices: [], skill_errors: [] }),
+    settings: async () => ({ mcp: [] }),
+    liveCall: async (key, method) => (asked.push(method), { tools: [], mcp: [] }),
+    onLive: async (handler) => ((heard = handler), () => {}),
+  };
+  await act(() => root.render(h(Extensions, { sessionKey: "chat", ensureOpen: async () => {}, locked: false, onAsk() {} })));
+  const catalogs = () => asked.filter((method) => method === "extensions.catalog").length;
+  const before = catalogs();
+  await act(async () => heard("chat", { method: "mcp.status", params: { servers: [{ server: "hosted", state: "connecting", tools: 0 }] } }));
+  assert.equal(catalogs(), before, "a server still connecting has nothing new to list");
+  await act(async () => heard("chat", { method: "mcp.status", params: { servers: [{ server: "hosted", state: "ready", tools: 2 }] } }));
+  assert.equal(catalogs(), before + 1);
+});
+
+const { ToolAccess } = await import(await moduleUrl("ToolAccess"));
+test("a tool switch saves where its scope says, and one it cannot honour there says where instead", async () => {
+  const saved = [];
+  const tools = [
+    { name: "web", description: "Reach the open web.", category: "web", reach: "external", off: [] },
+    { name: "lsp.start", description: "", category: "other", reach: "external", off: ["project_deny"] },
+    { name: "mcp__github__merge_pull_request", description: "", category: "other", reach: "external", off: [] },
+  ];
+  const props = { tools, servers: [{ id: "github", deny_tools: ["create_issue"] }], findBox: null, query: "", onQuery() {} };
+  await act(() =>
+    root.render(h(ToolAccess, { ...props, matches: () => true, busy: false, onSave: (method, params) => saved.push([method, params]) })),
+  );
+  const toggle = (label) => document.querySelector(`[role="switch"][aria-label="${label}"]`);
+  await click(toggle("Turn off web"));
+  await click(toggle("Turn off merge_pull_request"));
+  assert.ok(toggle("Turn on lsp.start").disabled, "Just me cannot undo what this project turned off");
+  assert.match(document.body.textContent, /Off in this project, from medha\.lock\. Switch it on under This project/);
+  await click([...document.querySelectorAll(".ext-seg button")].find((button) => button.textContent === "This project"));
+  await click(toggle("Turn on lsp.start"));
+  assert.deepEqual(saved, [
+    ["settings.tools.switch", { tool: "web", on: false, scope: "user" }],
+    // The same setting the server's own page edits, so the two never disagree.
+    ["settings.mcp.update", { id: "github", deny_tools: ["create_issue", "merge_pull_request"] }],
+    ["settings.tools.switch", { tool: "lsp.start", on: true, scope: "project" }],
+  ]);
+});

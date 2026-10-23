@@ -27,8 +27,9 @@ pub struct Workspace {
 }
 
 /// Requests that change the chat's own folder or its state, not the user's settings.
-const CHAT_WRITES: [&str; 15] = [
+const CHAT_WRITES: [&str; 16] = [
     "settings.tools.save",
+    "settings.tools.switch",
     "instructions.save",
     "extensions.install",
     "extensions.enable",

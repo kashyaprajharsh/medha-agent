@@ -269,7 +269,8 @@ autonomy = "careful"          # careful · normal · yolo
 approve  = ["edit", "skill.save"]
 
 [tools]
-preset = "full"               # full · minimal (read, edit, shell.exec, grep, glob)
+preset = "full"               # full · minimal (read, write, edit, shell.exec, grep, glob)
+deny   = ["web", "lsp*"]      # optional; allow = [...] keeps only what it names. Deny always wins
 
 [sandbox]
 backend = "native"            # native · container · ssh · host

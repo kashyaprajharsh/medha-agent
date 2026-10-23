@@ -9,9 +9,10 @@ import { SkillBrowse } from "./SkillBrowse";
 import { Sheet } from "./Sheet";
 import { SkillList, type Skill } from "./SkillList";
 import { SkillManage } from "./SkillManage";
-import { Add, Find, InstallSource, PageTop, summaryOf, ViewBar } from "./ExtensionParts";
+import { Add, Find, InstallSource, PageTop, ViewBar } from "./ExtensionParts";
 import { Hooks } from "./Hooks";
 import { ToolPreset } from "./ToolPreset";
+import { ToolAccess, type Tool } from "./ToolAccess";
 type Mcp = McpServer;
 type Update = {
   id: string;
@@ -22,19 +23,6 @@ type Update = {
   up_to_date: boolean;
   access_changed: boolean;
   blocked?: string;
-};
-type Tool = {
-  name: string;
-  description: string;
-  category: string;
-  radius: string;
-};
-// How far a tool reaches, in the words a person would use for it.
-const REACH: Record<string, string> = {
-  read: "Looks only",
-  reversible_local: "Changes you can undo",
-  irreversible_local: "Changes that stay",
-  external: "Reaches outside",
 };
 export function Extensions({
   sessionKey,
@@ -92,6 +80,7 @@ export function Extensions({
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [refresh, setRefresh] = useState(0);
+  const [ready, setReady] = useState(0);
   const [source, setSource] = useState("");
   const [review, setReview] = useState<Plugin>();
   const [connect, setConnect] = useState<Mcp>();
@@ -130,6 +119,7 @@ export function Extensions({
       .then((catalog) => {
         if (active) {
           setTools((catalog.tools as Tool[]) ?? []);
+          if (catalog.tools_error) setError(String(catalog.tools_error));
           showStatuses((catalog.mcp as (McpStatus & { server: string })[]) || []);
           if (catalog.skills) setSkills(catalog.skills as Skill[]);
           const runtime = catalog.plugins as { plugins: Plugin[] };
@@ -140,16 +130,19 @@ export function Extensions({
     return () => {
       active = false;
     };
-  }, [tab, sessionKey, refresh]);
-  // The chat announces every connection change, so the page never has to ask again.
+  }, [tab, sessionKey, refresh, ready]);
+  // The chat announces every connection change. A server that reconnects, as it does after its settings
+  // change, has no tools until it is ready again, so the tools are asked for again then.
   useEffect(() => {
     if (!sessionKey) return;
     let off: (() => void) | undefined;
     let gone = false;
     void api
       .onLive((key, frame) => {
-        if (key === sessionKey && frame.method === "mcp.status")
-          showStatuses(((frame.params as { servers?: (McpStatus & { server: string })[] })?.servers) ?? []);
+        if (key !== sessionKey || frame.method !== "mcp.status") return;
+        const servers = (frame.params as { servers?: (McpStatus & { server: string })[] })?.servers ?? [];
+        showStatuses(servers);
+        if (servers.some((server) => server.state === "ready")) setReady((value) => value + 1);
       })
       .then((unlisten) => (gone ? unlisten() : (off = unlisten)));
     return () => {
@@ -585,35 +578,21 @@ export function Extensions({
         {tab === "tool access" && (
           <>
             <PageTop title="Tool access">
-              What Medha may reach for in new chats of this project. Chat mode controls approvals; every use is still
-              checked by Medha’s policy, and asked about when it matters.
+              What Medha may reach for in new chats. Chat mode controls approvals; every use is still checked by
+              Medha’s policy, and asked about when it matters.
             </PageTop>
-            <ToolPreset available={tools.length} locked={locked} />
+            <ToolPreset available={tools.filter((tool) => !tool.off.length).length} locked={locked} />
             {tools.length > 0 && (
-              <section className="ix-group">
-                <ViewBar>
-                  <Find box={filter} label="Find a tool" value={query} onChange={setQuery} />
-                </ViewBar>
-                <h3>
-                  In this chat <span>{tools.length}</span>
-                </h3>
-                <div className="ix">
-                  {tools
-                    .filter((tool) => matches(tool.name, tool.description))
-                    .map((tool) => (
-                      <details className="ix-row tool" key={tool.name}>
-                        <summary>
-                          <span className="ix-main">
-                            <b className="mono">{tool.name}</b>
-                            <span className="ix-sum">{summaryOf(tool.description)}</span>
-                          </span>
-                          <small className={`ix-note reach-${tool.radius}`}>{REACH[tool.radius] ?? tool.radius.replaceAll("_", " ")}</small>
-                        </summary>
-                        <p>{tool.description}</p>
-                      </details>
-                    ))}
-                </div>
-              </section>
+              <ToolAccess
+                tools={tools}
+                servers={mcp}
+                findBox={filter}
+                query={query}
+                onQuery={setQuery}
+                matches={matches}
+                busy={busy || locked}
+                onSave={(method, params) => void act(method, params)}
+              />
             )}
             {!sessionKey && (
               <p className="quiet">

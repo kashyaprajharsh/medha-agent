@@ -518,6 +518,14 @@
 .ix-note.reach-external {
   color: var(--warn);
 }
+/* Which settings the switches below change, said once under the scope choice. */
+.tool-scope {
+  margin: calc(-1 * var(--s-2)) 0 var(--s-4);
+}
+/* An off tool's reason is read, not skimmed: it keeps the summary's own weight. */
+.ix-row.off .ix-sum .tool-why {
+  color: var(--dim);
+}
 .ix-group .ext-bar {
   margin-bottom: var(--s-4);
 }

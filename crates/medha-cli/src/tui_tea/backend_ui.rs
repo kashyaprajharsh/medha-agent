@@ -2,6 +2,7 @@
 //! conversation ownership and tool execution belong to the shared backend.
 pub(super) use super::backend_features::begin_model_setup;
 pub(super) use super::backend_features::*;
+pub(super) use super::backend_tools::*;
 use super::*;
 use medha_client::{Backend, Chat, Connection, Said, View, ViewLimits};
 use protocol::{ReadResource as Read, ResourceResult as Resource, SessionRead as Inspect};
@@ -130,6 +131,8 @@ pub(super) enum Effect {
     Reload(After),
     SavedProfile(protocol::ActivateSavedProfile),
     Mcp(protocol::McpCommand, After),
+    /// The scope rides along so the list that comes back keeps the one the person chose.
+    Tools(protocol::ToolsCommand, protocol::ToolScope),
     Send(Draft),
     Expand(Draft),
     Approve(protocol::AnswerApproval),
@@ -221,6 +224,7 @@ impl Effect {
             Self::Configure(p) => size(p),
             Self::SavedProfile(p) => size(p),
             Self::Mcp(p, _) => size(p),
+            Self::Tools(p, _) => size(p),
             Self::Send(d) | Self::Expand(d) => size(&d.request) + d.raw.len(),
             Self::Approve(p) => size(p),
             Self::Question(p) => size(p),
@@ -350,6 +354,7 @@ enum Answer {
     Session(protocol::SessionResult),
     Settings(protocol::Settings),
     Mcp(protocol::McpResult),
+    Tools(protocol::ToolsResult),
     Sent(protocol::MessageAccepted),
     Expanded(protocol::ExpandedCommand),
     Accepted(protocol::Accepted),
@@ -557,6 +562,7 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             .map(Answer::Reloaded),
         Effect::SavedProfile(p) => connection.call_chat(&chat, p).await.map(Answer::Settings),
         Effect::Mcp(p, _) => connection.call_chat(&chat, p).await.map(Answer::Mcp),
+        Effect::Tools(p, _) => connection.call_chat(&chat, p).await.map(Answer::Tools),
         Effect::Send(d) => {
             if let Some(agent) = &d.target {
                 let command = if d.followup {
@@ -1899,6 +1905,11 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                     _ => After::Notice,
                 };
                 mcp_reply(model, reply, after);
+            }
+            Answer::Tools(reply) => {
+                if let Effect::Tools(_, scope) = done.effect {
+                    tools_reply(model, reply, scope);
+                }
             }
             Answer::Sent(accepted) => {
                 peer.sending = false;

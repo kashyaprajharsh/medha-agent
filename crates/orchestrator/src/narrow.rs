@@ -15,8 +15,16 @@ use kernel::{BlastRadius, Containment, Executor, Observation, ToolCategory, Tool
 /// An executor restricted to a subset of another executor's tools.
 pub struct NarrowedExecutor {
     inner: Arc<dyn Executor>,
-    allowed: BTreeSet<String>,
+    scope: Scope,
     read_only: bool,
+    no_clarify: bool,
+}
+
+enum Scope {
+    /// Snapshotted at construction: what a child was handed.
+    Fixed(BTreeSet<String>),
+    /// Asked on every use, so a tool that appears later, such as an MCP server's, is judged too.
+    Live(Box<dyn Fn(&str) -> bool + Send + Sync>),
 }
 
 impl NarrowedExecutor {
@@ -35,10 +43,23 @@ impl NarrowedExecutor {
                 .collect(),
             None => available,
         };
+        Self::scoped(inner, Scope::Fixed(allowed))
+    }
+
+    /// Keep the tools `admit` accepts, judged whenever a tool is listed or called.
+    pub fn filtered(
+        inner: Arc<dyn Executor>,
+        admit: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self::scoped(inner, Scope::Live(Box::new(admit)))
+    }
+
+    fn scoped(inner: Arc<dyn Executor>, scope: Scope) -> Self {
         Self {
             inner,
-            allowed,
+            scope,
             read_only: false,
+            no_clarify: false,
         }
     }
 
@@ -46,8 +67,6 @@ impl NarrowedExecutor {
     /// workspace safely; writers require an isolated workspace.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
-        self.allowed
-            .retain(|name| matches!(self.inner.blast_radius(name), Some(BlastRadius::Read)));
         self
     }
 
@@ -55,20 +74,22 @@ impl NarrowedExecutor {
     /// unanswerable and a background one blocks forever. Not permission gating —
     /// consequential actions still route through the human gate.
     pub fn no_clarifying_questions(mut self) -> Self {
-        self.allowed.retain(|name| name != "clarify");
+        self.no_clarify = true;
         self
     }
 
     pub fn allows(&self, tool: &str) -> bool {
-        self.allowed.contains(tool)
+        let in_scope = match &self.scope {
+            Scope::Fixed(allowed) => allowed.contains(tool),
+            Scope::Live(admit) => admit(tool),
+        };
+        in_scope
+            && (!self.read_only || matches!(self.inner.blast_radius(tool), Some(BlastRadius::Read)))
+            && !(self.no_clarify && tool == "clarify")
     }
 
     fn allows_intent(&self, intent: &ToolIntent) -> bool {
         self.allows(&intent.tool) && (!self.read_only || self.inner.mutation_key(intent).is_none())
-    }
-
-    pub fn allowed(&self) -> impl Iterator<Item = &str> {
-        self.allowed.iter().map(String::as_str)
     }
 }
 
@@ -130,15 +151,9 @@ impl Executor for NarrowedExecutor {
         previous_sources: &std::collections::BTreeMap<String, String>,
     ) -> kernel::tool_snapshot::ToolInventory {
         let mut inventory = self.inner.tool_inventory(previous_sources).await;
-        inventory
-            .specs
-            .retain(|spec| self.allowed.contains(&spec.name));
-        inventory
-            .sources
-            .retain(|name, _| self.allowed.contains(name));
-        inventory
-            .unavailable
-            .retain(|name| self.allowed.contains(name));
+        inventory.specs.retain(|spec| self.allows(&spec.name));
+        inventory.sources.retain(|name, _| self.allows(name));
+        inventory.unavailable.retain(|name| self.allows(name));
         inventory
     }
 
@@ -146,7 +161,7 @@ impl Executor for NarrowedExecutor {
         self.inner
             .specs()
             .into_iter()
-            .filter(|spec| self.allowed.contains(&spec.name))
+            .filter(|spec| self.allows(&spec.name))
             .collect()
     }
 
@@ -246,6 +261,10 @@ impl Executor for NarrowedExecutor {
 
     fn images_reach_model(&self, reach: bool) {
         self.inner.images_reach_model(reach);
+    }
+
+    async fn named_outputs(&self, text: &str, since: f64) -> Vec<serde_json::Value> {
+        self.inner.named_outputs(text, since).await
     }
 }
 
@@ -447,6 +466,65 @@ mod tests {
         assert_eq!(child.execute(&call).await.status, kernel::ObsStatus::Denied);
         call.args = json!({"op": "search"});
         assert_eq!(child.execute(&call).await.status, kernel::ObsStatus::Ok);
+    }
+
+    /// A registry whose tool list grows, as it does when an MCP server connects mid-session.
+    struct Growing(std::sync::Mutex<Vec<&'static str>>);
+
+    #[async_trait]
+    impl Executor for Growing {
+        fn specs(&self) -> Vec<ToolSpec> {
+            let connected = self.0.lock().unwrap().clone();
+            std::iter::once("read")
+                .chain(connected)
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: String::new(),
+                    schema: json!({}),
+                    blast_radius: BlastRadius::Read,
+                    category: ToolCategory::Other,
+                    icon: "•".into(),
+                })
+                .collect()
+        }
+        fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {
+            Some(BlastRadius::Read)
+        }
+        async fn execute(&self, intent: &ToolIntent) -> Observation {
+            Fake.execute(intent).await
+        }
+        async fn named_outputs(&self, _text: &str, _since: f64) -> Vec<Value> {
+            vec![json!({"path": "deck.pptx", "kind": "deck"})]
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_judges_tools_that_connect_later_and_a_denied_one_stays_uncallable() {
+        let inner = Arc::new(Growing(Default::default()));
+        let session = NarrowedExecutor::filtered(inner.clone(), |tool| tool != "mcp__db__drop");
+        inner
+            .0
+            .lock()
+            .unwrap()
+            .extend(["mcp__db__query", "mcp__db__drop"]);
+        assert_eq!(names(&session), vec!["read", "mcp__db__query"]);
+        let refused = session.execute(&intent("mcp__db__drop")).await;
+        assert_eq!(
+            refused.status,
+            kernel::ObsStatus::Denied,
+            "hidden is not enough; naming it must fail"
+        );
+        let child = NarrowedExecutor::new(Arc::new(session), Some(&["mcp__db__drop".into()]));
+        assert!(
+            names(&child).is_empty(),
+            "a child cannot win back what its parent denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn outputs_a_reply_names_survive_narrowing() {
+        let narrowed = NarrowedExecutor::filtered(Arc::new(Growing(Default::default())), |_| true);
+        assert_eq!(narrowed.named_outputs("made deck.pptx", 0.0).await.len(), 1);
     }
 
     #[tokio::test]

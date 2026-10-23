@@ -24,6 +24,9 @@ mod pricing;
 mod prompt;
 mod sandbox_setup;
 mod services;
+mod tool_rules;
+
+pub use tool_rules::{off_reasons, tool_switches};
 
 struct Setup<'a> {
     lock: &'a lockfile::MedhaLock,
@@ -236,23 +239,8 @@ pub async fn start(
     if let Ok(mut slot) = agent_registry.lock() {
         *slot = Some(Arc::downgrade(&executor));
     }
-    // `[tools] preset = "minimal"`, or MEDHA_TOOLS. Narrowing happens once, at
-    // the boundary: children inherit from the narrowed executor, so a preset
-    // cannot be widened by delegating.
-    let preset = lockfile::ToolsConfig {
-        preset: options
-            .tools_preset
-            .clone()
-            .unwrap_or(lock.tools.preset.clone()),
-    };
-    preset.validate().map_err(anyhow::Error::msg)?;
-    let executor: Arc<dyn kernel::Executor> = match preset.exposed() {
-        Some(exposed) => Arc::new(orchestrator::NarrowedExecutor::new(
-            executor,
-            Some(&exposed),
-        )),
-        None => executor,
-    };
+    let all_tools: Arc<dyn kernel::Executor> = executor.clone();
+    let executor = tool_rules::narrow(&setup, &model_profiles, &registered_tools, executor)?;
     let known_tools: std::collections::HashSet<String> =
         executor.specs().into_iter().map(|spec| spec.name).collect();
     let fallback = catalogue_pricing.map(|(input, output, cached, written)| kernel::Pricing {
@@ -279,7 +267,6 @@ pub async fn start(
         artifacts.clone(),
     );
 
-    pricing::warn_unknown(lock, &registered_tools, notices);
     let policy: Arc<dyn kernel::Policy> = live_settings.clone();
     let verifier: Arc<dyn kernel::Verifier> = Arc::new(crate::project_session::LiveVerifier::new(
         live_settings.clone(),
@@ -401,6 +388,7 @@ pub async fn start(
         k3_budget_tokens,
         stale_after_days,
         known_tools,
+        all_tools,
         search_handle,
         lsp_manager,
         mcp_manager,
@@ -436,6 +424,8 @@ pub struct Started {
     pub k3_budget_tokens: u32,
     pub stale_after_days: u32,
     pub known_tools: std::collections::HashSet<String>,
+    /// Every registered tool before `[tools]` narrowing, so a settings page can list the ones turned off.
+    pub all_tools: Arc<dyn kernel::Executor>,
     pub search_handle: tools::SearchHandle,
     pub lsp_manager: Option<Arc<lsp::LspManager>>,
     pub mcp_manager: Option<Arc<mcp::McpManager>>,

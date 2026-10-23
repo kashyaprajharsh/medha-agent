@@ -2931,6 +2931,124 @@ async fn a_chat_in_the_backend_obeys_the_environment_as_one_in_its_own_process_d
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tools_hidden_by_the_project_or_the_user_are_never_offered_and_a_typo_is_named() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home()).unwrap();
+    std::fs::write(
+        world.home().join("config.toml"),
+        "[tools]\ndeny = [\"glob\"]\n",
+    )
+    .unwrap();
+    let folder = world.folder("w");
+    std::fs::write(
+        folder.join("medha.lock"),
+        "[tools]\ndeny = [\"grep\", \"webb\"]\n\n[lsp]\nenabled = false\n",
+    )
+    .unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let made = client.create(&folder, None).await;
+    assert!(
+        made["result"]["about"]["notices"]
+            .to_string()
+            .contains("webb"),
+        "{made}"
+    );
+    let chat = made["result"]["session"].as_str().unwrap().to_string();
+    client
+        .ask("session.attach", Some(&chat), json!({"after": 0}))
+        .await;
+
+    client.send(&chat, "what may you use").await;
+    let tools = offered(&world.provider.seen.recv_timeout(WAIT).unwrap());
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(tools.contains(&"read".to_string()), "{tools:?}");
+    for hidden in ["grep", "glob", "lsp", "lsp.start"] {
+        assert!(
+            !tools.contains(&hidden.to_string()),
+            "{hidden} was offered: {tools:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switched_off_tool_leaves_new_chats_and_the_page_says_who_turned_it_off() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let switch = |tool: &str, on: bool, scope: &str| json!({"method": "settings.tools.switch", "params": {"tool": tool, "on": on, "scope": scope}});
+    for (tool, scope) in [("web", "user"), ("grep", "project")] {
+        client
+            .about(&folder, switch(tool, false, scope))
+            .await
+            .unwrap();
+    }
+    let config = || std::fs::read_to_string(world.home().join("config.toml")).unwrap();
+    assert!(config().contains("\"web\""), "{}", config());
+    let lock = std::fs::read_to_string(folder.join("medha.lock")).unwrap();
+    assert!(lock.contains("deny = [\"grep\"]"), "{lock}");
+
+    let chat = client.open(&folder).await;
+    let listed = outcome(
+        &client
+            .ask("extensions.catalog", Some(&chat), json!({}))
+            .await,
+    );
+    let row = |name: &str| {
+        listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not listed: {listed}"))
+            .clone()
+    };
+    assert_eq!(row("web")["off"], json!(["user_deny"]));
+    assert_eq!(row("grep")["off"], json!(["project_deny"]));
+    assert_eq!(row("read")["off"], json!([]));
+    // A web tool only reads, but what it reads is outside, and the page says so.
+    assert_eq!(row("web")["reach"], "external");
+    assert_eq!(row("read")["reach"], "read");
+    client.send(&chat, "what may you use").await;
+    let tools = offered(&world.provider.seen.recv_timeout(WAIT).unwrap());
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(tools.contains(&"read".to_string()), "{tools:?}");
+    assert!(
+        !tools.iter().any(|tool| tool == "web" || tool == "grep"),
+        "{tools:?}"
+    );
+
+    client
+        .about(&folder, switch("web", true, "user"))
+        .await
+        .unwrap();
+    assert!(!config().contains("\"web\""), "{}", config());
+
+    // The terminal's /tools takes the same switch through the chat, and lists what the page lists.
+    let switch_on =
+        json!({"operation": "switch", "data": {"tool": "grep", "on": true, "scope": "project"}});
+    let switched = outcome(&client.ask("session.tools", Some(&chat), switch_on).await);
+    assert_eq!(switched["result"], "changed", "{switched}");
+    let listed = outcome(
+        &client
+            .ask("session.tools", Some(&chat), json!({"operation": "list"}))
+            .await,
+    );
+    let grep = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "grep")
+        .cloned();
+    assert_eq!(
+        grep.map(|tool| tool["off"].clone()),
+        Some(json!([])),
+        "{listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_setting_that_makes_no_sense_stops_only_what_would_have_used_it() {
     let env = [("MEDHA_MODE", "no-such-mode")];
     let world = World::new();
@@ -2985,8 +3103,9 @@ fn remote_mcp_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
                     json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
                         "serverInfo": {"name": "hosted", "version": "0.0.1"}})
                 }
-                Some("tools/list") => json!({"tools": [{"name": "ping",
-                    "description": "Ping the hosted server", "inputSchema": {"type": "object"}}]}),
+                Some("tools/list") => json!({"tools": [
+                    {"name": "ping", "description": "Ping the hosted server", "inputSchema": {"type": "object"}},
+                    {"name": "echo", "description": "Echo a message back", "inputSchema": {"type": "object"}}]}),
                 _ => json!({}),
             };
             let reply = json!({"jsonrpc": "2.0", "id": asked["id"], "result": result});
@@ -3242,6 +3361,63 @@ async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
     assert_eq!(
         connections, 1,
         "each chat connected to the server for itself"
+    );
+}
+
+/// Saving a tool setting reconnects the server, so for a moment it lists none of its tools. The page asks
+/// again on the status that follows; by then the switched-off tool is listed as off and the rest are back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_an_mcp_tool_is_switched_off_the_ready_server_lists_it_off_and_the_rest_on() {
+    let world = World::new();
+    let (url, _) = remote_mcp_server();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    std::fs::write(world.home().join("config.toml"), config).unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("w");
+    let chat = client.open(&folder).await;
+    let ready = async |client: &mut Client| loop {
+        let frame = client.next().await;
+        let said = &frame["params"]["frame"];
+        let ready = said["params"]["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|server| server["server"] == "hosted" && server["state"] == "ready");
+        if said["method"] == "mcp.status" && ready {
+            break;
+        }
+    };
+    ready(&mut client).await;
+    let off = |listed: &Value, tool: &str| {
+        listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == format!("mcp__hosted__{tool}"))
+            .map(|row| row["off"].clone())
+    };
+    let before = outcome(
+        &client
+            .ask("extensions.catalog", Some(&chat), json!({}))
+            .await,
+    );
+    assert_eq!(off(&before, "ping"), Some(json!([])), "{before}");
+
+    let update = json!({"method": "settings.mcp.update", "params": {"id": "hosted", "deny_tools": ["ping"]}});
+    client.about(&folder, update).await.unwrap();
+    ready(&mut client).await;
+    let after = outcome(
+        &client
+            .ask("extensions.catalog", Some(&chat), json!({}))
+            .await,
+    );
+    assert_eq!(off(&after, "ping"), Some(json!(["server_deny"])), "{after}");
+    assert_eq!(
+        off(&after, "echo"),
+        Some(json!([])),
+        "the server's other tools left with it: {after}"
     );
 }
 

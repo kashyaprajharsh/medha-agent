@@ -699,6 +699,7 @@ async fn settings_request(
         "settings.health.fix",
         "settings.tools",
         "settings.tools.save",
+        "settings.tools.switch",
         "settings.keys",
         "settings.keys.store",
         "settings.keys.set",

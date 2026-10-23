@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) fn warn_unknown(
     lock: &lockfile::MedhaLock,
+    user_tools: &kernel::tool_pattern::ToolFilter,
     registered_tools: &std::collections::HashSet<String>,
     notices: &dyn Notices,
 ) {
@@ -13,6 +14,24 @@ pub(super) fn warn_unknown(
             stale.len(),
             stale.join(", ")
         ));
+    }
+    for (place, filter) in [
+        ("medha.lock", &lock.tools.filter),
+        ("config.toml", user_tools),
+    ] {
+        // An MCP tool's server may connect later, so only built-in names can be judged now.
+        let unknown: Vec<&str> = filter
+            .exact_names()
+            .filter(|name| !registered_tools.contains(*name) && !mcp::McpManager::is_mcp_tool(name))
+            .collect();
+        if !unknown.is_empty() {
+            notices.say(&format!(
+                "warning: [tools] in {place} names {} tool(s) that do not exist here: {}. \
+                 They change nothing; check the spelling",
+                unknown.len(),
+                unknown.join(", ")
+            ));
+        }
     }
 }
 

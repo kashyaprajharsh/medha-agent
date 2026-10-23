@@ -199,6 +199,26 @@ pub(crate) async fn handle<P: Provider, L: EventLog>(
             .map(|reply| json!(reply)),
             Err(_) => Err("Invalid MCP request".into()),
         },
+        // Switches apply to new chats, so they never wait for this chat's work to finish.
+        "session.tools" => match serde_json::from_value::<protocol::ToolsCommand>(params) {
+            Ok(protocol::ToolsCommand::List) => runtime::session::tool_switches(
+                resources.workspace.root(),
+                resources.all_tools.as_ref(),
+            )
+            .map(|tools| json!(protocol::ToolsResult::Tools(tools)))
+            .map_err(|error| format!("{error:#}")),
+            Ok(protocol::ToolsCommand::Switch { tool, on, scope }) => {
+                crate::desktop_preferences::switch_tool(
+                    resources.workspace.root(),
+                    &tool,
+                    on,
+                    scope,
+                )
+                .map(|()| json!(protocol::ToolsResult::Changed))
+                .map_err(|error| format!("{error:#}"))
+            }
+            Err(_) => Err("Invalid tools request".into()),
+        },
         "session.inspect" => match serde_json::from_value::<protocol::SessionRead>(params) {
             Ok(query) => inspect(kernel, session, resources, agents, query)
                 .await

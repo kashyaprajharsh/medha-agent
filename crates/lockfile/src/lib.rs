@@ -111,12 +111,16 @@ pub struct MedhaLock {
 #[serde(default)]
 pub struct ToolsConfig {
     pub preset: String,
+    /// `allow` and `deny` narrow the preset further; neither can add a tool.
+    #[serde(flatten)]
+    pub filter: kernel::tool_pattern::ToolFilter,
 }
 
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             preset: "full".into(),
+            filter: Default::default(),
         }
     }
 }
@@ -128,19 +132,17 @@ pub const MINIMAL_TOOLS: [&str; 6] = ["read", "write", "edit", "shell.exec", "gr
 impl ToolsConfig {
     pub fn validate(&self) -> Result<(), String> {
         match self.preset.as_str() {
-            "full" | "minimal" => Ok(()),
+            "full" | "minimal" => self.filter.validate(),
             _ => Err(format!(
                 "unknown tools preset {:?}; expected full or minimal",
                 self.preset
             )),
         }
     }
-    /// The names to expose, or `None` for everything registered.
-    pub fn exposed(&self) -> Option<Vec<String>> {
-        match self.preset.as_str() {
-            "minimal" => Some(MINIMAL_TOOLS.map(String::from).into()),
-            _ => None,
-        }
+
+    /// Whether this narrows anything; `full` with no patterns exposes everything registered.
+    pub fn narrows(&self) -> bool {
+        self.preset == "minimal" || !self.filter.is_empty()
     }
 }
 
@@ -859,6 +861,19 @@ mod tests {
 
         assert_eq!(lock.permissions.trusted_paths.len(), 1);
         assert_eq!(lock.permissions.trusted_paths[0].path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn tool_patterns_sit_beside_the_preset_and_a_bad_one_stops_the_lock() {
+        let lock = MedhaLock::parse(
+            "[tools]\npreset = \"minimal\"\nallow = [\"read\", \"web\"]\ndeny = [\"read\"]\n",
+        )
+        .unwrap();
+        assert_eq!(lock.tools.preset, "minimal");
+        assert_eq!(lock.tools.filter.deny, ["read"]);
+        assert!(lock.tools.narrows());
+        assert!(MedhaLock::parse("[tools]\ndeny = [\"w*b\"]\n").is_err());
+        assert!(!MedhaLock::default().tools.narrows());
     }
 
     #[test]

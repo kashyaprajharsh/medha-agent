@@ -681,3 +681,97 @@ async fn space_switches_a_skill_off_or_on_and_asks_only_for_one_that_was_flagged
     let flagged = pressed(&catalogue, "flagged").await;
     assert_eq!(flagged, (None, Some("flagged".into())));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tools_switch_goes_where_its_scope_says_and_one_it_cannot_honour_says_where_instead() {
+    use protocol::{OffReason, ToolScope, ToolsCommand};
+    let mut f = fixture().await;
+    let tool = |name: &str, off: Vec<OffReason>| protocol::ToolSwitch {
+        name: name.into(),
+        description: format!("{name} does one thing"),
+        reach: protocol::Reach::Read,
+        off,
+    };
+    let listed = || {
+        vec![
+            tool("web", vec![]),
+            tool("lsp.start", vec![OffReason::ProjectDeny]),
+            tool("mcp__github__merge_pull_request", vec![]),
+        ]
+    };
+    // Answers the oldest request as the backend would, so the next one has room.
+    let answer = |f: &mut Fixture, result: Answer| {
+        let next = f
+            .model
+            .remote
+            .as_mut()
+            .unwrap()
+            .pending
+            .pop_front()
+            .unwrap();
+        completed(
+            &mut f.model,
+            &mut f.view,
+            Completion {
+                generation: 1,
+                effect: next.effect,
+                form: next.form,
+                command: next.command,
+                result: Ok(result),
+            },
+        );
+    };
+    let saved = |f: &mut Fixture| {
+        answer(f, Answer::Tools(protocol::ToolsResult::Changed));
+        answer(f, Answer::Tools(protocol::ToolsResult::Tools(listed())));
+    };
+    backend_features::dispatch_slash(&mut f.model, "tools");
+    answer(
+        &mut f,
+        Answer::Tools(protocol::ToolsResult::Tools(listed())),
+    );
+    let sent = |f: &Fixture| f.model.remote.as_ref().unwrap().pending.len();
+
+    input::handle_key(&mut f.model, key(KeyCode::Char(' ')));
+    assert!(matches!(
+        &f.model.remote.as_ref().unwrap().pending.back().unwrap().effect,
+        Effect::Tools(ToolsCommand::Switch { tool, on: false, scope: ToolScope::User }, _) if tool == "web"
+    ));
+    saved(&mut f);
+    assert_eq!(
+        f.model.picker.as_ref().unwrap().selected,
+        0,
+        "the cursor stays on the row switched"
+    );
+    input::handle_key(&mut f.model, key(KeyCode::Down));
+    let before = sent(&f);
+    input::handle_key(&mut f.model, key(KeyCode::Char(' ')));
+    assert_eq!(
+        sent(&f),
+        before,
+        "Just me cannot undo what this project turned off"
+    );
+    assert!(
+        f.model
+            .items
+            .iter()
+            .any(|entry| format!("{:?}", entry.item).contains("Tab to This project")),
+        "it says where to go instead"
+    );
+    input::handle_key(&mut f.model, key(KeyCode::Tab));
+    input::handle_key(&mut f.model, key(KeyCode::Char(' ')));
+    assert!(matches!(
+        &f.model.remote.as_ref().unwrap().pending.back().unwrap().effect,
+        Effect::Tools(ToolsCommand::Switch { tool, on: true, scope: ToolScope::Project }, _) if tool == "lsp.start"
+    ));
+    saved(&mut f);
+    // Just me, for an MCP tool, is its server's own setting, the one /mcp edits too.
+    input::handle_key(&mut f.model, key(KeyCode::Tab));
+    input::handle_key(&mut f.model, key(KeyCode::Down));
+    input::handle_key(&mut f.model, key(KeyCode::Char(' ')));
+    assert!(matches!(
+        &f.model.remote.as_ref().unwrap().pending.back().unwrap().effect,
+        Effect::Mcp(protocol::McpCommand::Expose { id, tool, exposed: false }, _)
+            if id == "github" && tool == "merge_pull_request"
+    ));
+}

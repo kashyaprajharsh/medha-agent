@@ -40,6 +40,12 @@ pub struct Config {
     /// User-scoped, secret-free MCP definitions.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
+    /// Tools hidden in every project; a project's `medha.lock` can only narrow further.
+    #[serde(
+        default,
+        skip_serializing_if = "kernel::tool_pattern::ToolFilter::is_empty"
+    )]
+    pub tools: kernel::tool_pattern::ToolFilter,
     /// ChatGPT sign-ins without their tokens, which stay in the credential store.
     #[serde(
         default,
@@ -2176,6 +2182,19 @@ mod env_key;
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn hidden_tools_survive_a_settings_save_and_an_empty_rule_writes_nothing() {
+        let configured: Config = toml::from_str("[tools]\ndeny = [\"web\", \"lsp*\"]\n").unwrap();
+        let reloaded: Config =
+            toml::from_str(&toml::to_string_pretty(&configured).unwrap()).unwrap();
+        assert_eq!(reloaded.tools.deny, ["web", "lsp*"]);
+        assert!(
+            !toml::to_string_pretty(&Config::default())
+                .unwrap()
+                .contains("[tools]")
+        );
+    }
 
     #[test]
     fn compression_profile_is_optional_and_round_trips_independently_of_vision() {

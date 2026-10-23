@@ -57,6 +57,32 @@ pub(super) fn handle(model: &mut Model, key: KeyEvent) -> bool {
                 }
                 return true;
             }
+            // Space or Enter switches the selected tool for the scope shown; Enter on Back closes.
+            KeyCode::Char(' ') | KeyCode::Enter
+                if matches!(&picker.kind, PickerKind::Tools { .. }) =>
+            {
+                if let PickerKind::Tools { scope, tools } = &picker.kind {
+                    match tools.get(picker.selected).cloned() {
+                        Some(tool) => {
+                            let scope = *scope;
+                            flip(model, scope, &tool);
+                        }
+                        None if key.code == KeyCode::Enter => model.picker = None,
+                        None => {}
+                    }
+                }
+                return true;
+            }
+            // Tab changes which settings the switches change; what is off, and why, stays as it is.
+            KeyCode::Tab => {
+                if let PickerKind::Tools { scope, .. } = &mut picker.kind {
+                    *scope = match scope {
+                        protocol::ToolScope::User => protocol::ToolScope::Project,
+                        protocol::ToolScope::Project => protocol::ToolScope::User,
+                    };
+                    return true;
+                }
+            }
             // `t` opens the selected server's catalogue.
             KeyCode::Char('t') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
                 let id = if let PickerKind::Mcp(rows) = &picker.kind {

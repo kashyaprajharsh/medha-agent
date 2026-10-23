@@ -62,6 +62,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "MCP servers — manage · connect · remove · add  ·  /mcp catalog <search> to browse the registry",
     ),
     (
+        "/tools",
+        "switch tools on or off for new chats, for you or for this project",
+    ),
+    (
         "/agents",
         "manage agents · /agents tree · /agents steer … · /agents followup …",
     ),

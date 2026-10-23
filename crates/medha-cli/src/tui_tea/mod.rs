@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 mod backend_features;
 mod backend_plugins;
+mod backend_tools;
 pub(crate) mod backend_ui;
 mod connect;
 mod connect_view;
@@ -863,6 +864,12 @@ enum PickerKind {
         id: String,
         tools: Vec<(String, bool)>,
     },
+    /// `/tools`: every tool new chats could have. Space or Enter switches one for
+    /// `scope`; Tab changes the scope.
+    Tools {
+        scope: protocol::ToolScope,
+        tools: Vec<protocol::ToolSwitch>,
+    },
     /// `/agents`: what has been delegated. `d` stops a running child; `a`
     /// applies a finished writer's patch.
     Agents(Vec<AgentRow>),
@@ -1045,6 +1052,7 @@ impl PickerKind {
                     tools.len()
                 )
             }
+            PickerKind::Tools { scope, tools } => backend_tools::title(*scope, tools),
             PickerKind::Agents(rows) => {
                 let running = rows
                     .iter()
@@ -1356,6 +1364,7 @@ impl PickerKind {
                 .map(|(name, on)| format!("{} {name}", if *on { "●" } else { "○" }))
                 .chain(std::iter::once("← Back".to_string()))
                 .collect(),
+            PickerKind::Tools { scope, tools } => backend_tools::labels(*scope, tools),
             // Row 0 is always "install from a link" (never a dead end); the rest
             // are the browsable catalog, one row per skill.
             PickerKind::SkillSearch(hits) => {

@@ -76,11 +76,17 @@ approve = ["edit", "skill.save"]
 # re-sent on every request of every turn, so the catalogue is a fixed tax on the
 # whole session whether or not it gets used.
 #   preset = "full"     (default) → everything registered
-#           = "minimal"           → read, edit, shell.exec, grep, glob
+#           = "minimal"           → read, write, edit, shell.exec, grep, glob
 # Minimal suits small models and short runs: anything the specialised tools do
 # is still reachable through the shell, at the cost of more model work. Override
 # for one run with MEDHA_TOOLS=minimal.
 preset = "full"
+# Narrow further by name. An entry is a tool name or a prefix ending in one *,
+# such as "lsp*", "task.*" or "mcp__github__*". allow keeps only what it names;
+# deny removes; deny always wins. Neither can add a tool the preset leaves out.
+# The same keys under [tools] in ~/.medha/config.toml apply to every project.
+# allow = ["read", "grep", "mcp__db__*"]
+# deny  = ["web"]
 
 [sandbox]
 # Execution isolation for shell, build, and VCS commands.

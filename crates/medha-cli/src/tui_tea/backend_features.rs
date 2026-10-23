@@ -111,6 +111,7 @@ fn lsp_inventory_line(payload: &serde_json::Value) -> String {
     text
 }
 
+use super::backend_tools::open_tools_picker;
 use super::backend_ui::{After, Draft, Effect, request};
 use super::*;
 use protocol::{
@@ -443,6 +444,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::Plugins(args) => backend_plugins::run_command(model, &args),
         A::Hooks(args) => backend_plugins::hooks_command(model, &args),
         A::Mcp => open_mcp_picker(model),
+        A::Tools => open_tools_picker(model, protocol::ToolScope::User),
         A::McpStart(id) => start_mcp_server(model, &id),
         A::McpAdd(args) => mcp_add(model, &args),
         A::McpCatalog(query) => search_mcp_catalog(model, &query),
@@ -2359,23 +2361,18 @@ pub(super) fn mcp_reply(model: &mut Model, reply: protocol::McpResult, after: Af
                 }
             }
         }
-        protocol::McpResult::Changed => {
-            if matches!(
-                model.picker.as_ref().map(|picker| &picker.kind),
-                Some(PickerKind::McpTools { .. })
-            ) {
-                if let Some(Picker {
-                    kind: PickerKind::McpTools { id, .. },
-                    ..
-                }) = &model.picker
-                {
-                    let id = id.clone();
-                    open_mcp_tools(model, &id);
-                }
-            } else {
-                open_mcp_picker(model);
+        protocol::McpResult::Changed => match model.picker.as_ref().map(|picker| &picker.kind) {
+            Some(PickerKind::McpTools { id, .. }) => {
+                let id = id.clone();
+                open_mcp_tools(model, &id);
             }
-        }
+            // An MCP tool switched from `/tools` goes back to `/tools`.
+            Some(PickerKind::Tools { scope, .. }) => {
+                let scope = *scope;
+                open_tools_picker(model, scope);
+            }
+            _ => open_mcp_picker(model),
+        },
     }
 }
 

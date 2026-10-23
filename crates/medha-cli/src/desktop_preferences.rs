@@ -11,6 +11,52 @@ fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("{key} is required"))
 }
+/// Turns one tool on or off for new chats, in your settings or in this project's `medha.lock`.
+pub(crate) fn switch_tool(
+    workspace: &Path,
+    tool: &str,
+    on: bool,
+    scope: protocol::ToolScope,
+) -> Result<()> {
+    match scope {
+        protocol::ToolScope::User => {
+            // One place per MCP tool: its server's own setting, which that server's page also edits.
+            if mcp::McpManager::is_mcp_tool(tool) {
+                bail!("Switch an MCP tool on its server's settings");
+            }
+            config::edit(|cfg| {
+                cfg.tools.deny.retain(|entry| entry != tool);
+                if !on {
+                    cfg.tools.deny.push(tool.to_owned());
+                }
+                if cfg.tools.denies(tool) == on {
+                    bail!("Your settings turn {tool} off with a pattern; change it in config.toml");
+                }
+                Ok(())
+            })
+        }
+        protocol::ToolScope::Project => edit_lock(workspace, |current| {
+            crate::lock_edit::set_tool_denied(current, tool, !on)
+        }),
+    }
+}
+/// Rewrites the project's `medha.lock` through `change`, replacing it whole so a reader never sees half of it.
+fn edit_lock(workspace: &Path, change: impl FnOnce(&str) -> Result<String>) -> Result<()> {
+    let path = workspace.join("medha.lock");
+    if path.is_symlink() {
+        bail!("medha.lock is a symbolic link; change it in your editor");
+    }
+    let current = match std::fs::read_to_string(&path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let edited = change(&current)?;
+    let temporary = path.with_extension(format!("tmp-{}", ulid::Ulid::new()));
+    std::fs::write(&temporary, edited)?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(())
+}
 fn plugin_store(workspace: &Path) -> Result<extensions::Store> {
     Ok(plugins_cmd::store(
         &config::medha_home()?,
@@ -414,19 +460,20 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             }))
         }
         "settings.tools.save" => {
-            let path = workspace.join("medha.lock");
-            if path.is_symlink() {
-                bail!("medha.lock is a symbolic link; change it in your editor");
-            }
-            let current = match std::fs::read_to_string(&path) {
-                Ok(current) => current,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(error.into()),
-            };
-            let edited = crate::lock_edit::set_tools_preset(&current, text(params, "preset")?)?;
-            let temporary = path.with_extension(format!("tmp-{}", ulid::Ulid::new()));
-            std::fs::write(&temporary, edited)?;
-            std::fs::rename(&temporary, &path)?;
+            let preset = text(params, "preset")?;
+            edit_lock(workspace, |current| {
+                crate::lock_edit::set_tools_preset(current, preset)
+            })?;
+            Ok(json!({"saved": true}))
+        }
+        "settings.tools.switch" => {
+            let tool = text(params, "tool")?;
+            let on = params["on"]
+                .as_bool()
+                .ok_or_else(|| anyhow!("on must be true or false"))?;
+            let scope = serde_json::from_value(params["scope"].clone())
+                .map_err(|_| anyhow!("scope must be user or project"))?;
+            switch_tool(workspace, tool, on, scope)?;
             Ok(json!({"saved": true}))
         }
         "settings.health" => {

@@ -730,7 +730,7 @@ pub struct LiveVerifier {
     timeout: std::time::Duration,
 }
 
-struct Quiet;
+pub(crate) struct Quiet;
 impl crate::Notices for Quiet {
     fn say(&self, _: &str) {}
 }

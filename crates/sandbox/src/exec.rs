@@ -4449,14 +4449,17 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// Windows sets no `HOME`; without one, credential folders must still be refused, never offered as a grant.
+    /// A service or server may run without `HOME`; credential folders must still be refused, never offered as a grant.
     #[test]
     fn credentials_stay_protected_when_home_is_unset() {
         const CHILD: &str = "MEDHA_NO_HOME_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let home = dirs::home_dir().expect("the user profile names a home");
-            assert!(!path_grant_is_safe(&home.join(".ssh")));
-            assert!(!path_grant_is_safe(&home.join(".medha")));
+            for secret in [".ssh", ".medha"] {
+                // Callers resolve a path before asking, so the test does too.
+                let asked = resolve_native_policy_path(&home.join(secret)).unwrap();
+                assert!(!path_grant_is_safe(&asked), "{secret}");
+            }
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())

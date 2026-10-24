@@ -9,6 +9,7 @@ import {
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { App } from "./App";
+import { MAC } from "./shortcut";
 import {
   createApi,
   desktop,
@@ -73,7 +74,7 @@ export function WorkspaceHost() {
   const theme = mode === "system" ? (systemDark ? "dark" : "light") : mode;
   useEffect(() => {
     const root = document.documentElement;
-    root.dataset.platform = /Mac/.test(navigator.userAgent) ? "mac" : "other";
+    root.dataset.platform = MAC ? "mac" : "other";
     root.dataset.switching = "";
     root.dataset.theme = theme;
     root.dataset.look = look;

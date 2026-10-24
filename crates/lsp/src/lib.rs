@@ -2144,7 +2144,7 @@ impl LspClient {
         );
         if !config.allow_network && backend.label() == "host" {
             return Err(Error::Sandbox(
-                "network-denied native isolation is unavailable; explicitly set lsp.allow_network = true to run without it"
+                "language servers run with the network blocked, and this system has no sandbox to block it; to run them anyway, trust this project and set lsp.allow_network = true in its medha.lock"
                     .into(),
             ));
         }

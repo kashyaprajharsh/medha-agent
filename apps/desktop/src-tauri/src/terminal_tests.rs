@@ -274,7 +274,7 @@ fn real_shell_has_a_tty_workspace_unicode_resize_and_interrupts() {
     let _alone = SHELL_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let workspace = std::env::temp_dir().canonicalize().unwrap();
+    let workspace = dunce::canonicalize(std::env::temp_dir()).unwrap();
     let terminals = Terminals::new(workspace.clone());
     let rx = shell(&terminals, "interactive");
     // An interactive shell may discard input typed before its first prompt.

@@ -10,6 +10,7 @@ import { Icon } from "./Icon";
 import type { LiveState } from "./live";
 import { Preview } from "./OutputPreview";
 import { SubagentPanel } from "./SubagentPanel";
+import { shortcut } from "./shortcut";
 import {
   doingLine,
   outcomeLabel,
@@ -190,7 +191,7 @@ export function WorkSurface(props: Props) {
           type="button"
           className="icon-btn"
           onClick={props.onClose}
-          title="Close · ⌘."
+          title={`Close · ${shortcut(".")}`}
           aria-label="Close work surface"
         >
           <Icon name="x" />

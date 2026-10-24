@@ -9,10 +9,7 @@ const MAX_TEXT: u64 = 2 * 1024 * 1024;
 const MAX_BINARY: u64 = 24 * 1024 * 1024;
 
 pub fn resolve(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let path = root
-        .join(requested)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
+    let path = dunce::canonicalize(root.join(requested)).map_err(|e| e.to_string())?;
     if !path.starts_with(root) {
         return Err("This file is outside the selected workspace".into());
     }
@@ -31,7 +28,7 @@ pub fn list(root: &Path, directory: &str) -> Result<Value, String> {
         if matches!(name.as_str(), ".git" | "node_modules" | "target") {
             continue;
         }
-        let Ok(path) = entry.path().canonicalize() else {
+        let Ok(path) = dunce::canonicalize(entry.path()) else {
             continue;
         };
         if !path.starts_with(root) {
@@ -155,7 +152,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("workspace")).unwrap();
         fs::write(root.join("outside.md"), "secret").unwrap();
-        let workspace = root.join("workspace").canonicalize().unwrap();
+        let workspace = dunce::canonicalize(root.join("workspace")).unwrap();
         fs::write(
             workspace.join("report.md"),
             "# Report\n\n<script>bad()</script>",

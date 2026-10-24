@@ -19,6 +19,7 @@ ulid.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "rt"] }
 permissions = { path = "../permissions" }
+dirs = "5"
 kernel = { path = "../kernel" }
 shell-reader = { path = "../shell-reader" }
 sha2 = "0.10"

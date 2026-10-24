@@ -4,9 +4,7 @@ use super::*;
 /// folder inside the workspace: no name in a manifest can reach anything else.
 #[test]
 fn a_saved_page_reads_only_its_own_folder_as_it_is_now() {
-    let root = test_support::scratch("desktop-current-assets")
-        .canonicalize()
-        .unwrap();
+    let root = dunce::canonicalize(test_support::scratch("desktop-current-assets")).unwrap();
     let site = root.join("site");
     std::fs::create_dir_all(site.join("css")).unwrap();
     std::fs::write(site.join("css/style.css"), "h1{color:blue}").unwrap();

@@ -98,18 +98,46 @@ pub fn open_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+#[cfg(not(windows))]
 pub fn open_path(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let program = "open";
-    #[cfg(windows)]
-    let program = "explorer.exe";
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(target_os = "macos"))]
     let program = "xdg-open";
     Command::new(program)
         .arg(path)
         .spawn()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Windows opens a file or link with its default app; explorer.exe would misread a link's query as its own switches.
+#[cfg(windows)]
+pub fn open_path(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    let target: Vec<u16> = dunce::simplified(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW reports success as a value above 32, and a failure as its error code.
+    match result as usize {
+        code if code > 32 => Ok(()),
+        code => Err(format!("Windows could not open it (error {code})")),
+    }
 }
 
 pub fn reveal(path: &Path) -> Result<(), String> {
@@ -121,8 +149,9 @@ pub fn reveal(path: &Path) -> Result<(), String> {
     };
     #[cfg(windows)]
     let mut command = {
+        use std::os::windows::process::CommandExt;
         let mut command = Command::new("explorer.exe");
-        command.arg(format!("/select,{}", path.display()));
+        command.raw_arg(format!("/select,\"{}\"", dunce::simplified(path).display()));
         command
     };
     #[cfg(not(any(target_os = "macos", windows)))]

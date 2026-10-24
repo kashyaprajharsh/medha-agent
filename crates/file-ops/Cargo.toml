@@ -10,4 +10,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
+dunce = "1"
+windows-sys = { version = "0.60", features = [
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }

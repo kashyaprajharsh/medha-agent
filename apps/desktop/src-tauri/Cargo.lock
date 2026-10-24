@@ -867,6 +867,7 @@ dependencies = [
 name = "file-ops"
 version = "0.1.11"
 dependencies = [
+ "dunce",
  "windows-sys 0.60.2",
 ]
 
@@ -2067,6 +2068,7 @@ version = "0.1.11"
 dependencies = [
  "base64 0.22.1",
  "dirs",
+ "dunce",
  "file-ops",
  "getrandom 0.3.4",
  "git-safety",

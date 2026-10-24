@@ -1,6 +1,7 @@
 import type { Session } from "./api";
 import { type ReactNode, useId, useState } from "react";
 import { Icon } from "./Icon";
+import { shortcut } from "./shortcut";
 
 export const medhaIcon = new URL("./assets/medha-logo.png", import.meta.url)
   .href;
@@ -104,12 +105,12 @@ export function Sidebar(props: Props) {
         >
           <Icon name="plus" />
           <span>New session</span>
-          <kbd>⌘N</kbd>
+          <kbd>{shortcut("N")}</kbd>
         </button>
         <button type="button" className="side-btn" onClick={props.onPalette}>
           <Icon name="search" />
           <span>Search and commands</span>
-          <kbd>⌘K</kbd>
+          <kbd>{shortcut("K")}</kbd>
         </button>
       </div>
       <div className="side-heading">

@@ -50,7 +50,7 @@ pub fn executable() -> Result<PathBuf, String> {
     let name = if cfg!(windows) { "medha.exe" } else { "medha" };
     if let Some(path) = std::env::current_exe()
         .ok()
-        .and_then(|path| path.canonicalize().ok())
+        .and_then(|path| dunce::canonicalize(path).ok())
         .and_then(|path| path.parent().map(|parent| parent.join(name)))
         .filter(|path| path.is_file())
     {

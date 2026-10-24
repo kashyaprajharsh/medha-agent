@@ -1190,6 +1190,7 @@ dependencies = [
 name = "file-ops"
 version = "0.1.11"
 dependencies = [
+ "dunce",
  "windows-sys 0.60.2",
 ]
 
@@ -3994,6 +3995,7 @@ name = "sandbox"
 version = "0.1.11"
 dependencies = [
  "async-trait",
+ "dirs 5.0.1",
  "errno",
  "git-safety",
  "kernel",

@@ -1887,7 +1887,7 @@ impl IsolatedHome {
         {
             use std::os::unix::fs::{PermissionsExt, symlink};
             let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
-            if let Some(real_home) = home_dir_from_env() {
+            if let Some(real_home) = home_dir() {
                 // Read-only toolchain payloads remain usable. Native policies
                 // grant their real targets read/execute, never write; credential
                 // files such as ~/.cargo/credentials are not linked or allowed.
@@ -2008,16 +2008,14 @@ impl Drop for IsolatedHome {
     }
 }
 
-fn home_dir_from_env() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|path| path.canonicalize().unwrap_or(path))
+/// The same home the permissions crate protects; Windows sets no `HOME`, so it comes from the user profile.
+fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|path| path.canonicalize().unwrap_or(path))
 }
 
 /// Medha's own state: `~/.medha`, and the folder `MEDHA_HOME` names when it is set.
 fn state_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = home_dir_from_env()
+    let mut dirs: Vec<PathBuf> = home_dir()
         .map(|home| home.join(".medha"))
         .into_iter()
         .collect();
@@ -2031,7 +2029,7 @@ fn state_dirs() -> Vec<PathBuf> {
 }
 
 fn native_sensitive_paths() -> Vec<PathBuf> {
-    let Some(home) = home_dir_from_env() else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
     // Commands also lose all of Medha's state, wherever it is kept; what the
@@ -2418,7 +2416,7 @@ fn apply_isolated_environment(cmd: &mut tokio::process::Command, home: &Isolated
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn native_toolchain_read_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = home_dir_from_env() {
+    if let Some(home) = home_dir() {
         for relative in [
             ".cargo/bin",
             ".cargo/registry",
@@ -4451,11 +4449,39 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Windows sets no `HOME`; without one, credential folders must still be refused, never offered as a grant.
+    #[test]
+    fn credentials_stay_protected_when_home_is_unset() {
+        const CHILD: &str = "MEDHA_NO_HOME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let home = dirs::home_dir().expect("the user profile names a home");
+            assert!(!path_grant_is_safe(&home.join(".ssh")));
+            assert!(!path_grant_is_safe(&home.join(".medha")));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::tests::credentials_stay_protected_when_home_is_unset",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// A denial naming a browser profile must never become an offer to open it.
     #[cfg(unix)]
     #[test]
     fn a_denied_browser_profile_is_never_offered_as_a_grant() {
-        let Some(home) = home_dir_from_env() else {
+        let Some(home) = home_dir() else {
             return;
         };
         let ws = std::env::temp_dir().join(format!("medha-browser-ws-{}", ulid::Ulid::new()));
@@ -4574,7 +4600,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_profile_is_read_deny_by_default_and_filters_sensitive_writes() {
-        let sensitive = home_dir_from_env()
+        let sensitive = home_dir()
             .unwrap_or_else(|| PathBuf::from("/Users/example"))
             .join(".ssh");
         let backend =
@@ -4669,7 +4695,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn native_sandbox_includes_installed_version_manager_payloads() {
-        let Some(home) = home_dir_from_env() else {
+        let Some(home) = home_dir() else {
             return;
         };
         let roots = native_toolchain_read_roots();
@@ -4696,7 +4722,7 @@ mod tests {
         if !native_sandbox_supported() {
             return;
         }
-        let Some(home) = home_dir_from_env() else {
+        let Some(home) = home_dir() else {
             return;
         };
         let Ok(versions) = std::fs::read_dir(home.join(".pyenv/versions")) else {
@@ -4820,7 +4846,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn escalation_candidates_never_offer_credential_paths() {
-        let Some(home) = home_dir_from_env() else {
+        let Some(home) = home_dir() else {
             return;
         };
         let ssh = home.join(".ssh");
@@ -4914,7 +4940,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn request_scoped_reads_defensively_reject_sensitive_roots() {
-        let Some(home) = home_dir_from_env() else {
+        let Some(home) = home_dir() else {
             return;
         };
         assert!(safe_request_readable(&[home.join(".ssh")]).is_empty());

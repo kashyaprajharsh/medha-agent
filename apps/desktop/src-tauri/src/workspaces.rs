@@ -123,12 +123,16 @@ impl Workspaces {
             vec![]
         };
         entries.retain(|w| !w.personal && w.id != "personal");
+        // Projects saved before paths were simplified on Windows still read `\\?\C:\…`.
+        for entry in &mut entries {
+            entry.path = dunce::simplified(&entry.path).to_path_buf();
+        }
         entries.insert(
             0,
             Workspace {
                 id: "personal".into(),
                 name: "Chats".into(),
-                path: personal.canonicalize().map_err(|e| e.to_string())?,
+                path: dunce::canonicalize(&personal).map_err(|e| e.to_string())?,
                 personal: true,
             },
         );
@@ -159,7 +163,7 @@ impl Workspaces {
         )
     }
     pub fn add(&self, path: PathBuf) -> Result<Workspace, String> {
-        let path = path.canonicalize().map_err(|e| e.to_string())?;
+        let path = dunce::canonicalize(path).map_err(|e| e.to_string())?;
         if !path.is_dir() {
             return Err("Choose a folder".into());
         }
@@ -299,7 +303,7 @@ impl Workspaces {
                 return self.runtime(path);
             }
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-            let path = path.canonicalize().map_err(|e| e.to_string())?;
+            let path = dunce::canonicalize(path).map_err(|e| e.to_string())?;
             if !path.starts_with(&workspace.path) {
                 return Err("Personal chat folder is outside the library".into());
             }

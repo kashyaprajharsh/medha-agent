@@ -106,8 +106,9 @@ function EditRow({ edit, initiallyOpen }: { edit: FileEdit; initiallyOpen: boole
 }
 
 function shortPath(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 3 ? `…/${parts.slice(-3).join("/")}` : path;
+  const slash = path.includes("\\") ? "\\" : "/";
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length > 3 ? `…${slash}${parts.slice(-3).join(slash)}` : path;
 }
 
 function ChangedFile({

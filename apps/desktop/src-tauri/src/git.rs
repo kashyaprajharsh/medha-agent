@@ -73,7 +73,9 @@ fn repository(dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
             .map_err(|e| e.to_string())?
             .trim_end_matches(['\r', '\n']),
     );
-    root.canonicalize().map(Some).map_err(|e| e.to_string())
+    dunce::canonicalize(root)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 /// Changes under `dir`. A folder that is not itself a repository, such as one
 /// holding several projects, reports the repositories directly inside it.
@@ -111,7 +113,7 @@ fn nested_repositories(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     children.truncate(NESTED_LIMIT);
     Ok(children
         .into_iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| dunce::canonicalize(path).ok())
         .filter(|path| path.starts_with(dir))
         .collect())
 }
@@ -222,7 +224,7 @@ mod working_tests {
         let root = std::env::temp_dir().join(format!("medha-git-preview-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("sub")).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = dunce::canonicalize(root).unwrap();
         assert_eq!(status(&root).unwrap()["repository"], false);
         assert_eq!(run(&root, &["init", "-q"]).unwrap().0, 0);
         fs::write(root.join("sub/new report.md"), "# report\n").unwrap();
@@ -251,7 +253,7 @@ mod working_tests {
                 .unwrap()
                 .contains("+# amended")
         );
-        let sub = root.join("sub").canonicalize().unwrap();
+        let sub = dunce::canonicalize(root.join("sub")).unwrap();
         assert_eq!(status(&sub).unwrap()["files"][0]["path"], "new report.md");
         fs::remove_file(root.join("sub/new report.md")).unwrap();
         assert!(
@@ -270,7 +272,7 @@ mod working_tests {
         let _ = fs::remove_dir_all(&parent);
         fs::create_dir_all(parent.join("antarman/docs")).unwrap();
         fs::create_dir_all(parent.join("notes")).unwrap();
-        let parent = parent.canonicalize().unwrap();
+        let parent = dunce::canonicalize(parent).unwrap();
         let repo = parent.join("antarman");
         assert_eq!(run(&repo, &["init", "-q"]).unwrap().0, 0);
         fs::write(repo.join("docs/spec.json"), "{}\n").unwrap();

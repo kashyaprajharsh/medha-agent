@@ -28,6 +28,7 @@ import { WorkSurface, type SurfaceTab } from "./WorkSurface";
 import { OutputScope } from "./OutputScope";
 import type { OutputAbout } from "./outputBlocks";
 import { toBlocks, type SubagentRun } from "./timeline";
+import { shortcut } from "./shortcut";
 import { Transcript } from "./Transcript";
 import { UpdateReady } from "./UpdateReady";
 import { useLive } from "./useLive";
@@ -742,21 +743,21 @@ export function App() {
       id: "sidebar",
       icon: "panel",
       label: sidebarOpen ? "Hide sessions" : "Show sessions",
-      hint: "⌘B",
+      hint: shortcut("B"),
       run: () => setSidebarOpen(!sidebarOpen),
     },
     {
       id: "new",
       icon: "plus",
       label: "New session",
-      hint: "⌘N",
+      hint: shortcut("N"),
       run: startNew,
     },
     {
       id: "theme",
       icon: theme === "dark" ? "sun" : "moon",
       label: theme === "dark" ? "Switch to parchment" : "Switch to ink",
-      hint: "⇧⌘L",
+      hint: shortcut("L", true),
       run: () => setTheme(theme === "dark" ? "light" : "dark"),
     },
     {
@@ -882,7 +883,7 @@ export function App() {
             aria-expanded={sidebarOpen}
             aria-controls="session-sidebar"
             aria-label={sidebarOpen ? "Hide sessions" : "Show sessions"}
-            title={sidebarOpen ? "Hide sessions · ⌘B" : "Show sessions · ⌘B"}
+            title={`${sidebarOpen ? "Hide sessions" : "Show sessions"} · ${shortcut("B")}`}
           >
             <Icon name="panel" />
           </button>
@@ -936,7 +937,7 @@ export function App() {
               onClick={() => setSurface(surface ? null : "agents")}
               aria-pressed={Boolean(surface)}
               aria-label="Toggle work surface"
-              title="Work surface · ⌘."
+              title={`Work surface · ${shortcut(".")}`}
             >
               <Icon name="panel" />
             </button>

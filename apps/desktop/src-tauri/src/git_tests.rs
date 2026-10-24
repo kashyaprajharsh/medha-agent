@@ -54,7 +54,7 @@ fn outside_a_repository_there_is_no_branch() {
 #[test]
 fn a_repositorys_own_config_cannot_run_a_program() {
     use std::process::Command;
-    let root = scratch("hostile").canonicalize().unwrap();
+    let root = dunce::canonicalize(scratch("hostile")).unwrap();
     let (repo, marker) = (root.join("repo"), root.join("ran"));
     let nested = repo.join("nested");
     fs::create_dir_all(&nested).unwrap();

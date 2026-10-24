@@ -124,7 +124,7 @@ fn target_at(text: &str, column: usize) -> Option<OpenTarget> {
         return None;
     }
     let path = match bare.strip_prefix("~/") {
-        Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        Some(rest) => dirs::home_dir()?.join(rest),
         None => std::path::PathBuf::from(bare),
     };
     let path = if path.is_absolute() {

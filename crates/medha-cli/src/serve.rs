@@ -236,7 +236,18 @@ fn allow_many_open_files() {
     }
 }
 
-pub async fn run(_args: &[String]) -> anyhow::Result<()> {
+const USAGE: &str =
+    "usage: medha serve\n\nRuns the backend that the TUI, the desktop app and editors attach to.";
+
+pub async fn run(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("medha serve takes no arguments, not `{other}`\n\n{USAGE}"),
+    }
     #[cfg(unix)]
     allow_many_open_files();
     let positive = |name: &str, default: u64| -> anyhow::Result<u64> {

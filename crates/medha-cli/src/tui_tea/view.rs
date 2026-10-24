@@ -1785,19 +1785,33 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
         );
         return;
     }
+    // While the card is open it shows what is typed and holds the cursor; this box only points to it.
+    if model
+        .model_setup
+        .as_ref()
+        .is_some_and(|setup| setup.screen.is_some())
+    {
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{glyph} "),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Connecting a model: the card above takes your keys",
+                Style::default().fg(theme::faint()),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), inner);
+        return;
+    }
     if input.is_empty() && !model.running {
         if let Some(setup) = &model.model_setup {
-            let prompt = if setup.screen.is_some() {
-                "Connecting a model: the card above takes your keys".to_owned()
-            } else {
-                setup.prompt()
-            };
             let line = Line::from(vec![
                 Span::styled(
                     format!("{glyph} "),
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(prompt, Style::default().fg(theme::faint())),
+                Span::styled(setup.prompt(), Style::default().fg(theme::faint())),
             ]);
             f.render_widget(Paragraph::new(line), inner);
             f.set_cursor_position(ratatui::layout::Position::new(inner.x + 2, inner.y));

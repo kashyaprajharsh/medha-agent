@@ -96,13 +96,20 @@ fn type_text(model: &mut Model, text: &str) {
 
 /// The card as a terminal of this size shows it, one string per row.
 fn drawn(model: &Model, width: u16, height: u16) -> Vec<String> {
+    drawn_with_cursor(model, width, height).0
+}
+
+/// The card as drawn, and the cell the terminal's own cursor sits on (0, 0 when none is shown).
+fn drawn_with_cursor(model: &Model, width: u16, height: u16) -> (Vec<String>, (usize, usize)) {
+    use ratatui::backend::Backend;
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| crate::tui_tea::connect_view::draw(f, model, Rect::new(0, height - 2, width, 2)))
         .unwrap();
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     let buffer = terminal.backend().buffer().clone();
-    (0..height)
+    let rows = (0..height)
         .map(|y| {
             (0..width)
                 .map(|x| buffer[(x, y)].symbol().to_owned())
@@ -110,7 +117,16 @@ fn drawn(model: &Model, width: u16, height: u16) -> Vec<String> {
                 .trim_end()
                 .to_owned()
         })
-        .collect()
+        .collect();
+    (rows, (cursor.x as usize, cursor.y as usize))
+}
+
+/// The character under the terminal's cursor: where the next typed key will appear.
+fn under_cursor(model: &Model) -> (String, char) {
+    let (rows, (x, y)) = drawn_with_cursor(model, 100, 24);
+    let row = rows[y].clone();
+    let at = row.chars().nth(x).unwrap_or(' ');
+    (row, at)
 }
 
 fn pending(f: &Fixture) -> Vec<&Effect> {
@@ -353,6 +369,70 @@ async fn found_models_are_listed_with_prices_and_enter_saves_the_highlighted_one
     assert_eq!(saved.model, "gpt-6-luna");
     assert_eq!(saved.context_limit, Some(1_050_000));
     assert_eq!(saved.provider_id.as_deref(), Some("openai"));
+}
+
+/// A pasted key lands in the card, and the box below must not show a blinking cursor that says otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_pasted_on_a_provider_card_lands_in_the_card_not_the_box_below() {
+    use ratatui::backend::Backend;
+    let mut f = fixture().await;
+    catalogue(&mut f);
+    backend_features::begin_model_setup(&mut f.model);
+    press(&mut f.model, KeyCode::Down);
+    press(&mut f.model, KeyCode::Down);
+    press(&mut f.model, KeyCode::Enter);
+    input::handle_paste(&mut f.model, "sk-pasted-key".into());
+    assert_eq!(
+        f.model.model_setup.as_ref().unwrap().editor.text,
+        "sk-pasted-key"
+    );
+    let (row, at) = under_cursor(&f.model);
+    assert!(row.contains("› •••••••••••••"), "{row}");
+    assert_eq!(at, '▏', "the cursor is not where the key is typed: {row}");
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+    terminal
+        .draw(|frame| crate::tui_tea::view::draw_input(frame, &f.model, Rect::new(0, 2, 100, 3)))
+        .unwrap();
+    assert_eq!(
+        terminal.backend_mut().get_cursor_position().unwrap(),
+        ratatui::layout::Position::new(0, 0),
+        "the box below the card took the cursor"
+    );
+}
+
+/// The search line is a place the arrows reach, and the cursor waits there for typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_arrows_reach_the_search_line_and_the_cursor_waits_there() {
+    let mut f = fixture().await;
+    catalogue(&mut f);
+    backend_features::begin_model_setup(&mut f.model);
+    let in_search = |model: &Model| match model.model_setup.as_ref().unwrap().screen.as_ref() {
+        Some(connect::Screen::List(list)) => list.in_search,
+        _ => panic!("not on the list"),
+    };
+    let (row, at) = under_cursor(&f.model);
+    assert!(
+        row.contains("search or paste a key ›") && at == '▏',
+        "{row}"
+    );
+
+    press(&mut f.model, KeyCode::Up);
+    assert!(
+        in_search(&f.model),
+        "Up from the first row did not reach the search line"
+    );
+    press(&mut f.model, KeyCode::Down);
+    assert!(!in_search(&f.model), "Down did not return to the list");
+
+    press(&mut f.model, KeyCode::Char('/'));
+    assert!(in_search(&f.model), "/ did not move to the search line");
+    type_text(&mut f.model, "nv");
+    let (row, at) = under_cursor(&f.model);
+    assert!(
+        row.contains("search or paste a key › nv") && at == '▏',
+        "{row}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

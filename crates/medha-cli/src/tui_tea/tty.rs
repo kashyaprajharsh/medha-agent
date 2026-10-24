@@ -74,8 +74,47 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
             EnableBracketedPaste,
             EnableMouseCapture
         )?;
+        #[cfg(windows)]
+        console_input::read_key_records();
         let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         Ok((terminal, StrayRedirect {}))
+    }
+}
+
+/// The input reader understands Windows key records, not escape text: with virtual terminal
+/// input on, a paste or a terminal's reply would reach it as stray keys, Esc first.
+#[cfg(windows)]
+mod console_input {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+        SetConsoleMode,
+    };
+
+    static WAS_ON: AtomicBool = AtomicBool::new(false);
+
+    fn mode() -> Option<(windows_sys::Win32::Foundation::HANDLE, u32)> {
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut mode = 0;
+        (unsafe { GetConsoleMode(handle, &mut mode) } != 0).then_some((handle, mode))
+    }
+
+    pub(super) fn read_key_records() {
+        if let Some((handle, mode)) = mode()
+            && mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+            && unsafe { SetConsoleMode(handle, mode & !ENABLE_VIRTUAL_TERMINAL_INPUT) } != 0
+        {
+            WAS_ON.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Only the one setting goes back; the rest of the mode is whatever leaving raw mode left.
+    pub(super) fn restore() {
+        if WAS_ON.swap(false, Ordering::SeqCst)
+            && let Some((handle, mode)) = mode()
+        {
+            unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) };
+        }
     }
 }
 
@@ -83,6 +122,8 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
 /// terminal's own (private) handle, then undo the fd redirection.
 pub fn restore(terminal: &mut TuiTerminal, redirect: &mut StrayRedirect) {
     let _ = disable_raw_mode();
+    #[cfg(windows)]
+    console_input::restore();
     let _ = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
@@ -185,6 +226,8 @@ fn set_panic_hook_plain() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        console_input::restore();
         let _ = execute!(
             std::io::stdout(),
             DisableMouseCapture,

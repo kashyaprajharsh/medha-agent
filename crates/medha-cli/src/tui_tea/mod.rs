@@ -26,6 +26,7 @@ mod connect;
 mod connect_view;
 mod input;
 mod markdown;
+mod paste;
 mod spin;
 mod staged_images;
 #[cfg(test)]

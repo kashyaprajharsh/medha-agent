@@ -17,6 +17,8 @@ struct Card {
     lines: Vec<Line<'static>>,
     /// The line to keep in view when the card is taller than the space above the composer.
     focus: usize,
+    /// Where typing lands, as line and column, so the terminal's own cursor sits there.
+    caret: Option<(usize, usize)>,
 }
 
 fn faint(text: impl Into<String>) -> Span<'static> {
@@ -97,13 +99,11 @@ fn list_card(model: &Model, list: &List, width: usize) -> Card {
     } else {
         list.query.clone()
     };
+    let search = "search or paste a key › ";
+    let caret = Some((1, width_of(search) + width_of(&shown)));
     let mut lines = vec![
         Line::from(""),
-        Line::from(vec![
-            faint("search or paste a key › "),
-            bold(shown),
-            gold("▏"),
-        ]),
+        Line::from(vec![faint(search), bold(shown), gold("▏")]),
         Line::from(""),
     ];
     if let Some(key) = &list.carried {
@@ -136,9 +136,9 @@ fn list_card(model: &Model, list: &List, width: usize) -> Card {
         })));
         lines.push(Line::from(""));
     }
-    let mut focus = lines.len();
+    let mut focus = if list.in_search { 1 } else { lines.len() };
     for (i, entry) in all.iter().enumerate() {
-        let chosen = i == selected && entry.choosable() && !list.opening;
+        let chosen = i == selected && entry.choosable() && !list.opening && !list.in_search;
         if chosen {
             focus = lines.len();
         }
@@ -268,6 +268,7 @@ fn list_card(model: &Model, list: &List, width: usize) -> Card {
         keys: keys.into(),
         lines,
         focus,
+        caret,
     }
 }
 
@@ -377,6 +378,7 @@ fn provider_card(model: &Model, setup: &ModelSetup, provider: &Provider, width: 
             keys: "↑↓ move | Enter choose | Esc back".into(),
             lines,
             focus,
+            caret: None,
         };
     }
     let saved = model.remote.as_ref().is_some_and(|peer| {
@@ -432,6 +434,7 @@ fn provider_card(model: &Model, setup: &ModelSetup, provider: &Provider, width: 
         };
         lines.push(Line::from(faint(setup.prompt())));
         focus = lines.len();
+        let caret = Some((focus, width_of("› ") + width_of(&shown)));
         lines.push(Line::from(vec![gold("› "), bold(shown), gold("▏")]));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -443,6 +446,7 @@ fn provider_card(model: &Model, setup: &ModelSetup, provider: &Provider, width: 
             keys: "Enter continue | Esc back".into(),
             lines,
             focus,
+            caret,
         };
     }
     let busy = matches!(
@@ -466,11 +470,18 @@ fn provider_card(model: &Model, setup: &ModelSetup, provider: &Provider, width: 
             keys: "Esc back".into(),
             lines,
             focus,
+            caret: None,
         };
     }
     let shown = filtered(provider);
     let filter = provider.filter.as_deref();
     let mut header = vec![faint("  model   ")];
+    let caret = filter.map(|text| {
+        (
+            lines.len(),
+            width_of("  model   ") + width_of("filter › ") + width_of(text),
+        )
+    });
     match filter {
         Some(text) => header.extend([faint("filter › "), bold(text.to_owned()), gold("▏")]),
         None => header.push(faint("/ to filter")),
@@ -526,6 +537,7 @@ fn provider_card(model: &Model, setup: &ModelSetup, provider: &Provider, width: 
         keys: keys.into(),
         lines,
         focus,
+        caret,
     }
 }
 
@@ -567,6 +579,7 @@ fn waiting_card(link: &str, again: bool) -> Card {
         keys: "c copy link | o open again | Esc cancel".into(),
         lines,
         focus: 0,
+        caret: None,
     }
 }
 
@@ -594,6 +607,7 @@ fn plan_off_card(account: &protocol::ChatGptAccount) -> Card {
         keys: "Enter allow | Esc back".into(),
         lines,
         focus: 0,
+        caret: None,
     }
 }
 
@@ -658,6 +672,7 @@ fn plan_card(setup: &ModelSetup, plan: &Plan, width: usize) -> Card {
         keys: "↑↓ move | Enter add | s switch account | Esc back".into(),
         lines,
         focus,
+        caret: None,
     }
 }
 
@@ -728,6 +743,7 @@ fn accounts_card(
         keys: "↑↓ move | Enter use or sign in | o sign out | n add | Esc close".into(),
         lines,
         focus,
+        caret: None,
     }
 }
 
@@ -832,4 +848,14 @@ pub(super) fn draw(f: &mut Frame, model: &Model, input_area: Rect) {
         Paragraph::new(card.lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
+    if let Some((line, column)) = card.caret
+        && line >= scroll
+        && line - scroll < rows
+    {
+        let column = (column as u16).min(inner.width.saturating_sub(1));
+        f.set_cursor_position(ratatui::layout::Position::new(
+            inner.x + column,
+            inner.y + (line - scroll) as u16,
+        ));
+    }
 }

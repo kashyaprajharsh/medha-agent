@@ -888,11 +888,23 @@ pub(crate) async fn run(
             let paused = model.remote.as_ref().is_some_and(|p| p.recovering || p.ended);
             tokio::select! {
                 event = events.next() => { redraw = true; match event {
-                    Some(Ok(CtEvent::Key(key))) => input::handle_key(&mut model, key),
-                    Some(Ok(CtEvent::Paste(text))) => input::handle_paste(&mut model, text),
-                    Some(Ok(CtEvent::Mouse(mouse))) => match mouse.kind { MouseEventKind::ScrollUp => model.scroll_by(-2), MouseEventKind::ScrollDown => model.scroll_by(2), _ => input::handle_mouse(&mut model, mouse) },
-                    Some(Ok(CtEvent::Resize(_, h))) => { model.viewport_height = h as usize; model.text_selection = None; model.invalidate_all_renders(); },
-                    Some(Err(error)) => return Err(anyhow::Error::from(error)), None => break, _ => {}
+                    Some(Ok(first)) => {
+                        let mut burst = vec![first];
+                        // A paste sent as key presses arrives within milliseconds; a person never types that fast.
+                        if paste::may_start_burst(&burst[0]) {
+                            while burst.len() < paste::MOST_EVENTS {
+                                match tokio::time::timeout(paste::BURST_GAP, events.next()).await {
+                                    Ok(Some(Ok(next))) => burst.push(next),
+                                    Ok(Some(Err(error))) => return Err(anyhow::Error::from(error)),
+                                    Ok(None) | Err(_) => break,
+                                }
+                            }
+                        }
+                        for event in paste::coalesce(burst) {
+                            dispatch(&mut model, event);
+                        }
+                    }
+                    Some(Err(error)) => return Err(anyhow::Error::from(error)), None => break,
                 } },
                 completion = jobs.join_next(), if !jobs.is_empty() => if let Some(completion) = completion {
                     redraw = true;
@@ -2124,6 +2136,24 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
         },
     }
     model.dirty = true;
+}
+
+fn dispatch(model: &mut Model, event: CtEvent) {
+    match event {
+        CtEvent::Key(key) => input::handle_key(model, key),
+        CtEvent::Paste(text) => input::handle_paste(model, text),
+        CtEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => model.scroll_by(-2),
+            MouseEventKind::ScrollDown => model.scroll_by(2),
+            _ => input::handle_mouse(model, mouse),
+        },
+        CtEvent::Resize(_, h) => {
+            model.viewport_height = h as usize;
+            model.text_selection = None;
+            model.invalidate_all_renders();
+        }
+        _ => {}
+    }
 }
 
 fn tick(model: &mut Model) -> bool {

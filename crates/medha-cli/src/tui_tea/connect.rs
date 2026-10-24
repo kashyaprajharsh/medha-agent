@@ -35,6 +35,8 @@ pub(super) enum Screen {
 pub(super) struct List {
     pub(super) query: String,
     pub(super) selected: usize,
+    /// The search line holds the focus: no row is highlighted and the cursor waits there.
+    pub(super) in_search: bool,
     /// Local servers looked for when the list opened: `Some(n)` running with n models.
     pub(super) running: BTreeMap<String, Option<usize>>,
     /// The backend's reading of the key in the search line, with that key.
@@ -460,6 +462,8 @@ fn list_key(model: &mut Model, key: KeyEvent) -> bool {
             list.selected = 0;
         }
         KeyCode::Esc => close(model),
+        KeyCode::Down if list.in_search => list.in_search = false,
+        KeyCode::Up if list.in_search => {}
         KeyCode::Up | KeyCode::Down => {
             let down = key.code == KeyCode::Down;
             let list = model.model_setup.as_ref().and_then(|s| s.screen.as_ref());
@@ -467,10 +471,19 @@ fn list_key(model: &mut Model, key: KeyEvent) -> bool {
                 return true;
             };
             let rows = rows(model, list);
-            let next = move_in(&rows, settled_row(&rows, list.selected), down);
-            list_mut(model).expect("list").selected = next;
+            let current = settled_row(&rows, list.selected);
+            let next = move_in(&rows, current, down);
+            let list = list_mut(model).expect("list");
+            // Up from the first row climbs into the search line.
+            if !down && next == current {
+                list.in_search = true;
+            } else {
+                list.selected = next;
+            }
         }
+        KeyCode::Enter if list.in_search && list.query.trim().is_empty() => list.in_search = false,
         KeyCode::Enter => choose_row(model),
+        KeyCode::Char('/') if list.query.is_empty() && !list.in_search => list.in_search = true,
         KeyCode::Backspace => {
             list.query.pop();
             list.selected = 0;

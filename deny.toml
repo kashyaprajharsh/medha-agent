@@ -3,9 +3,10 @@
 # reviewed explanation and an expiry/removal condition.
 
 [advisories]
-# Every entry is an `unmaintained` notice (no vulnerability, no exploit path) in
-# a transitive dependency of a pinned, widely-used direct dep. Remove each
-# entry when the named parent ships a release that drops the crate. The same
+# Each entry is an `unmaintained` notice (no vulnerability, no exploit path) in
+# a transitive dependency of a pinned, widely-used direct dep, or a soundness
+# notice for an API Medha never calls. Remove each entry when its stated
+# condition is met. The same
 # policy checks the desktop shell's own graph, so an entry that belongs to one
 # graph is reported as not encountered in the other.
 ignore = [
@@ -31,6 +32,10 @@ ignore = [
     # yaml-rust via syntect. Drop when syntect moves to a maintained YAML
     # parser.
     "RUSTSEC-2024-0320",
+    # tokio AsyncFd soundness (Unix only); Medha never constructs an AsyncFd.
+    # The fixed 1.53.3 broke headless Medha on Windows CI, so the workspace stays
+    # on 1.52.3. Drop when a fixed tokio passes the Windows tests.
+    "RUSTSEC-2026-0386",
 ]
 
 [licenses]

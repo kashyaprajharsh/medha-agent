@@ -8,11 +8,24 @@
 #[path = "termbg_tests.rs"]
 mod tests;
 
+#[cfg(windows)]
+#[path = "termbg_windows.rs"]
+mod windows;
+
 /// Rec. 601 luma above this counts as a light canvas. Only a deliberately grey
 /// terminal is ambiguous at the midpoint.
 const LIGHT_LUMA: f32 = 0.5;
 
+#[cfg(unix)]
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(120);
+/// ConPTY relays the reply through one more process than a Unix tty, so Windows waits longer.
+#[cfg(windows)]
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(any(windows, test))]
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+#[cfg(any(windows, test))]
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 pub fn is_light() -> Option<bool> {
     query_luma()
@@ -51,10 +64,29 @@ fn query_luma() -> Option<f32> {
     out.write_all(b"\x1b]11;?\x1b\\").ok()?;
     out.flush().ok()?;
 
-    // Unbuffered fd reads keep `poll(2)` and the remaining reply in the same
-    // queue; `Stdin` buffering could consume bytes that `poll(2)` cannot see.
-    let mut buf = Vec::with_capacity(64);
     let deadline = std::time::Instant::now() + QUERY_TIMEOUT;
+    read_reply(deadline)
+        .and_then(|reply| parse_osc11_luma(&String::from_utf8_lossy(&reply)))
+        .or_else(unanswered_luma)
+}
+
+/// A Unix terminal that does not answer has nothing else to read.
+#[cfg(unix)]
+fn unanswered_luma() -> Option<f32> {
+    None
+}
+
+/// The old Windows console answers no query but shows its own colour table.
+#[cfg(windows)]
+fn unanswered_luma() -> Option<f32> {
+    windows::console_palette_luma()
+}
+
+/// Unbuffered fd reads keep `poll(2)` and the remaining reply in the same
+/// queue; `Stdin` buffering could consume bytes that `poll(2)` cannot see.
+#[cfg(unix)]
+fn read_reply(deadline: std::time::Instant) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(64);
     while std::time::Instant::now() < deadline && buf.len() < 64 {
         if !stdin_ready(deadline) {
             break;
@@ -69,8 +101,48 @@ fn query_luma() -> Option<f32> {
             None => break,
         }
     }
+    Some(buf)
+}
 
-    parse_osc11_luma(&String::from_utf8_lossy(&buf))
+/// Windows delivers the reply as console key events, mixed with whatever the person typed.
+#[cfg(windows)]
+fn read_reply(deadline: std::time::Instant) -> Option<Vec<u8>> {
+    windows::read_reply(deadline)
+}
+
+/// The first complete OSC 11 reply in `input`, never one inside a paste or still unfinished.
+#[cfg(any(windows, test))]
+fn reply_range(input: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let rest = &input[cursor..];
+        if rest.starts_with(BRACKETED_PASTE_START) {
+            let body = cursor + BRACKETED_PASTE_START.len();
+            let end = input[body..]
+                .windows(BRACKETED_PASTE_END.len())
+                .position(|window| window == BRACKETED_PASTE_END)?;
+            cursor = body + end + BRACKETED_PASTE_END.len();
+            continue;
+        }
+        if !rest.starts_with(b"\x1b]11;") {
+            cursor += 1;
+            continue;
+        }
+        let body = cursor + b"\x1b]11;".len();
+        let end = input[body..]
+            .iter()
+            .enumerate()
+            .find_map(|(at, byte)| match byte {
+                0x07 => Some(body + at + 1),
+                0x1b if input.get(body + at + 1) == Some(&b'\\') => Some(body + at + 2),
+                _ => None,
+            })?;
+        if parse_osc11_luma(&String::from_utf8_lossy(&input[cursor..end])).is_some() {
+            return Some(cursor..end);
+        }
+        cursor = end;
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -79,11 +151,6 @@ fn read_stdin_byte() -> Option<u8> {
     // SAFETY: a one-byte read into a live local, on the already-open fd 0.
     let n = unsafe { libc::read(0, std::ptr::addr_of_mut!(b).cast(), 1) };
     (n == 1).then_some(b)
-}
-
-#[cfg(not(unix))]
-fn read_stdin_byte() -> Option<u8> {
-    None
 }
 
 /// Perceived brightness of an OSC 11 reply (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB`),
@@ -125,9 +192,4 @@ fn stdin_ready(deadline: std::time::Instant) -> bool {
     };
     // SAFETY: a single well-formed pollfd for stdin, with a bounded timeout.
     unsafe { libc::poll(&mut fd, 1, remaining.as_millis() as i32) == 1 }
-}
-
-#[cfg(not(unix))]
-fn stdin_ready(_deadline: std::time::Instant) -> bool {
-    false
 }

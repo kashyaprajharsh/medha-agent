@@ -1,3 +1,6 @@
+// Release builds are windowed apps on Windows, so no console opens beside the window.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod artifacts;
 mod attachments;
 mod backend;

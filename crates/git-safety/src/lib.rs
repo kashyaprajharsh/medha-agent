@@ -12,6 +12,19 @@ pub mod fetch;
 mod workspace;
 pub use workspace::project_root;
 
+/// A `git` command that opens no console window when started from a windowed app on Windows.
+pub fn git() -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut command = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub fn environment() -> Vec<(OsString, OsString)> {
     let mut env: Vec<_> = std::env::vars_os()
         .filter(|(key, _)| {
@@ -84,7 +97,7 @@ fn configured_arguments(
     if operator_auth {
         fixed.retain(|setting| setting != "credential.helper=");
     }
-    let mut child = Command::new("git")
+    let mut child = git()
         .arg("--no-pager")
         .args(fixed.iter().flat_map(|value| ["-c", value]))
         .args(["config", "--list", "--show-scope", "--show-origin", "-z"])

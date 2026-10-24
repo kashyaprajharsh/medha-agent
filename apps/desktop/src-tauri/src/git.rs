@@ -30,7 +30,7 @@ mod tests;
 use serde_json::{Value, json};
 use std::{
     io::Read,
-    process::{Command, Stdio},
+    process::Stdio,
 };
 const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 
@@ -39,7 +39,7 @@ fn run(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
         dir,
         &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
     )?;
-    let mut child = Command::new("git")
+    let mut child = git_safety::git()
         .args(args)
         .current_dir(dir)
         .env_clear()

@@ -14,15 +14,16 @@ pub use workspace::project_root;
 
 /// A `git` command that opens no console window when started from a windowed app on Windows.
 pub fn git() -> Command {
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut command = Command::new("git");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = Command::new("git");
         command.creation_flags(CREATE_NO_WINDOW);
+        command
     }
-    command
+    #[cfg(not(windows))]
+    Command::new("git")
 }
 
 pub fn environment() -> Vec<(OsString, OsString)> {

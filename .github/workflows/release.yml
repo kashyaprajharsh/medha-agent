@@ -178,6 +178,11 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p medha-cli
 
+      - name: Check the Windows program
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/check_windows_exe.ps1 -Console target/${{ matrix.target }}/release/medha.exe
+
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -292,6 +297,15 @@ jobs:
         run: >-
           npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
           --config src-tauri/tauri.updates.conf.json
+
+      # The app opens no console beside its window, and neither program needs the Visual C++ runtime DLL.
+      - name: Check the Windows programs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ../../.github/scripts/check_windows_exe.ps1
+          -Windowed src-tauri/target/${{ matrix.target }}/release/medha-desktop.exe
+          -Console src-tauri/binaries/medha-${{ matrix.target }}.exe
 
       # One flat folder of installers, each named for its system and chip, with its
       # checksum and, when signed, its update signature.

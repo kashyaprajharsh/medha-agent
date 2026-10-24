@@ -111,6 +111,90 @@ function Expand-ValidatedMedhaArchive {
     }
 }
 
+function Lock-MedhaInstall {
+    param([string] $Path, [int] $Seconds)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+        try {
+            return [System.IO.File]::Open($Path, 'OpenOrCreate', 'ReadWrite', 'None')
+        } catch [System.IO.IOException] {
+            if ((Get-Date) -ge $deadline) { throw "Another Medha install is still running ($Path)."? }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
+# The junction's own folder, or $null when there is none; a real folder there is never ours to replace.
+function Get-MedhaJunctionTarget {
+    param([string] $Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return $null }
+    if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "Refusing to replace $Path because it is not a link this installer made."
+    }
+    return [System.IO.Path]::GetFullPath(@($item.Target)[0])
+}
+
+# Directory.Delete without recursion removes only the junction, never the version it points to.
+function Switch-MedhaJunction {
+    param([string] $Link, [string] $Target)
+    $next = "$Link.next"
+    if (Get-Item -LiteralPath $next -Force -ErrorAction SilentlyContinue) { [System.IO.Directory]::Delete($next) }
+    New-Item -ItemType Junction -Path $next -Target $Target | Out-Null
+    if ($null -ne (Get-MedhaJunctionTarget $Link)) { [System.IO.Directory]::Delete($Link) }
+    Rename-Item -LiteralPath $next -NewName (Split-Path -Leaf $Link)
+}
+
+# Each version keeps its own folder and `bin` points at one, so an update never touches a running medha.exe.
+function Install-MedhaVersion {
+    param([string] $Binary, [string] $Root, [string] $Version, [int] $LockSeconds = 120)
+    if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Not a release tag: $Version" }
+    $versions = Join-Path $Root 'versions'
+    $bin = Join-Path $Root 'bin'
+    New-Item -ItemType Directory -Path $versions -Force | Out-Null
+    $lock = Lock-MedhaInstall (Join-Path $Root 'install.lock') $LockSeconds
+    try {
+        # Holding the lock, anything hidden here was left by an install that crashed or was still running.
+        Get-ChildItem -LiteralPath $versions -Force -Filter '.*' -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        $staging = Join-Path $versions ".staging.$([guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $staging | Out-Null
+        Copy-Item -LiteralPath $Binary -Destination (Join-Path $staging 'medha.exe')
+        $release = [System.IO.Path]::GetFullPath((Join-Path $versions $Version))
+        if (Test-Path -LiteralPath $release) {
+            try { Remove-Item -LiteralPath $release -Recurse -Force } catch { $release = "$release.$([guid]::NewGuid().ToString('N'))" }
+        }
+        Move-Item -LiteralPath $staging -Destination $release
+        # An install from before version folders: moving a running exe aside is allowed, writing over it is not.
+        $loose = Join-Path $Root 'medha.exe'
+        if (Test-Path -LiteralPath $loose -PathType Leaf) {
+            Move-Item -LiteralPath $loose -Destination (Join-Path $versions ".loose.$([guid]::NewGuid().ToString('N')).exe")
+        }
+        $previous = Get-MedhaJunctionTarget $bin
+        Switch-MedhaJunction $bin $release
+        Get-ChildItem -LiteralPath $versions -Directory |
+            Where-Object { $_.FullName -ne $release -and $_.FullName -ne $previous } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    } finally {
+        $lock.Dispose()
+    }
+    return $bin
+}
+
+# PATH loses the folder older installers used and gains `bin`, once.
+function Update-MedhaPath {
+    param([AllowNull()][string] $PathValue, [string] $Root, [string] $Bin)
+    if ((Test-PathContains -PathValue $PathValue -Expected $Bin) -and -not (Test-PathContains -PathValue $PathValue -Expected $Root)) {
+        return $PathValue
+    }
+    $kept = @(@($PathValue -split ';') | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        -not (Test-PathContains -PathValue $_ -Expected $Root) -and
+        -not (Test-PathContains -PathValue $_ -Expected $Bin)
+    })
+    return (@($kept) + $Bin) -join ';'
+}
+
 if ($env:MEDHA_INSTALLER_TEST_MODE -eq '1') {
     # Dot-sourcing exposes helpers to tests without running the installer.
     return
@@ -214,20 +298,18 @@ try {
     Expand-ValidatedMedhaArchive -Archive $archive -Output $binary
 
     New-Item -ItemType Directory -Path $Dest -Force | Out-Null
-    Copy-Item -LiteralPath $binary -Destination (Join-Path $Dest 'medha.exe') -Force
+    $bin = Install-MedhaVersion -Binary $binary -Root $Dest -Version $Version
 
     # Update both persistent and current-session PATH.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (-not (Test-PathContains -PathValue $userPath -Expected $Dest)) {
-        $newUserPath = if ([string]::IsNullOrEmpty($userPath)) { $Dest } else { "$userPath;$Dest" }
+    $newUserPath = Update-MedhaPath -PathValue $userPath -Root $Dest -Bin $bin
+    if ($newUserPath -cne $userPath) {
         [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-        Write-Note "added $Dest to your PATH"
+        Write-Note "added $bin to your PATH"
     }
-    if (-not (Test-PathContains -PathValue $env:Path -Expected $Dest)) {
-        $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $Dest } else { "$env:Path;$Dest" }
-    }
+    $env:Path = Update-MedhaPath -PathValue $env:Path -Root $Dest -Bin $bin
 
-    Write-Ok "installed  $Dest\medha.exe"
+    Write-Ok "installed  $bin\medha.exe"
     Write-Host ''
     Write-Host "  medha $Version is ready.  run " -NoNewline
     Write-Host 'medha' -ForegroundColor Cyan -NoNewline

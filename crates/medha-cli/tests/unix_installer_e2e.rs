@@ -98,9 +98,13 @@ fn write_executable(path: &Path, contents: &str) {
 
 fn command_path(root: &Path, with_sha256sum: bool, use_wget: bool) -> PathBuf {
     let bin = root.join("bin");
+    if bin.exists() {
+        return bin;
+    }
     fs::create_dir(&bin).unwrap();
     for name in [
-        "awk", "chmod", "cp", "gzip", "install", "mkdir", "mktemp", "rm", "tar", "tr", "uname",
+        "awk", "cat", "chmod", "cp", "grep", "gzip", "ln", "ls", "mkdir", "mktemp", "mv", "ps",
+        "rm", "sleep", "tail", "tar", "tr", "uname",
     ] {
         let target = find_command(name);
         symlink(target, bin.join(name)).unwrap();
@@ -186,6 +190,18 @@ fn invoke(
     checksum: &str,
     with_sha256sum: bool,
 ) -> Output {
+    installer(case, archive, checksum_mode, checksum, with_sha256sum)
+        .output()
+        .unwrap()
+}
+
+fn installer(
+    case: &TempDir,
+    archive: &Path,
+    checksum_mode: &str,
+    checksum: &str,
+    with_sha256sum: bool,
+) -> Command {
     let checksum_path = case.path().join("asset.sha256");
     fs::write(&checksum_path, checksum).unwrap();
     let marker = case.path().join("sha256sum-used");
@@ -193,7 +209,8 @@ fn invoke(
     let bin = command_path(case.path(), with_sha256sum, false);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
 
-    Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .arg(script)
         .env("MEDHA_REPO", "example/medha")
         .env("MEDHA_VERSION", "v-test")
@@ -204,9 +221,36 @@ fn invoke(
         .env("TEST_ACTUAL", sha256(archive))
         .env("TEST_SHA_MARKER", marker)
         .env("HOME", case.path())
-        .env("PATH", OsString::from(bin))
+        .env("PATH", OsString::from(bin));
+    command
+}
+
+/// Installs `body` as `version` into `case`, the way a release reaches a user.
+fn install_version(case: &TempDir, version: &str, body: &[u8]) -> Output {
+    let archive = case.path().join(format!("{version}.tar.gz"));
+    make_archive(
+        &archive,
+        &[Entry {
+            name: "medha",
+            kind: EntryKind::Regular,
+            body,
+            link: "",
+        }],
+    );
+    let checksum = format!("{}  medha-test.tar.gz\n", sha256(&archive));
+    installer(case, &archive, "present", &checksum, true)
+        .env("MEDHA_VERSION", version)
         .output()
         .unwrap()
+}
+
+fn versions(case: &TempDir) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(case.path().join(".local/lib/medha/versions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 fn invoke_with_wget(case: &TempDir, archive: &Path, checksum_mode: &str, checksum: &str) -> Output {
@@ -419,4 +463,80 @@ fn a_missing_checksum_is_refused_with_curl_and_with_wget() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("checksum download failed"));
     assert!(!transient.path().join("installed/medha").exists());
+}
+
+/// An update while medha runs as the backend must leave that process and its file untouched.
+#[test]
+fn an_update_never_writes_over_a_running_medha() {
+    let case = TempDir::new().unwrap();
+    let link = case.path().join("installed/medha");
+    let sleeper = fs::read(find_command("sleep")).unwrap();
+    let first = install_version(&case, "v-one", &sleeper);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let mut running = Command::new(&link).arg("30").spawn().unwrap();
+
+    let second = install_version(&case, "v-two", b"two");
+    let still_running = running.try_wait().unwrap().is_none();
+    let _ = running.kill();
+    let _ = running.wait();
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(still_running, "installing stopped the running medha");
+    assert_eq!(fs::read(&link).unwrap(), b"two");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(versions(&case), ["v-one", "v-two"]);
+
+    let third = install_version(&case, "v-three", b"three");
+    assert!(third.status.success(), "{}", stderr(&third));
+    assert_eq!(
+        versions(&case),
+        ["v-three", "v-two"],
+        "only the current and previous version stay"
+    );
+}
+
+/// A binary written by an older installer is replaced by the versioned link, not left beside it.
+#[test]
+fn an_existing_plain_install_becomes_the_versioned_link() {
+    let case = TempDir::new().unwrap();
+    let link = case.path().join("installed/medha");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    fs::write(&link, b"old layout").unwrap();
+    let output = install_version(&case, "v-new", b"new");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&link).unwrap(), b"new");
+}
+
+/// A lock whose installer is gone must not block every later install.
+#[test]
+fn a_lock_left_by_a_crashed_install_is_taken_over() {
+    let case = TempDir::new().unwrap();
+    let lock = case.path().join(".local/lib/medha/install.lock");
+    fs::create_dir_all(&lock).unwrap();
+    let mut gone = Command::new(find_command("true")).spawn().unwrap();
+    gone.wait().unwrap();
+    fs::write(lock.join("pid"), gone.id().to_string()).unwrap();
+    let output = install_version(&case, "v-after", b"after");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!lock.exists(), "the lock outlived the install");
+}
+
+/// The version becomes a folder name, so anything but a plain tag is refused before download.
+#[test]
+fn a_version_that_is_not_a_tag_is_refused() {
+    let case = TempDir::new().unwrap();
+    let output = install_version(&case, "../escape", b"never");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("not a release tag"));
+    assert!(!case.path().join("installed/medha").exists());
 }

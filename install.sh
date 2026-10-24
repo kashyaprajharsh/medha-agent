@@ -105,6 +105,11 @@ Set MEDHA_VERSION to a tag, or check that the repository has a published release
   ok "resolved $VERSION"
 fi
 
+# The version names a folder, so it may hold only what a release tag holds.
+case "$VERSION" in
+  ''|.*|*[!A-Za-z0-9._-]*) die "not a release tag: $VERSION" ;;
+esac
+
 ASSET="medha-${TARGET}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 
@@ -119,9 +124,31 @@ if [ -z "$INSTALL_DIR" ]; then
 fi
 mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 
+# Each version keeps its own folder, so an update never writes over a medha that is running.
+# `.local/lib` is readable inside Medha's sandbox, so the command still works there.
+STORE="$HOME/.local/lib/medha"
+if [ "$INSTALL_DIR" = "/usr/local/bin" ] && mkdir -p /usr/local/lib/medha 2>/dev/null; then
+  STORE="/usr/local/lib/medha"
+fi
+mkdir -p "$STORE/versions" || die "cannot create $STORE"
+
+# One installer at a time; a lock left by one that crashed is taken over.
+LOCK="$STORE/install.lock"
+waited=0
+until mkdir "$LOCK" 2>/dev/null; do
+  holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
+  if [ -n "$holder" ] && ! ps -p "$holder" >/dev/null 2>&1; then
+    rm -rf "$LOCK"
+    continue
+  fi
+  [ "$waited" -lt 120 ] || die "another medha install is still running (lock: $LOCK)"
+  sleep 1
+  waited=$((waited + 1))
+done
+printf '%s\n' "$$" > "$LOCK/pid"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$LOCK"' EXIT
 
 step "downloading medha $VERSION  ($TARGET)"
 fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
@@ -177,10 +204,26 @@ binary="$tmp/extracted/medha"
 [ -f "$binary" ] && [ ! -L "$binary" ] \
   || die "the validated archive did not produce a regular medha binary"
 
-install -m 755 "$binary" "$INSTALL_DIR/medha" 2>/dev/null \
-  || { cp "$binary" "$INSTALL_DIR/medha" && chmod 755 "$INSTALL_DIR/medha"; }
+# Holding the lock, any staging folder still here was left by an install that crashed.
+rm -rf "$STORE/versions"/.staging.*
+staging="$STORE/versions/.staging.$$"
+mkdir "$staging" || die "could not prepare $staging"
+cp "$binary" "$staging/medha" && chmod 755 "$staging/medha" \
+  || die "could not stage the medha binary"
+release="$STORE/versions/$VERSION"
+# A running copy of the same version keeps its open file after the folder is replaced.
+rm -rf "$release"
+mv "$staging" "$release" || die "could not move the new version into $release"
 
-ok "installed  ${c_dim}${g_step}${c_reset}  $INSTALL_DIR/medha"
+link="$INSTALL_DIR/medha"
+ln -s "$release/medha" "$link.new.$$" || die "could not create the medha link in $INSTALL_DIR"
+mv -f "$link.new.$$" "$link" || { rm -f "$link.new.$$"; die "could not switch $link to $VERSION"; }
+
+# Keep this version and the one before it; a running older one keeps its open file.
+ls -1t "$STORE/versions" | grep -v '^\.' | grep -Fvx "$VERSION" | tail -n +2 \
+  | while IFS= read -r old; do rm -rf "$STORE/versions/$old"; done
+
+ok "installed  ${c_dim}${g_step}${c_reset}  $link"
 printf '\n'
 
 case ":$PATH:" in

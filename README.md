@@ -82,6 +82,8 @@ irm https://medha.manojavamlabs.com/install.ps1 | iex
 
 One binary. No Python, no Node, no Docker daemon. SQLite is compiled in and TLS is rustls, so there's nothing to resolve at startup. The installer refuses any download whose checksum is missing or does not match.
 
+To update, run the same command again. Each version gets its own folder, so a Medha that is still running keeps working until you restart it.
+
 <details>
 <summary>Pin a version, change the location, or build from source</summary>
 

@@ -89,7 +89,7 @@ impl Saved {
     }
 }
 
-fn credential_id(client_id: &str) -> String {
+pub(crate) fn credential_id(client_id: &str) -> String {
     format!("chatgpt://{client_id}")
 }
 

@@ -3,7 +3,7 @@
 
 use super::{
     Config, KEYRING_SERVICE, credentials_path, key_store_forced, mcp_key_id, mcp_oauth_id,
-    prefer_keychain, read_credentials_file, search_cred_id, with_credentials_lock,
+    prefer_keychain, read_credentials_file, sealed, search_cred_id, with_credentials_lock,
     write_credentials_file,
 };
 use anyhow::{Context, Result};
@@ -42,6 +42,14 @@ impl Vault for Keychain {
     }
 }
 
+/// Windows Credential Manager refuses a key longer than 1,280 characters.
+fn too_long(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<keyring::Error>(),
+        Some(keyring::Error::TooLong(..))
+    )
+}
+
 /// Every credential the saved settings can reach. A keychain cannot be listed,
 /// so these are the entries a move out of it looks for.
 fn credential_ids(cfg: &Config) -> Vec<String> {
@@ -57,6 +65,12 @@ fn credential_ids(cfg: &Config) -> Vec<String> {
             .map(str::to_owned),
     );
     ids.extend(crate::key_pool::ids(cfg));
+    ids.extend(
+        cfg.chatgpt
+            .accounts
+            .iter()
+            .map(|account| crate::chatgpt_accounts::credential_id(&account.client_id)),
+    );
     for (id, server) in &cfg.mcp {
         ids.push(mcp_key_id(id, server));
         if !server.url.is_empty() {
@@ -77,17 +91,21 @@ fn relocate(
     vault: &dyn Vault,
 ) -> Result<Vec<String>> {
     if to_keychain {
-        let mut arrived: Vec<&str> = Vec::new();
+        let mut arrived: Vec<String> = Vec::new();
         for (id, key) in keys.iter() {
-            if let Err(error) = vault.put(id, key) {
-                arrived.iter().for_each(|id| vault.forget(id));
-                return Err(error.context(
-                    "The system keychain did not accept your keys, so they stay in the file",
-                ));
+            match vault.put(id, &sealed::unseal(key)?) {
+                Ok(()) => arrived.push(id.clone()),
+                // A key longer than the keychain holds stays in the file; `move_keys` seals it there.
+                Err(error) if too_long(&error) => {}
+                Err(error) => {
+                    arrived.iter().for_each(|id| vault.forget(id));
+                    return Err(error.context(
+                        "The system keychain did not accept your keys, so they stay in the file",
+                    ));
+                }
             }
-            arrived.push(id);
         }
-        keys.clear();
+        keys.retain(|id, _| !arrived.contains(id));
         return Ok(Vec::new());
     }
     let mut found = Vec::new();
@@ -125,6 +143,11 @@ pub fn move_keys(cfg: &Config, to_keychain: bool) -> Result<()> {
                 &Keychain,
             )?
         };
+        if to_keychain {
+            sealed::seal_kept(&mut creds.keys)?;
+        } else {
+            sealed::unseal_all(&mut creds.keys)?;
+        }
         creds.store = Some(if to_keychain { "keychain" } else { "file" }.into());
         write_credentials_file(&path, &creds)?;
         stale.iter().for_each(|id| Keychain.forget(id));

@@ -8,6 +8,8 @@ use std::path::PathBuf;
 #[path = "key_store.rs"]
 mod key_store;
 pub use key_store::move_keys;
+#[path = "sealed.rs"]
+mod sealed;
 
 const KEYRING_SERVICE: &str = "medha";
 
@@ -1917,7 +1919,7 @@ fn file_load_key(base_url: &str) -> Option<String> {
         .keys
         .get(base_url)
         .filter(|k| !k.is_empty())
-        .cloned()
+        .and_then(|key| sealed::unseal(key).ok())
 }
 
 fn keychain_load_key(base_url: &str) -> Option<String> {
@@ -1937,17 +1939,28 @@ pub fn store_key(base_url: &str, key: &str) -> Result<()> {
     // Store and purge share one lock across both persistence layers.
     with_credentials_lock(|| {
         if prefer_keychain() {
-            keyring::Entry::new(KEYRING_SERVICE, base_url)
-                .and_then(|entry| entry.set_password(&key))
-                .map_err(anyhow::Error::from)
-                .or_else(|keychain_err| {
-                    write_key_file_locked(base_url, &key).map_err(|file_err| {
-                        anyhow::anyhow!(
-                            "could not store the key in the OS keychain ({keychain_err}) or \
-                             ~/.medha/credentials.toml ({file_err}); pair MEDHA_API_KEY with MEDHA_BASE_URL instead"
-                        )
-                    })
-                })
+            let stored = keyring::Entry::new(KEYRING_SERVICE, base_url).and_then(|entry| {
+                let stored = entry.set_password(&key);
+                // An older, shorter copy left in the keychain must not win over the file.
+                if matches!(stored, Err(keyring::Error::TooLong(..))) {
+                    let _ = entry.delete_credential();
+                }
+                stored
+            });
+            match stored {
+                Ok(()) => Ok(()),
+                // Windows Credential Manager holds at most 1,280 characters.
+                #[cfg(windows)]
+                Err(keyring::Error::TooLong(..)) => {
+                    write_key_file_locked(base_url, &sealed::seal(&key)?)
+                }
+                Err(keychain_err) => write_key_file_locked(base_url, &key).map_err(|file_err| {
+                    anyhow::anyhow!(
+                        "could not store the key in the OS keychain ({keychain_err}) or \
+                         ~/.medha/credentials.toml ({file_err}); pair MEDHA_API_KEY with MEDHA_BASE_URL instead"
+                    )
+                }),
+            }
         } else {
             write_key_file_locked(base_url, &key)
         }
@@ -2162,7 +2175,9 @@ pub(crate) fn read_key(id: &str) -> Result<Option<String>> {
         let filed = read_credentials_file(&path)?
             .keys
             .remove(id)
-            .filter(|key| !key.is_empty());
+            .filter(|key| !key.is_empty())
+            .map(|key| sealed::unseal(&key))
+            .transpose()?;
         if !prefer_keychain() {
             return Ok(filed.or_else(|| keychain_load_key(id)));
         }

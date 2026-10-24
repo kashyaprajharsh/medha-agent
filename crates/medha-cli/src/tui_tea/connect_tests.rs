@@ -192,7 +192,7 @@ async fn the_list_offers_plans_keys_and_this_computer_and_looks_for_local_server
     let text = card.join("\n");
     for expected in [
         "connect a model",
-        "/ search | ↑↓ move | Enter choose | Ctrl-R refresh | Esc close",
+        "/ or ↑ search | ↑↓ move | Enter choose | Ctrl-R refresh | Esc close",
         "search or paste a key ›",
         "Plans",
         "> ChatGPT",
@@ -407,26 +407,42 @@ async fn the_arrows_reach_the_search_line_and_the_cursor_waits_there() {
     let mut f = fixture().await;
     catalogue(&mut f);
     backend_features::begin_model_setup(&mut f.model);
-    let in_search = |model: &Model| match model.model_setup.as_ref().unwrap().screen.as_ref() {
-        Some(connect::Screen::List(list)) => list.in_search,
-        _ => panic!("not on the list"),
+    // The line a person sees marked with `>`: the search line or a row.
+    let marked = |model: &Model| -> Vec<String> {
+        drawn(model, 100, 24)
+            .into_iter()
+            .filter(|row| row.trim_start_matches(['│', ' ']).starts_with("> "))
+            .collect()
     };
     let (row, at) = under_cursor(&f.model);
     assert!(
         row.contains("search or paste a key ›") && at == '▏',
         "{row}"
     );
+    assert!(
+        marked(&f.model)[0].contains("> ChatGPT"),
+        "{:?}",
+        marked(&f.model)
+    );
 
     press(&mut f.model, KeyCode::Up);
+    let shown = marked(&f.model);
     assert!(
-        in_search(&f.model),
-        "Up from the first row did not reach the search line"
+        shown.len() == 1 && shown[0].contains("> search or paste a key"),
+        "Up from the first row did not visibly reach the search line: {shown:?}"
     );
     press(&mut f.model, KeyCode::Down);
-    assert!(!in_search(&f.model), "Down did not return to the list");
+    let shown = marked(&f.model);
+    assert!(
+        shown.len() == 1 && shown[0].contains("> ChatGPT"),
+        "Down did not visibly return to the list: {shown:?}"
+    );
 
     press(&mut f.model, KeyCode::Char('/'));
-    assert!(in_search(&f.model), "/ did not move to the search line");
+    assert!(
+        marked(&f.model)[0].contains("> search or paste a key"),
+        "/ did not visibly move to the search line"
+    );
     type_text(&mut f.model, "nv");
     let (row, at) = under_cursor(&f.model);
     assert!(

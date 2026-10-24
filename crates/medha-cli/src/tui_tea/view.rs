@@ -1744,17 +1744,31 @@ pub(super) fn input_rows(model: &Model, outer_width: u16) -> usize {
 /// Composer placeholder, longest variant that fits `width` cells. Hints are
 /// worth showing but not worth truncating: a half-printed shortcut is noise.
 fn placeholder(width: usize) -> &'static str {
-    const VARIANTS: [&str; 4] = [
-        "Ask medha to build, fix, or explain something…   ( / commands · \\+enter newline · ctrl-click opens links )",
-        "Ask medha to build, fix, or explain something…   ( / commands · \\+enter newline )",
-        "Ask medha to build, fix, or explain something…   ( / for commands )",
-        "Ask medha to build, fix, or explain something…",
-    ];
+    static VARIANTS: std::sync::LazyLock<[String; 4]> = std::sync::LazyLock::new(|| {
+        [
+            format!(
+                "Ask medha to build, fix, or explain something…   ( / commands · {IMAGE_KEY} · \\+enter newline · ctrl-click opens links )"
+            ),
+            format!(
+                "Ask medha to build, fix, or explain something…   ( / commands · {IMAGE_KEY} · \\+enter newline )"
+            ),
+            "Ask medha to build, fix, or explain something…   ( / for commands )".into(),
+            "Ask medha to build, fix, or explain something…".into(),
+        ]
+    });
     VARIANTS
-        .into_iter()
+        .iter()
+        .map(String::as_str)
         .find(|variant| UnicodeWidthStr::width(*variant) <= width)
         .unwrap_or("Ask medha…")
 }
+
+/// Windows Terminal keeps Ctrl+V for its own text paste, so an image needs Ctrl+Alt+V there.
+pub(super) const IMAGE_KEY: &str = if cfg!(windows) {
+    "ctrl-alt-v image"
+} else {
+    "ctrl-v image"
+};
 
 pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
     let (input, cursor) = model.edited();
@@ -2844,6 +2858,10 @@ mod clarify_view_tests {
             );
         }
         assert!(super::placeholder(200).contains("ctrl-click"));
+        assert!(
+            super::placeholder(200).contains(super::IMAGE_KEY),
+            "the way to paste an image must be shown where it fits"
+        );
         assert!(!super::placeholder(60).contains("ctrl-click"));
         assert!(super::placeholder(60).starts_with("Ask medha"));
     }

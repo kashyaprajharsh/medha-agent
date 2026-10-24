@@ -9,7 +9,33 @@ use anyhow::{Context, Result, bail, ensure};
 
 const NO_IMAGE: &str = "the clipboard does not contain an image; copy one, or use /attach PATH";
 
-pub(crate) fn bytes() -> Result<Vec<u8>> {
+/// What Ctrl+V finds: an image to attach, or text to paste as the terminal would have.
+pub(crate) enum Contents {
+    Image(Vec<u8>),
+    Text(String),
+}
+
+pub(crate) fn read() -> Result<Contents> {
+    choose(image(), text)
+}
+
+/// An image wins over text: copying a picture often puts its name or address there too.
+fn choose(image: Result<Vec<u8>>, text: impl FnOnce() -> Option<String>) -> Result<Contents> {
+    match image {
+        Ok(bytes) => Ok(Contents::Image(bytes)),
+        Err(error) => text().map(Contents::Text).ok_or(error),
+    }
+}
+
+pub(crate) fn text() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()?
+        .get_text()
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+fn image() -> Result<Vec<u8>> {
     match native_image() {
         Ok(bytes) => Ok(bytes),
         Err(error) if is_wsl() => windows_clipboard_image().map_err(|fallback| {
@@ -82,3 +108,7 @@ impl Drop for Remove {
         let _ = std::fs::remove_file(&self.0);
     }
 }
+
+#[cfg(test)]
+#[path = "clipboard_tests.rs"]
+mod tests;

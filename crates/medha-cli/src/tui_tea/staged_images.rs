@@ -140,7 +140,13 @@ fn admit(raw: Vec<u8>, name: String, source: Option<PathBuf>) -> Result<Image, S
     })
 }
 
-pub(super) async fn load(source: &ImageSource) -> Result<Vec<Image>, String> {
+/// What a load produced: images to stage, or the clipboard's text when it held no image.
+pub(super) enum Loaded {
+    Images(Vec<Image>),
+    Text(String),
+}
+
+pub(super) async fn load(source: &ImageSource) -> Result<Loaded, String> {
     let paths = match source {
         ImageSource::Paths(paths) => Some(paths.clone()),
         ImageSource::Clipboard => None,
@@ -156,12 +162,17 @@ pub(super) async fn load(source: &ImageSource) -> Result<Vec<Image>, String> {
                     let raw = media::read_source(&path).map_err(|error| error.to_string())?;
                     admit(raw, crate::attachments::label_for(&path), Some(path))
                 })
-                .collect()
+                .collect::<Result<_, _>>()
+                .map(Loaded::Images)
         }
-        None => {
-            let bytes = crate::attachments::clipboard_bytes().map_err(|error| error.to_string())?;
-            Ok(vec![admit(bytes, "clipboard".into(), None)?])
-        }
+        None => match crate::attachments::read_clipboard().map_err(|error| error.to_string())? {
+            crate::attachments::ClipboardContents::Image(bytes) => Ok(Loaded::Images(vec![admit(
+                bytes,
+                "clipboard".into(),
+                None,
+            )?])),
+            crate::attachments::ClipboardContents::Text(text) => Ok(Loaded::Text(text)),
+        },
     })
     .await
     .map_err(|error| error.to_string())?
@@ -258,7 +269,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("image.png");
         std::fs::write(&path, png()).unwrap();
-        let admitted = load(&ImageSource::Paths(vec![path.clone()])).await.unwrap();
+        let Ok(Loaded::Images(admitted)) = load(&ImageSource::Paths(vec![path.clone()])).await
+        else {
+            panic!("an image file loaded as something else");
+        };
         let mut pending = Pending::default();
         let generation = pending.begin().unwrap();
         pending.accept(generation, admitted).unwrap();

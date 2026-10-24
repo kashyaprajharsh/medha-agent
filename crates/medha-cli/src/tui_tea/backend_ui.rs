@@ -378,6 +378,8 @@ enum Answer {
     Snapshot(Box<protocol::PresentationSnapshot>),
     Opened(Box<Opened>),
     Images(Vec<staged_images::Image>),
+    /// Ctrl+V found text rather than an image: it is pasted as the terminal would have.
+    ClipboardText(String),
     Reloaded(protocol::ExtensionsReloaded),
 }
 struct Opened {
@@ -715,7 +717,14 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
                 .await
                 .map(|o| Answer::Opened(Box::new(o)))
         }
-        Effect::Images { source, .. } => staged_images::load(source).await.map(Answer::Images),
+        Effect::Images { source, .. } => {
+            staged_images::load(source)
+                .await
+                .map(|loaded| match loaded {
+                    staged_images::Loaded::Images(images) => Answer::Images(images),
+                    staged_images::Loaded::Text(text) => Answer::ClipboardText(text),
+                })
+        }
     }
 }
 
@@ -2124,6 +2133,15 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                         }
                     }
                 }
+            }
+            Answer::ClipboardText(text) => {
+                if let Effect::Images { generation, .. } = done.effect {
+                    model.images.failed(generation);
+                }
+                if let Some(draft) = model.backend_deferred.take() {
+                    restore_draft(model, draft.raw);
+                }
+                input::handle_paste(model, text);
             }
             Answer::Reloaded(reloaded) => {
                 for warning in reloaded.warnings {

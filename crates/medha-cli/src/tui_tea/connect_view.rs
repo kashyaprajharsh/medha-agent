@@ -100,12 +100,27 @@ fn list_card(model: &Model, list: &List, width: usize) -> Card {
         list.query.clone()
     };
     let search = "search or paste a key › ";
-    let caret = Some((1, width_of(search) + width_of(&shown)));
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![faint(search), bold(shown), gold("▏")]),
-        Line::from(""),
+    let used = 2 + width_of(search) + width_of(&shown);
+    let caret = Some((1, used));
+    // The search line is marked like a chosen row when the arrows have moved the focus there.
+    let mut spans = vec![
+        if list.in_search {
+            gold("> ")
+        } else {
+            plain("  ")
+        },
+        faint(search),
+        bold(shown),
+        gold("▏"),
+        plain(" ".repeat(width.saturating_sub(used + 1))),
     ];
+    if list.in_search {
+        let style = Style::default().bg(band());
+        for span in &mut spans {
+            span.style = span.style.patch(style);
+        }
+    }
+    let mut lines = vec![Line::from(""), Line::from(spans), Line::from("")];
     if let Some(key) = &list.carried {
         lines.push(Line::from(faint(format!(
             "Pick the provider for {}. Nothing is sent until you choose.",
@@ -258,10 +273,14 @@ fn list_card(model: &Model, list: &List, width: usize) -> Card {
     } else {
         String::new()
     })));
-    let keys = if asking || !list.query.is_empty() {
+    let keys = if list.in_search && list.query.is_empty() {
+        "type to search | ↓ list | Esc close"
+    } else if list.in_search {
+        "type to search | ↓ list | Enter choose | Esc clear"
+    } else if asking || !list.query.is_empty() {
         "↑↓ move | Enter choose | Esc clear"
     } else {
-        "/ search | ↑↓ move | Enter choose | Ctrl-R refresh | Esc close"
+        "/ or ↑ search | ↑↓ move | Enter choose | Ctrl-R refresh | Esc close"
     };
     Card {
         title: vec![bold("connect a model")],

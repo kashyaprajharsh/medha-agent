@@ -283,6 +283,22 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
         return;
     }
 
+    // Where Ctrl+V reaches Medha instead of the terminal, a form takes the clipboard's text as a paste.
+    let form_open = model
+        .clarify
+        .as_ref()
+        .is_some_and(|form| form.entering_other)
+        || model.model_setup.is_some()
+        || model.mcp_credential.is_some()
+        || model.search_setup.is_some();
+    if form_open && key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        if let Some(text) = crate::attachments::clipboard_text() {
+            handle_paste(model, text);
+        }
+        return;
+    }
+
     // Clarify owns Esc while its tool is awaiting an answer.
     if model.clarify.is_some() {
         handle_clarify_key(model, key);

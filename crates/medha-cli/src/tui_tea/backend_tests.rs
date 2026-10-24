@@ -288,6 +288,33 @@ async fn a_model_setup_timeout_is_unconfirmed_and_does_not_save_or_activate() {
     assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
 }
 
+/// Ctrl+V with copied text pastes it, folded like any long paste, instead of an image error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_v_with_text_on_the_clipboard_pastes_it_into_the_composer() {
+    let mut f = fixture().await;
+    let ctrl_v = |modifiers| KeyEvent::new(KeyCode::Char('v'), modifiers);
+    input::handle_key(&mut f.model, ctrl_v(KeyModifiers::CONTROL));
+    finish_setup_request(&mut f, Ok(Answer::ClipboardText("short note".into())));
+    assert_eq!(f.model.input, "short note");
+    assert!(
+        !f.model.images.is_loading(),
+        "the clipboard read stayed open"
+    );
+
+    f.model.input.clear();
+    f.model.cursor = 0;
+    input::handle_key(
+        &mut f.model,
+        ctrl_v(KeyModifiers::CONTROL | KeyModifiers::ALT),
+    );
+    finish_setup_request(&mut f, Ok(Answer::ClipboardText("x".repeat(1500))));
+    assert!(
+        f.model.input.contains("[paste #0: 1500 chars]"),
+        "Ctrl+Alt+V reads the clipboard too, and long text folds: {}",
+        f.model.input
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catalogue_refresh_preserves_provider_search_and_the_current_chat() {
     let mut f = fixture().await;

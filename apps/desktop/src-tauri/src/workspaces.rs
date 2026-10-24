@@ -343,10 +343,11 @@ impl Workspaces {
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
         for row in &mut rows {
             let folder = row.as_object_mut().and_then(|row| row.remove("folder"));
-            let folder = folder.as_ref().and_then(Value::as_str).map(PathBuf::from);
-            if let (Some(id), Some(folder)) = (row["id"].as_str(), folder)
-                && folder.starts_with(&workspace.path)
-            {
+            let folder = folder
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(|folder| chat_folder(folder, &workspace.path));
+            if let (Some(id), Some(folder)) = (row["id"].as_str(), folder) {
                 sessions.insert(id.into(), folder);
             }
         }
@@ -367,6 +368,13 @@ impl Workspaces {
             }
         }
     }
+}
+
+/// A chat folder the backend reported, in the desktop's own form, if it lies in `library`.
+/// The backend's Windows paths carry `\\?\`; the desktop's do not, and must still match.
+fn chat_folder(reported: &str, library: &std::path::Path) -> Option<PathBuf> {
+    let folder = dunce::simplified(std::path::Path::new(reported)).to_path_buf();
+    folder.starts_with(library).then_some(folder)
 }
 
 pub fn explicit_workspace() -> Option<PathBuf> {
@@ -408,6 +416,17 @@ mod tests {
         let reopened = Workspaces::new(root.join("app"), Some(root.join("repo"))).unwrap();
         assert_eq!(reopened.initial, first.id);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    /// The backend names Windows chat folders `\\?\C:\…`; Chats broke when they stopped matching.
+    #[cfg(windows)]
+    #[test]
+    fn a_backend_chat_folder_matches_the_library_in_either_form() {
+        let library = std::path::Path::new(r"C:\Users\me\Medha\personal");
+        assert_eq!(
+            chat_folder(r"\\?\C:\Users\me\Medha\personal\chat-a", library),
+            Some(PathBuf::from(r"C:\Users\me\Medha\personal\chat-a"))
+        );
+        assert!(chat_folder(r"\\?\C:\Users\me\elsewhere", library).is_none());
     }
     #[test]
     fn a_draft_owns_nothing_on_disk_until_it_starts() {

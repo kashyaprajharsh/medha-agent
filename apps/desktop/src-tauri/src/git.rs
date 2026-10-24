@@ -28,10 +28,7 @@ pub fn branch(dir: &Path) -> Option<String> {
 mod tests;
 
 use serde_json::{Value, json};
-use std::{
-    io::Read,
-    process::Stdio,
-};
+use std::{io::Read, process::Stdio};
 const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 
 fn run(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {

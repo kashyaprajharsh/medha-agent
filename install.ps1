@@ -118,7 +118,7 @@ function Lock-MedhaInstall {
         try {
             return [System.IO.File]::Open($Path, 'OpenOrCreate', 'ReadWrite', 'None')
         } catch [System.IO.IOException] {
-            if ((Get-Date) -ge $deadline) { throw "Another Medha install is still running ($Path)."? }
+            if ((Get-Date) -ge $deadline) { throw "Another Medha install is still running ($Path)." }
             Start-Sleep -Milliseconds 250
         }
     }

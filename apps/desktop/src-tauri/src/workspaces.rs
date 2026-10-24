@@ -370,8 +370,7 @@ impl Workspaces {
     }
 }
 
-/// A chat folder the backend reported, in the desktop's own form, if it lies in `library`.
-/// The backend's Windows paths carry `\\?\`; the desktop's do not, and must still match.
+/// A chat folder the backend reported (`\\?\C:\…` on Windows), in the desktop's form, if inside `library`.
 fn chat_folder(reported: &str, library: &std::path::Path) -> Option<PathBuf> {
     let folder = dunce::simplified(std::path::Path::new(reported)).to_path_buf();
     folder.starts_with(library).then_some(folder)

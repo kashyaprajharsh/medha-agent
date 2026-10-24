@@ -1,5 +1,4 @@
-//! Keys too long for Windows Credential Manager, kept in the credentials file
-//! but sealed with DPAPI so only the signed-in Windows user can open them.
+//! Keys too long for Windows Credential Manager, kept in the file sealed with DPAPI for this user.
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};

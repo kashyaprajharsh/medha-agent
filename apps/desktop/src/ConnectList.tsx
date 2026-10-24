@@ -39,6 +39,9 @@ export function ConnectList({ protocols, servers, savedKeys, unavailable, onChoo
   const [recognised, setRecognised] = useState<Recognised>();
   const [running, setRunning] = useState<Record<string, Found[]>>({});
   const asked = useRef(0);
+  const search = useRef<HTMLInputElement>(null);
+  // After mount, so typing reaches the search even when the sheet around it focused its Close button.
+  useEffect(() => search.current?.focus(), []);
   const listed: Listed[] = useMemo(
     () => protocols.filter((item) => item.available).flatMap((item) => item.providers.map((provider) => ({ ...provider, protocol: item.value }))),
     [protocols],
@@ -86,7 +89,7 @@ export function ConnectList({ protocols, servers, savedKeys, unavailable, onChoo
     <div className="pv-list">
       <div className="pv-search">
         <Icon name="search" />
-        <input aria-label="Search providers, or paste a key" placeholder={`Search ${listed.length} providers, or paste a key`} value={query} spellCheck={false} autoComplete="off"
+        <input ref={search} aria-label="Search providers, or paste a key" placeholder={`Search ${listed.length} providers, or paste a key`} value={query} spellCheck={false} autoComplete="off"
           className={pasted ? "filled" : ""} onChange={(event) => setQuery(event.target.value)} />
         <button type="button" className="icon-btn" aria-label="Refresh provider catalogue" title="Refresh provider catalogue" aria-busy={refreshing} disabled={refreshing} onClick={onRefresh}>
           {refreshing ? <Spinner /> : <Icon name="refresh" />}

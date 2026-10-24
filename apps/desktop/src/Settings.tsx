@@ -952,7 +952,7 @@ export function ModelForm({
                   type="password"
                   autoComplete="new-password"
                   value={key}
-                  autoFocus={changingKey}
+                  autoFocus={changingKey || !ownServer}
                   placeholder={ownServer ? "API key, if it needs one" : keySavedAt(url) ? "Leave empty to use the saved key" : `Paste your ${brand} key`}
                   onChange={(event) => {
                     setKey(event.target.value);

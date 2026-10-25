@@ -88,7 +88,7 @@ To update, run the same command again. Each version gets its own folder, so a Me
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-version=v0.1.11
+version=v0.1.12
 curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$version/install.sh" \
   | MEDHA_VERSION="$version" sh                            # pin installer + binary
 

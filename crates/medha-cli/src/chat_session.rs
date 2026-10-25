@@ -25,6 +25,10 @@ where
     let model_env = start.options.model_env.clone();
     let flag_model = start.options.model.clone();
     let flag_base_url = start.options.base_url.clone();
+    let (approval_wait, question_wait) =
+        start.model.profiles.lock().map_or((None, None), |config| {
+            (config.agent.approval_wait(), config.agent.question_wait())
+        });
     let mut bridge = None;
     let Started {
         kernel,
@@ -58,11 +62,14 @@ where
         made.writer.enable_presentation();
         made.control = control;
         let surface = runtime::Surface {
-            gate: Arc::new(chat::Gate::new(made.writer.clone(), made.pending.clone())),
+            gate: Arc::new(
+                chat::Gate::new(made.writer.clone(), made.pending.clone()).timed(approval_wait),
+            ),
             asker: Arc::new(chat_questions::Asker {
                 writer: Arc::clone(&made.writer),
                 pending: Arc::clone(&made.questions),
                 next_id: std::sync::atomic::AtomicU64::new(1),
+                limit: question_wait,
             }),
             agents: Some(Arc::new(crate::chat_agents::Watch {
                 writer: Arc::clone(&made.writer),

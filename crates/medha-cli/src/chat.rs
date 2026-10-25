@@ -728,6 +728,7 @@ pub struct Gate {
     pending: Pending,
     next_id: AtomicU64,
     always: Mutex<HashSet<String>>,
+    limit: Option<Duration>,
 }
 
 impl Gate {
@@ -737,8 +738,39 @@ impl Gate {
             pending,
             next_id: AtomicU64::new(1),
             always: Mutex::new(HashSet::new()),
+            limit: None,
         }
     }
+
+    /// An approval left unanswered this long is denied, and the chat is told.
+    pub(crate) fn timed(mut self, limit: Option<Duration>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    async fn answer<T>(&self, answered: oneshot::Receiver<T>, deny: T) -> T {
+        tokio::select! {
+            answer = answered => answer.unwrap_or(deny),
+            _ = self.writer.cancelled() => deny,
+            _ = expiry(self.limit) => {
+                self.writer.turn_event(protocol::TurnEvent::Notice { text: unanswered("approval", self.limit, "denied") });
+                deny
+            }
+        }
+    }
+}
+
+/// Never completes when there is no limit.
+pub(crate) async fn expiry(limit: Option<Duration>) {
+    match limit {
+        Some(limit) => tokio::time::sleep(limit).await,
+        None => std::future::pending().await,
+    }
+}
+
+pub(crate) fn unanswered(what: &str, limit: Option<Duration>, outcome: &str) -> String {
+    let minutes = limit.map_or(0, |limit| limit.as_secs().div_ceil(60));
+    format!("No answer to the {what} within {minutes} minutes, so it was {outcome}.")
 }
 
 /// Removes a pending approval if its await is cancelled.
@@ -817,12 +849,9 @@ impl kernel::HumanGate for Gate {
         if !sent {
             return kernel::Approval::Deny;
         }
-        // Disconnect or no response denies the action. Remembering applies to
+        // Disconnect, no response or the time limit denies the action. Remembering applies to
         // this live bridge only; it never writes authority into the repository.
-        let approval = tokio::select! {
-            result = rx => result.unwrap_or(kernel::Approval::Deny),
-            _ = self.writer.cancelled() => kernel::Approval::Deny,
-        };
+        let approval = self.answer(rx, kernel::Approval::Deny).await;
         // The guard settles every viewer even if this future is cancelled.
         guard.approved = approval.approved();
         if approval == kernel::Approval::Always && !escalated {
@@ -882,11 +911,8 @@ impl kernel::HumanGate for Gate {
         if !self.writer.notify_params("approval", &prompt) {
             return kernel::PathApproval::Deny;
         }
-        // Disconnect or no response denies it, as for any other approval.
-        let approval = tokio::select! {
-            result = rx => result.unwrap_or(kernel::PathApproval::Deny),
-            _ = self.writer.cancelled() => kernel::PathApproval::Deny,
-        };
+        // Disconnect, no response or the time limit denies it, as for any other approval.
+        let approval = self.answer(rx, kernel::PathApproval::Deny).await;
         guard.approved = approval != kernel::PathApproval::Deny;
         approval
     }
@@ -959,10 +985,7 @@ impl Gate {
         ) {
             return kernel::NetworkDecision::Deny;
         }
-        let decision = tokio::select! {
-            answer = answered => answer.unwrap_or(kernel::NetworkDecision::Deny),
-            _ = self.writer.cancelled() => kernel::NetworkDecision::Deny,
-        };
+        let decision = self.answer(answered, kernel::NetworkDecision::Deny).await;
         guard.approved = decision != kernel::NetworkDecision::Deny;
         decision
     }
@@ -2580,6 +2603,32 @@ mod tests {
         assert!(lock_pending(&pending).is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_approval_is_denied_at_its_limit_and_every_viewer_is_told() {
+        let (writer, mut rx) = capture_writer(8);
+        let pending: Pending = Arc::default();
+        let gate = Arc::new(
+            Gate::new(Arc::clone(&writer), Arc::clone(&pending))
+                .timed(Some(Duration::from_secs(300))),
+        );
+        let asking = Arc::clone(&gate);
+        let asked = tokio::spawn(async move { asking.confirm("shell.exec", None, false).await });
+        let _approval_frame = rx.recv().await.expect("approval notification");
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert_eq!(lock_pending(&pending).len(), 1, "denied before its limit");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(asked.await.unwrap(), Approval::Deny);
+        assert!(lock_pending(&pending).is_empty());
+        let told = captured_values(&mut rx);
+        assert_eq!(told[0]["params"]["kind"], "notice");
+        assert_eq!(
+            told[0]["params"]["text"],
+            "No answer to the approval within 5 minutes, so it was denied."
+        );
+        assert_eq!(told[1]["method"], "approval.resolved");
+        assert_eq!(told[1]["params"]["approved"], false);
+    }
+
     #[tokio::test]
     async fn command_access_preserves_every_tui_grant_tier_and_settles_all_viewers() {
         use kernel::NetworkDecision as N;
@@ -2758,6 +2807,7 @@ mod tests {
             writer,
             pending: Arc::clone(&pending),
             next_id: AtomicU64::new(1),
+            limit: None,
         };
         let asked = tokio::spawn(async move { kernel::Asker::ask(&asker, vec![]).await });
         let prompt = output.recv().await.unwrap();

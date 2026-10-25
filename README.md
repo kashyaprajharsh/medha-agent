@@ -133,7 +133,10 @@ then it keeps serving. A backend that cannot do what a client needs is asked to
 give way, and that is refused while it has active work.
 
 Type a task, press **Enter**, and approve or deny the actions it proposes as they come
-up. Press `/` for the command palette.
+up. Press `/` for the command palette. An approval left unanswered for 5 minutes is
+denied, and a question left for an hour is dismissed; change either with
+`approval_timeout` or `question_timeout` (seconds, 0 waits forever) under `[agent]` in
+`~/.medha/config.toml`.
 
 | Key | |
 |---|---|

@@ -517,6 +517,34 @@ pub struct ApprovalPrompt {
     pub path: Option<ApprovalPath>,
 }
 
+impl ApprovalPrompt {
+    /// One short label per offered choice, in order; every chat surface shows these words.
+    pub fn labels(&self) -> Vec<&'static str> {
+        let about_a_path = matches!(self.kind, ApprovalKind::Path);
+        self.choices
+            .iter()
+            .map(|choice| match choice {
+                ApprovalDecision::Approve | ApprovalDecision::Once => "Yes, allow once",
+                // For a path, which of the two is remembered is said in the choice itself.
+                ApprovalDecision::Always if about_a_path => {
+                    match self.path.as_ref().map(|path| path.kind) {
+                        Some(PathKind::File) => "Yes, always allow this file",
+                        Some(PathKind::Directory) => {
+                            "Yes, always allow this folder and its contents"
+                        }
+                        _ => "Yes, always allow this path",
+                    }
+                }
+                ApprovalDecision::Always => "Yes, always allow",
+                ApprovalDecision::Folder => "Yes, always allow this whole folder",
+                ApprovalDecision::Session => "Allow for this session",
+                ApprovalDecision::Persistent => "Always allow for this project",
+                ApprovalDecision::Deny => "No, deny",
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResolved {
     pub gate_id: u64,

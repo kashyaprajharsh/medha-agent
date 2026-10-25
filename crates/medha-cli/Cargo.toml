@@ -97,6 +97,7 @@ windows-sys = { version = "0.60", features = [
 medha-client = { path = "../medha-client", features = ["test-support"] }
 test-support = { path = "../test-support" }
 flate2 = "1"
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 portable-pty = "0.9"

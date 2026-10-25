@@ -16,6 +16,7 @@ pub(crate) struct Asker {
     pub writer: Arc<Writer>,
     pub pending: Questions,
     pub next_id: AtomicU64,
+    pub limit: Option<std::time::Duration>,
 }
 
 struct Guard {
@@ -78,7 +79,15 @@ impl kernel::Asker for Asker {
         ) {
             return None;
         }
-        rx.await.ok().flatten()
+        tokio::select! {
+            answers = rx => answers.ok().flatten(),
+            _ = crate::chat::expiry(self.limit) => {
+                self.writer.notify_params("event", &protocol::TurnEvent::Notice {
+                    text: crate::chat::unanswered("question", self.limit, "dismissed"),
+                });
+                None
+            }
+        }
     }
 }
 

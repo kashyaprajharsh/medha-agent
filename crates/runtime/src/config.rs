@@ -282,6 +282,26 @@ pub struct AgentConfig {
     /// retries and stand-in models are used up. Unset is 5; 0 never waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_waits: Option<u32>,
+    /// Seconds an approval waits for an answer before it is denied. Unset is 300; 0 waits forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_timeout: Option<u64>,
+    /// Seconds a question waits for an answer before it is dismissed. Unset is 3600; 0 waits forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_timeout: Option<u64>,
+}
+
+impl AgentConfig {
+    pub fn approval_wait(&self) -> Option<std::time::Duration> {
+        wait(self.approval_timeout.unwrap_or(300))
+    }
+
+    pub fn question_wait(&self) -> Option<std::time::Duration> {
+        wait(self.question_timeout.unwrap_or(3600))
+    }
+}
+
+fn wait(seconds: u64) -> Option<std::time::Duration> {
+    (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
 }
 
 /// Models used beside the main one for work it cannot do itself.

@@ -530,8 +530,9 @@ async fn actual_tui_editor_and_application_client_follow_the_same_chat() {
     assert!(world.provider.asked().contains("FROM_EDITOR"));
     viewer.until(|frame| kind(frame, "turn.done")).await;
     terminal.until("echo: FROM_EDITOR");
+    terminal.until_idle();
     terminal.type_text("FROM_TERMINAL\r");
-    assert!(world.provider.asked().contains("FROM_TERMINAL"));
+    assert!(terminal.asked(&world.provider).contains("FROM_TERMINAL"));
     viewer.until(|frame| kind(frame, "turn.done")).await;
     loop {
         editor.frame();

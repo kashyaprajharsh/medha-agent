@@ -559,6 +559,11 @@ impl TerminalClient {
         user_texts(&request)
     }
 
+    /// The composer prompt only shows once the terminal has settled its turn, so Enter starts a new one.
+    fn until_idle(&mut self) {
+        self.until("Ask medha");
+    }
+
     fn until(&mut self, marker: &str) {
         let deadline = Instant::now() + WAIT;
         loop {
@@ -659,6 +664,7 @@ async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit
             pixel_height: 0,
         })
         .unwrap();
+    terminal.until_idle();
     terminal.type_text("HOLD terminal cancellation\r");
     assert!(
         terminal

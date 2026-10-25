@@ -14,7 +14,8 @@ fn tool_request(tool: &str, command: &str) -> kernel::HookRequest {
 
 fn runner_for(temp: &Path, id: &str, script: &str, extra: &str) -> ProcessHookRunner {
     let source = temp.join("source");
-    write_hook_package_with(&source, id, script, 2_000, extra);
+    // Room for a shell to start while the whole workspace suite runs in parallel.
+    write_hook_package_with(&source, id, script, 10_000, extra);
     let store = store(temp);
     store.install(&source).unwrap();
     store.enable(id, None, &Grant::default()).unwrap();

@@ -44,6 +44,8 @@ htmd = "0.5"
 urlencoding = "2"
 pulldown-cmark = { version = "0.13", default-features = false }
 pdf-extract = "0.12"
+quick-xml = "0.41"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 sha2 = "0.10"
 fd-lock = "4"
 

@@ -2,6 +2,7 @@
 
 use super::*;
 use kernel::protected_paths::{classify, matters};
+use std::path::Path;
 
 struct Change {
     sandbox: Arc<WorkspaceSandbox>,
@@ -87,7 +88,25 @@ pub(crate) async fn preflight(
     let Some(path) = args["path"].as_str() else {
         return Ok(());
     };
-    let Some(resolved) = sandbox.resolve_if_permitted(path).await else {
+    let permitted = sandbox.resolve_if_permitted(path).await;
+    let target = permitted
+        .clone()
+        .unwrap_or_else(|| sandbox.root().join(path));
+    // The start of the file decides whether it is binary, whatever its name says.
+    let existing = target.is_file().then(|| {
+        use std::io::Read;
+        let mut start = Vec::new();
+        if let Ok(file) = std::fs::File::open(&target) {
+            let _ = file.take(8192).read_to_end(&mut start);
+        }
+        start
+    });
+    if let Some(refusal) =
+        crate::documents::text_write_refusal(Path::new(path), existing.as_deref())
+    {
+        return Err(ToolError::Args(refusal));
+    }
+    let Some(resolved) = permitted else {
         return Ok(());
     };
     let web = kernel::egress::mutation_context().is_some_and(|(_, web)| web);

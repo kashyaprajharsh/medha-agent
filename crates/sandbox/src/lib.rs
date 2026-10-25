@@ -633,8 +633,13 @@ fn publish_windows_file(
     temporary: &Path,
     target: &Path,
     target_exists: bool,
+    unchanged: impl Fn() -> Result<(), SandboxError>,
 ) -> Result<(), SandboxError> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_REMOVE_REPLACED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
     };
@@ -647,28 +652,47 @@ fn publish_windows_file(
     // encryption/compression state, object id, and named streams into the
     // replacement. MoveFileExW without REPLACE_EXISTING is the no-clobber
     // publication primitive for a target approved as missing.
-    let result = unsafe {
-        if target_exists {
-            ReplaceFileW(
-                target_wide.as_ptr(),
-                temporary_wide.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } else {
-            MoveFileExW(
-                temporary_wide.as_ptr(),
-                target_wide.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let error = loop {
+        let result = unsafe {
+            if target_exists {
+                ReplaceFileW(
+                    target_wide.as_ptr(),
+                    temporary_wide.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } else {
+                MoveFileExW(
+                    temporary_wide.as_ptr(),
+                    target_wide.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if result != 0 {
+            return Ok(());
         }
+        let error = std::io::Error::last_os_error();
+        // An editor or virus scanner can hold the target a moment; each retry first re-checks it is unchanged.
+        let held = error.raw_os_error().is_some_and(|code| {
+            [
+                ERROR_ACCESS_DENIED,
+                ERROR_SHARING_VIOLATION,
+                ERROR_LOCK_VIOLATION,
+                ERROR_UNABLE_TO_REMOVE_REPLACED,
+                ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+            ]
+            .contains(&(code as u32))
+        });
+        if !held || std::time::Instant::now() >= deadline {
+            break error;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        unchanged()?;
     };
-    if result != 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
     if !target_exists && error.kind() == std::io::ErrorKind::AlreadyExists {
         Err(SandboxError::Conflict(target.display().to_string()))
     } else {
@@ -2841,17 +2865,20 @@ impl WorkspaceSandbox {
                 drop(temp_file);
 
                 // Revalidate immediately before the atomic OS publication.
-                let latest = match std::fs::File::open(&resolved) {
-                    Ok(file) => inspect_open_file(file)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        GuardedInspection {
-                            state: GuardedFileState::Missing,
-                            bytes: None,
+                let unchanged = || -> Result<bool, SandboxError> {
+                    let latest = match std::fs::File::open(&resolved) {
+                        Ok(file) => inspect_open_file(file)?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            GuardedInspection {
+                                state: GuardedFileState::Missing,
+                                bytes: None,
+                            }
                         }
-                    }
-                    Err(error) => return Err(SandboxError::Io(error.to_string())),
+                        Err(error) => return Err(SandboxError::Io(error.to_string())),
+                    };
+                    Ok(latest.state == current.state)
                 };
-                if latest.state != current.state {
+                if !unchanged()? {
                     let _ = std::fs::remove_file(&tmp);
                     if let Some(id) = &snapshot_id {
                         let _ = std::fs::remove_file(snapshots.join(id));
@@ -2860,7 +2887,12 @@ impl WorkspaceSandbox {
                 }
 
                 #[cfg(windows)]
-                let publish = publish_windows_file(&tmp, &resolved, target_existed);
+                let publish = publish_windows_file(&tmp, &resolved, target_existed, || {
+                    match unchanged()? {
+                        true => Ok(()),
+                        false => Err(SandboxError::Conflict(resolved.display().to_string())),
+                    }
+                });
                 #[cfg(not(windows))]
                 let publish = std::fs::rename(&tmp, &resolved)
                     .map_err(|error| SandboxError::Io(error.to_string()));
@@ -2999,7 +3031,8 @@ impl WorkspaceSandbox {
                     // snapshot before publishing it over the target.
                     drop(temp_file);
                     #[cfg(windows)]
-                    let publish = publish_windows_file(&temporary, resolved, resolved.exists());
+                    let publish =
+                        publish_windows_file(&temporary, resolved, resolved.exists(), || Ok(()));
                     #[cfg(not(windows))]
                     let publish = std::fs::rename(&temporary, resolved)
                         .map_err(|error| SandboxError::Io(error.to_string()));

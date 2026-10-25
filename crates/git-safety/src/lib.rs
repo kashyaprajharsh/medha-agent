@@ -26,28 +26,40 @@ pub fn git() -> Command {
     Command::new("git")
 }
 
+/// Whether a `git` program starts on this machine at all; checked once, since installing Git needs a restart anyway.
+pub fn installed() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        git()
+            .arg("--version")
+            .env_clear()
+            .envs(environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
 pub fn environment() -> Vec<(OsString, OsString)> {
-    let mut env: Vec<_> = std::env::vars_os()
-        .filter(|(key, _)| {
-            matches!(
-                key.to_str(),
-                Some(
-                    "PATH"
-                        | "HOME"
-                        | "USERPROFILE"
-                        | "SystemRoot"
-                        | "SYSTEMROOT"
-                        | "WINDIR"
-                        | "TMPDIR"
-                        | "TEMP"
-                        | "TMP"
-                        | "LANG"
-                        | "LC_ALL"
-                        | "LC_CTYPE"
-                )
-            )
-        })
-        .collect();
+    // Looked up one name at a time: Windows matches `PATH` to its `Path`, an exact filter would not.
+    let mut env: Vec<_> = [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SystemRoot",
+        "WINDIR",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ]
+    .into_iter()
+    .filter_map(|key| Some((key.into(), std::env::var_os(key)?)))
+    .collect();
     env.extend(
         [("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")]
             .map(|(key, value)| (key.into(), value.into())),

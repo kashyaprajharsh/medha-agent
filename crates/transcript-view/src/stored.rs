@@ -57,7 +57,16 @@ impl StoredNames {
 
     /// The target for a call that reads a stored output by hash.
     pub fn target(&self, args: &Value) -> Option<String> {
-        args.get("hash")?;
+        // Matches `read` in tools: beside a path, only a real 64-hex hash means stored output.
+        let real = args
+            .get("hash")?
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty());
+        (real || !path).then_some(())?;
         self.page_name(args)
     }
 

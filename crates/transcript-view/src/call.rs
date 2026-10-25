@@ -45,7 +45,7 @@ fn verb(name: &str, args: &Value) -> String {
         "ls" => "Listed",
         "glob" => "Found files",
         "grep" => "Searched",
-        "code" if args.get("symbol").is_some() => "Found references",
+        "code" if text(args, "symbol").is_some() => "Found references",
         "code" => "Outlined",
         "edit" if args.get("old_string").is_none() && args.get("content").is_some() => "Wrote",
         "edit" => "Edited",
@@ -54,7 +54,7 @@ fn verb(name: &str, args: &Value) -> String {
         "web.search" => "Searched the web",
         "web.fetch" => "Fetched",
         "update_plan" => "Updated the plan",
-        "agent.spawn" if args.get("tasks").is_some() => "Started agents",
+        "agent.spawn" if tasks(args).is_some() => "Started agents",
         "agent.spawn" => "Started agent",
         "agent.wait" => "Waited for agents",
         "agent.list" => "Checked on agents",
@@ -110,7 +110,7 @@ fn target(name: &str, args: &Value) -> Option<String> {
                 .to_owned(),
         ),
         "git" => text(args, "subcommand").map(|command| format!("git {command}")),
-        "agent.spawn" => Some(match args.get("tasks").and_then(Value::as_array) {
+        "agent.spawn" => Some(match tasks(args) {
             Some(tasks) => tasks.iter().map(agent_name).collect::<Vec<_>>().join(", "),
             None => agent_name(args),
         }),
@@ -138,6 +138,13 @@ fn target(name: &str, args: &Value) -> Option<String> {
 
 /// The name an agent is known by: the one it was given, or the first words of
 /// its objective, as the orchestrator names an agent that was not named.
+/// The batch an `agent.spawn` names; an empty list is a model filling every field, so one agent.
+fn tasks(args: &Value) -> Option<&Vec<Value>> {
+    args.get("tasks")
+        .and_then(Value::as_array)
+        .filter(|tasks| !tasks.is_empty())
+}
+
 fn agent_name(args: &Value) -> String {
     if let Some(name) = text(args, "name") {
         return name.trim_start_matches('/').to_owned();
@@ -168,7 +175,7 @@ fn input(name: &str, args: &Value) -> Option<(&'static str, String)> {
             (command.contains('\n') || command.chars().count() > 240)
                 .then(|| ("Command", command.to_owned()))
         }
-        "agent.spawn" => match args.get("tasks").and_then(Value::as_array) {
+        "agent.spawn" => match tasks(args) {
             Some(tasks) => Some((
                 "Tasks",
                 tasks

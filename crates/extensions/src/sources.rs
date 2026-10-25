@@ -188,6 +188,19 @@ pub fn fetch(source: &GitSource) -> Result<Checkout, Error> {
         dir: dir.clone(),
         commit: String::new(),
     };
+    if !git_safety::installed() {
+        let Some((owner, repo)) = crate::github_download::repository(&source.url) else {
+            return Err(Error::Source(format!(
+                "{} needs Git, which is not installed here. Install Git (git-scm.com) and \
+                 restart Medha; plugins from GitHub download without it.",
+                source.url
+            )));
+        };
+        std::fs::create_dir_all(&dir).map_err(|error| io_error("creating", &dir, error))?;
+        checkout.commit =
+            crate::github_download::fetch(&owner, &repo, source.git_ref.as_deref(), &dir)?;
+        return Ok(checkout);
+    }
     let target = dir.to_string_lossy().into_owned();
     let is_commit = source.git_ref.as_deref().is_some_and(|git_ref| {
         git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
@@ -262,7 +275,7 @@ fn links_under(dir: &Path) -> Vec<PathBuf> {
     links
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
     let kind = std::fs::symlink_metadata(from)
         .map_err(|error| io_error("reading link target", from, error))?
         .file_type();

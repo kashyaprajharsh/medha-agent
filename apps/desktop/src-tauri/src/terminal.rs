@@ -427,8 +427,22 @@ fn user_shell() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        std::env::var_os("COMSPEC")
+        // PowerShell, as Windows Terminal and VS Code open; cmd.exe has no `ls` and stays the last resort.
+        // A zero-byte Store alias passes `is_file` but cannot be started.
+        let runnable = |path: PathBuf| {
+            std::fs::metadata(&path)
+                .is_ok_and(|found| found.is_file() && found.len() > 0)
+                .then_some(path)
+        };
+        let system = std::env::var_os("SystemRoot")
             .map(PathBuf::from)
+            .unwrap_or_else(|| r"C:\Windows".into());
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|dir| runnable(dir.join("pwsh.exe")))
+            })
+            .or_else(|| runnable(system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe")))
+            .or_else(|| std::env::var_os("COMSPEC").map(PathBuf::from))
             .unwrap_or_else(|| "cmd.exe".into())
     }
 }

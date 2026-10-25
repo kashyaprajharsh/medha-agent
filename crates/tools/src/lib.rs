@@ -10,6 +10,7 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 mod agents;
 mod browser;
 mod checkpoints;
+mod documents;
 mod edit_match;
 mod file_checks;
 mod lanes;
@@ -307,6 +308,18 @@ fn take_net_denied(payload: &mut Value) -> bool {
         .and_then(|obj| obj.remove(NET_DENIED))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+/// A field the model actually filled. Some models send every field, unused ones as `""`, `null` or `[]`,
+/// so a tool choosing its job by a field must not count those.
+pub(crate) fn given(args: &Value, key: &str) -> bool {
+    match args.get(key) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(fields)) => !fields.is_empty(),
+        Some(_) => true,
+    }
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
@@ -1081,10 +1094,7 @@ impl ToolRegistry {
         // handle, and only a bounded TTL/LRU tail remains after settlement.
         let tasks = Arc::new(TaskTable::default());
         r.tasks = Some(tasks.clone());
-        r.register(Arc::new(ShellExec {
-            sbx: sandbox,
-            tasks: tasks.clone(),
-        }));
+        r.register(Arc::new(ShellExec::new(sandbox, tasks.clone())));
         // `task.list` is not registered: `task.output` with no `task_id` runs
         // the identical expression, so it was two names for one answer.
         r.register(Arc::new(TaskOutput {
@@ -1582,7 +1592,12 @@ impl Tool for Read {
         schema
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        if args.get("hash").is_some() {
+        // A model that fills every field sends `"hash": ""` beside a path; a real hash still wins as before.
+        let hash = args.get("hash");
+        let real = hash
+            .and_then(Value::as_str)
+            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        if hash.is_some() && (real || !given(args, "path")) {
             return self.artifact.execute(args).await;
         }
         let path = arg_str(args, "path")
@@ -1621,6 +1636,82 @@ impl Tool for Read {
 struct FsRead {
     sbx: Arc<WorkspaceSandbox>,
     shown: shown::ShownPages,
+}
+
+impl FsRead {
+    /// The text of a Word, Excel, PowerPoint or PDF file, read through the sandbox like any file.
+    async fn document_text(
+        &self,
+        path: &str,
+        resolved: &std::path::Path,
+        kind: documents::Kind,
+    ) -> Result<String, ToolError> {
+        let size = std::fs::metadata(resolved).map_or(0, |found| found.len());
+        if size > documents::MAX_DOCUMENT_BYTES as u64 {
+            return Err(ToolError::Failed(format!(
+                "{path} is a {} of {}, over the 50 MB that read extracts; inspect it with a command",
+                kind.label(),
+                documents::human_size(size)
+            )));
+        }
+        let bytes = self
+            .sbx
+            .read_bytes_resolved(resolved, documents::MAX_DOCUMENT_BYTES)
+            .await
+            .map_err(|error| ToolError::Failed(format!("read failed: {error}")))?;
+        // A malformed file can make a parser panic; that is a failed read, not a crashed tool.
+        tokio::task::spawn_blocking(move || documents::extract(kind, &bytes))
+            .await
+            .unwrap_or_else(|_| Err("its text could not be extracted".into()))
+            .map_err(|reason| {
+                ToolError::Failed(format!(
+                    "{path} is a {}, but {reason}. Inspect or convert it with a command.",
+                    kind.label()
+                ))
+            })
+    }
+}
+
+/// One page of extracted text, shaped like a page read from a text file.
+fn text_page(text: &str, start: u64, limit: u64) -> sandbox::LineRangeRead {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len() as u64;
+    let first = start.saturating_sub(1).min(total);
+    let last = first.saturating_add(limit).min(total);
+    let mut content = lines[first as usize..last as usize].join("\n");
+    if last > first {
+        content.push('\n');
+    }
+    sandbox::LineRangeRead {
+        content,
+        start_line: first + 1,
+        end_line: last,
+        total_lines: Some(total),
+        has_more: last < total,
+        beyond_eof: total > 0 && start.saturating_sub(1) >= total,
+        bytes_scanned: text.len() as u64,
+    }
+}
+
+/// Names a binary file's type and size instead of a UTF-8 error the model cannot act on.
+async fn binary_file(path: &str, resolved: &std::path::Path) -> ToolError {
+    let resolved = resolved.to_path_buf();
+    let (sample, size) = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut sample = Vec::new();
+        let size = std::fs::metadata(&resolved).map_or(0, |found| found.len());
+        if let Ok(file) = std::fs::File::open(&resolved) {
+            let _ = file.take(16).read_to_end(&mut sample);
+        }
+        (sample, size)
+    })
+    .await
+    .unwrap_or_default();
+    ToolError::Failed(format!(
+        "{path} is a binary file ({}), not text, so read cannot show it. Inspect it with a \
+         command (its format, size or metadata) or a tool made for that format.",
+        documents::describe_binary(&sample, size)
+    ))
 }
 
 /// Lets the model look at an image file itself, instead of the user having to
@@ -1787,17 +1878,38 @@ impl Tool for FsRead {
         // Every read is a page: without a range it is the first one, so a large
         // file is read in steps rather than refused or sent whole.
         let start = offset.unwrap_or(1);
-        let mut range = self
-            .sbx
-            .read_line_range_resolved(
-                &resolved,
-                start,
-                Some(limit.unwrap_or(READ_PAGE_LINES)),
-                FS_READ_MAX_RANGE_SCAN_BYTES,
-                FS_READ_MAX_RANGE_OUTPUT_BYTES,
-            )
-            .await
-            .map_err(|error| ToolError::Failed(format!("read failed: {error}")))?;
+        let document = documents::Kind::of(&resolved);
+        let mut range = match document {
+            Some(kind) => {
+                let text = self.document_text(&path, &resolved, kind).await?;
+                text_page(&text, start, limit.unwrap_or(READ_PAGE_LINES))
+            }
+            None => match self
+                .sbx
+                .read_line_range_resolved(
+                    &resolved,
+                    start,
+                    Some(limit.unwrap_or(READ_PAGE_LINES)),
+                    FS_READ_MAX_RANGE_SCAN_BYTES,
+                    FS_READ_MAX_RANGE_OUTPUT_BYTES,
+                )
+                .await
+            {
+                Ok(range) => range,
+                Err(error) if error.to_string().contains("not valid UTF-8") => {
+                    let bytes = self
+                        .sbx
+                        .read_bytes_resolved(&resolved, documents::MAX_DOCUMENT_BYTES)
+                        .await
+                        .ok();
+                    match bytes.as_deref().and_then(documents::utf16) {
+                        Some(text) => text_page(&text, start, limit.unwrap_or(READ_PAGE_LINES)),
+                        None => return Err(binary_file(&path, &resolved).await),
+                    }
+                }
+                Err(error) => return Err(ToolError::Failed(format!("read failed: {error}"))),
+            },
+        };
         // A page also ends at whole lines before READ_PAGE_CHARS; the next one
         // starts where it stopped.
         if range.content.len() > READ_PAGE_CHARS {
@@ -1830,6 +1942,7 @@ impl Tool for FsRead {
             "has_more": range.has_more,
             "bytes_scanned": range.bytes_scanned,
             "note": note,
+            "extracted_from": document.map(documents::Kind::label),
         }))
     }
 
@@ -1980,16 +2093,20 @@ impl Edit {
     /// Which edit this call is, or `None` when the arguments name more than one
     /// shape or none at all — including a whole-file `content`, which is `write`'s.
     fn shape(&self, args: &Value) -> Option<Shape> {
-        match (
-            args.get("edits").is_some(),
-            args.get("content").is_some(),
-            args.get("old_string").is_some(),
-            args.get("new_string").is_some(),
-            args.get("replace_all").is_some(),
-        ) {
-            (true, false, false, false, false) => Some(Shape::Many),
-            (false, false, true, true, _) => Some(Shape::Replace),
-            _ => None,
+        let (edits, content, old) = (
+            given(args, "edits"),
+            given(args, "content"),
+            given(args, "old_string"),
+        );
+        let all = args.get("replace_all") == Some(&Value::Bool(true));
+        // For one replacement an empty `new_string` is a deletion, so any text counts.
+        if edits && !content && !old && !given(args, "new_string") && !all {
+            Some(Shape::Many)
+        } else if !edits && !content && old && args.get("new_string").is_some_and(Value::is_string)
+        {
+            Some(Shape::Replace)
+        } else {
+            None
         }
     }
 }
@@ -2218,7 +2335,7 @@ impl Tool for Ls {
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        if args.get("depth").is_some() {
+        if given(args, "depth") {
             self.tree.execute(args).await
         } else {
             self.flat.execute(args).await
@@ -3267,9 +3384,9 @@ impl Tool for Code {
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        match args.get("symbol") {
-            Some(_) => self.references.execute(args).await,
-            None => self.outline.execute(args).await,
+        match given(args, "symbol") {
+            true => self.references.execute(args).await,
+            false => self.outline.execute(args).await,
         }
     }
 }
@@ -5005,10 +5122,52 @@ fn shell_env() -> Vec<(String, String)> {
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        // Windows system paths: PowerShell fails to load without SystemRoot.
+        "SystemRoot",
+        "WINDIR",
+        "SystemDrive",
+        "COMSPEC",
+        "PATHEXT",
+        "PSModulePath",
+        "POWERSHELL",
+        "PWSH",
+        "USERNAME",
+        "USERDOMAIN",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ALLUSERSPROFILE",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
     ];
-    std::env::vars()
-        .filter(|(k, _)| ALLOW.contains(&k.as_str()) || k.starts_with("LC_"))
-        .collect()
+    // Looked up one name at a time: Windows matches `PATH` to its `Path`, an exact filter would not.
+    let named = ALLOW.iter().filter_map(|name| {
+        let value = std::env::var_os(name)?.into_string().ok()?;
+        Some((name.to_string(), value))
+    });
+    let locale = std::env::vars_os().filter_map(|(key, value)| {
+        let key = key
+            .into_string()
+            .ok()
+            .filter(|key| key.starts_with("LC_"))?;
+        Some((key, value.into_string().ok()?))
+    });
+    let mut env: Vec<_> = named.chain(locale).collect();
+    // Without PATHEXT, Windows cannot run `npm` or `git` by name.
+    if cfg!(windows) && !env.iter().any(|(key, _)| key == "PATHEXT") {
+        env.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
+    }
+    env
 }
 
 /// True if `program` resolves on the current PATH (or is an existing absolute
@@ -5027,6 +5186,49 @@ fn program_on_path(program: &str) -> bool {
 struct ShellExec {
     sbx: Arc<WorkspaceSandbox>,
     tasks: Arc<TaskTable>,
+    /// Names the interpreter that actually runs the line, so the model writes for it.
+    description: String,
+}
+
+impl ShellExec {
+    fn new(sbx: Arc<WorkspaceSandbox>, tasks: Arc<TaskTable>) -> Self {
+        let syntax = match sandbox::exec::shell_name(sbx.exec_backend_label()) {
+            "PowerShell" => {
+                "The line runs in Windows PowerShell, not a POSIX shell: write PowerShell \
+                 (Get-ChildItem, Select-String, Get-Content; $null, not /dev/null)."
+            }
+            "cmd" => {
+                "The line runs in Windows cmd.exe, not a POSIX shell: write cmd \
+                 (dir, findstr, type; NUL, not /dev/null)."
+            }
+            "bash" => "The line runs with bash -c.",
+            "Git Bash" => {
+                "The line runs with Git Bash on Windows: avoid bash-only syntax such as \
+                 ${PIPESTATUS[0]}."
+            }
+            _ => {
+                "The line runs with sh -c (Git Bash, PowerShell or cmd on Windows): avoid \
+                 bash-only syntax such as ${PIPESTATUS[0]}."
+            }
+        };
+        let description = [
+            "Run a shell command in the workspace and capture stdout, stderr and exit code: \
+             builds, tests, git, pipelines. It runs in the foreground; on timeout or cancel \
+             the whole process tree is killed. Use edit to change files and glob/grep to find \
+             them. Set network=true for installs and downloads; access is requested before it \
+             runs. Outside the workspace, name absolute folders in read_paths or write_paths.",
+            syntax,
+            "A pipeline's status is its last command's, so write output to a file and read it \
+             rather than piping into tail. Writing commands are backed up for undo. To see a \
+             web page, use read with render: true.",
+        ]
+        .join(" ");
+        Self {
+            sbx,
+            tasks,
+            description,
+        }
+    }
 }
 
 /// Validated once before approval and again before spawning. Canonical paths
@@ -5744,16 +5946,7 @@ impl Tool for ShellExec {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Run a shell command in the workspace and capture stdout, stderr and exit code: \
-         builds, tests, git, pipelines. It runs in the foreground; on timeout or cancel \
-         the whole process tree is killed. Use edit to change files and glob/grep to find \
-         them. Set network=true for installs and downloads; access is requested before it \
-         runs. Outside the workspace, name absolute folders in read_paths or write_paths. \
-         The line runs with sh -c (Git Bash, PowerShell or cmd on Windows): avoid \
-         bash-only syntax such as ${PIPESTATUS[0]}. A pipeline's status is its last \
-         command's, so write output to a file and read it rather than piping into tail. \
-         Writing commands are backed up for undo. To see a web page, use read with \
-         render: true."
+        &self.description
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal
@@ -8474,12 +8667,12 @@ mod tests {
     }
 
     /// A registry over a fresh jailed workspace, for exercising tools end-to-end.
-    fn reg_in(dir: &std::path::Path) -> ToolRegistry {
+    pub(super) fn reg_in(dir: &std::path::Path) -> ToolRegistry {
         std::fs::create_dir_all(dir).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(dir).unwrap());
         ToolRegistry::with_workspace(sbx, mem_artifacts())
     }
-    async fn run(reg: &ToolRegistry, tool: &str, args: Value) -> kernel::Observation {
+    pub(super) async fn run(reg: &ToolRegistry, tool: &str, args: Value) -> kernel::Observation {
         reg.execute(&ToolIntent {
             id: "t".into(),
             tool: tool.into(),
@@ -8910,6 +9103,169 @@ mod tests {
         .await;
         assert_eq!(me.status, kernel::ObsStatus::Error);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Some models send every field, unused ones empty; the job they meant must still run.
+    #[tokio::test]
+    async fn empty_fields_never_pick_another_job_and_an_empty_replacement_still_deletes() {
+        let dir = std::env::temp_dir().join(format!("medha-filled-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        std::fs::write(dir.join("notes.txt"), "keep\ndrop me\n").unwrap();
+        run(&reg, "read", json!({ "path": "notes.txt" })).await;
+        let edit = json!({
+            "path": "notes.txt", "old_string": "drop me\n", "new_string": "",
+            "edits": [], "content": "", "replace_all": false
+        });
+        let edited = run(&reg, "edit", edit).await;
+        assert_eq!(edited.status, kernel::ObsStatus::Ok, "{}", edited.payload);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "keep\n"
+        );
+        let listed = run(&reg, "ls", json!({ "path": ".", "depth": null })).await;
+        assert_eq!(listed.status, kernel::ObsStatus::Ok, "{}", listed.payload);
+        assert!(
+            listed.payload.get("tree").is_none(),
+            "a null depth is a flat list"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_blank_hash_beside_a_path_still_reads_the_file() {
+        let dir = std::env::temp_dir().join(format!("medha-read-blank-hash-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        std::fs::write(dir.join("notes.txt"), "kept\n").unwrap();
+        for hash in ["", "unused"] {
+            let obs = run(&reg, "read", json!({ "path": "notes.txt", "hash": hash })).await;
+            assert_eq!(
+                obs.status,
+                kernel::ObsStatus::Ok,
+                "{hash:?}: {}",
+                obs.payload
+            );
+            assert!(
+                obs.payload.to_string().contains("kept"),
+                "{hash:?}: {}",
+                obs.payload
+            );
+        }
+        let real = "0".repeat(64);
+        let obs = run(&reg, "read", json!({ "path": "notes.txt", "hash": real })).await;
+        assert!(
+            obs.status != kernel::ObsStatus::Ok && !obs.payload.to_string().contains("kept"),
+            "a real hash still reads stored output, not the file: {}",
+            obs.payload
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_pages_a_document_and_names_a_binary_file() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("medha-read-documents-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let paragraphs: String = (1..=3)
+            .map(|n| format!("<w:p><w:r><w:t>paragraph {n}</w:t></w:r></w:p>"))
+            .collect();
+        writer
+            .write_all(
+                format!("<w:document xmlns:w=\"w\"><w:body>{paragraphs}</w:body></w:document>")
+                    .as_bytes(),
+            )
+            .unwrap();
+        std::fs::write(
+            dir.join("report.docx"),
+            writer.finish().unwrap().into_inner(),
+        )
+        .unwrap();
+        let page = run(
+            &reg,
+            "read",
+            json!({ "path": "report.docx", "offset": 2, "limit": 1 }),
+        )
+        .await;
+        assert_eq!(page.status, kernel::ObsStatus::Ok, "{}", page.payload);
+        assert_eq!(page.payload["content"], "paragraph 2\n");
+        assert_eq!(page.payload["total_lines"], 3);
+        assert_eq!(page.payload["has_more"], true);
+        assert_eq!(page.payload["extracted_from"], "Word document");
+
+        // The kernel runs this check before any write: extracted text written back over the document is refused...
+        let write = |args: Value| ToolIntent {
+            id: "w".into(),
+            tool: "write".into(),
+            args,
+        };
+        let refused = kernel::Executor::mutation_preflight(
+            &reg,
+            &write(json!({ "path": "report.docx", "content": "paragraph 2\n" })),
+        )
+        .await
+        .expect("plain text over a .docx is refused before it runs");
+        assert!(
+            refused.payload.to_string().contains("would destroy it"),
+            "{}",
+            refused.payload
+        );
+        // ...while making documents stays open: a new PDF, and the script that builds a .docx.
+        for (path, content) in [
+            ("new.pdf", "%PDF-1.4\n"),
+            ("make_report.py", "import docx\n"),
+        ] {
+            let args = json!({ "path": path, "content": content });
+            assert!(
+                kernel::Executor::mutation_preflight(&reg, &write(args.clone()))
+                    .await
+                    .is_none(),
+                "{path} must not be refused"
+            );
+            let made = run(&reg, "write", args).await;
+            assert_eq!(
+                made.status,
+                kernel::ObsStatus::Ok,
+                "{path}: {}",
+                made.payload
+            );
+        }
+
+        std::fs::write(dir.join("logo.bin"), b"\x89PNG\r\n\x1a\n\xff\xfe\x00").unwrap();
+        let binary = run(&reg, "read", json!({ "path": "logo.bin" })).await;
+        let said = binary.payload.to_string();
+        assert!(said.contains("binary file (PNG image, 11 bytes)"), "{said}");
+        assert!(!said.contains("UTF-8"), "{said}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CI has Git Bash, so shell.exec never reached PowerShell there; a laptop without it got only PowerShell.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_loads_and_finds_programs_with_the_shell_environment() {
+        let powershell = sandbox::exec::WindowsShellCandidates::probe()
+            .powershell
+            .expect("Windows ships PowerShell");
+        let (program, args) = sandbox::exec::WinShell::PowerShell(powershell)
+            .argv("Get-Command cmd.exe -ErrorAction Stop | Out-Null; Write-Output ok");
+        let output = tokio::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .envs(shell_env())
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "ok",
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
@@ -9409,11 +9765,7 @@ mod tests {
         );
         // shell.exec self-manages a bounded kill-and-settle deadline → no outer cap.
         assert_eq!(
-            ShellExec {
-                sbx: mk_sbx(),
-                tasks: Arc::new(TaskTable::default())
-            }
-            .timeout(&json!({})),
+            ShellExec::new(mk_sbx(), Arc::new(TaskTable::default())).timeout(&json!({})),
             None
         );
         assert!(

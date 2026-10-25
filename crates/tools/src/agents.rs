@@ -439,13 +439,13 @@ impl Tool for AgentSpawn {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         // Naming an agent means continuing that one, not starting another.
-        if args.get("agent").is_some() {
+        if crate::given(args, "agent") {
             return self.followup.execute(args).await;
         }
         // Batch: independent questions run at once rather than one call after
         // another. Capacity is already bounded per tree, so an over-large batch
         // is refused by the runtime rather than flooding it.
-        if let Some(tasks_value) = args.get("tasks") {
+        if let Some(tasks_value) = args.get("tasks").filter(|_| crate::given(args, "tasks")) {
             let tasks = tasks_value
                 .as_array()
                 .ok_or_else(|| ToolError::Args("expected array 'tasks'".into()))?;

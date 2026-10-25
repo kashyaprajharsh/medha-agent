@@ -21,8 +21,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "time"] }
+reqwest.workspace = true
+tokio = { workspace = true, features = ["process", "rt", "time"] }
 tokio-util = "0.7"
 toml = "0.8"
 ulid.workspace = true
 tempfile = "3"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# zip leaves the inflate backend to its user; this is the pure-Rust one already in the build.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

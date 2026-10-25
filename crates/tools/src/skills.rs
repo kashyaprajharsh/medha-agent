@@ -1817,9 +1817,9 @@ impl Tool for SkillTool {
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        match args.get("name") {
-            Some(_) => self.load.execute(args).await,
-            None => self.list.execute(args).await,
+        match crate::given(args, "name") {
+            true => self.load.execute(args).await,
+            false => self.list.execute(args).await,
         }
     }
 }

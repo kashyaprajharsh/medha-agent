@@ -1089,9 +1089,11 @@ dependencies = [
  "async-trait",
  "fd-lock",
  "file-ops",
+ "flate2",
  "git-safety",
  "kernel",
  "medha-extension-api",
+ "reqwest 0.12.28",
  "sandbox",
  "serde",
  "serde_json",
@@ -1102,6 +1104,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "ulid",
+ "zip",
 ]
 
 [[package]]
@@ -4580,7 +4583,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4956,6 +4959,7 @@ dependencies = [
  "pdf-extract",
  "policy",
  "pulldown-cmark",
+ "quick-xml",
  "regex",
  "reqwest 0.12.28",
  "sandbox",
@@ -4976,6 +4980,7 @@ dependencies = [
  "ulid",
  "urlencoding",
  "windows-sys 0.60.2",
+ "zip",
 ]
 
 [[package]]
@@ -5156,6 +5161,12 @@ checksum = "fa10c302f5a53b7ad27fd42a3996e23d096ba39b5b8dd6d9e683a05b01bee749"
 dependencies = [
  "pom",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typenum"
@@ -6144,6 +6155,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "zip"
+version = "9.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2886b00003a72c4ccee3f42cfc34908d33b2508a74d827dc2a4244706475c704"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "getrandom 0.4.3",
+ "indexmap",
+ "memchr",
+ "nix 0.31.3",
+ "typed-path",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

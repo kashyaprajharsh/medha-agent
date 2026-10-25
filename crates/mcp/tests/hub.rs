@@ -165,10 +165,16 @@ async fn host_with(
         endpoint.token.clone(),
     );
     tokio::spawn(async move { mcp::hub::run_host(serving, &address, token.into(), resolve).await });
-    for _ in 0..50 {
-        if std::path::Path::new(&endpoint.address).exists() {
-            break;
-        }
+    // The socket file appears at bind, a moment before listen accepts; only a connection proves it is up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while tokio::net::UnixStream::connect(&endpoint.address)
+        .await
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the host never accepted a connection"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     (manager, endpoint, user)

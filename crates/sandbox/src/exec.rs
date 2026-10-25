@@ -701,17 +701,25 @@ pub enum WinShell {
     Cmd,
 }
 
+/// Run before an approved PowerShell line so its output is UTF-8, not the console code page; it changes nothing else.
+pub const POWERSHELL_UTF8: &str =
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+
 impl WinShell {
     /// `/D` and `-NoProfile` stop AutoRun hooks and user profiles injecting into
     /// an approved command. The command string itself is passed through untouched
-    /// so it matches exactly what the policy scanner read.
+    /// so it matches exactly what the policy scanner read; PowerShell gets only [`POWERSHELL_UTF8`] before it.
     pub fn argv(&self, command: &str) -> (String, Vec<String>) {
         let s = |p: &PathBuf| p.display().to_string();
         match self {
             Self::Bash(p) => (s(p), vec!["-c".into(), command.to_string()]),
             Self::PowerShell(p) => (
                 s(p),
-                vec!["-NoProfile".into(), "-Command".into(), command.to_string()],
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    format!("{POWERSHELL_UTF8}{command}"),
+                ],
             ),
             Self::Cmd => (
                 "cmd.exe".into(),
@@ -829,16 +837,49 @@ impl WindowsShellCandidates {
 pub fn shell_argv(backend_label: &str, command: &str) -> (String, Vec<String>) {
     if cfg!(windows) && matches!(backend_label, "host" | "native") {
         #[cfg(windows)]
-        {
-            // Probed once: the cascade spawns processes to validate candidates,
-            // and shell.exec runs on every tool call.
-            static SHELL: std::sync::OnceLock<WinShell> = std::sync::OnceLock::new();
-            return SHELL
-                .get_or_init(|| choose_windows_shell(&WindowsShellCandidates::probe()))
-                .argv(command);
-        }
+        return windows_shell().argv(command);
     }
-    ("sh".to_string(), vec!["-c".into(), command.to_string()])
+    let program = match local_bash(backend_label) {
+        Some(bash) => bash.to_string(),
+        None => "sh".to_string(),
+    };
+    (program, vec!["-c".into(), command.to_string()])
+}
+
+/// bash where this machine runs the line, so macOS and Linux (whose `sh` is often dash) read it alike.
+fn local_bash(backend_label: &str) -> Option<&'static str> {
+    static BASH: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    if cfg!(windows) || !matches!(backend_label, "host" | "native") {
+        return None;
+    }
+    *BASH.get_or_init(|| {
+        ["/bin/bash", "/usr/bin/bash"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+    })
+}
+
+/// The interpreter [`shell_argv`] runs a command line with, as the model is told it.
+pub fn shell_name(backend_label: &str) -> &'static str {
+    if cfg!(windows) && matches!(backend_label, "host" | "native") {
+        #[cfg(windows)]
+        return match windows_shell() {
+            WinShell::Bash(_) => "Git Bash",
+            WinShell::PowerShell(_) => "PowerShell",
+            WinShell::Cmd => "cmd",
+        };
+    }
+    match local_bash(backend_label) {
+        Some(_) => "bash",
+        None => "sh",
+    }
+}
+
+/// Probed once: the cascade spawns processes to validate candidates, and shell.exec runs on every tool call.
+#[cfg(windows)]
+fn windows_shell() -> &'static WinShell {
+    static SHELL: std::sync::OnceLock<WinShell> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| choose_windows_shell(&WindowsShellCandidates::probe()))
 }
 
 /// Run an already-configured command with the same bounded capture and process
@@ -5545,7 +5586,15 @@ mod tests {
             let (program, args) = shell_argv(label, "git status");
             assert_eq!(args.last().unwrap(), "git status", "command must survive");
             if !cfg!(windows) {
-                assert_eq!(program, "sh");
+                // bash where the machine has it, so macOS and a dash-based Linux read the line alike.
+                let bash = ["/bin/bash", "/usr/bin/bash"]
+                    .into_iter()
+                    .find(|path| Path::new(path).is_file());
+                assert_eq!(program, bash.unwrap_or("sh"));
+                assert_eq!(
+                    shell_name(label),
+                    if bash.is_some() { "bash" } else { "sh" }
+                );
                 assert_eq!(&args[..1], ["-c"]);
             }
         }
@@ -5682,7 +5731,13 @@ mod tests {
             WinShell::Cmd,
         ] {
             let (_, args) = shell.argv(cmd);
-            assert_eq!(args.last().unwrap(), cmd, "{shell:?} rewrote the command");
+            // PowerShell gets only the fixed UTF-8 line in front; the approved text follows byte for byte.
+            let sent = args.last().unwrap();
+            let approved = match shell {
+                WinShell::PowerShell(_) => sent.strip_prefix(POWERSHELL_UTF8),
+                _ => Some(sent.as_str()),
+            };
+            assert_eq!(approved, Some(cmd), "{shell:?} rewrote the command");
         }
     }
 

@@ -7,6 +7,7 @@
 mod actions;
 mod compat;
 pub mod doctor;
+mod github_download;
 mod health;
 mod hook_sets;
 mod hooks;

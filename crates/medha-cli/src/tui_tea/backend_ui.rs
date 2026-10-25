@@ -909,6 +909,14 @@ pub(crate) async fn run(
                                 }
                             }
                         }
+                        // Keys act on what the backend already said, so Enter after a turn ended starts a new one.
+                        while !model.remote.as_ref().is_some_and(|p| p.recovering || p.ended) {
+                            match futures::FutureExt::now_or_never(stream.recv()) {
+                                Some(Some(said)) => observed(&mut model, said)?,
+                                Some(None) => { ended(&mut model, None); break; }
+                                None => break,
+                            }
+                        }
                         for event in paste::coalesce(burst) {
                             dispatch(&mut model, event);
                         }

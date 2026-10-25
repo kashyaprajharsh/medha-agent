@@ -59,14 +59,14 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
             "\n- Scratch folder: {} (yours, empty, deleted when this session ends). Put \
              throwaway files, test repositories and experiments here, never in the workspace \
              or /tmp; file tools and shell commands can use it without asking.",
-            scratch.path().display()
+            file_ops::shown(scratch.path()).display()
         )
     });
     system.push_str(&format!(
         "\n\nEnvironment:\n- Today's date: {today}\n- Workspace: {}{scratch_line}\n\nFor anything \
          time-sensitive (news, prices, \"latest\"/\"recent\"/\"today\"), use the current \
          date above — do not assume an older year in your searches or answers.",
-        cwd.display()
+        file_ops::shown(cwd).display()
     ));
     let project_context = context::ctxfiles::render_startup(startup_context);
     if !project_context.is_empty() {

@@ -885,6 +885,12 @@ pub(crate) async fn run(
     if setup || model.model.is_empty() {
         begin_model_setup(&mut model);
     }
+    // Connecting a model comes first; a newer release is offered on a later start.
+    if model.model_setup.is_none()
+        && let Some(latest) = crate::self_update::offer()
+    {
+        model.picker = Some(Picker::new(PickerKind::Update(latest)));
+    }
     request(&mut model, Effect::Read(Read::Plugins, After::Startup));
     request(&mut model, Effect::Read(Read::Models, After::Startup));
     let mut jobs = JoinSet::new();
@@ -989,6 +995,12 @@ pub(crate) async fn run(
                 }))
             }
         };
+    }
+    // The start card's Update now runs here, with the terminal already back to normal.
+    if result.is_ok()
+        && let Some(tag) = crate::self_update::requested()
+    {
+        crate::self_update::update_and_restart(&tag).await;
     }
     result
 }

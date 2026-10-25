@@ -51,7 +51,7 @@ The whole of Medha in one window: your chats, the apps it connects to, a termina
 | **Windows** | [Medha for Windows](https://medha.manojavamlabs.com/download/windows) |
 | **Linux** | [AppImage](https://medha.manojavamlabs.com/download/linux) or [.deb](https://medha.manojavamlabs.com/download/deb) |
 
-Open the file and Medha is ready, and from then on it keeps itself up to date: a new version is fetched in the background and starts when you choose Restart.
+Open the file and Medha is ready, and from then on it keeps itself up to date. It looks for a new release when it starts and every six hours after, downloads it in the background, and accepts it only when its signature matches the key built into the app. A note then says the new version is ready; it starts when you choose **Restart**, and waits while a chat is still running. On Linux this works for the AppImage; with the `.deb`, install the new download over the old one.
 
 The first time you open it, your system asks you to confirm an app from the internet. On a Mac, open System Settings, then Privacy & Security, and choose **Open Anyway**. On Windows, choose **More info**, then **Run anyway**.
 
@@ -82,7 +82,9 @@ irm https://medha.manojavamlabs.com/install.ps1 | iex
 
 One binary. No Python, no Node, no Docker daemon. SQLite is compiled in and TLS is rustls, so there's nothing to resolve at startup. The installer refuses any download whose checksum is missing or does not match.
 
-To update, run the same command again. Each version gets its own folder, so a Medha that is still running keeps working until you restart it.
+**Updating.** Medha checks for a new release at most once a day, in the background, and offers it when the TUI starts: **Update now** installs it and restarts Medha in the same terminal; **Not now** asks again next time; **Skip this version** waits for the one after. From the shell, `medha update` installs the newest release where Medha is installed, and `medha update --check` only reports. Each version gets its own folder, so a Medha that is still running keeps working until you restart it. The desktop app updates itself, as described above.
+
+Versions up to 0.1.12 do not have the check yet: update them once by running the install command again. To turn the check off, set `check = false` under `[updates]` in `~/.medha/config.toml`, or `MEDHA_NO_UPDATE_CHECK=1`.
 
 <details>
 <summary>Pin a version, change the location, or build from source</summary>
@@ -172,6 +174,7 @@ medha gate scenarios/          # run eval scenarios: CI for agent behavior
 medha mcp                      # add, connect, authorize MCP servers
 medha plugins                  # discover, install, enable, update, roll back plugins
 medha lsp                      # language-server sessions and health
+medha update                   # install the newest release   (--check only reports)
 ```
 
 `--acp` connects editors to the same backend as Desktop and TUI. One editor

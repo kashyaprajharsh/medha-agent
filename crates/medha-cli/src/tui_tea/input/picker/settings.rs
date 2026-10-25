@@ -4,6 +4,20 @@ pub(super) fn activate(model: &mut Model) -> bool {
     let Some(picker) = model.picker.as_mut() else {
         return false;
     };
+    if let PickerKind::Update(latest) = &picker.kind {
+        let (latest, selected) = (latest.clone(), picker.selected);
+        model.picker = None;
+        match selected {
+            // The installer runs once the TUI has closed and the terminal is back to normal.
+            0 => {
+                crate::self_update::request(&latest);
+                model.should_quit = true;
+            }
+            2 => crate::self_update::skip(&latest),
+            _ => {}
+        }
+        return true;
+    }
     if matches!(picker.kind, PickerKind::AutonomyMode) {
         let selected = picker.selected;
         model.picker = None;

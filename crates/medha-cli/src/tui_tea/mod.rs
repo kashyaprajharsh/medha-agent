@@ -802,6 +802,8 @@ enum PickerKind {
     /// A skill installed switched off, for its code to be read first, is
     /// switched on only by saying so.
     EnableSkill(String),
+    /// At start, a newer Medha release: update now, not now, or skip it.
+    Update(String),
     /// Custom deployments choose their protocol explicitly.
     ModelProtocol,
     /// Saved provider/model profiles. Switching is available only while idle,
@@ -1005,6 +1007,11 @@ impl PickerKind {
             PickerKind::EnableSkill(name) => {
                 format!(" switch on '{name}'? · ↑↓ move · Enter confirm · Esc back ")
             }
+            PickerKind::Update(latest) => format!(
+                " medha {} is available (you have {}) · ↑↓ move · Enter choose · Esc not now ",
+                crate::self_update::shown(latest),
+                crate::self_update::CURRENT
+            ),
             PickerKind::ModelProtocol => {
                 " choose model protocol — ↑↓ move · Enter/→ continue · Esc/← back ".into()
             }
@@ -1172,6 +1179,11 @@ impl PickerKind {
             PickerKind::EnableSkill(_) => vec![
                 "Keep it off".to_string(),
                 "Switch it on. I have read what it runs".to_string(),
+            ],
+            PickerKind::Update(_) => vec![
+                "Update now, then restart medha".to_string(),
+                "Not now".to_string(),
+                "Skip this version".to_string(),
             ],
             PickerKind::ModelProtocol => MODEL_PROTOCOLS
                 .iter()

@@ -54,6 +54,31 @@ pub struct Config {
         skip_serializing_if = "crate::chatgpt_accounts::Registry::is_empty"
     )]
     pub chatgpt: crate::chatgpt_accounts::Registry,
+    /// `[updates] check = false` stops the TUI asking GitHub for a newer Medha.
+    #[serde(default, skip_serializing_if = "UpdatesConfig::is_default")]
+    pub updates: UpdatesConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatesConfig {
+    #[serde(default = "checks_by_default")]
+    pub check: bool,
+}
+
+fn checks_by_default() -> bool {
+    true
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
+}
+
+impl UpdatesConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl McpServer {

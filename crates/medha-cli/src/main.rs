@@ -32,6 +32,7 @@ mod hook_files;
 mod lock_edit;
 mod mcp_host;
 mod plugins_cmd;
+mod self_update;
 mod serve;
 mod serve_chats;
 mod skill_hub;
@@ -310,6 +311,44 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
 }
 
 /// Inspect configuration offline and optionally apply safe repairs.
+/// `medha update [--check]`: install the latest release where this copy was installed.
+async fn run_update_command(args: &[String]) -> Result<()> {
+    let check_only = match args {
+        [] => false,
+        [flag] if flag == "--check" => true,
+        _ => anyhow::bail!("usage: medha update [--check]"),
+    };
+    let latest = self_update::latest()
+        .await
+        .context("could not ask GitHub for the latest release")?;
+    if !self_update::newer(&latest, self_update::CURRENT) {
+        println!("medha {} is the latest version.", self_update::CURRENT);
+        return Ok(());
+    }
+    println!(
+        "medha {} is available (you have {}).",
+        self_update::shown(&latest),
+        self_update::CURRENT
+    );
+    if check_only {
+        return Ok(());
+    }
+    let Some(install) = self_update::Install::current() else {
+        anyhow::bail!(
+            "this copy was not installed by Medha's installer, so it cannot update itself. Update it \
+             the way you installed it, or install the latest with: {}",
+            if cfg!(windows) {
+                "irm https://medha.manojavamlabs.com/install.ps1 | iex"
+            } else {
+                "curl -fsSL https://medha.manojavamlabs.com/install.sh | sh"
+            }
+        );
+    };
+    self_update::install(&latest, &install).await?;
+    println!("medha {} is installed.", self_update::shown(&latest));
+    Ok(())
+}
+
 fn run_pulse_command(args: &[String]) -> Result<()> {
     let fix = args.iter().any(|a| a == "--fix" || a == "fix");
     let cfg = config::load()?;
@@ -833,6 +872,9 @@ async fn main() -> Result<()> {
     }
     if raw.get(1).map(|s| s == "serve").unwrap_or(false) {
         return serve::run(&raw[2..]).await;
+    }
+    if raw.get(1).map(|s| s == "update").unwrap_or(false) {
+        return run_update_command(&raw[2..]).await;
     }
 
     let cli = Cli::parse();

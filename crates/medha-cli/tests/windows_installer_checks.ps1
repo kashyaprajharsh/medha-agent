@@ -115,6 +115,17 @@ Assert-Throws { Expand-ValidatedMedhaArchive $traversalZip (Join-Path $TempRoot 
 Assert-Throws { Expand-ValidatedMedhaArchive $absoluteZip (Join-Path $TempRoot 'absolute.exe') } 'absolute-path archive was accepted'
 Assert-Throws { Expand-ValidatedMedhaArchive $symlinkZip (Join-Path $TempRoot 'symlink.exe') } 'symlink archive was accepted'
 
+# From 0.1.13 the gateway's windowless launcher rides beside medha.exe, and nothing else may.
+$launcherEntry = [pscustomobject]@{ Name = 'medhaw.exe'; Body = 'launcher'; Attributes = 0 }
+$pairZip = New-TestZip 'pair.zip' @($regular, $launcherEntry)
+$pairOutput = Join-Path $TempRoot 'pair-medha.exe'
+$pairLauncher = Join-Path $TempRoot 'pair-medhaw.exe'
+Expand-ValidatedMedhaArchive $pairZip $pairOutput -Launcher $pairLauncher
+Assert-True (([System.IO.File]::ReadAllText($pairLauncher)) -ceq 'launcher') 'the launcher did not extract'
+Assert-Throws { Expand-ValidatedMedhaArchive (New-TestZip 'launcher-only.zip' @($launcherEntry)) (Join-Path $TempRoot 'none.exe') } 'an archive without medha.exe was accepted'
+Assert-Throws { Expand-ValidatedMedhaArchive (New-TestZip 'extra.zip' @($regular, [pscustomobject]@{ Name = 'payload.dll'; Body = 'x'; Attributes = 0 })) (Join-Path $TempRoot 'extra.exe') } 'an archive with an unknown file was accepted'
+Assert-Throws { Expand-ValidatedMedhaArchive (New-TestZip 'two-launchers.zip' @($regular, $launcherEntry, $launcherEntry)) (Join-Path $TempRoot 'twice.exe') -Launcher (Join-Path $TempRoot 'twice-w.exe') } 'a duplicate launcher was accepted'
+
 function Write-Build {
     param([string] $Name, [string] $Body)
     $path = Join-Path $TempRoot $Name
@@ -156,7 +167,8 @@ try {
     Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
     $running.WaitForExit()
 }
-Install-MedhaVersion -Binary (Write-Build 'three.exe' 'build three') -Root $root -Version 'v-three' | Out-Null
+Install-MedhaVersion -Binary (Write-Build 'three.exe' 'build three') -Root $root -Version 'v-three' -Launcher (Write-Build 'three-w.exe' 'launcher three') | Out-Null
+Assert-True (([System.IO.File]::ReadAllText((Join-Path $bin 'medhaw.exe'))) -ceq 'launcher three') 'the launcher is not beside medha.exe in bin'
 Assert-True ((Get-VersionNames $root) -ceq 'v-three,v-two') 'only the current and previous version stay'
 
 # A medha.exe from an older installer, still running, moves aside instead of blocking the update.

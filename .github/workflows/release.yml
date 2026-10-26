@@ -178,10 +178,15 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p medha-cli
 
+      # The windowless launcher Windows starts the messaging gateway through at login.
+      - name: Build the gateway launcher (windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --target ${{ matrix.target }} -p medhaw
+
       - name: Check the Windows program
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./.github/scripts/check_windows_exe.ps1 -Console target/${{ matrix.target }}/release/medha.exe
+        run: ./.github/scripts/check_windows_exe.ps1 -Console target/${{ matrix.target }}/release/medha.exe -Windowed target/${{ matrix.target }}/release/medhaw.exe
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -198,7 +203,8 @@ jobs:
         run: |
           staging="medha-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/medha.exe" medha.exe
-          7z a "$staging.zip" medha.exe
+          cp "target/${{ matrix.target }}/release/medhaw.exe" medhaw.exe
+          7z a "$staging.zip" medha.exe medhaw.exe
           certutil -hashfile "$staging.zip" SHA256 | sed -n 2p > "$staging.zip.sha256"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

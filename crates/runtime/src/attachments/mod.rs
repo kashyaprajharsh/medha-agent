@@ -16,6 +16,9 @@ pub const IMAGE_ONLY_PROMPT: &str = "Describe the attached image(s).";
 /// resized rather than rejected.
 pub const MAX_SOURCE_BYTES: usize = media::MAX_SOURCE_BYTES;
 
+/// The most bytes one image may take on its way to the backend.
+pub const TRANSPORT_BYTES: usize = 2_200_000;
+
 /// One admitted image: the artifact reference that travels with the message,
 /// plus what the surface needs to show the user what they attached.
 #[derive(Clone, Debug)]

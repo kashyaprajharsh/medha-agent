@@ -143,19 +143,17 @@ async fn open(
     } else {
         Some(params.session_id.ok_or("sessionId is required")?)
     };
-    if requested.is_none() {
-        startup.resume = protocol::Resume::None;
-    }
-    let listed = connection
-        .call_async(protocol::Scope::Service, &protocol::ListSessions {})
-        .await?;
-    let live = requested.as_ref().and_then(|id| {
-        listed
-            .sessions
-            .iter()
-            .find(|live| live.session == *id || live.conversation.as_ref() == Some(id))
-    });
-    let (mut view, session) = if let Some(live) = live {
+    let params = protocol::CreateSession {
+        folder: folder.clone(),
+        ends_with_client: true,
+        resume: requested.clone(),
+        model: None,
+        mode: None,
+        reasoning: None,
+        settings: None,
+        startup: Some(startup),
+    };
+    let (mut view, session) = View::open(connection, params, ViewLimits::default(), |live| {
         let about = live
             .about
             .as_ref()
@@ -169,35 +167,9 @@ async fn open(
                     .into(),
             );
         }
-        let (view, _) = View::attach(
-            connection.clone(),
-            live.session.clone(),
-            None,
-            ViewLimits::default(),
-        )
-        .await?;
-        (view, live.session.clone())
-    } else {
-        if let Some(id) = &requested {
-            startup.resume = protocol::Resume::Id(id.clone());
-        }
-        let (view, made, _) = View::create(
-            connection.clone(),
-            &protocol::CreateSession {
-                folder,
-                ends_with_client: true,
-                resume: requested.clone(),
-                model: None,
-                mode: None,
-                reasoning: None,
-                settings: None,
-                startup: Some(startup),
-            },
-            ViewLimits::default(),
-        )
-        .await?;
-        (view, made.session)
-    };
+        Ok(())
+    })
+    .await?;
     let snapshot = if method == "session/load" || (method == "session/new" && requested.is_some()) {
         history::replay(&mut view, &writer, &session).await?
     } else {

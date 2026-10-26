@@ -102,7 +102,8 @@ pub fn clip(text: &str, max: usize) -> String {
     if cut { format!("{kept}…") } else { kept }
 }
 
-pub(crate) fn bounded(text: &str, max: usize) -> String {
+/// At most `max` characters, saying how many more there were.
+pub fn bounded(text: &str, max: usize) -> String {
     let total = text.chars().count();
     if total <= max {
         return text.to_owned();

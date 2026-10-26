@@ -71,6 +71,12 @@ fn credential_ids(cfg: &Config) -> Vec<String> {
             .iter()
             .map(|account| crate::chatgpt_accounts::credential_id(&account.client_id)),
     );
+    ids.extend(
+        cfg.gateway
+            .platforms
+            .keys()
+            .map(|platform| crate::messaging::credential_id(platform)),
+    );
     for (id, server) in &cfg.mcp {
         ids.push(mcp_key_id(id, server));
         if !server.url.is_empty() {

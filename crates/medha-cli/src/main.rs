@@ -28,9 +28,12 @@ mod desktop_screens;
 mod desktop_service;
 mod desktop_skills;
 mod editor;
+mod gateway_command;
+mod gateway_service;
 mod hook_files;
 mod lock_edit;
 mod mcp_host;
+mod pairing_command;
 mod plugins_cmd;
 mod self_update;
 mod serve;
@@ -875,6 +878,12 @@ async fn main() -> Result<()> {
     }
     if raw.get(1).map(|s| s == "update").unwrap_or(false) {
         return run_update_command(&raw[2..]).await;
+    }
+    if raw.get(1).map(|s| s == "gateway").unwrap_or(false) {
+        return gateway_command::run(&raw[2..]).await;
+    }
+    if raw.get(1).map(|s| s == "pairing").unwrap_or(false) {
+        return pairing_command::run(&raw[2..]);
     }
 
     let cli = Cli::parse();

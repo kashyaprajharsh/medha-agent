@@ -57,6 +57,9 @@ pub struct Config {
     /// `[updates] check = false` stops the TUI asking GitHub for a newer Medha.
     #[serde(default, skip_serializing_if = "UpdatesConfig::is_default")]
     pub updates: UpdatesConfig,
+    /// `[gateway]`: messaging platforms that reach this install's chats.
+    #[serde(default, skip_serializing_if = "crate::messaging::Messaging::is_empty")]
+    pub gateway: crate::messaging::Messaging,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -121,6 +121,11 @@ auth = "oauth"
 [[chatgpt.accounts]]
 client_id = "app_a"
 subject = "user-a"
+
+[gateway]
+folder = "/work"
+
+[gateway.telegram]
 "#,
     )
     .unwrap();
@@ -133,6 +138,7 @@ subject = "user-a"
         mcp_key_id("notes", server),
         mcp_oauth_id("notes", &server.url),
         crate::chatgpt_accounts::credential_id("app_a"),
+        crate::messaging::credential_id("telegram"),
     ] {
         assert!(ids.contains(&id), "{id} would be stranded in the keychain");
     }

@@ -64,6 +64,16 @@ impl Install {
     }
 }
 
+/// What always starts the installed version, even after an update: the link on PATH on Unix,
+/// the `bin` junction's copy on Windows. `None` for a copy no installer put in place.
+pub(crate) fn installed_command() -> Option<PathBuf> {
+    let install = Install::current()?;
+    match cfg!(windows) {
+        true => Some(install.root.join("bin").join("medha.exe")),
+        false => Some(install.install_dir?.join("medha")),
+    }
+}
+
 /// The folder on PATH whose `medha` link points at this copy, so an update lands where the user installed.
 fn link_on_path(exe: &Path) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
@@ -280,6 +290,8 @@ pub(crate) async fn install(tag: &str, install: &Install) -> Result<()> {
     if !status.success() {
         bail!("the installer stopped with {status}");
     }
+    // A messaging gateway left running would keep answering with the old version.
+    crate::gateway_service::restart_if_installed();
     Ok(())
 }
 

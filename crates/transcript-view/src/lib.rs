@@ -13,4 +13,4 @@ pub use call::{Call, tool_verb};
 pub use markdown::to_html;
 pub use outcome::Outcome;
 pub use steps::Steps;
-pub use tool::{clip, failure_detail, plan};
+pub use tool::{bounded, clip, failure_detail, plan};

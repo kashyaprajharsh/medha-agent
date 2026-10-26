@@ -193,6 +193,39 @@ impl View {
         Ok((view, attached))
     }
 
+    /// Follows the live chat that already continues `params.resume`, or starts one that resumes it.
+    /// `check` may refuse a live chat before it is followed.
+    pub async fn open(
+        connection: Arc<Connection>,
+        mut params: protocol::CreateSession,
+        limits: ViewLimits,
+        check: impl FnOnce(&protocol::LiveSession) -> Result<(), String>,
+    ) -> Result<(Self, String), String> {
+        if let Some(id) = params.resume.clone() {
+            let listed = connection
+                .call_async(protocol::Scope::Service, &protocol::ListSessions {})
+                .await?;
+            let live = listed
+                .sessions
+                .into_iter()
+                .find(|live| live.session == id || live.conversation.as_ref() == Some(&id));
+            if let Some(live) = live {
+                check(&live)?;
+                let (view, _) =
+                    Self::attach(connection, live.session.clone(), None, limits).await?;
+                return Ok((view, live.session));
+            }
+        }
+        if let Some(startup) = &mut params.startup {
+            startup.resume = params
+                .resume
+                .clone()
+                .map_or(protocol::Resume::None, protocol::Resume::Id);
+        }
+        let (view, made, _) = Self::create(connection, &params, limits).await?;
+        Ok((view, made.session))
+    }
+
     pub fn cursor(&self) -> Option<protocol::Cursor> {
         self.cursor.clone()
     }

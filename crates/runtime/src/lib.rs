@@ -9,6 +9,7 @@ pub mod config;
 pub mod key_pool;
 pub mod lease;
 pub mod mcp_shared;
+pub mod messaging;
 pub mod model;
 pub mod notices;
 pub mod options;

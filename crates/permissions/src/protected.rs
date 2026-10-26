@@ -37,6 +37,8 @@ pub const CREDENTIAL_RELATIVE: &[&str] = &[
     // The token admits clients, and unlinking the singleton lock would allow
     // two backends to own the same state. Protect the whole control directory.
     ".medha/serve",
+    // Who may message the agent: a write here would let a stranger in.
+    ".medha/gateway",
 ];
 
 /// Beneath the home directory on every platform.
@@ -189,6 +191,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         assert!(is_protected(&home.join(".medha/serve/lock")));
         assert!(is_protected(&home.join(".medha/serve/address")));
+        assert!(is_protected(&home.join(".medha/gateway/pairing.json")));
         assert!(is_protected(
             &home.join(".medha/projects/folder/session-leases/chat.lock")
         ));

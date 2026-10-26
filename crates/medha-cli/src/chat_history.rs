@@ -47,7 +47,7 @@ pub(crate) async fn read_image(
         if thumbnail {
             media::thumbnail(bytes, 128 * 1024)
         } else {
-            media::normalize_for_transport(bytes, 2_200_000)
+            media::normalize_for_transport(bytes, runtime::attachments::TRANSPORT_BYTES)
         }
     })
     .await

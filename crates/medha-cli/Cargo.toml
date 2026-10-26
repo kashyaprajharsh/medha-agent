@@ -34,6 +34,7 @@ runtime = { path = "../runtime" }
 loopback = { path = "../loopback" }
 backend = { path = "../backend" }
 medha-client = { path = "../medha-client" }
+gateway = { path = "../gateway" }
 protocol = { package = "medha-protocol", path = "../protocol" }
 wire = { path = "../wire" }
 getrandom = "0.3"
@@ -89,6 +90,7 @@ windows-sys = { version = "0.60", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_System_IO",
+  "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging",
 ] }

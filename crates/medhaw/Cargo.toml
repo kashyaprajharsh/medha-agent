@@ -1,0 +1,13 @@
+[lints]
+workspace = true
+
+[package]
+name = "medhaw"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Starts medha with no window and keeps it running; Windows starts the messaging gateway through it at login."
+
+[dependencies]

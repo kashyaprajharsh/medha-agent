@@ -137,8 +137,9 @@ pub(super) async fn prompt(value: Value) -> Result<protocol::SendMessage, String
                         (raw, crate::attachments::label_for(&path))
                     }
                 };
-                let image = media::normalize_for_transport(raw, 2_200_000)
-                    .map_err(|e| format!("image {}: {e}", index + 1))?;
+                let image =
+                    media::normalize_for_transport(raw, runtime::attachments::TRANSPORT_BYTES)
+                        .map_err(|e| format!("image {}: {e}", index + 1))?;
                 Ok(protocol::Image {
                     id: ulid::Ulid::new().to_string(),
                     name,

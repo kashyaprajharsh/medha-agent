@@ -62,49 +62,61 @@ function Test-PathContains {
     return $false
 }
 
+function Copy-MedhaArchiveEntry {
+    param($Entry, [string] $Output)
+    if ($Entry.Length -le 0) {
+        throw "Archive $($Entry.Name) entry is empty."
+    }
+    # Reject non-regular Unix entries; zero is normal for Windows ZIPs.
+    $attributes = [System.BitConverter]::ToUInt32(
+        [System.BitConverter]::GetBytes([int32] $Entry.ExternalAttributes),
+        0
+    )
+    $unixType = (($attributes -shr 16) -band 0xF000)
+    $dosDirectory = (($attributes -band 0x10) -ne 0)
+    if ($dosDirectory -or (($unixType -ne 0) -and ($unixType -ne 0x8000))) {
+        throw "Archive $($Entry.Name) entry is not a regular file."
+    }
+    $inputStream = $Entry.Open()
+    try {
+        $outputStream = [System.IO.File]::Create($Output)
+        try {
+            $inputStream.CopyTo($outputStream)
+            $outputStream.Flush()
+        } finally {
+            $outputStream.Dispose()
+        }
+    } finally {
+        $inputStream.Dispose()
+    }
+}
+
+# medha.exe at the root, and from 0.1.13 medhaw.exe beside it; nothing else, nothing twice.
 function Expand-ValidatedMedhaArchive {
     param(
         [Parameter(Mandatory = $true)][string] $Archive,
-        [Parameter(Mandatory = $true)][string] $Output
+        [Parameter(Mandatory = $true)][string] $Output,
+        [string] $Launcher
     )
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        $entries = @($zip.Entries)
-        if ($entries.Count -ne 1) {
-            throw "Archive layout is invalid; expected exactly one root file named medha.exe."
-        }
-        $entry = $entries[0]
-        if (($entry.FullName -cne 'medha.exe') -or ($entry.Name -cne 'medha.exe')) {
-            throw "Archive layout is invalid; expected exactly one root file named medha.exe."
-        }
-        if ($entry.Length -le 0) {
-            throw "Archive medha.exe entry is empty."
-        }
-
-        # Reject non-regular Unix entries; zero is normal for Windows ZIPs.
-        $attributes = [System.BitConverter]::ToUInt32(
-            [System.BitConverter]::GetBytes([int32] $entry.ExternalAttributes),
-            0
-        )
-        $unixType = (($attributes -shr 16) -band 0xF000)
-        $dosDirectory = (($attributes -band 0x10) -ne 0)
-        if ($dosDirectory -or (($unixType -ne 0) -and ($unixType -ne 0x8000))) {
-            throw "Archive medha.exe entry is not a regular file."
-        }
-
-        $inputStream = $entry.Open()
-        try {
-            $outputStream = [System.IO.File]::Create($Output)
-            try {
-                $inputStream.CopyTo($outputStream)
-                $outputStream.Flush()
-            } finally {
-                $outputStream.Dispose()
+        $layout = "Archive layout is invalid; expected medha.exe, and optionally medhaw.exe, at its root."
+        $byName = @{}
+        foreach ($entry in @($zip.Entries)) {
+            $name = $entry.Name
+            if (($entry.FullName -cne $name) -or (($name -cne 'medha.exe') -and ($name -cne 'medhaw.exe')) -or $byName.ContainsKey($name)) {
+                throw $layout
             }
-        } finally {
-            $inputStream.Dispose()
+            $byName[$name] = $entry
+        }
+        if (-not $byName.ContainsKey('medha.exe')) {
+            throw $layout
+        }
+        Copy-MedhaArchiveEntry $byName['medha.exe'] $Output
+        if ($Launcher -and $byName.ContainsKey('medhaw.exe')) {
+            Copy-MedhaArchiveEntry $byName['medhaw.exe'] $Launcher
         }
     } finally {
         $zip.Dispose()
@@ -147,7 +159,7 @@ function Switch-MedhaJunction {
 
 # Each version keeps its own folder and `bin` points at one, so an update never touches a running medha.exe.
 function Install-MedhaVersion {
-    param([string] $Binary, [string] $Root, [string] $Version, [int] $LockSeconds = 120)
+    param([string] $Binary, [string] $Root, [string] $Version, [int] $LockSeconds = 120, [string] $Launcher)
     if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Not a release tag: $Version" }
     $versions = Join-Path $Root 'versions'
     $bin = Join-Path $Root 'bin'
@@ -160,6 +172,10 @@ function Install-MedhaVersion {
         $staging = Join-Path $versions ".staging.$([guid]::NewGuid().ToString('N'))"
         New-Item -ItemType Directory -Path $staging | Out-Null
         Copy-Item -LiteralPath $Binary -Destination (Join-Path $staging 'medha.exe')
+        # Starts the messaging gateway at login with no window; `bin` finds it beside medha.exe.
+        if ($Launcher -and (Test-Path -LiteralPath $Launcher -PathType Leaf)) {
+            Copy-Item -LiteralPath $Launcher -Destination (Join-Path $staging 'medhaw.exe')
+        }
         $release = [System.IO.Path]::GetFullPath((Join-Path $versions $Version))
         if (Test-Path -LiteralPath $release) {
             try { Remove-Item -LiteralPath $release -Recurse -Force } catch { $release = "$release.$([guid]::NewGuid().ToString('N'))" }
@@ -295,10 +311,11 @@ try {
     Write-Ok 'checksum verified'
 
     $binary = Join-Path $Tmp 'medha.exe'
-    Expand-ValidatedMedhaArchive -Archive $archive -Output $binary
+    $launcher = Join-Path $Tmp 'medhaw.exe'
+    Expand-ValidatedMedhaArchive -Archive $archive -Output $binary -Launcher $launcher
 
     New-Item -ItemType Directory -Path $Dest -Force | Out-Null
-    $bin = Install-MedhaVersion -Binary $binary -Root $Dest -Version $Version
+    $bin = Install-MedhaVersion -Binary $binary -Root $Dest -Version $Version -Launcher $launcher
 
     # Update both persistent and current-session PATH.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

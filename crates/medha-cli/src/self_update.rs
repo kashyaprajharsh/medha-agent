@@ -165,33 +165,137 @@ pub(crate) fn offer() -> Option<String> {
     offered(&cache?, CURRENT)
 }
 
-/// The latest release tag, asked of GitHub now.
+/// Where releases are downloaded first; a fork named by `MEDHA_REPO` has no mirror and uses GitHub alone.
+fn mirror() -> Option<&'static str> {
+    std::env::var_os("MEDHA_REPO")
+        .is_none()
+        .then_some("https://download.manojavamlabs.com")
+}
+
+/// The public half of the update key, the same one built into the desktop app.
+const UPDATE_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENBQTNGNTUxOTIwOTU4MzgKUldRNFdBbVNVZldqeXNwVHNKSURMSGNDaUp2YmlucUI4R1pUS2NqREVzZ0lKcUFGRjJPS0RSL3UK";
+
+/// A client whose connect limit is shared across a name's addresses, so one that never answers costs
+/// a few seconds before the next is tried.
+fn client(connect: Duration, total: Duration) -> Result<reqwest::Client> {
+    Ok(client_builder(connect, total).build()?)
+}
+
+fn client_builder(connect: Duration, total: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent("medha")
+        .connect_timeout(connect)
+        .timeout(total)
+}
+
+async fn body(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("could not reach {url}"))?
+        .error_for_status()
+        .with_context(|| format!("could not download {url}"))?;
+    Ok(response.bytes().await?.to_vec())
+}
+
+/// The latest release tag: the mirror's manifest first, then GitHub's.
 pub(crate) async fn latest() -> Result<String> {
+    let client = client(Duration::from_secs(10), Duration::from_secs(15))?;
+    let mirrored = match mirror() {
+        Some(base) => latest_mirrored(&client, base).await.map_err(Some),
+        None => Err(None),
+    };
+    let tag = match mirrored {
+        Ok(tag) => tag,
+        Err(error) => {
+            if let Some(error) = error {
+                tracing::debug!("the download mirror gave no release: {error:#}");
+            }
+            latest_on_github(&client).await?
+        }
+    };
+    parse(&tag)
+        .map(|_| tag.clone())
+        .with_context(|| format!("the latest release tag {tag} is not a version"))
+}
+
+async fn latest_mirrored(client: &reqwest::Client, base: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Manifest {
+        version: String,
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&body(client, &format!("{base}/latest/latest.json")).await?)?;
+    Ok(format!("v{}", manifest.version.trim_start_matches('v')))
+}
+
+async fn latest_on_github(client: &reqwest::Client) -> Result<String> {
     #[derive(Deserialize)]
     struct Release {
         tag_name: String,
     }
-    let release: Release = reqwest::Client::builder()
-        .user_agent("medha")
-        .timeout(Duration::from_secs(15))
-        .build()?
-        .get(format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            repo()
-        ))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    parse(&release.tag_name)
-        .map(|_| release.tag_name.clone())
-        .with_context(|| {
-            format!(
-                "the latest release tag {} is not a version",
-                release.tag_name
-            )
-        })
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
+    let release: Release = serde_json::from_slice(&body(client, &url).await?)?;
+    Ok(release.tag_name)
+}
+
+/// Where release `tag`'s file `name` can be downloaded, the mirror first.
+fn sources(tag: &str, name: &str) -> Vec<String> {
+    let mut sources: Vec<String> = mirror()
+        .map(|base| format!("{base}/{tag}/{name}"))
+        .into_iter()
+        .collect();
+    sources.push(format!(
+        "https://github.com/{}/releases/download/{tag}/{name}",
+        repo()
+    ));
+    sources
+}
+
+/// Release `tag`'s installer and its signature, from the first source that serves both.
+async fn download_installer(
+    client: &reqwest::Client,
+    sources: &[String],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut failures = Vec::new();
+    for url in sources {
+        let fetched = async {
+            let script = body(client, url).await?;
+            let signature = body(client, &format!("{url}.minisig")).await?;
+            anyhow::Ok((script, signature))
+        };
+        match fetched.await {
+            Ok(fetched) => return Ok(fetched),
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    bail!(
+        "the installer could not be downloaded: {}",
+        failures.join("; ")
+    )
+}
+
+/// `script` runs only if `key` signed exactly it, as release `tag`'s `name`. Read after `verify`, the
+/// signed comment names the file and version, so an older genuine script cannot pass for a newer one.
+fn verify(script: &[u8], signature: &[u8], key: &str, name: &str, tag: &str) -> Result<()> {
+    use base64::Engine as _;
+    let text = |encoded: &[u8]| -> Result<String> {
+        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded.trim_ascii())?;
+        Ok(String::from_utf8(decoded)?)
+    };
+    let key = minisign_verify::PublicKey::decode(&text(key.as_bytes())?)
+        .context("the update key is not readable")?;
+    let signature = minisign_verify::Signature::decode(&text(signature)?)
+        .context("the installer's signature is not readable")?;
+    key.verify(script, &signature, false)
+        .context("the installer's signature does not match Medha's update key")?;
+    let signed: Vec<&str> = signature.trusted_comment().split('\t').collect();
+    let version = format!("version:{}", tag.trim_start_matches('v'));
+    if !signed.contains(&format!("file:{name}").as_str()) || !signed.contains(&version.as_str()) {
+        bail!("the installer was signed as another file or release, not {name} of {tag}");
+    }
+    Ok(())
 }
 
 async fn refresh(path: &Path) -> Result<String> {
@@ -257,28 +361,17 @@ fn installer(script: &Path, tag: &str, install: &Install) -> std::process::Comma
     command
 }
 
-/// Downloads release `tag`'s installer and runs it in this terminal.
+/// Downloads release `tag`'s installer, checks its signature, and runs it in this terminal.
 pub(crate) async fn install(tag: &str, install: &Install) -> Result<()> {
     let name = if cfg!(windows) {
         "install.ps1"
     } else {
         "install.sh"
     };
-    let url = format!(
-        "https://github.com/{}/releases/download/{tag}/{name}",
-        repo()
-    );
-    let script = reqwest::Client::builder()
-        .user_agent("medha")
-        .timeout(Duration::from_secs(60))
-        .build()?
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("could not download {url}"))?
-        .bytes()
-        .await?;
+    let client = client(Duration::from_secs(20), Duration::from_secs(60))?;
+    let (script, signature) = download_installer(&client, &sources(tag, name)).await?;
+    // A bad signature stops the update; it is never a reason to try another source.
+    verify(&script, &signature, UPDATE_KEY, name, tag)?;
     // A folder of its own: a file in the project cannot be picked up by the installer.
     let folder = tempfile::tempdir()?;
     let path = folder.path().join(name);

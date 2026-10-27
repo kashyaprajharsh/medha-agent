@@ -13,6 +13,14 @@ set -eu
 REPO="${MEDHA_REPO:-kashyaprajharsh/medha-agent}"
 VERSION="${MEDHA_VERSION:-latest}"
 INSTALL_DIR="${MEDHA_INSTALL_DIR:-}"
+# Releases are downloaded from this mirror first and from GitHub when it cannot serve them.
+# A fork named by MEDHA_REPO has no mirror and uses its own GitHub releases alone.
+if [ -n "${MEDHA_REPO:-}" ]; then
+  MIRROR=""
+else
+  MIRROR="${MEDHA_MIRROR:-https://download.manojavamlabs.com}"
+fi
+GITHUB="https://github.com/$REPO/releases/download"
 
 # Use color only on an interactive terminal unless NO_COLOR is set.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -38,11 +46,13 @@ printf '  %s──────────────────────�
 need uname
 need tar
 
-# Bound connection attempts and retry transient release-download failures.
+# Bound connection attempts and retry transient release-download failures. The mirror is asked once:
+# when it fails, GitHub is the retry.
 if command -v curl >/dev/null 2>&1; then
   NET_OPTS="--connect-timeout 5 --retry 3 --proto =https --proto-redir =https"
+  ONCE_OPTS="--connect-timeout 5 --proto =https --proto-redir =https"
   fetch() { curl -fsSL $NET_OPTS "$1"; }
-  fetch_to() { curl -fSL $NET_OPTS --progress-bar "$1" -o "$2"; }
+  fetch_once() { curl -fsSL $ONCE_OPTS "$1"; }
   # Return 0 for success, 2 for HTTP 404, and 1 for other failures.
   fetch_optional_to() {
     status="$(curl -sSL $NET_OPTS -o "$2" -w '%{http_code}' "$1")" || return 1
@@ -54,8 +64,9 @@ if command -v curl >/dev/null 2>&1; then
   }
 elif command -v wget >/dev/null 2>&1; then
   NET_OPTS="--connect-timeout=5 --tries=3"
+  ONCE_OPTS="--connect-timeout=5 --tries=1"
   fetch() { wget $NET_OPTS -qO- "$1"; }
-  fetch_to() { wget $NET_OPTS -qO "$2" "$1"; }
+  fetch_once() { wget $ONCE_OPTS -qO- "$1"; }
   fetch_optional_to() {
     headers="$2.headers"
     if wget $NET_OPTS -S -qO "$2" "$1" 2>"$headers"; then
@@ -72,6 +83,73 @@ elif command -v wget >/dev/null 2>&1; then
 else
   die "either curl or wget is required"
 fi
+
+# Whether a download that failed with exit code $1 may be tried on the next host: a network failure
+# or an error answer may; a certificate that does not check out is someone in the way, not a host
+# that is down, so it may not.
+retryable() {
+  if command -v curl >/dev/null 2>&1; then
+    case "$1" in 5|6|7|18|22|28|52|55|56) return 0 ;; esac
+  else
+    case "$1" in 4|8) return 0 ;; esac
+  fi
+  return 1
+}
+
+# Downloads $1 to $2, with a progress bar when $3 is set: 0 when it arrived, 3 when this host could
+# not serve it so the next host may (no connection, a timeout, a missing file, a refusal), 1 otherwise.
+get() {
+  rm -f "$2"
+  opts="$NET_OPTS"
+  case "$1" in "${MIRROR:-none}"/*) opts="$ONCE_OPTS" ;; esac
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "${3:-}" ]; then
+      code="$(curl -SL $opts --progress-bar -o "$2" -w '%{http_code}' "$1")" && rc=0 || rc=$?
+    else
+      code="$(curl -sSL $opts -o "$2" -w '%{http_code}' "$1")" && rc=0 || rc=$?
+    fi
+    if [ "$rc" != 0 ]; then
+      rm -f "$2"
+      retryable "$rc" && return 3
+      return 1
+    fi
+    case "$code" in
+      2??) return 0 ;;
+      403|429)
+        # Cloudflare answers for the mirror when it blocks a network, not the file being missing.
+        note "the download mirror refused this network ($code); trying GitHub"
+        rm -f "$2"; return 3 ;;
+      404|5??) rm -f "$2"; return 3 ;;
+      *) rm -f "$2"; return 1 ;;
+    esac
+  fi
+  wget $opts -qO "$2" "$1" && return 0
+  rc=$?
+  rm -f "$2"
+  retryable "$rc" && return 3
+  return 1
+}
+
+# A mirror that failed once is not asked again in this run.
+mirror_failed() {
+  [ -n "$MIRROR" ] && note "the download mirror could not serve this release; using GitHub"
+  MIRROR=""
+}
+
+# Downloads release file $1 to $2 from the mirror, else GitHub. Called without a subshell, so a
+# mirror that failed stays skipped for the rest of the run.
+get_release() {
+  for base in ${MIRROR:+"$MIRROR"} "$GITHUB"; do
+    status=0
+    get "$base/$VERSION/$1" "$2" "${3:-}" || status=$?
+    case "$status" in
+      0) return 0 ;;
+      3) [ "$base" = "$GITHUB" ] || mirror_failed ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
 
 
 os="$(uname -s)"
@@ -97,7 +175,18 @@ TARGET="${arch_part}-${os_part}"
 
 if [ "$VERSION" = "latest" ]; then
   step "resolving latest release"
-  VERSION="$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
+  VERSION=""
+  if [ -n "$MIRROR" ]; then
+    manifest="$(fetch_once "$MIRROR/latest/latest.json" 2>/dev/null)" && rc=0 || rc=$?
+    if [ "$rc" = 0 ]; then
+      VERSION="$(printf '%s\n' "$manifest" \
+        | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/v\1/p' | head -n1)"
+    elif ! retryable "$rc"; then
+      die "the download mirror's certificate or connection did not check out; refusing to continue"
+    fi
+    [ -n "$VERSION" ] || mirror_failed
+  fi
+  [ -n "$VERSION" ] || VERSION="$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -n1)"
   [ -n "$VERSION" ] || die "could not resolve the latest release of $REPO.
@@ -111,7 +200,6 @@ case "$VERSION" in
 esac
 
 ASSET="medha-${TARGET}.tar.gz"
-URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 
 
 if [ -z "$INSTALL_DIR" ]; then
@@ -151,12 +239,20 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp" "$LOCK"' EXIT
 
 step "downloading medha $VERSION  ($TARGET)"
-fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
+get_release "$ASSET" "$tmp/$ASSET" progress || die "download failed: $ASSET of $VERSION
 This platform may not have a published build for $VERSION."
 
 # Every release publishes a checksum beside each archive; a missing or unreadable one fails closed.
+# It is read from GitHub first, so a file from the mirror is checked against a second host.
+URL="$GITHUB/$VERSION/$ASSET"
 checksum_status=0
 fetch_optional_to "$URL.sha256" "$tmp/$ASSET.sha256" || checksum_status=$?
+if [ "$checksum_status" = 1 ] && [ -n "$MIRROR" ]; then
+  note "GitHub could not be reached for the checksum; reading the mirror's"
+  URL="$MIRROR/$VERSION/$ASSET"
+  checksum_status=0
+  fetch_optional_to "$URL.sha256" "$tmp/$ASSET.sha256" || checksum_status=$?
+fi
 case "$checksum_status" in
   0)
     records="$(awk 'NF { count += 1 } END { print count + 0 }' "$tmp/$ASSET.sha256")"

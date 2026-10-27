@@ -211,6 +211,24 @@ function Update-MedhaPath {
     return (@($kept) + $Bin) -join ';'
 }
 
+# The HTTP status of a failed request, 0 when it never got an answer.
+function Get-MedhaStatus($Failure) {
+    $status = 0
+    try { $status = [int]$Failure.Exception.Response.StatusCode } catch { $status = 0 }
+    return $status
+}
+
+# A certificate that does not check out is someone in the way, not a host that is down, so it is
+# never a reason to try another host. Windows PowerShell 5.1 and PowerShell 7 report it differently.
+function Test-MedhaTrustFailure($Failure) {
+    $exception = $Failure.Exception
+    if ($exception -is [System.Net.WebException]) {
+        return $exception.Status -in @('TrustFailure', 'SecureChannelFailure')
+    }
+    $inner = $exception.InnerException
+    return [bool]($inner -and $inner.GetType().FullName -eq 'System.Security.Authentication.AuthenticationException')
+}
+
 if ($env:MEDHA_INSTALLER_TEST_MODE -eq '1') {
     # Dot-sourcing exposes helpers to tests without running the installer.
     return
@@ -264,26 +282,73 @@ if ([Environment]::Is64BitOperatingSystem -eq $false) {
 }
 $Target = 'x86_64-pc-windows-msvc'
 
-# Bound response waits; PowerShell 6+ also retries transient failures.
+# Bound response waits; PowerShell 6+ also retries transient failures. The mirror is asked once:
+# when it fails, GitHub is the retry.
 $WebArgs = @{ UseBasicParsing = $true; TimeoutSec = 30 }
+$OnceArgs = @{ UseBasicParsing = $true; TimeoutSec = 30 }
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     $WebArgs['MaximumRetryCount'] = 3
     $WebArgs['RetryIntervalSec'] = 2
 }
 
+# Releases are downloaded from this mirror first and from GitHub when it cannot serve them.
+# A fork named by MEDHA_REPO has no mirror and uses its own GitHub releases alone.
+$Mirror = if ($env:MEDHA_REPO) { '' } elseif ($env:MEDHA_MIRROR) { $env:MEDHA_MIRROR } else { 'https://download.manojavamlabs.com' }
+$GitHub = "https://github.com/$Repo/releases/download"
+
+# A mirror that failed once is not asked again; Cloudflare's refusal of a network is named as such.
+function Skip-MedhaMirror($Failure) {
+    if (Test-MedhaTrustFailure $Failure) {
+        throw [System.Security.Authentication.AuthenticationException]::new("The download mirror's certificate did not check out; refusing to continue. $($Failure.Exception.Message)")
+    }
+    $status = Get-MedhaStatus $Failure
+    if ($status -eq 403 -or $status -eq 429) {
+        Write-Note "the download mirror refused this network ($status); using GitHub"
+    } else {
+        Write-Note 'the download mirror could not serve this release; using GitHub'
+    }
+    $script:Mirror = ''
+}
+
+# Downloads release file $Name to $OutFile from the mirror, else GitHub.
+function Get-MedhaRelease($Name, $OutFile) {
+    if ($script:Mirror) {
+        try {
+            Invoke-WebRequest -Uri "$script:Mirror/$Version/$Name" -OutFile $OutFile @OnceArgs
+            return
+        } catch {
+            Skip-MedhaMirror $_
+        }
+    }
+    Invoke-WebRequest -Uri "$GitHub/$Version/$Name" -OutFile $OutFile @WebArgs
+}
+
 if ($Version -eq 'latest') {
     Write-Step 'resolving latest release'
-    try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'medha-installer' } @WebArgs
-        $Version = $release.tag_name
-    } catch {
-        throw "Could not resolve the latest release of $Repo. Set `$env:MEDHA_VERSION to a tag, or check that the repository has a published release."
+    if ($Mirror) {
+        try {
+            $manifest = Invoke-RestMethod -Uri "$Mirror/latest/latest.json" @OnceArgs
+            $Version = 'v' + ([string]$manifest.version).TrimStart('v')
+        } catch {
+            Skip-MedhaMirror $_
+        }
+    }
+    if ($Version -eq 'latest' -or $Version -eq 'v') {
+        try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'medha-installer' } @WebArgs
+            $Version = $release.tag_name
+        } catch {
+            throw "Could not resolve the latest release of $Repo. Set `$env:MEDHA_VERSION to a tag, or check that the repository has a published release."
+        }
     }
     Write-Ok "resolved $Version"
 }
+# The version names a folder, so it may hold only what a release tag holds.
+if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+    throw "Not a release tag: $Version"
+}
 
 $Asset = "medha-$Target.zip"
-$Url   = "https://github.com/$Repo/releases/download/$Version/$Asset"
 $Tmp   = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $Tmp -Force | Out-Null
 
@@ -291,17 +356,34 @@ try {
     Write-Step "downloading medha $Version  ($Target)"
     $archive = Join-Path $Tmp $Asset
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $archive @WebArgs
+        Get-MedhaRelease $Asset $archive
     } catch {
-        throw "Download failed: $Url`nThis platform may not have a published build for $Version."
+        if ($_.Exception -is [System.Security.Authentication.AuthenticationException]) { throw }
+        throw "Download failed: $Asset of $Version`nThis platform may not have a published build for $Version."
     }
 
     # Every release publishes a checksum beside each archive; a missing or unreadable one fails closed.
+    # It is read from GitHub first, so a file from the mirror is checked against a second host.
+    # PowerShell stays on an address that never answers until the time limit, so this tiny file is
+    # given a short one before the mirror's copy is read.
     $sumFile = "$archive.sha256"
+    $Url = "$GitHub/$Version/$Asset"
+    $SumArgs = if ($Mirror) { @{ UseBasicParsing = $true; TimeoutSec = 10 } } else { $WebArgs }
     try {
-        Invoke-WebRequest -Uri "$Url.sha256" -OutFile $sumFile @WebArgs
+        Invoke-WebRequest -Uri "$Url.sha256" -OutFile $sumFile @SumArgs
     } catch {
-        throw "Checksum download failed: $Url.sha256 - refusing an unverifiable install. $($_.Exception.Message)"
+        $githubFailure = $_
+        $status = Get-MedhaStatus $githubFailure
+        if ($status -eq 404 -or -not $Mirror) {
+            throw "Checksum download failed: $Url.sha256 - refusing an unverifiable install. $($githubFailure.Exception.Message)"
+        }
+        Write-Note "GitHub could not be reached for the checksum; reading the mirror's"
+        $Url = "$Mirror/$Version/$Asset"
+        try {
+            Invoke-WebRequest -Uri "$Url.sha256" -OutFile $sumFile @OnceArgs
+        } catch {
+            throw "Checksum download failed: $Url.sha256 - refusing an unverifiable install. $($_.Exception.Message)"
+        }
     }
     $expected = Get-ChecksumDigest $sumFile
     $actual   = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()

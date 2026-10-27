@@ -339,6 +339,22 @@ jobs:
             else sha256sum "$file" > "$file.sha256"; fi
           done
 
+      # `medha update` runs only an install script whose signature, bound to this version, matches
+      # the update key; the release stages the same scripts from this commit.
+      - name: Sign the install scripts
+        if: env.RELEASE_PUBLISH == 'true' && runner.os == 'Linux'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        shell: bash
+        run: |
+          for script in install.sh install.ps1; do
+            cp "../../$script" "$RUNNER_TEMP/$script"
+            npx tauri signer sign --app-version "${TAG#v}" "$RUNNER_TEMP/$script"
+            mv "$RUNNER_TEMP/$script.sig" "out/$script.minisig"
+          done
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: medha-desktop-${{ matrix.target }}
@@ -373,8 +389,13 @@ jobs:
           path: dist
 
       # Ship installers from the same immutable tag as their binaries.
+      # `medha update` refuses an unsigned script, so a release without the signatures is not published.
       - name: Stage installers
-        run: cp install.sh install.ps1 dist/
+        run: |
+          cp install.sh install.ps1 dist/
+          for script in install.sh install.ps1; do
+            [ -f "dist/$script.minisig" ] || { echo "no signature for $script" >&2; exit 1; }
+          done
 
       # What an installed desktop app reads to learn of this release: where each
       # platform's update is and the signature it must carry.
@@ -395,6 +416,8 @@ jobs:
             dist/*.AppImage
             dist/*.exe
             dist/latest.json
+            dist/latest-github.json
+            dist/*.minisig
             dist/*.sha256
             dist/install.sh
             dist/install.ps1

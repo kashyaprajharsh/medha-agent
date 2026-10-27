@@ -51,6 +51,7 @@ tempfile = "3"
 url = "2"
 reqwest = { workspace = true }
 sha2 = "0.10"
+minisign-verify = "0.2"
 dirs = "5"
 rustyline = "14"
 # Keep crossterm pinned to the same version ratatui re-exports (PART 7) — a mismatch

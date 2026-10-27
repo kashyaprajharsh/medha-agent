@@ -33,9 +33,10 @@ for sum in *.sha256; do
   [ "$(cut -d' ' -f1 "$sum")" = "$(digest "$file")" ] || fail "$file does not match $sum"
 done
 
-# The mirror's own update manifest points at the mirror; each signature still binds the same bytes.
+# The mirror's manifest points at the mirror: releases since 0.1.13 already do, older ones are rewritten.
+# Each signature still binds the same bytes.
 jq --arg from "https://github.com/$repo/releases/download/$tag/" --arg to "$public/$tag/" \
-  '.platforms |= map_values(.url |= if startswith($from) then $to + .[($from | length):] else error("unexpected url \(.)") end)' \
+  '.platforms |= map_values(.url |= if startswith($to) then . elif startswith($from) then $to + .[($from | length):] else error("unexpected url \(.)") end)' \
   latest.json > "$work/latest.json"
 
 kind() {
@@ -108,4 +109,15 @@ for file in *; do
   [ "$file" = latest.json ] || latest "$file"
 done
 latest latest.json
+
+# The mirror keeps the newest versions; GitHub keeps every release, so nothing is lost.
+keep="${R2_KEEP:-5}"
+s3 s3api list-objects-v2 --bucket "$R2_BUCKET" --delimiter / --query 'CommonPrefixes[].Prefix' --output text \
+  | tr '\t' '\n' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?/$' | sed 's#/$##' \
+  | sort -t. -k1,1 -k2,2n -k3,3n | awk -v keep="$keep" '{ seen[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print seen[i] }' \
+  | while read -r old; do
+    [ "$old" = "$tag" ] && continue
+    s3 s3 rm "s3://$R2_BUCKET/$old/" --recursive --only-show-errors
+    echo "removed  $old"
+  done
 echo "mirrored $tag to $public"

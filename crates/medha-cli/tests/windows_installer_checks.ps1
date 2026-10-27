@@ -51,6 +51,19 @@ Assert-Throws { Get-ChecksumDigest $malformed } 'malformed digest was accepted'
 Assert-Throws { Get-ChecksumDigest $multiple } 'multiple checksum records were accepted'
 Assert-Throws { Get-ChecksumDigest $ambiguous } 'multiple digest tokens were accepted'
 
+# A bad certificate stops the install; a host that is down or refuses hands over to the next one.
+$trust = [System.Net.WebException]::new('untrusted', $null, [System.Net.WebExceptionStatus]::TrustFailure, $null)
+$channel = [System.Net.WebException]::new('no channel', $null, [System.Net.WebExceptionStatus]::SecureChannelFailure, $null)
+$down = [System.Net.WebException]::new('down', $null, [System.Net.WebExceptionStatus]::ConnectFailure, $null)
+$handshake = [System.Exception]::new('handshake', [System.Security.Authentication.AuthenticationException]::new('bad certificate'))
+$timeout = [System.Exception]::new('timeout', [System.TimeoutException]::new('slow'))
+Assert-True (Test-MedhaTrustFailure ([pscustomobject]@{ Exception = $trust })) 'a 5.1 trust failure was taken for an outage'
+Assert-True (Test-MedhaTrustFailure ([pscustomobject]@{ Exception = $channel })) 'a 5.1 secure-channel failure was taken for an outage'
+Assert-True (Test-MedhaTrustFailure ([pscustomobject]@{ Exception = $handshake })) 'a PowerShell 7 certificate failure was taken for an outage'
+Assert-True (-not (Test-MedhaTrustFailure ([pscustomobject]@{ Exception = $down }))) 'a host that is down was taken for a bad certificate'
+Assert-True (-not (Test-MedhaTrustFailure ([pscustomobject]@{ Exception = $timeout }))) 'a timeout was taken for a bad certificate'
+Assert-True ((Get-MedhaStatus ([pscustomobject]@{ Exception = $down })) -eq 0) 'a request that got no answer reported a status'
+
 Assert-True (-not (Test-PathContains 'C:\Tools\medha-old;C:\Else' 'C:\Tools\medha')) 'PATH substring was mistaken for an exact segment'
 Assert-True (Test-PathContains 'C:\Else;C:\Tools\medha\' 'c:\tools\MEDHA') 'normalized exact PATH segment was missed'
 

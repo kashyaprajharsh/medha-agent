@@ -144,14 +144,27 @@ esac
             r#"#!/bin/sh
 out=
 url=
+status=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) shift; out="$1" ;;
-    -w) shift ;;
+    -w) shift; status=true ;;
     http://*|https://*) url="$1" ;;
   esac
   shift
 done
+[ -n "${TEST_URL_LOG:-}" ] && printf '%s\n' "$url" >> "$TEST_URL_LOG"
+# The mirror behaves as TEST_MIRROR_MODE says: down, missing its files, or behind a bad certificate.
+case "$url" in
+  https://mirror.test/*)
+    case "${TEST_MIRROR_MODE:-}" in
+      down) exit 7 ;;
+      missing) [ "$status" = true ] && printf '404'; [ "$status" = true ] && exit 0; exit 22 ;;
+      certificate) exit 60 ;;
+      blocked) [ "$status" = true ] && printf '403'; exit 0 ;;
+    esac
+    ;;
+esac
 case "$url" in
   *.sha256)
     case "$TEST_CHECKSUM_MODE" in
@@ -161,7 +174,7 @@ case "$url" in
       *) exit 9 ;;
     esac
     ;;
-  *) cp "$TEST_ARCHIVE" "$out" ;;
+  *) cp "$TEST_ARCHIVE" "$out"; [ "$status" = true ] && printf '200'; exit 0 ;;
 esac
 "#,
         );
@@ -539,4 +552,103 @@ fn a_version_that_is_not_a_tag_is_refused() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("not a release tag"));
     assert!(!case.path().join("installed/medha").exists());
+}
+
+/// Installs through the download mirror in `mode`; gives the run and every address it asked for.
+fn install_mirrored(mode: &str) -> (TempDir, Output, Vec<String>) {
+    let case = TempDir::new().unwrap();
+    let archive = case.path().join("release.tar.gz");
+    make_archive(
+        &archive,
+        &[Entry {
+            name: "medha",
+            kind: EntryKind::Regular,
+            body: b"mirrored",
+            link: "",
+        }],
+    );
+    let checksum = format!("{}  medha-test.tar.gz\n", sha256(&archive));
+    let log = case.path().join("urls.log");
+    let output = installer(&case, &archive, "present", &checksum, true)
+        .env_remove("MEDHA_REPO")
+        .env("MEDHA_MIRROR", "https://mirror.test")
+        .env("TEST_MIRROR_MODE", mode)
+        .env("TEST_URL_LOG", &log)
+        .output()
+        .unwrap();
+    let asked = fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (case, output, asked)
+}
+
+/// The archive comes from the mirror, and its checksum from GitHub, a second host.
+#[test]
+fn a_release_comes_from_the_mirror_and_is_checked_against_github() {
+    let (case, output, asked) = install_mirrored("serves");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(case.path().join("installed/medha")).unwrap(),
+        b"mirrored"
+    );
+    let archive = asked
+        .iter()
+        .filter(|url| url.ends_with(".tar.gz"))
+        .collect::<Vec<_>>();
+    assert_eq!(archive.len(), 1, "{asked:?}");
+    assert!(
+        archive[0].starts_with("https://mirror.test/v-test/"),
+        "{asked:?}"
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|url| url.starts_with("https://github.com/") && url.ends_with(".tar.gz.sha256")),
+        "{asked:?}"
+    );
+}
+
+/// A mirror that is down, lacks the files, or refuses the network hands over to GitHub, and is
+/// asked once rather than retried.
+#[test]
+fn a_mirror_that_cannot_serve_hands_over_to_github() {
+    for mode in ["down", "missing", "blocked"] {
+        let (case, output, asked) = install_mirrored(mode);
+        assert!(output.status.success(), "{mode}: {}", stderr(&output));
+        assert_eq!(
+            fs::read(case.path().join("installed/medha")).unwrap(),
+            b"mirrored",
+            "{mode}"
+        );
+        let mirror = asked
+            .iter()
+            .filter(|url| url.starts_with("https://mirror.test/"))
+            .count();
+        assert_eq!(
+            mirror, 1,
+            "{mode}: the mirror was asked {mirror} times: {asked:?}"
+        );
+        assert!(
+            asked
+                .iter()
+                .any(|url| url.starts_with("https://github.com/") && url.ends_with(".tar.gz")),
+            "{mode}: {asked:?}"
+        );
+    }
+}
+
+/// A certificate that does not check out is someone in the way: the install stops and no other host is tried.
+#[test]
+fn a_mirror_with_a_bad_certificate_stops_the_install() {
+    let (case, output, asked) = install_mirrored("certificate");
+    assert!(!output.status.success());
+    assert!(!case.path().join("installed/medha").exists());
+    assert!(
+        !asked
+            .iter()
+            .any(|url| url.starts_with("https://github.com/") && url.ends_with(".tar.gz")),
+        "fell back after a bad certificate: {asked:?}"
+    );
 }

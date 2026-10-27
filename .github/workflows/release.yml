@@ -400,3 +400,42 @@ jobs:
           draft: false
           generate_release_notes: true
           files: dist/*
+
+      # The mirror takes these exact bytes, never a rebuild.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: published
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  # Downloads come from Cloudflare R2 so one unreachable GitHub address cannot stall them.
+  # Only this job holds the R2 key, through an environment that release tags alone may use.
+  mirror:
+    needs: [validate, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: published
+          path: dist
+
+      - name: Mirror to R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: medha-download
+        run: sh .github/scripts/mirror_r2.sh dist "$TAG"

@@ -5923,11 +5923,10 @@ impl Tool for ShellExec {
         {
             return false;
         }
-        !(observation.status == kernel::ObsStatus::Ok
-            && observation.payload["exit_code"] == 0
-            && observation.payload["command"]
-                .as_str()
-                .is_some_and(lanes::shell_only_reads))
+        // Read from the command line, so a reader that matched nothing, failed or timed out still wrote nothing.
+        !observation.payload["command"]
+            .as_str()
+            .is_some_and(lanes::shell_only_reads)
     }
     fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
         if !self.sbx.denies_network() || args["outside_sandbox"] == true || args["network"] == true
@@ -9283,6 +9282,35 @@ mod tests {
             obs.payload.get("task_id").is_none(),
             "fast command should not promote"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Only a command that may write starts the verifier; a reader that finds nothing or times out does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_readers_never_count_as_changes_whatever_their_outcome() {
+        use kernel::Executor;
+        let dir = std::env::temp_dir().join(format!("medha-sh-changed-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        std::fs::write(dir.join("log.txt"), "present\n").unwrap();
+        for (args, changed) in [
+            (json!({ "command": "grep -q ABSENT log.txt" }), false),
+            (json!({ "command": "grep present log.txt" }), false),
+            (json!({ "command": "cat missing.txt" }), false),
+            (
+                json!({ "command": "tail -f log.txt", "timeout_s": 1 }),
+                false,
+            ),
+            (json!({ "command": "printf x > made.txt" }), true),
+            (json!({ "command": "sh -c 'exit 7'" }), true),
+        ] {
+            let obs = run(&reg, "shell.exec", args.clone()).await;
+            assert_eq!(
+                reg.changed_files("shell.exec", &obs),
+                changed,
+                "{args} {obs:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

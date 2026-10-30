@@ -1818,9 +1818,15 @@ impl Tool for ImageView {
 }
 
 /// One page of a read: at most this many lines, ending at a whole line before
-/// this many characters. Larger files are read a page at a time.
+/// [`page_limit`]. Larger files are read a page at a time.
 const READ_PAGE_LINES: u64 = 2_000;
-const READ_PAGE_CHARS: usize = 50_000;
+/// Kept free in a page for a note the kernel may add to the result, such as a repaired argument.
+const PAGE_NOTE_ROOM: usize = 1_000;
+
+/// The most a page may hold so the model is shown it, not a stored copy of it.
+fn page_limit() -> usize {
+    kernel::result_limit().saturating_sub(PAGE_NOTE_ROOM)
+}
 /// Directory entries retained by one `fs.list` call; the count of what was
 /// left out is still reported, so truncation is visible rather than silent.
 const FS_LIST_MAX_ENTRIES: usize = 2_000;
@@ -1923,10 +1929,13 @@ impl Tool for FsRead {
                 Err(error) => return Err(ToolError::Failed(format!("read failed: {error}"))),
             },
         };
-        // A page also ends at whole lines before READ_PAGE_CHARS; the next one
+        // A page also ends at whole lines before the model's view of it, with a
+        // number and `|` on every line, outgrows the page limit; the next one
         // starts where it stopped.
-        if range.content.len() > READ_PAGE_CHARS {
-            let mut cut = READ_PAGE_CHARS;
+        let numbers = range.content.matches('\n').count() * (range.end_line.to_string().len() + 1);
+        let fits = page_limit().saturating_sub(numbers);
+        if range.content.len() > fits {
+            let mut cut = fits;
             while !range.content.is_char_boundary(cut) {
                 cut -= 1;
             }
@@ -3579,6 +3588,7 @@ impl Tool for ReadArtifact {
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
             .unwrap_or(MAX_PAGE_BYTES)
             .min(MAX_PAGE_BYTES);
+        let limit = page_limit();
         // Name the actual failure. A raw `No such file` from the store reads as a
         // transient IO fault, so a model that guessed a hash guesses again rather
         // than changing approach — the observed failure mode is several invented
@@ -3638,8 +3648,8 @@ impl Tool for ReadArtifact {
             0
         };
         let slice = &bytes[lead.min(bytes.len())..];
-        // Fit the encoded payload under the spill threshold. Shrinking on the
-        // measured length rather than a guessed escape ratio keeps the
+        // Fit the encoded payload under what one result may show. Shrinking on
+        // the measured length rather than a guessed escape ratio keeps the
         // invariant exact for any content, including artifacts that escape
         // badly; `consumed` always shrinks, so this terminates.
         let mut take = slice.len();
@@ -3657,10 +3667,10 @@ impl Tool for ReadArtifact {
                 out["next_offset"] = json!(next_offset);
             }
             let encoded = serde_json::to_string(&out).map_or(0, |s| s.len());
-            if encoded <= kernel::SPILL_THRESHOLD || consumed == 0 {
+            if encoded <= limit || consumed == 0 {
                 return Ok(out);
             }
-            take = floor_utf8_boundary(slice, consumed * kernel::SPILL_THRESHOLD / encoded);
+            take = floor_utf8_boundary(slice, consumed * limit / encoded);
         }
     }
 }

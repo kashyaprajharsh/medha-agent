@@ -62,7 +62,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 );
             }
         }
-        let mut observation = self.executor.execute(intent).await;
+        let mut observation = crate::kernel_loop::result_limit_scope(
+            self.result_limits().0,
+            self.executor.execute(intent),
+        )
+        .await;
         self.executor
             .finish_effect(intent, &preparation, &mut observation)
             .await;

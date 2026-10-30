@@ -589,6 +589,19 @@ pub struct Kernel<P: Provider, L: EventLog> {
 /// because the paging tool must size its pages to survive this threshold: a
 /// page that spills costs a round trip instead of saving one.
 pub const SPILL_THRESHOLD: usize = 40_000;
+
+tokio::task_local! { static RESULT_LIMIT: usize; }
+
+/// The most one result can show the model during the current call; a tool that pages sizes its pages to it.
+pub fn result_limit() -> usize {
+    RESULT_LIMIT
+        .try_with(|limit| *limit)
+        .unwrap_or(SPILL_THRESHOLD)
+}
+
+pub(crate) async fn result_limit_scope<T>(limit: usize, call: impl Future<Output = T>) -> T {
+    RESULT_LIMIT.scope(limit, call).await
+}
 /// The most one round of tool results may put in front of the model together.
 const ROUND_LIMIT: usize = 120_000;
 /// How much of a stored result the model sees in place of it: its start, where

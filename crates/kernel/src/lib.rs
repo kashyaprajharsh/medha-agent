@@ -69,7 +69,7 @@ pub use hooks::{
 pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
 pub use kernel_loop::{
     DEFAULT_MAX_PARALLEL_TOOLS, Kernel, OpeningContext, SPILL_THRESHOLD, SessionClaim,
-    SessionOwner, StopReason,
+    SessionOwner, StopReason, result_limit,
 };
 pub use medha_extension_api::{HookDecision, HookPoint};
 pub use policy::{AllowAll, Policy};

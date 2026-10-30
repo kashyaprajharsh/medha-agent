@@ -93,7 +93,7 @@ struct ReadTools;
 #[async_trait]
 impl Executor for ReadTools {
     fn specs(&self) -> Vec<ToolSpec> {
-        ["write", "edit", "read", "fail"]
+        ["write", "edit", "read", "fail", "exits"]
             .into_iter()
             .map(|name| ToolSpec {
                 name: name.into(),
@@ -110,11 +110,15 @@ impl Executor for ReadTools {
         Some(BlastRadius::Read)
     }
 
+    fn failed(&self, _tool: &str, observation: &Observation) -> bool {
+        observation.status == kernel::ObsStatus::Error || observation.payload["exit_code"] == 2
+    }
+
     async fn execute(&self, intent: &ToolIntent) -> Observation {
-        if intent.tool == "fail" {
-            Observation::error(&intent.id, "setup has not run")
-        } else {
-            Observation::ok(intent.id.clone(), json!({"ok": true}))
+        match intent.tool.as_str() {
+            "fail" => Observation::error(&intent.id, "setup has not run"),
+            "exits" => Observation::ok(intent.id.clone(), json!({"exit_code": 2})),
+            _ => Observation::ok(intent.id.clone(), json!({"ok": true})),
         }
     }
 }
@@ -460,6 +464,13 @@ async fn tool_failure_context_is_attached_to_the_failed_result() {
     run(&kernel, &Session::new(), &Notices::default()).await;
     assert_eq!(hooks.count(HookPoint::ToolFailure), 0);
     assert_eq!(hooks.count(HookPoint::PostTool), 1);
+
+    // A tool that ran but reports its command failed is a failure too.
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_call("exits")]));
+    let hooks = Arc::new(PointHooks::default());
+    let kernel = build(provider, Arc::new(InMemoryLog::new()), hooks.clone());
+    run(&kernel, &Session::new(), &Notices::default()).await;
+    assert_eq!(hooks.count(HookPoint::ToolFailure), 1);
 }
 
 #[tokio::test]

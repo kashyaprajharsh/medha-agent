@@ -139,6 +139,12 @@ impl kernel::Executor for Rebound {
             |tool| tool.changed_files(observation),
         )
     }
+    fn failed(&self, tool: &str, observation: &kernel::Observation) -> bool {
+        self.tools.get(tool).map_or_else(
+            || self.inner.failed(tool, observation),
+            |tool| tool.failed(observation),
+        )
+    }
     fn observation_delivered(&self, tool: &str, observation: &kernel::Observation) {
         match self.tools.get(tool) {
             Some(tool) => tool.delivered(observation),

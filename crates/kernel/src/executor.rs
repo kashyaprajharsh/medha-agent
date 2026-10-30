@@ -104,6 +104,11 @@ pub trait Executor: Send + Sync {
             .unwrap_or(true)
     }
 
+    /// The call did not do what it was asked: an error, or a tool that ran but reports failing (a command's exit code).
+    fn failed(&self, _tool: &str, observation: &Observation) -> bool {
+        observation.status == crate::ObsStatus::Error
+    }
+
     async fn check_outbound(&self, _intent: &ToolIntent) -> Result<(), String> {
         Ok(())
     }

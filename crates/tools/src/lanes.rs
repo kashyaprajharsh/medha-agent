@@ -51,6 +51,28 @@ pub(crate) fn shell_only_reads(command: &str) -> bool {
     shell_reader::read(command).reads_only()
 }
 
+/// Exit 1 from a search or comparison that ends the line means "nothing found" or "they differ", not a failure.
+pub(crate) fn found_nothing(command: &str) -> bool {
+    let reading = shell_reader::read(command);
+    let Some(last) = reading
+        .commands
+        .iter()
+        .rev()
+        .find(|command| !command.substituted)
+    else {
+        return false;
+    };
+    last.program()
+        .is_some_and(|program| match program.name.as_str() {
+            "grep" | "egrep" | "fgrep" | "rg" | "diff" | "cmp" | "test" | "[" => true,
+            "git" => program
+                .args
+                .first()
+                .is_some_and(|sub| sub.text == "grep" || sub.text == "diff"),
+            _ => false,
+        })
+}
+
 #[cfg(test)]
 #[path = "lanes_tests.rs"]
 mod tests;

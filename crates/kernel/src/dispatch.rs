@@ -139,7 +139,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         } else {
             TrustLabel::Tool
         };
-        let failed = observation.status == crate::types::ObsStatus::Error;
+        let failed = self.executor.failed(&intent.tool, &observation);
         let mut points = vec![medha_extension_api::HookPoint::PostTool];
         if failed {
             points.push(medha_extension_api::HookPoint::ToolFailure);

@@ -138,6 +138,10 @@ impl Executor for NarrowedExecutor {
         self.allows(tool) && self.inner.changed_files(tool, observation)
     }
 
+    fn failed(&self, tool: &str, observation: &Observation) -> bool {
+        self.inner.failed(tool, observation)
+    }
+
     fn background_tasks(&self) -> Vec<kernel::BackgroundTask> {
         if self.read_only {
             Vec::new()

@@ -155,6 +155,11 @@ pub trait Tool: Send + Sync {
     /// Called after redaction, result fitting and durable observation storage.
     fn delivered(&self, _observation: &Observation) {}
 
+    /// See [`kernel::Executor::failed`].
+    fn failed(&self, observation: &Observation) -> bool {
+        observation.status == kernel::ObsStatus::Error
+    }
+
     fn changed_files(&self, observation: &Observation) -> bool {
         if matches!(
             observation.status,
@@ -1473,6 +1478,14 @@ impl Executor for ToolRegistry {
         self.tools
             .get(tool)
             .is_some_and(|tool| tool.changed_files(observation))
+    }
+
+    fn failed(&self, tool: &str, observation: &Observation) -> bool {
+        self.tools
+            .get(tool)
+            .map_or(observation.status == kernel::ObsStatus::Error, |tool| {
+                tool.failed(observation)
+            })
     }
 
     async fn preview(&self, intent: &ToolIntent) -> Option<String> {
@@ -5927,6 +5940,20 @@ impl Tool for ShellExec {
         !observation.payload["command"]
             .as_str()
             .is_some_and(lanes::shell_only_reads)
+    }
+    /// A command that ran but exited nonzero, or was killed by a signal (no exit code), failed.
+    fn failed(&self, observation: &Observation) -> bool {
+        match observation.status {
+            kernel::ObsStatus::Error => true,
+            kernel::ObsStatus::Ok => match observation.payload["exit_code"].as_i64() {
+                Some(0) => false,
+                Some(1) => !observation.payload["command"]
+                    .as_str()
+                    .is_some_and(lanes::found_nothing),
+                _ => true,
+            },
+            _ => false,
+        }
     }
     fn check_outbound(&self, args: &Value) -> Result<(), ToolError> {
         if !self.sbx.denies_network() || args["outside_sandbox"] == true || args["network"] == true

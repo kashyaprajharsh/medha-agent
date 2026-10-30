@@ -198,25 +198,10 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
         ]
     } else if asked.contains("RUN") && !ran {
-        let shell = body["tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .find(|name| name.contains("shell") && name.contains("exec"))
-            .unwrap_or("shell_exec");
-        // The first `quoted` part of the message is the command, if there is one.
-        let command = asked
-            .split('`')
-            .nth(1)
-            .unwrap_or("touch made-by-the-test.txt");
-        let arguments = json!({"command": command, "network": false});
-        let call = json!({"index": 0, "id": "call_1", "type": "function",
-            "function": {"name": shell, "arguments": arguments.to_string()}});
-        vec![
-            json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
-            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
-        ]
+        shell_call(&body, &asked, "call_1")
+    } else if let Some(results) = repeat_left(&body, &asked) {
+        // REPEAT <n> sends the same command again until n results came back.
+        shell_call(&body, &asked, &format!("repeat_{results}"))
     } else {
         let text = format!("echo: {asked}");
         vec![
@@ -230,6 +215,44 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     }
     stream_body.push_str("data: [DONE]\n\n");
     respond(&mut stream, "text/event-stream", &stream_body);
+}
+
+/// A shell call whose command is the first `quoted` part of the message, if there is one.
+fn shell_call(body: &Value, asked: &str, id: &str) -> Vec<Value> {
+    let shell = body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .find(|name| name.contains("shell") && name.contains("exec"))
+        .unwrap_or("shell_exec");
+    let command = asked
+        .split('`')
+        .nth(1)
+        .unwrap_or("touch made-by-the-test.txt");
+    let arguments = json!({"command": command, "network": false});
+    let call = json!({"index": 0, "id": id, "type": "function",
+        "function": {"name": shell, "arguments": arguments.to_string()}});
+    vec![
+        json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+    ]
+}
+
+/// How many results a `REPEAT <n>` message has had, while fewer than n.
+fn repeat_left(body: &Value, asked: &str) -> Option<usize> {
+    let wanted: usize = asked
+        .strip_prefix("REPEAT ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let results = body["messages"]
+        .as_array()?
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .count();
+    (results < wanted).then_some(results)
 }
 
 struct Provider {
@@ -2259,6 +2282,59 @@ async fn a_command_that_prints_the_provider_key_never_shows_it_to_the_model() {
             .is_some_and(|out| out.contains(SECRET)),
         "the person's own record shows what the command printed: {observed}"
     );
+}
+
+/// The same failing command runs four times and the fifth is not run; a search that finds nothing is never stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_that_keeps_failing_stops_running_but_a_search_with_no_match_does_not() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("repeat");
+    for (message, failed) in [
+        ("REPEAT 6 `echo ran >> runs.txt; exit 7`", true),
+        ("REPEAT 6 `grep -q ABSENT runs.txt`", false),
+    ] {
+        let chat = client.open(&folder).await;
+        client.send(&chat, message).await;
+        let mut results = 0;
+        loop {
+            let (_, frame) = client
+                .until(|frame| {
+                    frame["method"] == "approval"
+                        || kind(frame, "tool.observation")
+                        || kind(frame, "turn.done")
+                })
+                .await;
+            if frame["method"] == "approval" {
+                let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+                client.ask("approval.respond", Some(&chat), gate).await;
+            } else if kind(&frame, "tool.observation") {
+                results += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(results, 6, "{message}");
+        let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+            .last()
+            .unwrap();
+        let blocked = last["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter(|message| {
+                message["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Not run")
+            })
+            .count();
+        assert_eq!(blocked, if failed { 2 } else { 0 }, "{message}");
+    }
+    let runs = std::fs::read_to_string(folder.join("runs.txt")).unwrap();
+    assert_eq!(runs.lines().count(), 4, "only four failing runs happened");
 }
 
 /// A window stays current from what each turn adds: every turn sends only its

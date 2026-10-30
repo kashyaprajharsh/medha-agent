@@ -84,6 +84,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 unavailable.insert(intent.id.clone(), observation);
             }
         }
+        // A call that kept failing settles in its slot without running, like an unavailable one.
+        for intent in &intents {
+            if !unavailable.contains_key(&intent.id)
+                && let Some(observation) = state.refusals.blocked(intent)
+            {
+                unavailable.insert(intent.id.clone(), observation);
+            }
+        }
+        // Each call as the model made it, for counting repeats once it has settled.
+        let calls: std::collections::HashMap<String, ToolIntent> = intents
+            .iter()
+            .map(|intent| (intent.id.clone(), intent.clone()))
+            .collect();
         let mut modified_files = false;
 
         // Reads run together; this turn's changes run one by one, in order. If
@@ -116,7 +129,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .await;
                     for (id, tool, mut obs, discovered) in settled {
                         modified_files |= self.executor.changed_files(&tool, &obs);
-                        if let Some(notice) = state.refusals.note(&tool, &mut obs) {
+                        let failed = self.executor.failed(&tool, &obs);
+                        if let Some(notice) = calls
+                            .get(&id)
+                            .and_then(|call| state.refusals.note(call, failed, &mut obs))
+                        {
                             cx.sink.notice(&notice);
                         }
                         self.persist_admitted(
@@ -158,7 +175,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     )
                     .await;
                 modified_files |= self.executor.changed_files(&tool, &obs);
-                if let Some(notice) = state.refusals.note(&tool, &mut obs) {
+                let failed = self.executor.failed(&tool, &obs);
+                if let Some(notice) = calls
+                    .get(&id)
+                    .and_then(|call| state.refusals.note(call, failed, &mut obs))
+                {
                     cx.sink.notice(&notice);
                 }
                 self.persist_admitted(
@@ -197,7 +218,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 .await;
             for (id, tool, mut obs, discovered) in settled {
                 modified_files |= self.executor.changed_files(&tool, &obs);
-                if let Some(notice) = state.refusals.note(&tool, &mut obs) {
+                let failed = self.executor.failed(&tool, &obs);
+                if let Some(notice) = calls
+                    .get(&id)
+                    .and_then(|call| state.refusals.note(call, failed, &mut obs))
+                {
                     cx.sink.notice(&notice);
                 }
                 self.persist_admitted(

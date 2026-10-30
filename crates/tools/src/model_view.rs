@@ -47,10 +47,8 @@ pub(crate) fn shell_run(payload: &Value) -> Option<String> {
         if text.trim().is_empty() {
             continue;
         }
+        // A cut stream marks its own gap, between the start and the end it kept.
         view.push_str(&format!("--- {stream} ---\n"));
-        if payload[format!("{stream}_truncated")] == true {
-            view.push_str("[earlier output was dropped; the last part is kept]\n");
-        }
         view.push_str(text.trim_end_matches('\n'));
         view.push('\n');
     }

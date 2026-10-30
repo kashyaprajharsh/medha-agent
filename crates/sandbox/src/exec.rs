@@ -924,7 +924,7 @@ async fn finish_bounded(
         process.wait().await;
     }
     let (stdout, stderr) = process.snapshot();
-    let mut captured = Rolling::new(max_output);
+    let mut captured = TailBuf::new(max_output.max(1));
     captured.push(stdout.as_bytes());
     if !stdout.is_empty() && !stderr.is_empty() {
         captured.push(b"\n");
@@ -1040,39 +1040,6 @@ async fn wait_bounded(
     }
 }
 
-/// The last `cap` bytes seen, remembering that earlier output was dropped. The
-/// tail is what matters: that is where a build or test run says what failed.
-struct Rolling {
-    data: Vec<u8>,
-    cap: usize,
-    dropped: bool,
-}
-
-impl Rolling {
-    fn new(cap: usize) -> Self {
-        Self {
-            data: Vec::new(),
-            cap: cap.max(1),
-            dropped: false,
-        }
-    }
-    fn push(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-        if self.data.len() > self.cap {
-            let excess = self.data.len() - self.cap;
-            self.data.drain(..excess);
-            self.dropped = true;
-        }
-    }
-    fn text(&self) -> String {
-        let body = String::from_utf8_lossy(&self.data);
-        match self.dropped {
-            true => format!("[… earlier output dropped …]\n{body}"),
-            false => body.into_owned(),
-        }
-    }
-}
-
 /// Independent and aggregate foreground/background capture ceilings. The
 /// aggregate is lower than the sum of the two independent ceilings so a child
 /// flooding both descriptors cannot double the memory budget.
@@ -1086,35 +1053,53 @@ enum CapturedStream {
     Stderr,
 }
 
-/// A fixed-memory tail buffer. `VecDeque` avoids repeatedly moving a megabyte
-/// of retained output for every 8 KiB read after the cap has been reached.
+/// The first bytes of a stream, where a build or test usually reports its first error, are kept
+/// up to this share of the buffer; the rest of it holds the end, where the run says how it finished.
+const HEAD_SHARE: usize = 16;
+const HEAD_MAX: usize = 64 * 1024;
+
+/// A fixed-memory buffer of a stream's start and end, counting what it dropped between them.
+/// `VecDeque` avoids moving a megabyte of retained output for every 8 KiB read once full.
 struct TailBuf {
+    head: Vec<u8>,
+    head_cap: usize,
     data: VecDeque<u8>,
     cap: usize,
+    dropped: u64,
     truncated: bool,
 }
 
 impl TailBuf {
     fn new(cap: usize) -> Self {
+        let head_cap = (cap / HEAD_SHARE).min(HEAD_MAX);
         Self {
-            data: VecDeque::with_capacity(cap.min(64 * 1024)),
-            cap,
+            head: Vec::new(),
+            head_cap,
+            data: VecDeque::with_capacity((cap - head_cap).min(64 * 1024)),
+            cap: cap - head_cap,
+            dropped: 0,
             truncated: false,
         }
     }
 
+    fn retained(&self) -> usize {
+        self.head.len() + self.data.len()
+    }
+
     fn push(&mut self, bytes: &[u8]) {
+        let into_head = bytes.len().min(self.head_cap - self.head.len());
+        self.head.extend_from_slice(&bytes[..into_head]);
+        let bytes = &bytes[into_head..];
         if self.cap == 0 {
+            self.dropped += bytes.len() as u64;
             self.truncated |= !bytes.is_empty();
             return;
         }
         if bytes.len() >= self.cap {
+            self.dropped += (self.data.len() + bytes.len() - self.cap) as u64;
             self.data.clear();
-            self.data.extend(
-                bytes[bytes.len().saturating_sub(self.cap)..]
-                    .iter()
-                    .copied(),
-            );
+            self.data
+                .extend(bytes[bytes.len() - self.cap..].iter().copied());
             self.truncated = true;
             return;
         }
@@ -1128,22 +1113,26 @@ impl TailBuf {
         let amount = amount.min(self.data.len());
         if amount != 0 {
             self.data.drain(..amount);
+            self.dropped += amount as u64;
             self.truncated = true;
         }
     }
 
     fn bytes(&self) -> Vec<u8> {
-        self.data.iter().copied().collect()
+        self.head.iter().chain(self.data.iter()).copied().collect()
     }
 
     fn text(&self) -> String {
-        let bytes = self.bytes();
-        let body = String::from_utf8_lossy(&bytes);
-        if self.truncated {
-            format!("[…earlier output dropped…]\n{body}")
-        } else {
-            body.into_owned()
+        if !self.truncated {
+            return String::from_utf8_lossy(&self.bytes()).into_owned();
         }
+        let tail: Vec<u8> = self.data.iter().copied().collect();
+        format!(
+            "{}\n[… {} bytes of output dropped …]\n{}",
+            String::from_utf8_lossy(&self.head),
+            self.dropped,
+            String::from_utf8_lossy(&tail)
+        )
     }
 }
 
@@ -1188,9 +1177,8 @@ impl CapturePair {
         }
         let excess = self
             .stdout
-            .data
-            .len()
-            .saturating_add(self.stderr.data.len())
+            .retained()
+            .saturating_add(self.stderr.retained())
             .saturating_sub(self.aggregate_cap);
         if excess == 0 {
             return;
@@ -4185,9 +4173,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bounded_shell_drains_but_retains_only_the_tail() {
+    async fn bounded_shell_drains_but_retains_only_its_start_and_end() {
         let output = run_shell_bounded(
-            "i=0; while [ \"$i\" -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf TAIL",
+            "printf HEAD; i=0; while [ \"$i\" -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf TAIL",
             &std::env::temp_dir(),
             std::time::Duration::from_secs(30),
             1024,
@@ -4196,13 +4184,14 @@ mod tests {
         .await
         .unwrap();
         assert!(output.passed());
+        assert!(output.output.starts_with("HEAD"));
         assert!(output.output.ends_with("TAIL"));
         assert!(
             output.output.len() <= 1100,
             "rolling capture retained too much: {} bytes",
             output.output.len()
         );
-        assert!(output.output.contains("earlier output dropped"));
+        assert!(output.output.contains("bytes of output dropped"));
     }
 
     #[cfg(unix)]

@@ -3506,14 +3506,6 @@ impl Tool for Tree {
     }
 }
 
-/// Largest page `read_artifact` will hand back. A result above the kernel's
-/// spill threshold is itself spilled to a fresh artifact and shown to the model
-/// as a 2k head, so an oversized page costs a round trip instead of saving one —
-/// the paging tool then pages its own output, and never converges. The margin
-/// below the threshold absorbs the JSON envelope; escaping is content-dependent,
-/// so the payload is fitted exactly rather than estimated.
-const MAX_PAGE_BYTES: usize = kernel::SPILL_THRESHOLD * 3 / 4;
-
 /// Decode the longest valid UTF-8 prefix of `slice`, returning it with the
 /// number of bytes it consumed so a caller can resume exactly where it ended.
 fn decode_utf8_prefix(slice: &[u8]) -> (String, usize) {
@@ -3567,9 +3559,8 @@ impl Tool for ReadArtifact {
                 "length": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_PAGE_BYTES,
-                    "description": "Bytes to read. Defaults to a full page; \
-                                    omit it and follow `next_offset`."
+                    "description": "Bytes to read, at most one page. Defaults to a full \
+                                    page; omit it and follow `next_offset`."
                 }
             },
             "required": ["hash"]
@@ -3582,13 +3573,14 @@ impl Tool for ReadArtifact {
             .and_then(Value::as_u64)
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
             .unwrap_or(0);
+        // One page at most, which also bounds what is read into memory for it.
+        let limit = page_limit();
         let length = args
             .get("length")
             .and_then(Value::as_u64)
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-            .unwrap_or(MAX_PAGE_BYTES)
-            .min(MAX_PAGE_BYTES);
-        let limit = page_limit();
+            .unwrap_or(limit)
+            .min(limit);
         // Name the actual failure. A raw `No such file` from the store reads as a
         // transient IO fault, so a model that guessed a hash guesses again rather
         // than changing approach — the observed failure mode is several invented
@@ -8037,7 +8029,7 @@ mod tests {
     #[tokio::test]
     async fn read_artifact_caps_omitted_and_oversized_page_lengths() {
         let store = mem_artifacts();
-        let bytes = vec![b'x'; MAX_PAGE_BYTES + 17];
+        let bytes = vec![b'x'; page_limit() + 17];
         let hash = store.put(&bytes).unwrap();
         let tool = ReadArtifact {
             store: store.clone(),
@@ -8048,13 +8040,14 @@ mod tests {
             json!({ "hash": hash, "length": u64::MAX }),
         ] {
             let page = tool.execute(&args).await.unwrap();
-            assert_eq!(
-                page["length"], MAX_PAGE_BYTES,
+            let length = page["length"].as_u64().unwrap() as usize;
+            assert!(
+                length <= page_limit(),
                 "every tool page must stay within the hard allocation ceiling"
             );
-            assert_eq!(page["content"].as_str().unwrap().len(), MAX_PAGE_BYTES);
+            assert_eq!(page["content"].as_str().unwrap().len(), length);
             assert_eq!(
-                page["next_offset"], MAX_PAGE_BYTES,
+                page["next_offset"], length,
                 "the caller can continue without losing bytes"
             );
         }

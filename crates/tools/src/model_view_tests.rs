@@ -66,7 +66,7 @@ fn a_command_reads_as_settled_text_with_errors_first_and_the_ending_last() {
         shell_run(&payload).unwrap(),
         "$ cargo test\nexit code: 101\ndenied_paths: [\"/etc/x\"]\nsandbox_hint: network is off\n\
          --- stderr ---\n   Compiling demo\n100%\nerror: oops\n\
-         --- stdout ---\n[earlier output was dropped; the last part is kept]\n\
+         --- stdout ---\n\
          test a ... ok\nlink\ntest result: FAILED. 1 passed; 1 failed"
     );
     assert_eq!(clean_terminal("\u{1b}(Bplain\u{1b}[?25l"), "plain");

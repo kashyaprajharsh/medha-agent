@@ -2240,6 +2240,35 @@ async fn a_plan_instruction_reaches_the_model_and_nowhere_a_person_reads() {
     assert_eq!(typed, ["fix the login bug"]);
 }
 
+/// A huge output keeps its start, where a build usually says what went wrong first, as well as its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_huge_output_keeps_its_first_error_and_its_end() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("huge");
+    let chat = client.open(&folder).await;
+    let command =
+        "echo FIRST_DIAGNOSTIC; yes padding | head -c 1200000; echo; echo LAST_DIAGNOSTIC";
+    client.send(&chat, &format!("RUN `{command}`")).await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let stdout = observed["params"]["payload"]["stdout"].as_str().unwrap();
+    assert!(
+        stdout.starts_with("FIRST_DIAGNOSTIC\n"),
+        "{}",
+        &stdout[..200]
+    );
+    assert!(stdout.trim_end().ends_with("LAST_DIAGNOSTIC"));
+    assert!(
+        stdout.contains("bytes of output dropped"),
+        "the gap is named"
+    );
+}
+
 /// The provider's key never travels back to the provider inside a tool result:
 /// a command that prints it shows the model a marker, while the record of the
 /// command keeps what it printed.

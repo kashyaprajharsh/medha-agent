@@ -1758,7 +1758,7 @@ esac
             "retained output exceeded its cap: {} bytes",
             out.output.len()
         );
-        assert!(out.output.contains("earlier output dropped"));
+        assert!(out.output.contains("bytes of output dropped"));
         std::fs::remove_dir_all(ws).ok();
     }
 

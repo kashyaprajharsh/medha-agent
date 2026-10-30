@@ -5231,9 +5231,9 @@ impl ShellExec {
              them. Set network=true for installs and downloads; access is requested before it \
              runs. Outside the workspace, name absolute folders in read_paths or write_paths.",
             syntax,
-            "A pipeline's status is its last command's, so write output to a file and read it \
-             rather than piping into tail. Writing commands are backed up for undo. To see a \
-             web page, use read with render: true.",
+            "Long output is already shortened to its start and end, so do not pipe into head or \
+             tail: a pipeline's status is its last command's, which hides a failure. Writing \
+             commands are backed up for undo. To see a web page, use read with render: true.",
         ]
         .join(" ");
         Self {

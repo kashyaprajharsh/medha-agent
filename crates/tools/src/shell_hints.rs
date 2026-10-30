@@ -24,6 +24,26 @@ pub(crate) fn launches_browser(command: &str) -> bool {
         .any(|name| command.contains(name))
 }
 
+/// Commands run without a terminal, so one that stops to ask fails instead of waiting.
+pub(crate) const TERMINAL_PROMPT: &str = "This command stopped to ask for a password, passphrase or \
+     confirmation on a terminal, and commands here have none, so it cannot be answered. Use a form \
+     that does not ask (a saved credential or token, ssh -o BatchMode=yes, a --yes flag). If it \
+     signs in with the user's own keys, rerun it unchanged once with outside_sandbox: true; \
+     otherwise tell the user it needs them.";
+
+pub(crate) fn asked_on_terminal(output: &str) -> bool {
+    [
+        "could not read Username",
+        "could not read Password",
+        "Host key verification failed",
+        "a terminal is required to read the password",
+        "/dev/tty: Device not configured",
+        "/dev/tty: No such device or address",
+    ]
+    .iter()
+    .any(|message| output.contains(message))
+}
+
 /// None unless the output shows the sandbox itself refusing.
 pub(crate) fn sandbox_blocked(
     command: &str,

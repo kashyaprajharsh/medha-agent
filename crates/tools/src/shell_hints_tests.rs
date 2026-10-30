@@ -1,5 +1,27 @@
 use super::*;
 
+/// Messages captured from git, sudo, ssh and shells run without a terminal (macOS and Linux forms).
+#[test]
+fn a_prompt_with_no_terminal_is_recognised_and_ordinary_failures_are_not() {
+    for asked in [
+        "fatal: could not read Username for 'https://github.com': Device not configured",
+        "fatal: could not read Password for 'https://x@github.com': No such device or address",
+        "sudo: a terminal is required to read the password; either use the -S option",
+        "Host key verification failed.",
+        "sh: /dev/tty: Device not configured",
+        "/bin/sh: 1: cannot open /dev/tty: No such device or address",
+    ] {
+        assert!(asked_on_terminal(asked), "{asked}");
+    }
+    for failed in [
+        "git@github.com: Permission denied (publickey).",
+        "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+        "error: could not lock config file",
+    ] {
+        assert!(!asked_on_terminal(failed), "{failed}");
+    }
+}
+
 /// Leaving the sandbox is offered only for a genuine sandbox refusal.
 #[test]
 fn outside_the_sandbox_is_offered_only_when_it_could_help() {

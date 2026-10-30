@@ -597,11 +597,14 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
-/// Put a command in its own process group (unix) and pipe stdout/stderr so it
-/// can be supervised and group-killed. Background tasks clear `kill_on_drop`.
+/// Put a command in its own session (unix) and pipe stdout/stderr so it can be
+/// supervised and group-killed. Background tasks clear `kill_on_drop`.
 fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool, pipe_stdin: bool) {
+    // A new session also leads its own process group, and has no terminal, so a prompt on /dev/tty fails at once.
     #[cfg(unix)]
-    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(new_session);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -621,6 +624,15 @@ fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool, pi
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
     .kill_on_drop(kill_on_drop);
+}
+
+/// Runs between fork and exec, where only async-signal-safe calls such as `setsid` belong.
+#[cfg(unix)]
+fn new_session() -> std::io::Result<()> {
+    match unsafe { libc::setsid() } {
+        -1 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
 }
 
 /// What a bounded shell run produced.
@@ -1381,8 +1393,18 @@ fn wait_for_leader_exit_without_reap(pid: u32) -> std::io::Result<()> {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if result == 0 {
+        // macOS also returns here for a stopped child (CLD_STOPPED), which is not an exit.
+        if result == 0
+            && matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            )
+        {
             return Ok(());
+        }
+        if result == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -3994,6 +4016,72 @@ mod tests {
     }
 
     /// Model commands must not consume input belonging to the Medha surface.
+    /// A command that asks on the user's terminal fails at once instead of stopping until its deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_prompt_fails_instead_of_waiting() {
+        const CHILD: &str = "MEDHA_TEST_TTY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(
+                std::fs::File::open("/dev/tty").is_ok(),
+                "the test process did not get a controlling terminal"
+            );
+            let output = run_shell_bounded(
+                "read -r answer </dev/tty",
+                &std::env::temp_dir(),
+                std::time::Duration::from_secs(5),
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+            // Stopped on the terminal, it would wait out the deadline (Linux) or be killed with no status (macOS).
+            assert!(!output.timed_out, "the prompt waited: {output:?}");
+            assert!(
+                output.status.is_some_and(|code| code != 0),
+                "the prompt did not fail with an exit code: {output:?}"
+            );
+            assert!(output.output.contains("/dev/tty"), "{output:?}");
+            return;
+        }
+        // A pseudo-terminal made the child's controlling terminal, as a terminal running the TUI is.
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        let terminal = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }.to_owned();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "exec::tests::a_terminal_prompt_fails_instead_of_waiting",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            child.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let fd = libc::open(terminal.as_ptr(), libc::O_RDWR);
+                if fd < 0 || libc::ioctl(fd, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        unsafe { libc::close(master) };
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_commands_do_not_consume_surface_stdin() {
@@ -4057,6 +4145,23 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// A stopped command is still running: macOS's waitid reports the stop, which must not read as an exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_command_is_not_taken_for_an_exited_one() {
+        let output = run_shell_bounded(
+            "(sleep 0.3; kill -CONT $$) & kill -STOP $$; echo resumed",
+            &std::env::temp_dir(),
+            std::time::Duration::from_secs(10),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.passed(), "{output:?}");
+        assert_eq!(output.output.trim(), "resumed");
     }
 
     /// A timed-out command must stop its whole process tree.

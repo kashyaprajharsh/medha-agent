@@ -6110,9 +6110,12 @@ impl Tool for ShellExec {
                     "The command may lack filesystem access. Use workdir for the intended directory and request needed directories in read_paths/write_paths before rerunning. A blocked read does not mean a file or program is missing. The command was not replayed; check for partial side effects first."
                 );
             }
-            if invocation.jailed() && completed.exit_code != Some(0) {
+            if completed.exit_code != Some(0) {
                 let output = format!("{}\n{}", completed.stdout, completed.stderr);
-                if (denied_filesystem || shell_hints::local_socket_refused(&output))
+                if shell_hints::asked_on_terminal(&output) {
+                    result["next_step"] = json!(shell_hints::TERMINAL_PROMPT);
+                } else if invocation.jailed()
+                    && (denied_filesystem || shell_hints::local_socket_refused(&output))
                     && let Some(next) =
                         shell_hints::sandbox_blocked(&command, &output, &denied_paths)
                 {
@@ -9280,6 +9283,25 @@ mod tests {
             obs.payload.get("task_id").is_none(),
             "fast command should not promote"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prompt on the terminal ends the command at once and names the way forward.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_terminal_prompt_fails_fast_with_a_next_step() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-tty-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let started = std::time::Instant::now();
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({ "command": "read -r answer </dev/tty", "timeout_s": 30 }),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_ne!(obs.payload["exit_code"].as_i64(), Some(0), "{obs:?}");
+        assert_eq!(obs.payload["next_step"], shell_hints::TERMINAL_PROMPT);
         std::fs::remove_dir_all(&dir).ok();
     }
 

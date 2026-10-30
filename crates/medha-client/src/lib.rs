@@ -1259,10 +1259,17 @@ fn inherit_nothing(_command: &mut Command) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Its own session: it outlives a closed terminal, and nothing it runs can block on that terminal.
 #[cfg(unix)]
 fn outlive_the_app(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    command.process_group(0);
+    // Only `setsid` runs between fork and exec, which is safe there.
+    unsafe {
+        command.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
 }
 
 #[cfg(windows)]

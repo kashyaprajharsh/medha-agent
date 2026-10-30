@@ -10,6 +10,7 @@ type Props = {
   onPointerEnter: () => void;
   onPointerLeave: () => void;
   onExtensions: () => void;
+  onMessaging: () => void;
   onSettings: () => void;
   page: string;
   notice?: ReactNode;
@@ -232,6 +233,13 @@ export function Sidebar(props: Props) {
         >
           <Icon name="blocks" />
           Extensions
+        </button>
+        <button
+          className={`side-btn ${props.page === "messaging" ? "active" : ""}`}
+          onClick={props.onMessaging}
+        >
+          <Icon name="phone" />
+          Messaging
         </button>
         <button
           className={`side-btn ${props.page === "settings" ? "active" : ""}`}

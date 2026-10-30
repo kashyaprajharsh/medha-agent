@@ -41,7 +41,7 @@ fn only_an_offered_choice_of_a_waiting_approval_is_sent_and_only_once() {
             .collect::<Vec<_>>(),
         ["Yes, allow once", "No, deny"]
     );
-    assert!(ask.text.ends_with("… 10 more characters"));
+    assert!(ask.text.contains("… 10 more characters\n```"));
 
     // Only two choices were offered, so a forged third finds nothing.
     assert!(decided(prompts.pressed("a.7.2")).is_none());
@@ -59,10 +59,12 @@ fn only_an_offered_choice_of_a_waiting_approval_is_sent_and_only_once() {
         decided(prompts.pressed("a.7.0")).is_none(),
         "a second press changes nothing"
     );
-    assert!(
-        !prompts.resolved(7),
-        "answered here, so nothing more to say"
+    assert_eq!(
+        prompts.resolved(7),
+        Some(Settled::Here("No, deny".into())),
+        "the first press is the one told"
     );
+    assert_eq!(prompts.resolved(7), None);
     assert!(!prompts.waiting());
 }
 
@@ -84,7 +86,20 @@ fn a_number_answers_the_oldest_approval_and_one_settled_elsewhere_is_told() {
     assert!(matches!(decided(prompts.reply("2")), Some((4, D::Deny))));
     let mut elsewhere = Prompts::default();
     elsewhere.approval(&approval(5, vec![D::Once, D::Deny]));
-    assert!(elsewhere.resolved(5));
+    assert_eq!(elsewhere.resolved(5), Some(Settled::Elsewhere));
+}
+
+#[test]
+fn a_command_and_a_diff_are_shown_as_written_not_as_formatting() {
+    let mut prompts = Prompts::default();
+    let mut prompt = approval(1, vec![ApprovalDecision::Once]);
+    prompt.action = "run rm *.tmp *.log".into();
+    prompt.detail = Some("- old line\n+ new line".into());
+    let ask = prompts.approval(&prompt).unwrap();
+    assert_eq!(
+        crate::telegram_format::to_telegram(&ask.text).0,
+        "Medha asks to: run rm *.tmp *.log\n\n<pre><code>- old line\n+ new line</code></pre>"
+    );
 }
 
 fn question(multi: bool) -> Question {
@@ -112,13 +127,20 @@ fn several_questions_are_asked_one_by_one_and_answered_together() {
         .unwrap();
     assert_eq!(first.buttons.len(), 3);
     assert!(prompts.pressed("q.9.5").is_none(), "no such option");
-    let Some(Step::Ask(second)) = prompts.pressed("q.9.1") else {
+    let Some(Step::Ask {
+        question: 9,
+        said,
+        ask: second,
+    }) = prompts.pressed("q.9.1")
+    else {
         panic!("expected the next question")
     };
+    assert_eq!(said, "blue");
     assert!(second.buttons.is_empty() && second.text.contains("3. green"));
-    let Some(Step::Answer(answer)) = prompts.reply("1,4") else {
+    let Some(Step::Answer { answer, said }) = prompts.reply("1,4") else {
         panic!("expected the answer")
     };
+    assert_eq!(said, "1,4");
     assert_eq!(answer.answers[0].selected, ["blue"]);
     assert_eq!(
         answer.answers[1].other.as_deref(),
@@ -134,19 +156,20 @@ fn numbers_pick_options_and_anything_else_is_a_written_answer() {
         question_id: 9,
         questions: vec![question(true)],
     });
-    let Some(Step::Answer(answer)) = prompts.reply("3, 1 3") else {
+    let Some(Step::Answer { answer, said }) = prompts.reply("3, 1 3") else {
         panic!("expected the answer")
     };
     assert_eq!(
         (answer.question_id, answer.answers[0].selected.clone()),
         (9, vec!["green".to_owned(), "red".to_owned()])
     );
+    assert_eq!(said, "green, red");
 
     prompts.question(QuestionPrompt {
         question_id: 10,
         questions: vec![question(false)],
     });
-    let Some(Step::Answer(answer)) = prompts.reply("1,2") else {
+    let Some(Step::Answer { answer, .. }) = prompts.reply("1,2") else {
         panic!("expected the answer")
     };
     assert_eq!(
@@ -159,7 +182,7 @@ fn numbers_pick_options_and_anything_else_is_a_written_answer() {
         question_id: 11,
         questions: vec![question(false)],
     });
-    let Some(Step::Answer(answer)) = prompts.reply("purple, please") else {
+    let Some(Step::Answer { answer, .. }) = prompts.reply("purple, please") else {
         panic!("expected the answer")
     };
     assert!(answer.answers[0].selected.is_empty());

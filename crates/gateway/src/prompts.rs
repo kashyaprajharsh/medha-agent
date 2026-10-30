@@ -2,8 +2,9 @@
 //! button or by a reply with a number. Only choices the backend offered can be sent back.
 
 use crate::platform::Button;
+use crate::telegram_format::{code_block, literal};
 use protocol::{Answer, AnswerQuestion, ApprovalDecision, ApprovalPrompt, QuestionPrompt};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// Long diffs and commands are cut so the choice stays readable on a phone.
 const DETAIL_CHARS: usize = 1500;
@@ -13,19 +14,36 @@ pub(crate) struct Ask {
     pub buttons: Vec<Button>,
 }
 
+/// What a press or a reply does. `said` is the answer just given, in words, for the message
+/// that asked.
 pub(crate) enum Step {
     Approve {
         gate: u64,
         decision: ApprovalDecision,
     },
-    Answer(AnswerQuestion),
-    Ask(Ask),
+    Answer {
+        answer: AnswerQuestion,
+        said: String,
+    },
+    Ask {
+        question: u64,
+        said: String,
+        ask: Ask,
+    },
+}
+
+/// How a waiting approval ended, as this chat knows it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// Answered from this chat, with the choice's label.
+    Here(String),
+    Elsewhere,
 }
 
 #[derive(Default)]
 pub(crate) struct Prompts {
-    approvals: BTreeMap<u64, Vec<ApprovalDecision>>,
-    answered: HashSet<u64>,
+    approvals: BTreeMap<u64, Vec<(ApprovalDecision, String)>>,
+    answered: HashMap<u64, String>,
     question: Option<Asking>,
 }
 
@@ -45,18 +63,21 @@ impl Prompts {
         if self.approvals.contains_key(&prompt.gate_id) {
             return None;
         }
-        let buttons = prompt
-            .labels()
-            .into_iter()
+        let labels: Vec<String> = prompt.labels().into_iter().map(Into::into).collect();
+        let buttons = labels
+            .iter()
             .enumerate()
             .map(|(index, label)| Button {
-                label: label.into(),
+                label: label.clone(),
                 choice: format!("a.{}.{index}", prompt.gate_id),
             })
             .collect();
-        self.approvals
-            .insert(prompt.gate_id, prompt.choices.clone());
-        let mut text = format!("Medha asks to: {}", prompt.action);
+        self.approvals.insert(
+            prompt.gate_id,
+            prompt.choices.iter().copied().zip(labels).collect(),
+        );
+        // A command or diff is shown as written: its `*` or `-` lines are not formatting.
+        let mut text = format!("Medha asks to: {}", literal(&prompt.action));
         if let Some(detail) = prompt
             .detail
             .as_deref()
@@ -64,15 +85,19 @@ impl Prompts {
         {
             text.push_str(&format!(
                 "\n\n{}",
-                transcript_view::bounded(detail.trim(), DETAIL_CHARS)
+                code_block(&transcript_view::bounded(detail.trim(), DETAIL_CHARS))
             ));
         }
         Some(Ask { text, buttons })
     }
 
-    /// Whether a pending approval was settled somewhere else, so the chat should say so.
-    pub fn resolved(&mut self, gate: u64) -> bool {
-        self.approvals.remove(&gate).is_some() && !self.answered.remove(&gate)
+    /// `None` when the approval was not waiting here.
+    pub fn resolved(&mut self, gate: u64) -> Option<Settled> {
+        self.approvals.remove(&gate)?;
+        Some(match self.answered.remove(&gate) {
+            Some(label) => Settled::Here(label),
+            None => Settled::Elsewhere,
+        })
     }
 
     pub fn question(&mut self, prompt: QuestionPrompt) -> Option<Ask> {
@@ -133,7 +158,7 @@ impl Prompts {
         if let Some((&gate, _)) = self
             .approvals
             .iter()
-            .find(|(gate, _)| !self.answered.contains(gate))
+            .find(|(gate, _)| !self.answered.contains_key(gate))
         {
             let index = text.parse::<usize>().ok()?.checked_sub(1)?;
             return self.decide(gate, index);
@@ -174,24 +199,37 @@ impl Prompts {
     }
 
     fn decide(&mut self, gate: u64, index: usize) -> Option<Step> {
-        let decision = *self.approvals.get(&gate)?.get(index)?;
-        self.answered
-            .insert(gate)
-            .then_some(Step::Approve { gate, decision })
+        if self.answered.contains_key(&gate) {
+            return None;
+        }
+        let (decision, label) = self.approvals.get(&gate)?.get(index)?.clone();
+        self.answered.insert(gate, label);
+        Some(Step::Approve { gate, decision })
     }
 
     fn answer(&mut self, answer: Answer) -> Option<Step> {
+        let said = match &answer.other {
+            Some(other) => other.clone(),
+            None => answer.selected.join(", "),
+        };
         let asking = self.question.as_mut()?;
         asking.answers.push(answer);
         if let Some(ask) = asking.current() {
-            return Some(Step::Ask(ask));
+            return Some(Step::Ask {
+                question: asking.id,
+                said,
+                ask,
+            });
         }
         let asking = self.question.take()?;
-        Some(Step::Answer(AnswerQuestion {
-            question_id: asking.id,
-            dismiss: false,
-            answers: asking.answers,
-        }))
+        Some(Step::Answer {
+            answer: AnswerQuestion {
+                question_id: asking.id,
+                dismiss: false,
+                answers: asking.answers,
+            },
+            said,
+        })
     }
 }
 

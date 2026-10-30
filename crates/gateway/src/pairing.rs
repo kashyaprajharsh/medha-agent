@@ -171,6 +171,16 @@ impl Pairing {
         })
     }
 
+    /// Lets in a person the owner confirmed at this computer, with no code.
+    pub fn admit(&self, platform: &str, user: &str, name: &str) -> Result<()> {
+        store::change(&self.path, |book: &mut Book| {
+            book.approved
+                .entry(platform.to_owned())
+                .or_default()
+                .insert(user.to_owned(), name.to_owned());
+        })
+    }
+
     pub fn revoke(&self, platform: &str, user: &str) -> Result<bool> {
         store::change(&self.path, |book: &mut Book| {
             book.approved

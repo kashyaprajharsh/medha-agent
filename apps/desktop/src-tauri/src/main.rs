@@ -129,6 +129,15 @@ async fn workspace_choose(
     };
     state.workspaces.add(folder.path().to_path_buf()).map(Some)
 }
+/// A folder for the caller to use, with nothing else done to it, as messaging needs.
+#[tauri::command]
+async fn folder_choose(title: String) -> Option<String> {
+    rfd::AsyncFileDialog::new()
+        .set_title(title)
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().display().to_string())
+}
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ExtensionSourceKind {
@@ -689,6 +698,17 @@ async fn settings_request(
         "settings.chatgpt.cancel",
         "settings.chatgpt.switch",
         "settings.chatgpt.sign_out",
+        "settings.messaging.status",
+        "settings.messaging.begin",
+        "settings.messaging.await",
+        "settings.messaging.save",
+        "settings.messaging.save_token",
+        "settings.messaging.cancel",
+        "settings.messaging.approve",
+        "settings.messaging.revoke",
+        "settings.messaging.gateway",
+        "settings.messaging.folder",
+        "settings.messaging.steps",
         "application.providers",
         "application.providers.refresh",
         "application.providers.resolve",
@@ -774,6 +794,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             workspace_list,
             workspace_choose,
+            folder_choose,
             extension_source_choose,
             workspace_info,
             workspace_reveal,

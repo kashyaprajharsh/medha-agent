@@ -2339,7 +2339,7 @@ async fn an_approval_is_shown_to_both_clients_and_answered_once() {
             .await;
         assert_eq!(
             settled["params"],
-            json!({"gate_id": gate, "approved": true})
+            json!({"gate_id": gate, "approved": true, "how": "answered"})
         );
         client.until(|frame| kind(frame, "turn.done")).await;
     }

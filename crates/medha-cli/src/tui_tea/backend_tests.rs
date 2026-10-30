@@ -2,6 +2,8 @@ use super::*;
 use serde_json::json;
 #[path = "connect_tests.rs"]
 mod connect_screens;
+#[path = "messaging_tests.rs"]
+mod messaging_screens;
 #[path = "feature_tests.rs"]
 mod parity;
 

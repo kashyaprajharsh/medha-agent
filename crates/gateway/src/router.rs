@@ -2,7 +2,7 @@
 //! reaches the agent, or presses its buttons, before the owner has paired them.
 
 use crate::chats::{self, Chats};
-use crate::link::{ChatLink, Input, Shared};
+use crate::link::{ChatLink, Input, Settings, Shared};
 use crate::pairing::Pairing;
 use crate::platform::{Heard, Incoming, Platform};
 use crate::store;
@@ -25,19 +25,28 @@ pub struct Router {
 }
 
 impl Router {
+    /// Chats follow Medha's saved settings, read again on each use.
     pub fn new(
         platform: Arc<dyn Platform>,
         backend: Arc<Backend>,
         folder: PathBuf,
     ) -> Result<Self> {
-        Ok(Self::in_home(platform, backend, folder, &store::home()?))
+        Ok(Self::in_home(
+            platform,
+            backend,
+            folder,
+            Settings::Saved,
+            &store::home()?,
+        ))
     }
 
-    /// Keeps pairing and the chat map in `home` instead of Medha's own gateway folder.
+    /// Keeps pairing and the chat map in `home` instead of Medha's own gateway folder, with the
+    /// settings given here rather than read from Medha's.
     pub fn in_home(
         platform: Arc<dyn Platform>,
         backend: Arc<Backend>,
         folder: PathBuf,
+        settings: Settings,
         home: &Path,
     ) -> Self {
         let chats = Arc::new(Chats::at(home.join("chats.json")));
@@ -47,6 +56,7 @@ impl Router {
                 backend,
                 chats,
                 folder,
+                settings,
                 home: std::sync::Mutex::new(None),
             }),
             pairing: Pairing::at(home.join("pairing.json")),
@@ -66,6 +76,14 @@ impl Router {
 
     /// Runs until the platform cannot be reached at all; a failed poll is retried with a growing wait.
     pub async fn run(mut self) -> Result<()> {
+        // A missing menu only loses the hint after `/`; the commands still work.
+        let menu: Vec<(&str, &str)> = protocol::commands::CHAT_COMMANDS
+            .iter()
+            .map(|(name, description)| (name.trim_start_matches('/'), *description))
+            .collect();
+        if let Err(error) = self.shared.platform.offer_commands(&menu).await {
+            tracing::warn!(error = %format!("{error:#}"), "gateway: listing commands");
+        }
         self.resume_running().await;
         let mut failures: u32 = 0;
         loop {

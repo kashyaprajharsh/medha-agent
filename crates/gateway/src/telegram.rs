@@ -1,7 +1,8 @@
 //! Telegram through its Bot API: long polling, so nothing on this computer listens to the
 //! internet. The token is part of every request address, so no error ever shows an address.
 
-use crate::platform::{Attachment, Button, Heard, Incoming, Platform, SetupProblem};
+use crate::platform::{Attachment, Button, Heard, Incoming, Platform, SetupProblem, split};
+use crate::telegram_format::to_telegram;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -17,6 +18,8 @@ const POLL_SECONDS: u64 = 50;
 const LONGEST_WAIT: Duration = Duration::from_secs(5);
 /// Telegram limits each chat to about one message a second.
 const PER_CHAT: Duration = Duration::from_secs(1);
+/// The longest message, counted as Telegram counts it once the formatting is read.
+const LIMIT: usize = 4096;
 /// The most a bot may download.
 const DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
@@ -68,8 +71,8 @@ impl Telegram {
         call(&self.http, &self.token, method, body).await
     }
 
-    /// Sends one message, keeping to Telegram's pace and waiting out a short flood limit once.
-    async fn post(&self, chat: &str, body: Value) -> Result<()> {
+    /// Sends or changes one message, keeping to Telegram's pace and waiting out a short flood limit once.
+    async fn post(&self, method: &str, chat: &str, body: Value) -> Result<Value> {
         let wait = {
             let mut last = self
                 .last_sent
@@ -82,29 +85,28 @@ impl Telegram {
             wait
         };
         tokio::time::sleep(wait).await;
-        match self.call("sendMessage", body.clone()).await {
+        match self.call(method, body.clone()).await {
             Err(error) => match error
                 .downcast_ref::<Refused>()
                 .and_then(|refused| refused.retry_after)
             {
                 Some(after) if after <= LONGEST_WAIT => {
                     tokio::time::sleep(after).await;
-                    self.call("sendMessage", body).await.map(|_| ())
+                    self.call(method, body).await
                 }
                 _ => Err(error),
             },
-            Ok(_) => Ok(()),
+            sent => sent,
         }
     }
 
-    /// Formatted first; if Telegram cannot read the formatting, the same words plainly.
-    async fn text(&self, chat: &str, text: &str, markup: Option<Value>) -> Result<()> {
-        let mut body = json!({"chat_id": chat, "text": html(text), "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": true}});
-        if let Some(markup) = &markup {
-            body["reply_markup"] = markup.clone();
-        }
-        match self.post(chat, body.clone()).await {
+    /// Markdown formatted first; if Telegram cannot read the formatting, the same words plainly.
+    async fn text(&self, method: &str, mut body: Value, text: &str) -> Result<Value> {
+        let chat = body["chat_id"].as_str().unwrap_or_default().to_owned();
+        body["text"] = json!(to_telegram(text).0);
+        body["parse_mode"] = json!("HTML");
+        body["link_preview_options"] = json!({"is_disabled": true});
+        match self.post(method, &chat, body.clone()).await {
             Err(error)
                 if error
                     .downcast_ref::<Refused>()
@@ -112,10 +114,30 @@ impl Telegram {
             {
                 body["text"] = json!(text);
                 body.as_object_mut().map(|body| body.remove("parse_mode"));
-                self.post(chat, body).await
+                self.post(method, &chat, body).await
             }
             sent => sent,
         }
+    }
+
+    /// Sends `text`, the last part with `markup`, and gives that part's id.
+    async fn message(&self, chat: &str, text: &str, markup: Option<Value>) -> Result<String> {
+        let mut parts = Vec::new();
+        fitted(text, &mut parts);
+        let last = parts.pop().unwrap_or_default();
+        for part in parts {
+            self.text("sendMessage", json!({"chat_id": chat}), &part)
+                .await?;
+        }
+        let mut body = json!({"chat_id": chat});
+        if let Some(markup) = markup {
+            body["reply_markup"] = markup;
+        }
+        let sent = self.text("sendMessage", body, &last).await?;
+        sent["message_id"]
+            .as_i64()
+            .map(|id| id.to_string())
+            .context("Telegram gave no message id")
     }
 
     fn heard(&self, update: &Value) -> Option<Heard> {
@@ -158,7 +180,7 @@ impl Platform for Telegram {
     }
 
     fn limit(&self) -> usize {
-        4096
+        LIMIT
     }
 
     async fn hear(&self) -> Result<Vec<Heard>> {
@@ -187,16 +209,52 @@ impl Platform for Telegram {
     }
 
     async fn send(&self, chat: &str, text: &str) -> Result<()> {
-        self.text(chat, text, None).await
+        self.message(chat, text, None).await.map(|_| ())
     }
 
-    async fn ask(&self, chat: &str, text: &str, buttons: &[Button]) -> Result<()> {
+    async fn ask(&self, chat: &str, text: &str, buttons: &[Button]) -> Result<Option<String>> {
         let rows: Vec<Value> = buttons
             .iter()
             .map(|button| json!([{"text": button.label, "callback_data": button.choice}]))
             .collect();
-        self.text(chat, text, Some(json!({"inline_keyboard": rows})))
+        self.message(chat, text, Some(json!({"inline_keyboard": rows})))
             .await
+            .map(Some)
+    }
+
+    async fn send_live(&self, chat: &str, text: &str) -> Result<Option<String>> {
+        self.message(chat, text, None).await.map(Some)
+    }
+
+    /// Leaving out `reply_markup` takes the buttons away.
+    async fn edit(&self, chat: &str, message: &str, text: &str) -> Result<()> {
+        let body = json!({"chat_id": chat, "message_id": message.parse::<i64>()?});
+        match self.text("editMessageText", body, text).await {
+            Err(error)
+                if error
+                    .downcast_ref::<Refused>()
+                    .is_some_and(Refused::unchanged) =>
+            {
+                Ok(())
+            }
+            edited => edited.map(|_| ()),
+        }
+    }
+
+    /// In every scope, since Telegram shows the narrowest one that matches a chat.
+    async fn offer_commands(&self, commands: &[(&str, &str)]) -> Result<()> {
+        let commands: Vec<Value> = commands
+            .iter()
+            .map(|(command, description)| json!({"command": command, "description": description}))
+            .collect();
+        for scope in ["default", "all_private_chats", "all_group_chats"] {
+            self.call(
+                "setMyCommands",
+                json!({"commands": commands, "scope": {"type": scope}}),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn typing(&self, chat: &str) -> Result<()> {
@@ -322,6 +380,11 @@ impl Refused {
     fn formatting(&self) -> bool {
         self.code == 400 && self.description.contains("can't parse entities")
     }
+
+    /// An edit to the same words; nothing needed changing.
+    fn unchanged(&self) -> bool {
+        self.code == 400 && self.description.contains("message is not modified")
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -403,67 +466,16 @@ fn entity_text(text: &str, entity: &Value) -> Option<String> {
     String::from_utf16(units.get(start..start + length)?).ok()
 }
 
-/// Telegram's HTML: code blocks, inline code and bold kept, everything else shown as written.
-fn html(text: &str) -> String {
-    let mut out = String::new();
-    let mut code = false;
-    for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with("```") {
-            out.push_str(if code { "</code></pre>" } else { "<pre><code>" });
-            code = !code;
-            continue;
-        }
-        if code {
-            out.push_str(&escape(line));
-        } else {
-            out.push_str(&inline(line));
-        }
+/// Parts whose formatted text fits a message: a drawn table adds words, so a part that fit as
+/// typed may not once formatted.
+fn fitted(text: &str, parts: &mut Vec<String>) {
+    let length = text.chars().count();
+    if length < 2 || to_telegram(text).1 <= LIMIT {
+        return parts.push(text.to_owned());
     }
-    if code {
-        out.push_str("</code></pre>");
+    for part in split(text, length.div_ceil(2)) {
+        fitted(&part, parts);
     }
-    out
-}
-
-fn inline(line: &str) -> String {
-    let mut out = String::new();
-    for (index, piece) in line.split('`').enumerate() {
-        // Odd pieces sit between backticks, unless the last backtick is unmatched.
-        let closed = index % 2 == 1 && line.matches('`').count() > index;
-        if closed {
-            out.push_str(&format!("<code>{}</code>", escape(piece)));
-        } else {
-            if index > 0 && index % 2 == 1 {
-                out.push('`');
-            }
-            out.push_str(&bold(piece));
-        }
-    }
-    out
-}
-
-fn bold(piece: &str) -> String {
-    let parts: Vec<&str> = piece.split("**").collect();
-    if parts.len().is_multiple_of(2) {
-        return escape(piece);
-    }
-    parts
-        .iter()
-        .enumerate()
-        .map(|(index, part)| {
-            if index % 2 == 1 {
-                format!("<b>{}</b>", escape(part))
-            } else {
-                escape(part)
-            }
-        })
-        .collect()
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 #[cfg(test)]

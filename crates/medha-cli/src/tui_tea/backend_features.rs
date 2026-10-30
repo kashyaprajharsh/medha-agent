@@ -449,6 +449,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::McpAdd(args) => mcp_add(model, &args),
         A::McpCatalog(query) => search_mcp_catalog(model, &query),
         A::Connect(query) => connect_command(model, &query),
+        A::Messaging => super::messaging::open(model),
         A::Agents => open_agents_picker(model),
         A::Steer(args) => agents_steer(model, &args),
         A::Followup(args) => agents_followup(model, &args),

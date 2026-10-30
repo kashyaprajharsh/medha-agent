@@ -1,0 +1,259 @@
+/* Messaging: the Extensions index and sheet, plus the code to scan and the gateway's state. */
+.ms-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-6);
+}
+
+/* Whether the gateway is running, said once at the top of the page. */
+.ms-gateway {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-4);
+  border-radius: var(--r-full);
+  box-shadow: inset 0 0 0 1px var(--hair);
+}
+[data-look="soft"] .ms-gateway {
+  box-shadow: var(--e1-shadow);
+}
+.ms-gateway > span:not(.ms-dot) {
+  display: grid;
+  line-height: 1.25;
+}
+.ms-gateway b {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.ms-gateway small {
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.ms-gateway .btn-line {
+  border-radius: var(--r-full);
+}
+.ms-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.ms-dot.on {
+  background: var(--ok);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 18%, transparent);
+}
+
+/* A platform with no bundled mark: its first letter, quietly. */
+.ms-letter {
+  display: grid;
+  place-items: center;
+  background: var(--gold-wash);
+  color: var(--gold);
+  font-weight: 600;
+}
+.ms-large.ms-letter {
+  font-size: var(--text-xl);
+}
+
+/* Apps are listed as on the Connectors page; projects and people are one line each, opening a sheet. */
+.ms-index .ix-main {
+  grid-template-columns: 120px minmax(0, 1fr);
+}
+.ms-go {
+  display: grid;
+  color: var(--faint);
+  transition: translate var(--t-base) var(--ease-out);
+}
+.ms-index:hover .ms-go {
+  translate: 2px 0;
+}
+
+/* Lists inside a sheet: the same rows, a narrower name column, actions at the end. */
+.ms-list {
+  margin: 0 -14px var(--s-4);
+}
+/* A sheet is narrow: the path sits under the name, so neither is cut short. */
+.ms-list .ix-main {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  padding: 10px 0;
+}
+.ms-static {
+  cursor: default;
+}
+.ms-row-actions,
+.ms-code {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.ms-row-actions .cx-link {
+  font-size: var(--text-sm);
+  opacity: 0;
+  transition: opacity var(--t-fast);
+}
+.ix-row:is(:hover, :focus-within) .ms-row-actions .cx-link {
+  opacity: 1;
+}
+.ix-chip.ms-starts {
+  color: var(--gold);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 40%, transparent);
+}
+.ms-group {
+  margin: var(--s-5) 0 var(--s-2);
+}
+.ms-note {
+  display: flex;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-4);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.ms-note > .icon {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  color: var(--faint);
+}
+
+/* Where new chats start, shown before pairing so nothing is chosen silently. */
+.ms-folder {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin-top: var(--s-5);
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--r-lg);
+  box-shadow: inset 0 0 0 1px var(--hair);
+  font-size: var(--text-sm);
+  color: var(--dim);
+}
+.ms-folder > .icon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--faint);
+}
+.ms-folder > span {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+}
+.ms-folder b {
+  color: var(--text);
+}
+.ms-folder small {
+  color: var(--faint);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+.ms-code input {
+  width: 13em;
+  padding-block: 6px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+}
+
+/* The code sits on paper in every theme, the way a phone's camera reads it. */
+.ms-code-plate {
+  display: block;
+  width: min(260px, 100%);
+  aspect-ratio: 1;
+  margin: var(--s-1) auto var(--s-5);
+  padding: var(--s-2);
+  border-radius: var(--r-lg);
+  background: var(--paper);
+  box-shadow:
+    0 0 0 1px var(--hair),
+    var(--e1-shadow);
+  animation: fade-in var(--t-slow) var(--ease-out) both;
+}
+.ms-steps {
+  margin: 0;
+  padding-left: 1.3em;
+  display: grid;
+  gap: var(--s-2);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.ms-steps li::marker {
+  color: var(--gold);
+  font-weight: 600;
+}
+
+/* A step that just happened: the bot made, a message heard. */
+.ms-moment {
+  display: flex;
+  gap: var(--s-3);
+  align-items: flex-start;
+  margin: 0 0 var(--s-5);
+  line-height: 1.55;
+  color: var(--dim);
+}
+.ms-moment > .icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-top: 3px;
+  color: var(--ok);
+}
+.ms-moment b {
+  color: var(--text);
+}
+.ms-ask {
+  display: grid;
+  gap: 2px;
+  padding: var(--s-4) var(--s-5);
+  border-radius: var(--r-lg);
+  background: var(--gold-wash);
+  animation: fade-in var(--t-slow) var(--ease-out) both;
+}
+.ms-ask small {
+  color: var(--gold);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.ms-ask b {
+  font-size: var(--text-lg);
+}
+.ms-ask span {
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+
+/* The token pasted for a bot made by hand. */
+.ms-token {
+  margin-top: var(--s-5);
+}
+.ms-token label {
+  display: grid;
+  gap: 6px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.ms-token .quiet {
+  margin: var(--s-2) 0 0;
+  line-height: 1.5;
+}
+
+/* A short window keeps the whole step in view; the code still scans at this size. */
+@media (max-height: 640px) {
+  .ms-code-plate {
+    width: min(184px, 100%);
+    margin-bottom: var(--s-3);
+  }
+}
+@media (max-width: 720px) {
+  .ms-top {
+    flex-direction: column;
+    gap: 0;
+  }
+  .ms-gateway {
+    margin-bottom: var(--s-6);
+  }
+}

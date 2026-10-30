@@ -1,0 +1,16 @@
+[lints]
+workspace = true
+
+[package]
+name = "handover"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Seals a secret to one computer's one-time key, so only that computer can open it."
+
+[dependencies]
+ring = "0.17"
+base64 = "0.22"
+serde.workspace = true

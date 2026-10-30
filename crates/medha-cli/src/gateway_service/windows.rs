@@ -20,7 +20,8 @@ const VALUE: &str = "MedhaGateway";
 pub(super) fn register(program: &Path) -> Result<String> {
     let line = command_line(&launcher(program)?);
     set(&line)?;
-    start()?;
+    // Restart, not start: a gateway already running picks up the new setup too.
+    restart()?;
     Ok(format!("Start-up entry: HKCU\\{RUN}\\{VALUE}"))
 }
 

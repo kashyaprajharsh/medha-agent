@@ -351,6 +351,9 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
     if connect::plan_limit_key(model, key) {
         return;
     }
+    if super::messaging::handle_key(model, key) {
+        return;
+    }
     if connect::handle_key(model, key) {
         return;
     }
@@ -676,6 +679,8 @@ pub(super) enum SlashAction {
     McpCatalog(String),
     /// `/connect [app]` — the reviewed connectors.
     Connect(String),
+    /// `/messaging`: reach Medha from a phone.
+    Messaging,
     /// `/usage` — tokens and cost for this session and the last week.
     Usage,
     /// Open the ChatGPT plan's usage settings in the browser.
@@ -794,6 +799,7 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
             SlashAction::McpAdd(c.strip_prefix("mcp add").unwrap_or("").trim().to_string())
         }
         "usage" => SlashAction::Usage,
+        "messaging" => SlashAction::Messaging,
         "usage manage" => SlashAction::ManageUsage,
         c if c.strip_prefix("connect").is_some_and(is_cmd_boundary) => {
             SlashAction::Connect(c.strip_prefix("connect").unwrap_or("").trim().to_string())
@@ -927,7 +933,9 @@ pub(super) fn message_for(model: &Model, line: &str, attached: &[std::path::Path
 }
 
 pub(super) fn handle_paste(model: &mut Model, data: String) {
-    if connect::paste(model, &strip_paste_markers(&data)) {
+    if connect::paste(model, &strip_paste_markers(&data))
+        || super::messaging::paste(model, &strip_paste_markers(&data))
+    {
         model.dirty = true;
         return;
     }

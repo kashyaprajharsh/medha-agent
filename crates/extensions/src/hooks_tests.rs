@@ -76,7 +76,22 @@ async fn causation_depth_limit_skips_hook_before_spawning_it() {
 #[tokio::test]
 async fn bundled_example_hook_returns_typed_context() {
     let temp = tempfile::tempdir().unwrap();
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello-plugin");
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello-plugin");
+    // The example as shipped, with room for python3 to start while the whole suite runs, as
+    // `runner_for` gives a shell; the example itself keeps the timeout users copy.
+    let source = temp.path().join("hello-plugin");
+    crate::sources::copy_tree(&bundled, &source).unwrap();
+    let manifest = source.join("plugin.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    assert!(
+        text.contains("timeout_ms = 2000"),
+        "the example's hook timeout moved"
+    );
+    fs::write(
+        &manifest,
+        text.replace("timeout_ms = 2000", "timeout_ms = 10000"),
+    )
+    .unwrap();
     let store = store(temp.path());
     store.install(&source).unwrap();
     store

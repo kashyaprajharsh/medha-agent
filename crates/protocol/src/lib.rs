@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub mod commands;
 mod presentation;
 pub use presentation::*;
 mod artifacts;
@@ -15,6 +16,8 @@ mod model_providers;
 pub use model_providers::*;
 mod chatgpt;
 pub use chatgpt::*;
+mod messaging;
+pub use messaging::*;
 mod session_features;
 pub use session_features::*;
 mod editor;
@@ -549,6 +552,20 @@ impl ApprovalPrompt {
 pub struct ApprovalResolved {
     pub gate_id: u64,
     pub approved: bool,
+    /// Absent from older backends, which only told of answers.
+    #[serde(default)]
+    pub how: Resolution,
+}
+
+/// Why a waiting approval ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resolution {
+    #[default]
+    Answered,
+    TimedOut,
+    /// The turn stopped or the chat closed before anyone answered.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

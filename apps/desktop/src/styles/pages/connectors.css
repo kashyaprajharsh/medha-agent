@@ -355,6 +355,13 @@
   filter: brightness(1.07);
   translate: 0 -1px;
 }
+/* Waiting on something the sheet asks for first, so it does not look pressable. */
+.cx-connect.gild:disabled {
+  opacity: 0.45;
+  filter: saturate(0.6);
+  translate: none;
+  cursor: not-allowed;
+}
 .cx-connect.busy {
   background: transparent;
   color: var(--text);

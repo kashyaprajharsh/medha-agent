@@ -327,10 +327,7 @@ pub(crate) fn plugins(store: &extensions::Store) -> Result<protocol::PluginCatal
             })
         })
         .cloned();
-    let builtin: Vec<_> = crate::application_catalog::COMMANDS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect();
+    let builtin: Vec<_> = protocol::commands::builtin_names().collect();
     let commands = crate::application_commands::load(store, &builtin)
         .into_iter()
         .map(|command| protocol::PluginCommand {
@@ -857,6 +854,13 @@ pub(crate) async fn folder<L: EventLog>(
         chatgpt if chatgpt.starts_with("application.chatgpt.") => {
             match crate::chatgpt_signin::handle(chatgpt, &params).await {
                 Some(answer) => answer.map_err(|error| error.to_string()),
+                None => return None,
+            }
+        }
+        // The same setup the desktop runs as `settings.messaging.*`.
+        messaging if messaging.starts_with("application.messaging.") => {
+            match crate::messaging_setup::handle(messaging, &params, workspace).await {
+                Some(answer) => answer.map_err(|error| format!("{error:#}")),
                 None => return None,
             }
         }

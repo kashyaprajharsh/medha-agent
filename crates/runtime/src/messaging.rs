@@ -7,9 +7,15 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Messaging {
-    /// The folder every messaging chat works in.
+    /// The folder a messaging chat works in until it picks another project at `/new`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<PathBuf>,
+    /// More folders a chat may pick at `/new`; added only on this computer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<PathBuf>,
+    /// Show each tool step in the chat, as one message rewritten as the work goes on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steps: bool,
     /// Set up platforms by name, such as `telegram`.
     #[serde(default, flatten)]
     pub platforms: BTreeMap<String, Platform>,
@@ -18,6 +24,28 @@ pub struct Messaging {
 impl Messaging {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Every folder a chat may work in: the default first, then the others as added.
+    pub fn allowed(&self) -> Vec<PathBuf> {
+        let mut allowed: Vec<PathBuf> = self.folder.iter().cloned().collect();
+        for folder in &self.folders {
+            if !allowed.contains(folder) {
+                allowed.push(folder.clone());
+            }
+        }
+        allowed
+    }
+
+    /// New chats start in `folder`; the old default stays open to chats that chose it.
+    pub fn make_default(&mut self, folder: PathBuf) {
+        if let Some(old) = self.folder.replace(folder.clone())
+            && old != folder
+            && !self.folders.contains(&old)
+        {
+            self.folders.push(old);
+        }
+        self.folders.retain(|kept| *kept != folder);
     }
 
     /// Set up platforms that are switched on.
@@ -66,7 +94,36 @@ pub fn set_home(platform: &str, chat: &str) -> anyhow::Result<()> {
     crate::config::save(&cfg)
 }
 
+/// A folder a phone may work in: a project, never the home folder, a root, or Medha's own data.
+pub fn admit_folder(folder: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let folder = folder
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("{} is not a folder on this computer", folder.display()))?;
+    anyhow::ensure!(folder.is_dir(), "{} is not a folder", folder.display());
+    let broad = folder.parent().is_none()
+        || dirs::home_dir()
+            .and_then(|home| home.canonicalize().ok())
+            .is_some_and(|home| home.starts_with(&folder));
+    anyhow::ensure!(
+        !broad,
+        "{} holds far more than one project. Choose a project folder inside it.",
+        folder.display()
+    );
+    let medha = crate::config::medha_home()?;
+    let medha = medha.canonicalize().unwrap_or(medha);
+    anyhow::ensure!(
+        !folder.starts_with(&medha) && !medha.starts_with(&folder),
+        "{} holds Medha's own settings and keys. Choose a project folder.",
+        folder.display()
+    );
+    Ok(folder)
+}
+
 /// Where a platform's token is kept in the credential store.
 pub fn credential_id(platform: &str) -> String {
     format!("messaging://{platform}")
 }
+
+#[cfg(test)]
+#[path = "messaging_tests.rs"]
+mod tests;

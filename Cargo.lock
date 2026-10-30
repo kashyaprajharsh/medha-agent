@@ -1401,9 +1401,12 @@ dependencies = [
  "fd-lock",
  "file-ops",
  "getrandom 0.3.4",
+ "handover",
  "medha-client",
  "medha-protocol",
  "media",
+ "pulldown-cmark",
+ "qrcode",
  "reqwest 0.12.28",
  "runtime",
  "serde",
@@ -1558,6 +1561,15 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
+]
+
+[[package]]
+name = "handover"
+version = "0.1.12"
+dependencies = [
+ "base64",
+ "ring",
+ "serde",
 ]
 
 [[package]]
@@ -3356,6 +3368,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

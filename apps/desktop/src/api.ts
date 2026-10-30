@@ -222,6 +222,8 @@ export const desktop = {
   workspaces: () =>
     invoke<{ initial: string; workspaces: Workspace[] }>("workspace_list"),
   chooseWorkspace: () => invoke<Workspace | null>("workspace_choose"),
+  /** A folder's path only: unlike `chooseWorkspace`, nothing is added to the workspace list. */
+  chooseFolder: (title: string) => invoke<string | null>("folder_choose", { title }),
   chooseExtensionSource: (kind: ExtensionSourceKind) =>
     invoke<string | null>("extension_source_choose", { kind }),
   chooseAttachments: async (kind: "files" | "folder"): Promise<Attachment[] | null> => {

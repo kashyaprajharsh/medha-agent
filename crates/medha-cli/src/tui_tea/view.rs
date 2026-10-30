@@ -2377,7 +2377,9 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
         .model_setup
         .as_ref()
         .is_some_and(|setup| setup.screen.is_some());
-    if !gate_open && connecting {
+    if !gate_open && model.messaging.is_some() {
+        super::messaging_view::draw(f, model, pad_h(chunks[3]));
+    } else if !gate_open && connecting {
         // The card draws its own choices, the protocol for a server of one's own included.
         super::connect_view::draw(f, model, pad_h(chunks[3]));
     } else if !gate_open && let Some(picker) = &model.picker {

@@ -73,9 +73,28 @@ pub trait Platform: Send + Sync {
 
     async fn send(&self, chat: &str, text: &str) -> Result<()>;
 
-    /// Offers choices. Without buttons, they are numbered and a reply with the number picks one.
-    async fn ask(&self, chat: &str, text: &str, buttons: &[Button]) -> Result<()> {
-        self.send(chat, &numbered(text, buttons)).await
+    /// Offers choices, giving the message's id where [`Self::edit`] can change it later. Without
+    /// buttons, they are numbered and a reply with the number picks one.
+    async fn ask(&self, chat: &str, text: &str, buttons: &[Button]) -> Result<Option<String>> {
+        self.send(chat, &numbered(text, buttons))
+            .await
+            .map(|_| None)
+    }
+
+    /// Sends a message to be rewritten as work goes on, giving its id; platforms that cannot
+    /// change a message send nothing and give `None`.
+    async fn send_live(&self, _chat: &str, _text: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Rewrites a message this bot sent and takes its buttons away.
+    async fn edit(&self, _chat: &str, _message: &str, _text: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Lists the chat's commands where people type `/`; platforms without a menu do nothing.
+    async fn offer_commands(&self, _commands: &[(&str, &str)]) -> Result<()> {
+        Ok(())
     }
 
     /// Shows that the agent is working; platforms without it do nothing.
@@ -113,27 +132,63 @@ pub fn numbered(text: &str, buttons: &[Button]) -> String {
 
 /// Splits text into messages no longer than `limit` characters, preferring to break between
 /// paragraphs, then lines, then words, and never inside a character.
+/// A code block cut between two messages is closed in the first and opened again in the next.
 pub fn split(text: &str, limit: usize) -> Vec<String> {
-    let limit = limit.max(1);
+    const CLOSE: &str = "\n```";
+    let fenced = text.contains("```");
+    // Room for the closing fence, when there may be one to add.
+    let room = if fenced {
+        limit.saturating_sub(CLOSE.len())
+    } else {
+        limit
+    }
+    .max(1);
     let mut parts = Vec::new();
-    let mut rest = text.trim();
+    let mut rest = text.trim().to_owned();
     while rest.chars().count() > limit {
         let end = rest
             .char_indices()
-            .nth(limit)
+            .nth(room)
             .map_or(rest.len(), |(at, _)| at);
+        // A part that opens a block again must carry more than the opening line.
+        let opened = if fenced && rest.starts_with("```") {
+            rest.find('\n').unwrap_or(0)
+        } else {
+            0
+        };
         let window = &rest[..end];
         let cut = ["\n\n", "\n", " "]
             .iter()
-            .find_map(|gap| window.rfind(gap).filter(|at| *at > 0))
+            .find_map(|gap| window.rfind(gap).filter(|at| *at > opened))
             .unwrap_or(end);
-        parts.push(rest[..cut].trim_end().to_owned());
-        rest = rest[cut..].trim_start();
+        let mut part = rest[..cut].trim_end().to_owned();
+        let mut next = rest[cut..].trim_start().to_owned();
+        if let Some(open) = fenced.then(|| open_fence(&part)).flatten() {
+            part.push_str(CLOSE);
+            next = format!("{open}\n{next}");
+        }
+        parts.push(part);
+        rest = next;
     }
     if !rest.is_empty() {
-        parts.push(rest.to_owned());
+        parts.push(rest);
     }
     parts
+}
+
+/// The opening line of a ``` block left open at the end of `text`.
+fn open_fence(text: &str) -> Option<String> {
+    let mut open = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with("```") {
+            open = match open {
+                None => Some(line.trim_end().to_owned()),
+                Some(_) => None,
+            };
+        }
+    }
+    open
 }
 
 #[cfg(test)]
@@ -174,5 +229,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             [40, 40, 15]
         );
+    }
+
+    #[test]
+    fn a_code_block_cut_in_two_is_closed_and_opened_again_so_both_parts_stay_code() {
+        let lines: Vec<String> = (0..12).map(|n| format!("line {n:02}")).collect();
+        let text = format!("Here:\n\n```rust\n{}\n```\nafter", lines.join("\n"));
+        let parts = split(&text, 40);
+        assert!(
+            parts.iter().all(|part| part.chars().count() <= 40),
+            "{parts:?}"
+        );
+        for part in &parts {
+            assert!(open_fence(part).is_none(), "left open: {part:?}");
+        }
+        assert!(parts[1].starts_with("```rust\n"), "{parts:?}");
+        let code: Vec<&str> = parts
+            .iter()
+            .flat_map(|part| part.lines())
+            .filter(|line| line.starts_with("line"))
+            .collect();
+        assert_eq!(code, lines, "every line arrives once, in order");
+
+        // One unbroken line inside a block cannot keep the split from moving on.
+        let long = format!("```\n{}\n```", "x".repeat(100));
+        let parts = split(&long, 40);
+        assert!(
+            parts.iter().all(|part| part.chars().count() <= 40),
+            "{parts:?}"
+        );
+        assert_eq!(parts.concat().matches('x').count(), 100);
     }
 }

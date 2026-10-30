@@ -148,6 +148,7 @@ pub(super) enum Effect {
     },
     Recognise(protocol::RecogniseKey),
     ChatGpt(ChatGptCall),
+    Messaging(MessagingCall),
     CheckKey(protocol::CheckModelKey),
     RefreshProviders,
     ResolveDeployment(protocol::ResolveDeployment),
@@ -187,6 +188,33 @@ pub(super) enum ChatGptAnswer {
     SignedOut {
         revoked: bool,
     },
+}
+
+/// The backend's messaging setup calls, shared with the desktop's Messaging page.
+pub(super) enum MessagingCall {
+    Status,
+    Begin(protocol::BeginMessagingSetup),
+    Await(protocol::AwaitMessagingSetup),
+    Save(protocol::SaveMessagingSetup),
+    SaveToken(protocol::SaveMessagingToken),
+    Cancel(protocol::CancelMessagingSetup),
+    Approve(protocol::ApproveMessagingPerson),
+    Revoke(protocol::RevokeMessagingPerson),
+    Gateway(protocol::ControlGateway),
+    Folder(protocol::ChangeMessagingFolder),
+    Steps(protocol::ShowMessagingSteps),
+}
+pub(super) enum MessagingAnswer {
+    Overview(protocol::MessagingOverview),
+    Begun(protocol::MessagingSetup),
+    Step {
+        id: u64,
+        step: protocol::MessagingStep,
+    },
+    Saved(protocol::MessagingSaved),
+    Approved(protocol::MessagingPerson),
+    /// Revoked or cancelled: the overview is read again.
+    Changed,
 }
 
 impl Effect {
@@ -369,6 +397,7 @@ enum Answer {
         found: protocol::RecognisedKey,
     },
     ChatGpt(ChatGptAnswer),
+    Messaging(MessagingAnswer),
     KeyChecked(protocol::ModelKeyCheck),
     Providers(protocol::ProviderCatalogue),
     Deployment(protocol::ModelDeployment),
@@ -664,6 +693,56 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
                 }
             }
             .map(Answer::ChatGpt)
+        }
+        Effect::Messaging(call) => {
+            let scope = protocol::Scope::Folder(&folder);
+            match call {
+                MessagingCall::Status => connection
+                    .call_async(scope, &protocol::MessagingStatus {})
+                    .await
+                    .map(MessagingAnswer::Overview),
+                MessagingCall::Begin(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Begun),
+                MessagingCall::Await(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(|step| MessagingAnswer::Step { id: p.id, step }),
+                MessagingCall::Save(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Saved),
+                MessagingCall::SaveToken(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Saved),
+                MessagingCall::Cancel(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(|_| MessagingAnswer::Changed),
+                MessagingCall::Approve(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Approved),
+                MessagingCall::Revoke(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(|_| MessagingAnswer::Changed),
+                MessagingCall::Gateway(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Overview),
+                MessagingCall::Folder(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Overview),
+                MessagingCall::Steps(p) => connection
+                    .call_async(scope, p)
+                    .await
+                    .map(MessagingAnswer::Overview),
+            }
+            .map(Answer::Messaging)
         }
         Effect::CheckKey(p) => connection
             .call_async(protocol::Scope::Folder(&folder), p)
@@ -1874,6 +1953,11 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                     model.dirty = true;
                     return;
                 }
+                Effect::Messaging(call) => {
+                    super::messaging::failed(model, call, &error);
+                    model.dirty = true;
+                    return;
+                }
                 _ => {}
             }
             if done.form.is_some() {
@@ -2018,6 +2102,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
             Answer::Probed { url, count } => connect::probed(model, url, count),
             Answer::Recognised { key, found } => connect::recognised(model, key, found),
             Answer::ChatGpt(answer) => connect::chatgpt(model, answer),
+            Answer::Messaging(answer) => super::messaging::answered(model, answer),
             Answer::Discovered(listing) => connect::discovered(model, listing),
             Answer::KeyChecked(check) => backend_features::key_checked(model, check),
             Answer::Providers(catalogue) => {
@@ -2197,6 +2282,7 @@ fn dispatch(model: &mut Model, event: CtEvent) {
 fn tick(model: &mut Model) -> bool {
     backend_plugins::review_startup(model);
     connect::tick(model);
+    let clock = super::messaging::tick(model);
     let expired = model
         .clipboard_status
         .as_ref()
@@ -2225,7 +2311,7 @@ fn tick(model: &mut Model) -> bool {
     {
         model.remote.as_mut().expect("viewer").live_pending = true;
     }
-    expired
+    expired || clock
 }
 
 pub(super) fn cancel_foreground(model: &mut Model) {

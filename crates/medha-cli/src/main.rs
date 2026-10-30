@@ -33,6 +33,7 @@ mod gateway_service;
 mod hook_files;
 mod lock_edit;
 mod mcp_host;
+mod messaging_setup;
 mod pairing_command;
 mod plugins_cmd;
 mod self_update;

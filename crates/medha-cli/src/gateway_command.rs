@@ -1,9 +1,10 @@
 //! `medha gateway`: set up messaging platforms and run the gateway that links them to Medha.
 
+use crate::messaging_setup::Owner;
 use anyhow::{Context, Result, bail};
 use gateway::platforms::{self, Manifest};
 use runtime::config;
-use runtime::messaging::{Platform, credential_id};
+use runtime::messaging::credential_id;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
         ["setup", name] => setup(Some(name)).await,
         ["run"] => serve().await,
         [] | ["status"] => status(),
-        ["install"] => crate::gateway_service::install(),
+        ["install"] => crate::gateway_service::install().map(|done| println!("{done}")),
         ["uninstall"] => crate::gateway_service::uninstall(),
         ["start"] => crate::gateway_service::start(),
         ["stop"] => crate::gateway_service::stop(),
@@ -43,13 +44,12 @@ async fn setup(name: Option<&str>) -> Result<()> {
             .with_context(|| format!("Medha does not know the platform {name}"))?,
         None => choose()?,
     };
-    println!("Set up {}\n\n{}\n", manifest.label, manifest.steps);
-    let token = secret(&format!("{}: ", manifest.token))?;
-    let account = platforms::check(manifest.name, &token).await?;
-    println!("Connected to {account}.");
-
-    let mut cfg = config::load()?.unwrap_or_default();
-    let folder = match cfg.gateway.folder.clone() {
+    let Obtained {
+        token,
+        account,
+        owner,
+    } = obtain(manifest).await?;
+    let folder = match config::load()?.unwrap_or_default().gateway.folder {
         Some(folder) => folder,
         None => {
             let here = std::env::current_dir()?;
@@ -62,30 +62,110 @@ async fn setup(name: Option<&str>) -> Result<()> {
             } else {
                 PathBuf::from(answer.trim())
             };
-            chosen
-                .canonicalize()
-                .with_context(|| format!("{} is not a folder", chosen.display()))?
+            runtime::messaging::admit_folder(&chosen)?
         }
     };
-    config::store_key(&credential_id(manifest.name), &token)?;
-    cfg.gateway.folder = Some(folder.clone());
-    cfg.gateway.platforms.insert(
-        manifest.name.to_owned(),
-        Platform {
-            enabled: true,
-            settings: Default::default(),
-        },
-    );
-    config::save(&cfg)?;
-    // An installed gateway that stopped for want of this setup starts on it now.
-    crate::gateway_service::restart_if_installed();
-    println!(
-        "\nSaved. Messages from {} work in {}.\n\nNext:\n  1. Start it: medha gateway run\n  2. Message {account} from your phone. It answers with a code.\n  3. Let yourself in: medha pairing approve {} <code>",
-        manifest.label,
-        folder.display(),
-        manifest.name
-    );
+    let saved = crate::messaging_setup::save(
+        manifest.name,
+        &token,
+        &account,
+        &folder,
+        owner.as_ref().map(|(owner, telegram)| (owner, telegram)),
+    )
+    .await?;
+    let running = match &saved.problem {
+        None => "It runs now, at login and after a crash.".to_owned(),
+        Some(problem) => format!(
+            "It could not be started at login: {problem}\nStart it yourself: medha gateway run"
+        ),
+    };
+    match owner {
+        Some(_) => println!(
+            "\nSaved. You are paired, and Medha's notices come to this chat. Messages work in {}.\n{running}",
+            folder.display()
+        ),
+        None => println!(
+            "\nSaved. Messages from {} work in {}.\n{running}\n\nNext:\n  1. Message {account} from your phone. It answers with a code.\n  2. Let yourself in: medha pairing approve {} <code>",
+            manifest.label,
+            folder.display(),
+            manifest.name
+        ),
+    }
     Ok(())
+}
+
+struct Obtained {
+    token: String,
+    account: String,
+    /// The owner, with the connection to their new bot that saying "Paired" needs.
+    owner: Option<(Owner, gateway::telegram::Telegram)>,
+}
+
+/// Telegram offers making the bot by scanning a code; every platform takes a pasted token.
+async fn obtain(manifest: &Manifest) -> Result<Obtained> {
+    if manifest.name == "telegram" && std::io::stdin().is_terminal() {
+        println!(
+            "Set up Telegram\n\n  1. Scan a code with your phone: Medha Setup makes a bot of your own (recommended)\n  2. Use a bot you made yourself with @BotFather\n"
+        );
+        if line("Choose [1]: ")?.trim() != "2" {
+            return one_tap().await;
+        }
+    }
+    println!("Set up {}\n\n{}\n", manifest.label, manifest.steps);
+    let token = secret(&format!("{}: ", manifest.token))?;
+    let account = platforms::check(manifest.name, &token).await?;
+    println!("Connected to {account}.");
+    Ok(Obtained {
+        token,
+        account,
+        owner: None,
+    })
+}
+
+async fn one_tap() -> Result<Obtained> {
+    println!(
+        "\nThe bot is yours and only you can message it. Telegram lets Medha Setup read the token of a bot it made for as long as that bot exists; choose 2 instead if no one else should.\n"
+    );
+    let waiting = gateway::one_tap::begin(&gateway::one_tap::service()).await?;
+    if let Some(code) = gateway::one_tap::qr(&waiting.link) {
+        println!("{code}");
+    }
+    println!(
+        "Scan this with your phone, or open {}\nIn Telegram tap Start, then Create bot. Waiting for up to ten minutes…",
+        waiting.link
+    );
+    let handed = waiting.wait().await?;
+    println!("Created @{}.", handed.bot);
+    let telegram = gateway::telegram::Telegram::connect(&handed.token).await?;
+    println!("Now send any message to @{} from your phone.", handed.bot);
+    let owner = tokio::time::timeout(
+        std::time::Duration::from_secs(5 * 60),
+        crate::messaging_setup::first_message(&telegram, handed.owner),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "No message reached @{} within five minutes. Run setup again.",
+            handed.bot
+        )
+    })??;
+    // The service names the creator and Telegram shows who wrote; the person confirms the
+    // name, so a service that lied could not make someone else the owner.
+    let answer = line(&format!(
+        "Is this you: {} (Telegram {})? [Y/n] ",
+        owner.name, owner.user
+    ))?;
+    if answer.trim().eq_ignore_ascii_case("n") {
+        bail!(
+            "Setup stopped. Delete @{} in @BotFather and run setup again.",
+            handed.bot
+        );
+    }
+    Ok(Obtained {
+        token: handed.token,
+        account: format!("@{}", handed.bot),
+        owner: Some((owner, telegram)),
+    })
 }
 
 fn choose() -> Result<&'static Manifest> {

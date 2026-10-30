@@ -148,10 +148,7 @@ pub(crate) async fn handle<P: Provider, L: EventLog>(
         "application.command.expand" => {
             match serde_json::from_value::<protocol::ExpandCommand>(params) {
                 Ok(request) => {
-                    let builtin: Vec<_> = crate::application_catalog::COMMANDS
-                        .iter()
-                        .map(|(name, _)| *name)
-                        .collect();
+                    let builtin: Vec<_> = protocol::commands::builtin_names().collect();
                     let commands = crate::application_commands::load(&resources.store, &builtin);
                     if crate::application_commands::has_snippets(&commands, &request.typed)
                         && (running

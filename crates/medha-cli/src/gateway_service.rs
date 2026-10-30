@@ -19,10 +19,13 @@ mod system;
 #[path = "gateway_service/unsupported.rs"]
 mod system;
 
-pub(crate) fn install() -> Result<()> {
+/// Starts the gateway now, at login and after a crash; one already running restarts on the
+/// current setup. Says where the service was written.
+pub(crate) fn install() -> Result<String> {
     let place = system::register(&program()?)?;
-    println!("Installed: the gateway starts at login and restarts if it crashes.\n{place}");
-    Ok(())
+    Ok(format!(
+        "Installed: the gateway starts at login and restarts if it crashes.\n{place}"
+    ))
 }
 
 pub(crate) fn uninstall() -> Result<()> {

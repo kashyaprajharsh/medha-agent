@@ -97,16 +97,35 @@ fn reply(stream: &mut TcpStream, kind: &str, body: &str) {
     );
 }
 
-/// What the gateway sent to the platform.
+/// What the gateway sent to the platform: a new message with its id, or a change to one.
 #[derive(Debug)]
 struct Sent {
+    id: String,
     text: String,
     buttons: Vec<Button>,
+    edit: bool,
 }
 
 struct FakePlatform {
     heard: Mutex<channel::Receiver<Heard>>,
     sent: channel::UnboundedSender<Sent>,
+    ids: std::sync::atomic::AtomicU64,
+}
+
+impl FakePlatform {
+    fn record(&self, text: &str, buttons: &[Button]) -> String {
+        let id = self
+            .ids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
+        let _ = self.sent.send(Sent {
+            id: id.clone(),
+            text: text.into(),
+            buttons: buttons.to_vec(),
+            edit: false,
+        });
+        id
+    }
 }
 
 #[async_trait::async_trait]
@@ -124,17 +143,29 @@ impl Platform for FakePlatform {
     }
 
     async fn send(&self, _chat: &str, text: &str) -> anyhow::Result<()> {
-        let _ = self.sent.send(Sent {
-            text: text.into(),
-            buttons: Vec::new(),
-        });
+        self.record(text, &[]);
         Ok(())
     }
 
-    async fn ask(&self, _chat: &str, text: &str, buttons: &[Button]) -> anyhow::Result<()> {
+    async fn ask(
+        &self,
+        _chat: &str,
+        text: &str,
+        buttons: &[Button],
+    ) -> anyhow::Result<Option<String>> {
+        Ok(Some(self.record(text, buttons)))
+    }
+
+    async fn send_live(&self, _chat: &str, text: &str) -> anyhow::Result<Option<String>> {
+        Ok(Some(self.record(text, &[])))
+    }
+
+    async fn edit(&self, _chat: &str, message: &str, text: &str) -> anyhow::Result<()> {
         let _ = self.sent.send(Sent {
+            id: message.into(),
             text: text.into(),
-            buttons: buttons.to_vec(),
+            buttons: Vec::new(),
+            edit: true,
         });
         Ok(())
     }
@@ -227,18 +258,32 @@ impl World {
         Pairing::at(self.gateway_home().join("pairing.json"))
     }
 
-    /// A running gateway on a fresh fake platform.
+    /// A running gateway on a fresh fake platform, with chats in the test's folder.
     fn gateway(&self) -> Gateway {
+        self.gateway_with(vec![self.folder.clone()])
+    }
+
+    /// A running gateway whose chats may work in `folders`, the first being the default.
+    fn gateway_with(&self, folders: Vec<PathBuf>) -> Gateway {
+        self.gateway_set(gateway::Settings::Fixed {
+            folders,
+            steps: false,
+        })
+    }
+
+    fn gateway_set(&self, settings: gateway::Settings) -> Gateway {
         let (tell, heard) = channel::channel(16);
         let (sent_tx, sent) = channel::unbounded_channel();
         let platform = Arc::new(FakePlatform {
             heard: Mutex::new(heard),
             sent: sent_tx,
+            ids: std::sync::atomic::AtomicU64::new(1),
         });
         let router = gateway::Router::in_home(
             platform,
             Arc::clone(&self.client),
             self.folder.clone(),
+            settings,
             &self.gateway_home(),
         );
         Gateway {
@@ -360,6 +405,71 @@ async fn stranger_then_restart(world: &World) {
 }
 
 #[test]
+fn new_offers_only_the_allowed_projects_and_a_removed_one_is_refused() {
+    let world = World::start();
+    runtime().block_on(projects(&world));
+}
+
+/// The folder each live chat works in, as the backend reports it.
+async fn folders_in_use(world: &World) -> Vec<PathBuf> {
+    let listed = world
+        .client
+        .connection()
+        .unwrap()
+        .call_async(protocol::Scope::Service, &protocol::ListSessions {})
+        .await
+        .unwrap();
+    listed
+        .sessions
+        .into_iter()
+        .filter_map(|live| Some(live.about?.folder))
+        .collect()
+}
+
+async fn projects(world: &World) {
+    world.pair(OWNER);
+    let site = world.root.path().join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    let site = site.canonicalize().unwrap();
+    let mut gateway = world.gateway_with(vec![world.folder.clone(), site.clone()]);
+
+    gateway.write(OWNER, "/new").await;
+    let asked = gateway.next().await;
+    let labels: Vec<_> = asked.buttons.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["work", "site"], "{asked:?}");
+    // A button names a place in the list, never a path.
+    assert!(
+        asked.buttons.iter().all(|b| !b.choice.contains('/')),
+        "{asked:?}"
+    );
+    // A path typed on the phone is not taken.
+    gateway.write(OWNER, "/new /etc").await;
+    assert!(gateway.next().await.text.contains("no project called /etc"));
+
+    gateway.press(OWNER, OWNER, &asked.buttons[1].choice).await;
+    let chosen = gateway.next().await;
+    assert!(chosen.edit && chosen.id == asked.id, "{chosen:?}");
+    assert_eq!(chosen.text, format!("{}\n\nYou chose site.", asked.text));
+    let moved = gateway.next().await.text;
+    assert!(moved.contains(&site.display().to_string()), "{moved}");
+    gateway.write(OWNER, "hello from site").await;
+    assert_eq!(gateway.next().await.text, "echo: hello from site");
+    world.seen.recv_timeout(WAIT).unwrap();
+    assert!(folders_in_use(world).await.contains(&site));
+    drop(gateway);
+
+    // Taken off the list on the computer: the chat is told, and works in the default again.
+    let mut restarted = world.gateway_with(vec![world.folder.clone()]);
+    restarted.write(OWNER, "hello again").await;
+    let told = restarted.next().await.text;
+    assert!(told.contains("no longer open to messages"), "{told}");
+    assert_eq!(restarted.next().await.text, "echo: hello again");
+    world.seen.recv_timeout(WAIT).unwrap();
+    let in_use = folders_in_use(world).await;
+    assert!(in_use.contains(&world.folder), "{in_use:?}");
+}
+
+#[test]
 fn an_approval_arrives_as_buttons_only_a_paired_person_can_press() {
     let world = World::start();
     runtime().block_on(approval_by_button(&world));
@@ -391,11 +501,77 @@ async fn approval_by_button(world: &World) {
     );
 
     gateway.press(OWNER, OWNER, &allow.choice).await;
-    gateway
-        .until(|sent| sent.text == "echo: RUN the command")
-        .await;
+    let mut seen = Vec::new();
+    loop {
+        let sent = gateway.next().await;
+        if sent.text == "echo: RUN the command" {
+            break;
+        }
+        seen.push(sent);
+    }
     assert!(
         world.folder.join("made-by-the-test.txt").exists(),
         "the approved command did not run"
+    );
+    // The request stays where it was asked, its buttons gone and the choice under it.
+    let settled = seen
+        .iter()
+        .find(|sent| sent.edit && sent.id == asked.id)
+        .expect("the approval was not settled in place");
+    assert!(
+        settled.text.starts_with("Medha asks to:"),
+        "{}",
+        settled.text
+    );
+    assert!(
+        settled.text.ends_with("\n\n✓ Yes, allow once"),
+        "{}",
+        settled.text
+    );
+    assert!(
+        !seen.iter().any(|sent| sent.text.contains("Ran `touch")),
+        "steps are off unless chosen: {seen:?}"
+    );
+}
+
+#[test]
+fn chosen_steps_show_as_one_message_marked_as_they_end() {
+    let world = World::start();
+    runtime().block_on(steps_shown(&world));
+}
+
+async fn steps_shown(world: &World) {
+    world.pair(OWNER);
+    let mut gateway = world.gateway_set(gateway::Settings::Fixed {
+        folders: vec![world.folder.clone()],
+        steps: true,
+    });
+    gateway.write(OWNER, "RUN the command").await;
+    let step = "Ran `touch made-by-the-test.txt`";
+    let running = gateway.next().await;
+    assert_eq!(
+        running.text,
+        format!("◦ {step}"),
+        "the step comes before its approval"
+    );
+    let asked = gateway.until(|sent| !sent.buttons.is_empty()).await;
+    let allow = asked.buttons[0].choice.clone();
+    gateway.press(OWNER, OWNER, &allow).await;
+    let mut seen = Vec::new();
+    loop {
+        let sent = gateway.next().await;
+        if sent.text == "echo: RUN the command" {
+            break;
+        }
+        seen.push(sent);
+    }
+    let marked = seen
+        .iter()
+        .find(|sent| sent.edit && sent.id == running.id)
+        .unwrap_or_else(|| panic!("the step was not marked in its message: {seen:?}"));
+    assert_eq!(marked.text, format!("✓ {step}"));
+    assert!(
+        seen.iter().filter(|sent| !sent.edit).count() == 0,
+        "one message for the steps, not one per change: {seen:?}"
     );
 }

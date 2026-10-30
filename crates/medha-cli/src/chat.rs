@@ -2,6 +2,7 @@
 //! JSON-RPC is translated by `editor`, which never constructs a kernel.
 
 use kernel::{Budget, EventLog, Kernel, Message, Session, StopReason};
+use protocol::Resolution;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -748,13 +749,16 @@ impl Gate {
         self
     }
 
-    async fn answer<T>(&self, answered: oneshot::Receiver<T>, deny: T) -> T {
+    async fn answer<T>(&self, answered: oneshot::Receiver<T>, deny: T) -> (T, Resolution) {
         tokio::select! {
-            answer = answered => answer.unwrap_or(deny),
-            _ = self.writer.cancelled() => deny,
+            answer = answered => match answer {
+                Ok(answer) => (answer, Resolution::Answered),
+                Err(_) => (deny, Resolution::Stopped),
+            },
+            _ = self.writer.cancelled() => (deny, Resolution::Stopped),
             _ = expiry(self.limit) => {
                 self.writer.turn_event(protocol::TurnEvent::Notice { text: unanswered("approval", self.limit, "denied") });
-                deny
+                (deny, Resolution::TimedOut)
             }
         }
     }
@@ -779,6 +783,8 @@ struct PendingGuard {
     gate_id: u64,
     writer: Arc<Writer>,
     approved: bool,
+    /// Stays `Stopped` when the await is cancelled before an answer.
+    how: Resolution,
 }
 
 impl Drop for PendingGuard {
@@ -789,6 +795,7 @@ impl Drop for PendingGuard {
             &protocol::ApprovalResolved {
                 gate_id: self.gate_id,
                 approved: self.approved,
+                how: self.how,
             },
         );
     }
@@ -825,6 +832,7 @@ impl kernel::HumanGate for Gate {
             gate_id,
             writer: Arc::clone(&self.writer),
             approved: false,
+            how: Resolution::Stopped,
         };
         let sent = {
             let mut choices = vec![protocol::ApprovalDecision::Once];
@@ -851,9 +859,10 @@ impl kernel::HumanGate for Gate {
         }
         // Disconnect, no response or the time limit denies the action. Remembering applies to
         // this live bridge only; it never writes authority into the repository.
-        let approval = self.answer(rx, kernel::Approval::Deny).await;
+        let (approval, how) = self.answer(rx, kernel::Approval::Deny).await;
         // The guard settles every viewer even if this future is cancelled.
         guard.approved = approval.approved();
+        guard.how = how;
         if approval == kernel::Approval::Always && !escalated {
             self.always
                 .lock()
@@ -883,6 +892,7 @@ impl kernel::HumanGate for Gate {
             gate_id,
             writer: Arc::clone(&self.writer),
             approved: false,
+            how: Resolution::Stopped,
         };
         use protocol::ApprovalDecision as D;
         let folder_choice = request.folder.map(|_| D::Folder);
@@ -912,8 +922,9 @@ impl kernel::HumanGate for Gate {
             return kernel::PathApproval::Deny;
         }
         // Disconnect, no response or the time limit denies it, as for any other approval.
-        let approval = self.answer(rx, kernel::PathApproval::Deny).await;
+        let (approval, how) = self.answer(rx, kernel::PathApproval::Deny).await;
         guard.approved = approval != kernel::PathApproval::Deny;
+        guard.how = how;
         approval
     }
 
@@ -961,6 +972,7 @@ impl Gate {
             gate_id,
             writer: Arc::clone(&self.writer),
             approved: false,
+            how: Resolution::Stopped,
         };
         let mut choices = vec![protocol::ApprovalDecision::Once];
         if !escalated {
@@ -985,8 +997,9 @@ impl Gate {
         ) {
             return kernel::NetworkDecision::Deny;
         }
-        let decision = self.answer(answered, kernel::NetworkDecision::Deny).await;
+        let (decision, how) = self.answer(answered, kernel::NetworkDecision::Deny).await;
         guard.approved = decision != kernel::NetworkDecision::Deny;
+        guard.how = how;
         decision
     }
 }
@@ -2592,6 +2605,7 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0]["method"], "approval.resolved");
         assert_eq!(settled[0]["params"]["approved"], false);
+        assert_eq!(settled[0]["params"]["how"], "stopped", "nobody answered it");
 
         let disconnected_gate = Arc::clone(&gate);
         let disconnected =
@@ -2627,6 +2641,7 @@ mod tests {
         );
         assert_eq!(told[1]["method"], "approval.resolved");
         assert_eq!(told[1]["params"]["approved"], false);
+        assert_eq!(told[1]["params"]["how"], "timed_out");
     }
 
     #[tokio::test]
@@ -2683,6 +2698,10 @@ mod tests {
                 .collect();
             assert_eq!(settled.len(), 1);
             assert_eq!(settled[0]["params"]["gate_id"], prompt.gate_id);
+            assert_eq!(
+                settled[0]["params"]["how"], "answered",
+                "even a denial was an answer"
+            );
             assert_eq!(settled[0]["params"]["approved"], expected != N::Deny);
             assert!(lock_pending(&pending).is_empty());
         }

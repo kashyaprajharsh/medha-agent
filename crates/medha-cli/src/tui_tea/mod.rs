@@ -26,6 +26,8 @@ mod connect;
 mod connect_view;
 mod input;
 mod markdown;
+mod messaging;
+mod messaging_view;
 mod paste;
 mod spin;
 mod staged_images;
@@ -1740,6 +1742,8 @@ struct Model {
     pending_link: Option<String>,
     /// The ChatGPT plan refused the last turn, with OpenAI's code; the chat waits instead of switching.
     plan_limit: Option<String>,
+    /// `/messaging`: reaching Medha from a phone, drawn over the composer while open.
+    messaging: Option<messaging::Panel>,
     /// Brief copy result shown without mutating the transcript.
     clipboard_status: Option<(String, Instant)>,
     /// The pending approval card has been rendered at least once, so its options
@@ -2095,6 +2099,7 @@ impl Model {
             pending_clipboard: None,
             pending_link: None,
             plan_limit: None,
+            messaging: None,
             clipboard_status: None,
             approval_ready: false,
             context_pressure: None,

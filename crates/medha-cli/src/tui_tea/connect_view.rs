@@ -11,25 +11,26 @@ use ratatui::widgets::{BorderType, Clear};
 /// Where the name column ends and the detail column starts, as in the design.
 const NAME: usize = 24;
 
-struct Card {
-    title: Vec<Span<'static>>,
-    keys: String,
-    lines: Vec<Line<'static>>,
+/// One card above the composer; the messaging screens draw with it too.
+pub(super) struct Card {
+    pub(super) title: Vec<Span<'static>>,
+    pub(super) keys: String,
+    pub(super) lines: Vec<Line<'static>>,
     /// The line to keep in view when the card is taller than the space above the composer.
-    focus: usize,
+    pub(super) focus: usize,
     /// Where typing lands, as line and column, so the terminal's own cursor sits there.
-    caret: Option<(usize, usize)>,
+    pub(super) caret: Option<(usize, usize)>,
 }
 
-fn faint(text: impl Into<String>) -> Span<'static> {
+pub(super) fn faint(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(theme::faint()))
 }
 
-fn plain(text: impl Into<String>) -> Span<'static> {
+pub(super) fn plain(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(theme::text()))
 }
 
-fn bold(text: impl Into<String>) -> Span<'static> {
+pub(super) fn bold(text: impl Into<String>) -> Span<'static> {
     Span::styled(
         text.into(),
         Style::default()
@@ -38,11 +39,11 @@ fn bold(text: impl Into<String>) -> Span<'static> {
     )
 }
 
-fn gold(text: impl Into<String>) -> Span<'static> {
+pub(super) fn gold(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(theme::accent()))
 }
 
-fn ok(text: impl Into<String>) -> Span<'static> {
+pub(super) fn ok(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(theme::ok()))
 }
 
@@ -57,12 +58,12 @@ fn band() -> Color {
     }
 }
 
-fn width_of(text: &str) -> usize {
+pub(super) fn width_of(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }
 
 /// One list line: marker, name column, detail, and a state set flush right.
-fn row(
+pub(super) fn row(
     width: usize,
     chosen: bool,
     name: Span<'static>,
@@ -560,7 +561,7 @@ fn provider_card(model: &Model, setup: &ModelSetup, provider: &Provider, width: 
     }
 }
 
-fn title(name: String, detail: &str) -> Vec<Span<'static>> {
+pub(super) fn title(name: String, detail: &str) -> Vec<Span<'static>> {
     vec![bold(name), faint(format!("   {detail}"))]
 }
 
@@ -833,6 +834,11 @@ pub(super) fn draw(f: &mut Frame, model: &Model, input_area: Rect) {
             loading,
         } => accounts_card(accounts, *selected, *loading, width),
     };
+    draw_card(f, card, input_area);
+}
+
+/// The card bordered and set above the composer, scrolled to keep its focus line in view.
+pub(super) fn draw_card(f: &mut Frame, card: Card, input_area: Rect) {
     let available = input_area.y;
     if available < 4 {
         return;

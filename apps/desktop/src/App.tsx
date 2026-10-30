@@ -17,6 +17,7 @@ import {
 import { FileViewer } from "./FileViewer";
 import { FirstRun } from "./FirstRun";
 import { Extensions } from "./Extensions";
+import { Messaging } from "./Messaging";
 import { Rewind } from "./Rewind";
 import { Settings } from "./Settings";
 import { Composer, type Control } from "./Composer";
@@ -61,7 +62,7 @@ export function App() {
   const context = useWorkspace();
   const appRoot = useRef<HTMLDivElement>(null);
   const { theme, setTheme } = context;
-  const [page, setPage] = useState<"chat" | "extensions" | "settings">("chat");
+  const [page, setPage] = useState<"chat" | "extensions" | "messaging" | "settings">("chat");
   const [rewind, setRewind] = useState<{ at?: string } | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [sidebarPeek, setSidebarPeek] = useState(false);
@@ -685,6 +686,12 @@ export function App() {
       run: () => setPage("extensions"),
     },
     {
+      id: "messaging",
+      icon: "phone",
+      label: "Messaging",
+      run: () => setPage("messaging"),
+    },
+    {
       id: "settings",
       icon: "settings",
       label: "Settings",
@@ -862,6 +869,7 @@ export function App() {
         onPointerEnter={peek}
         onPointerLeave={leaveSidebar}
         onExtensions={() => setPage("extensions")}
+        onMessaging={() => setPage("messaging")}
         onSettings={() => setPage("settings")}
         page={page}
         notice={<UpdateReady busy={runningSessions.size > 0} />}
@@ -891,7 +899,9 @@ export function App() {
             <h1>
               {page === "extensions"
                 ? "Extensions"
-                : page === "settings"
+                : page === "messaging"
+                  ? "Messaging"
+                  : page === "settings"
                   ? "Settings"
                   : draftKey
                     ? "New session"
@@ -969,6 +979,7 @@ export function App() {
             onAsk={startWith}
           />
         )}
+        {page === "messaging" && <Messaging />}
         {page === "settings" && (
           <Settings
             sessionKey={currentKey}

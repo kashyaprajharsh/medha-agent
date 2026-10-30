@@ -9,6 +9,8 @@
 .custom-answer,
 .rewind-label select,
 .key-edit input,
+.ms-token input,
+.ms-code input,
 .agent-message textarea,
 .instruction-editor textarea {
   min-width: 0;
@@ -28,6 +30,8 @@
     .plugin-install input,
     .custom-answer,
     .key-edit input,
+    .ms-token input,
+    .ms-code input,
     .agent-message textarea,
     .instruction-editor textarea
   ):focus {

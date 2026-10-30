@@ -18,15 +18,18 @@ pub(super) fn register(program: &Path) -> Result<String> {
     std::fs::create_dir_all(path.parent().context("a service file has a folder")?)?;
     std::fs::write(&path, text(program)).with_context(|| format!("writing {}", path.display()))?;
     let _ = run("systemctl", &["--user", "daemon-reload"]);
-    checked("systemctl", &["--user", "enable", "--now", UNIT])?;
+    checked("systemctl", &["--user", "enable", UNIT])?;
+    // Restart, not start: a gateway already running picks up the new setup too.
+    checked("systemctl", &["--user", "restart", UNIT])?;
+    let mut place = format!("Service file: {}", path.display());
     if let Ok(user) = std::env::var("USER")
         && run("loginctl", &["enable-linger", &user]).is_ok_and(|output| !output.status.success())
     {
-        eprintln!(
-            "Note: the gateway stops when you log out. To keep it running, ask an administrator to run: loginctl enable-linger {user}"
-        );
+        place.push_str(&format!(
+            "\nNote: the gateway stops when you log out. To keep it running, ask an administrator to run: loginctl enable-linger {user}"
+        ));
     }
-    Ok(format!("Service file: {}", path.display()))
+    Ok(place)
 }
 
 pub(super) fn unregister() -> Result<()> {

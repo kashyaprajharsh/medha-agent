@@ -8,26 +8,22 @@ fn bot() -> Bot {
 }
 
 #[test]
-fn the_models_text_cannot_inject_markup_and_code_survives_whole() {
-    assert_eq!(
-        html("a < b && <script>"),
-        "a &lt; b &amp;&amp; &lt;script&gt;"
-    );
-    assert_eq!(
-        html("run `ls <dir>` now"),
-        "run <code>ls &lt;dir&gt;</code> now"
-    );
-    assert_eq!(html("a ` lone tick"), "a ` lone tick");
-    // Unmatched markers are left as typed rather than guessed at.
-    assert_eq!(html("**done** and **not"), "**done** and **not");
-    assert_eq!(html("**done** twice **ok**"), "<b>done</b> twice <b>ok</b>");
-    assert_eq!(
-        html("```rust\nfn a<T>() {}\n```\nafter"),
-        "<pre><code>fn a&lt;T&gt;() {}\n</code></pre>after"
-    );
-    assert_eq!(
-        html("```\nnever closed"),
-        "<pre><code>never closed</code></pre>"
+fn a_reply_that_grows_when_formatted_is_sent_in_more_parts_not_refused() {
+    // Each row is short as typed but gains its column names once drawn for a phone.
+    let row = "| a | b |\n";
+    let mut table = "| first column name | second column name |\n|---|---|\n".to_owned();
+    while table.chars().count() < LIMIT - row.len() {
+        table.push_str(row);
+    }
+    assert!(table.chars().count() <= LIMIT);
+    assert!(crate::telegram_format::to_telegram(&table).1 > LIMIT);
+    let mut parts = Vec::new();
+    fitted(&table, &mut parts);
+    assert!(parts.len() > 1);
+    assert!(
+        parts
+            .iter()
+            .all(|part| crate::telegram_format::to_telegram(part).1 <= LIMIT)
     );
 }
 

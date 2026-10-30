@@ -2051,7 +2051,7 @@ test("saving a new default refreshes an open chat's model picker without restart
   const cache = new Map(modules);
   const stub = (name, source) => cache.set(name, "data:text/javascript," + encodeURIComponent(source));
   for (const [name, exports] of Object.entries({
-    FileViewer: ["FileViewer"], FirstRun: ["FirstRun"], Extensions: ["Extensions"],
+    FileViewer: ["FileViewer"], FirstRun: ["FirstRun"], Extensions: ["Extensions"], Messaging: ["Messaging"],
     Rewind: ["Rewind"], LiveTail: ["LiveTail"], Palette: ["Palette"],
     WorkSurface: ["WorkSurface"], Transcript: ["Transcript"], UpdateReady: ["UpdateReady"],
     Welcome: ["Starters", "Welcome"], WorkspaceMenu: ["WorkspaceMenu"],

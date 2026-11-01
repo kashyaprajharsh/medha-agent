@@ -62,7 +62,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 );
             }
         }
-        let mut observation = crate::kernel_loop::result_limit_scope(
+        let mut observation = crate::kernel_loop::call_scope(
+            intent.id.clone(),
             self.result_limits().0,
             self.executor.execute(intent),
         )

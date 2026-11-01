@@ -32,7 +32,7 @@ impl Reader {
         let mut calls = self.calls.lock().unwrap();
         let (count, hash, results) = &mut *calls;
         *count += 1;
-        assert!(*count < 80, "reading never finished: {results:?}");
+        assert!(*count < 150, "reading never finished: {:?}", results.last());
         if *count > 1 {
             results.push(last.to_owned());
         }
@@ -104,8 +104,17 @@ impl ContextEngine for Passthrough {
 struct NoopSink;
 impl StreamSink for NoopSink {}
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_small_model_pages_files_and_stored_results_to_the_end_without_storing_a_page() {
+    // 8,000 tokens lands on the smallest result limit; 128,000 on the largest.
+    for window in [8_000, 32_000, 128_000] {
+        read_all(window).await;
+    }
+}
+
+#[cfg(unix)]
+async fn read_all(window: u32) {
     let dir = test_support::scratch("medha-paging-e2e");
     let workspace = dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -118,7 +127,7 @@ async fn a_small_model_pages_files_and_stored_results_to_the_end_without_storing
         caps: ProviderCaps {
             images: kernel::ImageSupport::Unsupported,
             caching: false,
-            max_ctx: Some(32_000),
+            max_ctx: Some(window),
             tool_calls: ToolCallStrategy::Native,
         },
         calls: Mutex::default(),

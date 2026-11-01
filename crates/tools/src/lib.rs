@@ -1295,6 +1295,10 @@ impl Executor for ToolRegistry {
         self.tasks.as_ref().map(|t| t.info()).unwrap_or_default()
     }
 
+    fn task_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>> {
+        self.tasks.as_ref().and_then(|tasks| tasks.take_endings())
+    }
+
     fn images_reach_model(&self, reach: bool) {
         self.images_reach_model
             .store(reach, std::sync::atomic::Ordering::Relaxed);
@@ -1820,12 +1824,11 @@ impl Tool for ImageView {
 /// One page of a read: at most this many lines, ending at a whole line before
 /// [`page_limit`]. Larger files are read a page at a time.
 const READ_PAGE_LINES: u64 = 2_000;
-/// Kept free in a page for a note the kernel may add to the result, such as a repaired argument.
-const PAGE_NOTE_ROOM: usize = 1_000;
 
-/// The most a page may hold so the model is shown it, not a stored copy of it.
+/// The most a page may hold so the model is shown it, not a stored copy of it: a share of the
+/// result limit, leaving room for a note the kernel may add, and never too small to carry a page.
 fn page_limit() -> usize {
-    kernel::result_limit().saturating_sub(PAGE_NOTE_ROOM)
+    (kernel::result_limit() / 16 * 15).max(1_024)
 }
 /// Directory entries retained by one `fs.list` call; the count of what was
 /// left out is still reported, so truncation is visible rather than silent.
@@ -1929,21 +1932,28 @@ impl Tool for FsRead {
                 Err(error) => return Err(ToolError::Failed(format!("read failed: {error}"))),
             },
         };
-        // A page also ends at whole lines before the model's view of it, with a
-        // number and `|` on every line, outgrows the page limit; the next one
-        // starts where it stopped.
-        let numbers = range.content.matches('\n').count() * (range.end_line.to_string().len() + 1);
-        let fits = page_limit().saturating_sub(numbers);
-        if range.content.len() > fits {
-            let mut cut = fits;
+        // A page ends at the last whole line whose view, numbered, still fits; the next one
+        // starts where it stopped. A single line too long for a page is cut, and still shown.
+        let limit = page_limit();
+        let (mut shown, mut cut, mut lines) = (0, 0, 0u64);
+        for line in range.content.split_inclusive('\n') {
+            let number = (start + lines).to_string().len() + 1;
+            if shown + number + line.len() > limit {
+                break;
+            }
+            shown += number + line.len();
+            cut += line.len();
+            lines += 1;
+        }
+        if cut == 0 && !range.content.is_empty() {
+            cut = limit.min(range.content.len());
             while !range.content.is_char_boundary(cut) {
                 cut -= 1;
             }
-            if let Some(newline) = range.content[..cut].rfind('\n') {
-                cut = newline + 1;
-            }
+            lines = 1;
+        }
+        if cut < range.content.len() {
             range.content.truncate(cut);
-            let lines = range.content.matches('\n').count().max(1) as u64;
             range.end_line = start + lines - 1;
             range.has_more = true;
         }
@@ -5228,13 +5238,12 @@ impl ShellExec {
         };
         let description = [
             "Run a shell command in the workspace and capture stdout, stderr and exit code: \
-             builds, tests, git, pipelines. It runs in the foreground; on timeout or cancel \
-             the whole process tree is killed. Use edit to change files and glob/grep to find \
+             builds, tests, git, pipelines. Use edit to change files and glob/grep to find \
              them. Set network=true for installs and downloads; access is requested before it \
              runs. Outside the workspace, name absolute folders in read_paths or write_paths.",
             syntax,
-            "Long output is already shortened to its start and end, so do not pipe into head or \
-             tail: a pipeline's status is its last command's, which hides a failure. Writing \
+            "Do not pipe into head or tail: long output is already shortened, and a pipeline's \
+             status hides a failure. Writing \
              commands are backed up for undo. To see a web page, use read with render: true.",
         ]
         .join(" ");
@@ -5253,19 +5262,16 @@ struct ShellPlan {
     workdir: std::path::PathBuf,
     timeout_s: u64,
     access: kernel::ExecutionAccess,
+    background: bool,
 }
 
 impl ShellPlan {
     fn parse(args: &Value, sbx: &WorkspaceSandbox) -> Result<Self, ToolError> {
         let command = arg_str(args, "command")?;
-        if args.get("background").and_then(Value::as_bool) == Some(true) {
-            return Err(ToolError::Args(
-                "background commands cannot keep running after this call returns. Run it in the foreground \
-                 with timeout_s up to 600; for a server or watcher, bound it, for example \
-                 `timeout 60 npm run dev`"
-                    .into(),
-            ));
-        }
+        let background = args
+            .get("background")
+            .map_or(Some(false), Value::as_bool)
+            .ok_or_else(|| ToolError::Args("background must be a boolean".into()))?;
         let timeout_s = args
             .get("timeout_s")
             .map_or(Some(SHELL_TIMEOUT_SECS), Value::as_u64)
@@ -5342,6 +5348,7 @@ impl ShellPlan {
             workdir,
             timeout_s,
             access,
+            background,
         })
     }
 }
@@ -5374,6 +5381,10 @@ const MAX_RECENT_SHELL_TASKS: usize = 64;
 const MAX_RECENT_SHELL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RECENT_SHELL_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MAX_TASK_COMMAND_BYTES: usize = 4096;
+/// The end of each stream carried in the note that a background command finished.
+const TASK_NOTE_OUTPUT: usize = 2_000;
+/// How long `until` waits when no `wait_s` is given.
+const TASK_WAIT_DEFAULT_SECS: u64 = 30;
 const NETWORK_DISABLED_HINT: &str = "The active sandbox denies network access. Set network=true to \
      request a grant before running. This command was not automatically replayed; inspect partial \
      side effects before rerunning. The original error may also have another cause.";
@@ -5415,6 +5426,10 @@ struct TaskTable {
     inner: std::sync::Mutex<TaskTableState>,
     seq: std::sync::atomic::AtomicU64,
     limits: TaskLimits,
+    /// One message per task at most, and running tasks are capped, so this cannot grow without bound.
+    endings: tokio::sync::mpsc::UnboundedSender<kernel::TaskEnd>,
+    /// Until a chat takes this, nobody would hear a task end, so commands are not left running.
+    endings_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>>>,
 }
 
 #[derive(Default)]
@@ -5431,6 +5446,8 @@ struct TaskTableState {
 struct TaskEntry {
     proc: sandbox::exec::BgProc,
     command: String,
+    /// How far `task.output` has read stdout and stderr.
+    read: (u64, u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5459,13 +5476,20 @@ struct CompletedTask {
     stderr_truncated: bool,
     status: TerminalTaskStatus,
     finished_at: std::time::Instant,
+    /// Stdout and stderr `task.output` has not returned yet; `None` when it has read nothing.
+    unread: Option<(String, String)>,
 }
 
 impl CompletedTask {
     fn capture(entry: TaskEntry, status: TerminalTaskStatus) -> Self {
         let (stdout, stderr) = entry.proc.snapshot();
         let (stdout_truncated, stderr_truncated) = entry.proc.truncation();
+        let unread = (entry.read != (0, 0)).then(|| {
+            let (out, err, _) = entry.proc.output_since(entry.read);
+            (out, err)
+        });
         Self {
+            unread,
             command: entry.command,
             exit_code: entry.proc.exit_code(),
             stdout,
@@ -5482,6 +5506,11 @@ impl CompletedTask {
             .len()
             .saturating_add(self.stdout.len())
             .saturating_add(self.stderr.len())
+            .saturating_add(
+                self.unread
+                    .as_ref()
+                    .map_or(0, |(stdout, stderr)| stdout.len() + stderr.len()),
+            )
     }
 
     fn snapshot(&self, id: &str) -> Value {
@@ -5520,21 +5549,98 @@ fn bounded_task_command(command: &str) -> String {
 
 impl Default for TaskTable {
     fn default() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(TaskTableState::default()),
-            seq: std::sync::atomic::AtomicU64::new(0),
-            limits: TaskLimits::default(),
-        }
+        Self::limited(TaskLimits::default())
     }
 }
 
 impl TaskTable {
-    #[cfg(test)]
-    fn with_limits(limits: TaskLimits) -> Self {
+    fn limited(limits: TaskLimits) -> Self {
+        let (endings, endings_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             inner: std::sync::Mutex::new(TaskTableState::default()),
             seq: std::sync::atomic::AtomicU64::new(0),
             limits,
+            endings,
+            endings_rx: std::sync::Mutex::new(Some(endings_rx)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(limits: TaskLimits) -> Self {
+        Self::limited(limits)
+    }
+
+    fn take_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>> {
+        self.endings_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Whether a chat is listening, so a command left running will be heard ending.
+    fn attended(&self) -> bool {
+        self.endings_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// What a task printed since the last read, or all of it when `full`, moving the read position.
+    fn read(&self, id: &str, full: bool) -> Option<Value> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        if let Some(task) = state.active.get_mut(id) {
+            let from = if full { (0, 0) } else { task.read };
+            let (stdout, stderr, read) = task.proc.output_since(from);
+            task.read = read;
+            return Some(json!({
+                "task_id": id,
+                "command": task.command,
+                "status": if task.proc.is_running() { "running" } else { "exited" },
+                "exit_code": task.proc.exit_code(),
+                "stdout": stdout,
+                "stderr": stderr,
+            }));
+        }
+        let task = state.recent.get_mut(id)?;
+        let before = task.retained_bytes();
+        let mut snapshot = task.snapshot(id);
+        if !full {
+            if let Some((stdout, stderr)) = &task.unread {
+                snapshot["stdout"] = json!(stdout);
+                snapshot["stderr"] = json!(stderr);
+            }
+            task.unread = Some(Default::default());
+        }
+        let released = before.saturating_sub(task.retained_bytes());
+        state.recent_bytes = state.recent_bytes.saturating_sub(released);
+        state.recent_lru.retain(|candidate| candidate != id);
+        state.recent_lru.push_back(id.to_owned());
+        Some(snapshot)
+    }
+
+    /// Whether a task has ended or printed `until` (or, with no `until`, anything) since the last read.
+    fn has_news(&self, id: &str, until: Option<&str>) -> bool {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(task) = state.active.get(id) else {
+            return true;
+        };
+        if !task.proc.is_running() {
+            return true;
+        }
+        // A ready line may already be in what the first return showed, so `until` searches everything held.
+        match until {
+            Some(text) => {
+                let (stdout, stderr, _) = task.proc.output_since((0, 0));
+                stdout.contains(text) || stderr.contains(text)
+            }
+            None => task.proc.output_since(task.read).2 != task.read,
         }
     }
 
@@ -5572,9 +5678,14 @@ impl TaskTable {
         let Some(command) = state.reservations.remove(id) else {
             return Err(proc);
         };
-        state
-            .active
-            .insert(id.to_owned(), TaskEntry { proc, command });
+        state.active.insert(
+            id.to_owned(),
+            TaskEntry {
+                proc,
+                command,
+                read: (0, 0),
+            },
+        );
         Ok(())
     }
 
@@ -5642,35 +5753,6 @@ impl TaskTable {
         self.evict_recent_locked(&mut state);
     }
 
-    /// A JSON snapshot of one task (status + current output), or `None` if the id
-    /// is unknown.
-    fn snapshot(&self, id: &str) -> Option<Value> {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.prune_recent_locked(&mut state, std::time::Instant::now());
-        if let Some(task) = state.active.get(id) {
-            let (stdout, stderr) = task.proc.snapshot();
-            let (stdout_truncated, stderr_truncated) = task.proc.truncation();
-            let running = task.proc.is_running();
-            return Some(json!({
-                "task_id": id,
-                "command": task.command,
-                "status": if running { "running" } else { "exited" },
-                "exit_code": task.proc.exit_code(),
-                "stdout": stdout,
-                "stderr": stderr,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-            }));
-        }
-        let snapshot = state.recent.get(id)?.snapshot(id);
-        state.recent_lru.retain(|candidate| candidate != id);
-        state.recent_lru.push_back(id.to_owned());
-        Some(snapshot)
-    }
-
     /// Kill a task's process group; returns false if the id is unknown.
     fn kill(&self, id: &str) -> bool {
         let state = self
@@ -5731,6 +5813,15 @@ impl TaskTable {
             }
         };
         sandbox::exec::wait_done(rx, dur).await
+    }
+
+    fn done_receiver(&self, id: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .get(id)
+            .map(|task| task.proc.done_receiver())
     }
 
     /// Live resolver-failure flag and captured-byte count, or `None` if the id is
@@ -5916,6 +6007,76 @@ impl RegisteredTask {
         let id = self.id.take()?;
         self.tasks.take(&id).map(|entry| (id, entry))
     }
+
+    /// Leaves the command running: this guard no longer stops it when dropped.
+    fn release(mut self) -> Option<String> {
+        self.id.take()
+    }
+}
+
+/// Waits for a command left running to end, then files it and reports it to the chat.
+/// Holds the table weakly: the table stopping every task when its chat ends must still happen.
+async fn report_task_end(
+    tasks: std::sync::Weak<TaskTable>,
+    mut done: tokio::sync::watch::Receiver<bool>,
+    sbx: Arc<WorkspaceSandbox>,
+    id: String,
+    intent_id: String,
+    backup: Option<Value>,
+) {
+    let _ = done.wait_for(|finished| *finished).await;
+    let Some(tasks) = tasks.upgrade() else {
+        return;
+    };
+    let Some(entry) = tasks.take(&id) else {
+        return;
+    };
+    let task = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
+    let files = match backup {
+        Some(backup) => {
+            tokio::task::spawn_blocking(move || checkpoints::changed_since(&sbx, &backup))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+        }
+        None => Ok(Vec::new()),
+    };
+    let mut result = json!({"task_id": id, "command": task.command, "exit_code": task.exit_code});
+    match files {
+        Ok(files) => result["_checkpoint_files"] = json!(files),
+        Err(error) => {
+            result["_checkpoint_note"] = json!(format!(
+                "The backup is kept, but undo cannot confirm what this command changed: {error}"
+            ))
+        }
+    }
+    let exit = task
+        .exit_code
+        .map_or("no exit code, it was stopped".to_owned(), |code| {
+            format!("exit code {code}")
+        });
+    let mut note = format!(
+        "[background command {id} finished, {exit}]\n$ {}\n",
+        task.command
+    );
+    for (name, text) in [("stderr", &task.stderr), ("stdout", &task.stdout)] {
+        let text = model_view::clean_terminal(text);
+        if !text.trim().is_empty() {
+            let mut from = text.len().saturating_sub(TASK_NOTE_OUTPUT);
+            while !text.is_char_boundary(from) {
+                from += 1;
+            }
+            note.push_str(&format!("--- {name} ---\n{}\n", &text[from..]));
+        }
+    }
+    note.push_str(&format!(
+        "Read everything it printed with task.output, task_id \"{id}\", full: true."
+    ));
+    tasks.remember(id, task);
+    let _ = tasks.endings.send(kernel::TaskEnd {
+        intent_id,
+        result,
+        note,
+    });
 }
 
 impl Drop for RegisteredTask {
@@ -5935,6 +6096,7 @@ impl Tool for ShellExec {
                 | kernel::ObsStatus::Rejected
                 | kernel::ObsStatus::SchemaInvalid
         ) || observation.payload["changed"] == false
+            || observation.payload["status"] == "running"
         {
             return false;
         }
@@ -5947,6 +6109,7 @@ impl Tool for ShellExec {
     fn failed(&self, observation: &Observation) -> bool {
         match observation.status {
             kernel::ObsStatus::Error => true,
+            kernel::ObsStatus::Ok if observation.payload["status"] == "running" => false,
             kernel::ObsStatus::Ok => match observation.payload["exit_code"].as_i64() {
                 Some(0) => false,
                 Some(1) => !observation.payload["command"]
@@ -6024,7 +6187,16 @@ impl Tool for ShellExec {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": SHELL_TIMEOUT_MAX_SECS,
-                    "description": "Hard foreground deadline in seconds (default 300, maximum 600). Expiry kills the whole process tree and returns an error."
+                    "description": "Seconds to wait (default 300, maximum 600). Then it runs on in the background if this chat can report its end; else it stops."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Return at once with a task_id, for a server or watcher. You are told when it ends."
+                },
+                "max_output": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Read only the last N bytes of each stream."
                 }
             },
             "required": ["command", "network"]
@@ -6032,6 +6204,16 @@ impl Tool for ShellExec {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let plan = ShellPlan::parse(args, &self.sbx)?;
+        let attended = self.tasks.attended();
+        let background = plan.background;
+        if background && !attended {
+            return Err(ToolError::Args(
+                "background commands cannot keep running here: nothing would report their end. Run it \
+                 in the foreground with timeout_s up to 600; for a server or watcher, bound it, for \
+                 example `timeout 60 npm run dev`"
+                    .into(),
+            ));
+        }
         if !self.sbx.denies_network() || plan.access.outside_sandbox || plan.access.network {
             kernel::egress::check("shell.network", args).map_err(ToolError::Security)?;
         }
@@ -6084,10 +6266,48 @@ impl Tool for ShellExec {
         // synchronously signals the registered process group before the kernel
         // can release its mutation lease.
         let denies_network = self.sbx.denies_network();
-        let waited = self
-            .tasks
-            .watch_until(registered.id(), deadline, denies_network)
-            .await;
+        let waited = match background {
+            true => ShellWait::Deadline,
+            false => {
+                self.tasks
+                    .watch_until(registered.id(), deadline, denies_network)
+                    .await
+            }
+        };
+        // Stop waiting and let the model go on; a browser never ends, so it is still stopped.
+        let stalled = matches!(waited, ShellWait::NetStalled);
+        if !matches!(waited, ShellWait::Finished)
+            && attended
+            && !shell_hints::launches_browser(&command)
+        {
+            let id = registered.id().to_owned();
+            let done = self.tasks.done_receiver(&id);
+            let mut payload = self.tasks.read(&id, false).unwrap_or_default();
+            payload["workdir"] = json!(workdir);
+            if stalled {
+                payload["sandbox_hint"] = json!(format!(
+                    "It reported a name-resolution failure and has gone quiet, which may be useful work or a retry wait, so it was not stopped. {NETWORK_DISABLED_HINT} Stop this task with task.control before rerunning it."
+                ));
+            }
+            payload["note"] = json!(match background {
+                true => "Started in the background; you will be told when it ends. Go on with other work; task.output reads it, task.control stops it.".to_owned(),
+                false => format!("Still running after {timeout_s}s, so it keeps going in the background; you will be told when it ends. task.output reads it, task.control stops it."),
+            });
+            let backup = (!lanes::shell_only_reads(&command))
+                .then(|| checkpoints::backup(&self.sbx))
+                .flatten();
+            if let (Some(done), Some(id)) = (done, registered.release()) {
+                tokio::spawn(report_task_end(
+                    Arc::downgrade(&self.tasks),
+                    done,
+                    Arc::clone(&self.sbx),
+                    id,
+                    kernel::call_id().unwrap_or_default(),
+                    backup,
+                ));
+            }
+            return Ok(payload);
+        }
         if let ShellWait::Finished = waited {
             let (task_id, entry) = registered
                 .take()
@@ -6119,6 +6339,10 @@ impl Tool for ShellExec {
             });
             if let Some(hint) = sandbox_hint {
                 result["sandbox_hint"] = Value::String(hint.to_string());
+            }
+            if let Some(limit) = args.get("max_output").and_then(Value::as_u64) {
+                result["max_output"] = json!(limit);
+                result["task_id"] = json!(task_id);
             }
             if net_denied {
                 result[NET_DENIED] = Value::Bool(true);
@@ -6162,7 +6386,6 @@ impl Tool for ShellExec {
             .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
         entry.proc.kill();
         entry.proc.wait().await;
-        let stalled = matches!(waited, ShellWait::NetStalled);
         let completed = CompletedTask::capture(
             entry,
             if stalled {
@@ -6236,9 +6459,12 @@ impl Tool for TaskOutput {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Inspect a running foreground shell task or a recent bounded terminal \
-         result. Returns current stdout/stderr and status. Omit `task_id` to list \
-         running and retained recent tasks."
+        "Read a shell task: its status and what it printed since your last read. Omit \
+         `task_id` to list tasks. Use `until` to wait for a line such as a server's ready \
+         message instead of sleeping."
+    }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::shell_run(payload)
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -6246,17 +6472,35 @@ impl Tool for TaskOutput {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task_id": { "type": "string", "description": "Task id from shell.exec or task.output (omit to list all tasks)" } }
+            "properties": {
+                "task_id": { "type": "string", "description": "Task id from shell.exec or task.output (omit to list all tasks)" },
+                "full": { "type": "boolean", "description": "Everything it printed that is still held, not only what is new" },
+                "wait_s": { "type": "integer", "minimum": 0, "maximum": SHELL_TIMEOUT_MAX_SECS, "description": "Wait up to this long for new output or the end" },
+                "until": { "type": "string", "description": "Return as soon as this text is printed or the task ends (waits up to wait_s, or 30 seconds)" }
+            }
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        match args.get("task_id").and_then(Value::as_str) {
-            Some(id) => self
-                .tasks
-                .snapshot(id)
-                .ok_or_else(|| ToolError::Failed(format!("no such task '{id}'"))),
-            None => Ok(json!({ "tasks": self.tasks.list() })),
+        let Some(id) = args.get("task_id").and_then(Value::as_str) else {
+            return Ok(json!({ "tasks": self.tasks.list() }));
+        };
+        let until = args.get("until").and_then(Value::as_str);
+        let wait = args
+            .get("wait_s")
+            .and_then(Value::as_u64)
+            .unwrap_or(if until.is_some() {
+                TASK_WAIT_DEFAULT_SECS
+            } else {
+                0
+            })
+            .min(SHELL_TIMEOUT_MAX_SECS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+        while std::time::Instant::now() < deadline && !self.tasks.has_news(id, until) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        self.tasks
+            .read(id, args["full"] == true)
+            .ok_or_else(|| ToolError::Failed(format!("no such task '{id}'")))
     }
 }
 
@@ -6276,9 +6520,7 @@ impl Tool for TaskControl {
     }
     fn description(&self) -> &str {
         "`op: \"kill\"` stops a running shell task by id, SIGKILLing its whole process \
-         group. Shell commands hold the mutation lane while they run, so a task this \
-         agent started has already finished by the time you could kill it; use \
-         `task.output` to find one still running, and to read a finished one. \
+         group; use `task.output` to find one still running, and to read a finished one. \
          `op: \"remove\"` forgets a completed task and its retained output from the \
          bounded recent-result cache; a running task must be killed first."
     }
@@ -8078,10 +8320,10 @@ mod tests {
                 .unwrap();
             let encoded = serde_json::to_string(&page).unwrap().len();
             assert!(
-                encoded <= kernel::SPILL_THRESHOLD,
+                encoded <= kernel::result_limit(),
                 "page at offset {offset} encodes to {encoded} bytes, over the \
-                 {} spill threshold — it would be re-spilled",
-                kernel::SPILL_THRESHOLD
+                 {} result limit — it would be re-spilled",
+                kernel::result_limit()
             );
             seen.push_str(page["content"].as_str().unwrap());
             pages += 1;
@@ -9492,6 +9734,7 @@ mod tests {
                     stderr_truncated: false,
                     status: TerminalTaskStatus::Exited,
                     finished_at: std::time::Instant::now(),
+                    unread: None,
                 },
             );
         }
@@ -9527,6 +9770,7 @@ mod tests {
                 stderr_truncated: false,
                 status: TerminalTaskStatus::Exited,
                 finished_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
+                unread: None,
             },
         );
         assert!(table.list().is_empty());
@@ -9578,7 +9822,7 @@ mod tests {
             .into_iter()
             .find(|spec| spec.name == "shell.exec")
             .unwrap();
-        assert!(shell_spec.schema["properties"].get("background").is_none());
+        assert!(shell_spec.schema["properties"].get("background").is_some());
         assert_eq!(
             shell_spec.schema["properties"]["timeout_s"]["maximum"],
             SHELL_TIMEOUT_MAX_SECS

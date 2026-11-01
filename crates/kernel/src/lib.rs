@@ -57,7 +57,7 @@ pub use events::{
     Provenance, SessionMeta, TOOL_SCREEN_FIELD, cut_index, project_messages,
     project_ordered_messages, rollback_plan, rollback_plan_in,
 };
-pub use executor::{BackgroundTask, Executor};
+pub use executor::{BackgroundTask, Executor, TaskEnd};
 pub use gate::{
     Approval, AutoDeny, ExecutionAccess, HumanGate, NetworkDecision, PathAccess, PathApproval,
     PathKind, PathRequest, execution_access, execution_access_scope, network_once_active,
@@ -68,8 +68,8 @@ pub use hooks::{
 };
 pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
 pub use kernel_loop::{
-    DEFAULT_MAX_PARALLEL_TOOLS, Kernel, OpeningContext, SPILL_THRESHOLD, SessionClaim,
-    SessionOwner, StopReason, result_limit,
+    DEFAULT_MAX_PARALLEL_TOOLS, Kernel, OpeningContext, SessionClaim, SessionOwner, StopReason,
+    call_id, kept_start, result_limit,
 };
 pub use medha_extension_api::{HookDecision, HookPoint};
 pub use policy::{AllowAll, Policy};

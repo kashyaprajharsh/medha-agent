@@ -1061,6 +1061,28 @@ fn copy_required_metadata(
     copy_file_flags(source, destination)
 }
 
+/// The owner's own state folder, through any links on its way: snapshots open it refusing links,
+/// so a linked home would otherwise lose every backup. Windows keeps its plain form.
+fn without_links(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        return path;
+    }
+    let mut missing = Vec::new();
+    let mut existing = path.as_path();
+    while !existing.exists() {
+        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+            return path;
+        };
+        missing.push(name.to_owned());
+        existing = parent;
+    }
+    let Ok(mut real) = existing.canonicalize() else {
+        return path;
+    };
+    real.extend(missing.into_iter().rev());
+    real
+}
+
 #[cfg(unix)]
 /// `sealed: false` defers the device flush to one `seal_command_snapshots` call.
 fn write_snapshot_capability(
@@ -2134,7 +2156,7 @@ impl WorkspaceSandbox {
     }
 
     pub fn with_command_snapshots_dir(mut self, directory: PathBuf) -> Self {
-        self.command_snapshots = Some(directory);
+        self.command_snapshots = Some(without_links(directory));
         self
     }
     pub fn command_snapshots_dir(&self) -> &Path {

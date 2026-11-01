@@ -1263,7 +1263,7 @@ fn inherit_nothing(_command: &mut Command) -> std::io::Result<()> {
 #[cfg(unix)]
 fn outlive_the_app(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // Only `setsid` runs between fork and exec, which is safe there.
+    // SAFETY: the closure only calls `setsid`, which is async-signal-safe, and touches no shared state.
     unsafe {
         command.pre_exec(|| match libc::setsid() {
             -1 => Err(std::io::Error::last_os_error()),

@@ -110,6 +110,9 @@ impl kernel::Executor for Rebound {
     fn background_tasks(&self) -> Vec<kernel::BackgroundTask> {
         self.inner.background_tasks()
     }
+    fn task_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>> {
+        self.inner.task_endings()
+    }
 
     async fn prepare_effect(
         &self,

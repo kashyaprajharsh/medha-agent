@@ -555,6 +555,7 @@ pub struct Kernel<P: Provider, L: EventLog> {
     /// (per result, per round) limits set in config; each one unset is worked
     /// out from the model's context window.
     result_limits: (Option<usize>, Option<usize>),
+    background_wakes: u32,
     /// Removed from every tool result before the model reads it.
     secrets: Arc<crate::redact::Secrets>,
     pub egress: Arc<crate::egress::Guard>,
@@ -585,22 +586,38 @@ pub struct Kernel<P: Provider, L: EventLog> {
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
-/// replaced in-context by a head and a `read_artifact` reference. Public
-/// because the paging tool must size its pages to survive this threshold: a
-/// page that spills costs a round trip instead of saving one.
-pub const SPILL_THRESHOLD: usize = 40_000;
+/// replaced in-context by a head and a `read_artifact` reference. A tool that
+/// pages sizes its pages with [`result_limit`] instead.
+const SPILL_THRESHOLD: usize = 40_000;
+/// Background endings that may start a turn in a row with no message from the person.
+const DEFAULT_BACKGROUND_WAKES: u32 = 3;
 
-tokio::task_local! { static RESULT_LIMIT: usize; }
+/// What a tool may know about the call it is running for.
+struct Call {
+    id: String,
+    result_limit: usize,
+}
+
+tokio::task_local! { static CALL: Call; }
 
 /// The most one result can show the model during the current call; a tool that pages sizes its pages to it.
 pub fn result_limit() -> usize {
-    RESULT_LIMIT
-        .try_with(|limit| *limit)
+    CALL.try_with(|call| call.result_limit)
         .unwrap_or(SPILL_THRESHOLD)
 }
 
-pub(crate) async fn result_limit_scope<T>(limit: usize, call: impl Future<Output = T>) -> T {
-    RESULT_LIMIT.scope(limit, call).await
+/// The id of the call running now, so work it leaves running can be filed against it.
+pub fn call_id() -> Option<String> {
+    CALL.try_with(|call| call.id.clone()).ok()
+}
+
+pub(crate) async fn call_scope<T>(
+    id: String,
+    result_limit: usize,
+    call: impl Future<Output = T>,
+) -> T {
+    let call_info = Call { id, result_limit };
+    CALL.scope(call_info, call).await
 }
 /// The most one round of tool results may put in front of the model together.
 const ROUND_LIMIT: usize = 120_000;
@@ -608,10 +625,16 @@ const ROUND_LIMIT: usize = 120_000;
 /// errors usually begin, and a larger end, where a run says how it finished.
 const SPILL_PREVIEW: usize = 2_000;
 
+/// How much of `total` bytes of kept output is its start, where errors usually begin; the larger
+/// rest is its end, where a run says how it finished.
+pub fn kept_start(total: usize) -> usize {
+    total * 2 / 5
+}
+
 /// A stored result in brief: its first and last lines, how much was left out,
 /// and how to read the rest. The whole text stays in the store, readable later.
 fn spilled_preview(content: &str, hash: &str) -> String {
-    let head_budget = SPILL_PREVIEW * 2 / 5;
+    let head_budget = kept_start(SPILL_PREVIEW);
     let mut head = head_budget.min(content.len());
     while !content.is_char_boundary(head) {
         head -= 1;
@@ -796,6 +819,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             server_waits: crate::recovery::WAITS,
             result_limits: (None, None),
+            background_wakes: DEFAULT_BACKGROUND_WAKES,
             secrets: Arc::default(),
             egress: Arc::default(),
             pricing: None,
@@ -840,6 +864,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             max_parallel_tools: self.max_parallel_tools,
             server_waits: self.server_waits,
             result_limits: self.result_limits,
+            background_wakes: self.background_wakes,
             secrets: Arc::clone(&self.secrets),
             egress: Arc::clone(&self.egress),
             pricing: self.pricing,
@@ -1118,6 +1143,33 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             Ok(hash) => spilled_preview(&content, &hash),
             Err(_) => content, // spill failed → keep full rather than lose data
         }
+    }
+
+    /// Overrides how many background endings may start a turn in a row; `None` keeps the default.
+    pub fn with_background_wakes(mut self, wakes: Option<u32>) -> Self {
+        self.background_wakes = wakes.unwrap_or(DEFAULT_BACKGROUND_WAKES);
+        self
+    }
+
+    pub fn background_wakes(&self) -> u32 {
+        self.background_wakes
+    }
+
+    /// Records that a command left running ended, and returns the note for the model, without secrets.
+    pub async fn task_ended(
+        &self,
+        session: &Session,
+        end: &crate::executor::TaskEnd,
+    ) -> Result<String, KernelError> {
+        self.log
+            .append(Event::task_ended(
+                session,
+                &end.intent_id,
+                end.result.clone(),
+            ))
+            .await?;
+        let note = self.secrets.redact(&end.note).into_owned();
+        Ok(self.egress.redact(&note).into_owned())
     }
 
     /// Secrets to remove from every tool result before the model reads it.

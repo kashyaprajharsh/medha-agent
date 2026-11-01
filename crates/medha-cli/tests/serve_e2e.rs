@@ -197,8 +197,14 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
         ]
-    } else if asked.contains("RUN") && !ran {
+    } else if (asked.contains("RUN") || asked.starts_with("BACKGROUND")) && !ran {
         shell_call(&body, &asked, "call_1")
+    } else if let Some(call) = script_call(&body, &asked) {
+        // SCRIPT then one `tool arguments-json` per line, each sent once the last has its result.
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ]
     } else if let Some(results) = repeat_left(&body, &asked) {
         // REPEAT <n> sends the same command again until n results came back.
         shell_call(&body, &asked, &format!("repeat_{results}"))
@@ -230,13 +236,31 @@ fn shell_call(body: &Value, asked: &str, id: &str) -> Vec<Value> {
         .split('`')
         .nth(1)
         .unwrap_or("touch made-by-the-test.txt");
-    let arguments = json!({"command": command, "network": false});
+    let mut arguments = json!({"command": command, "network": false});
+    if asked.starts_with("BACKGROUND") {
+        arguments["background"] = json!(true);
+    }
     let call = json!({"index": 0, "id": id, "type": "function",
         "function": {"name": shell, "arguments": arguments.to_string()}});
     vec![
         json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
         json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
     ]
+}
+
+/// The next call of a `SCRIPT` message, by how many results have come back.
+fn script_call(body: &Value, asked: &str) -> Option<Value> {
+    let lines = asked.strip_prefix("SCRIPT\n")?;
+    let results = body["messages"]
+        .as_array()?
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .count();
+    let (tool, arguments) = lines.lines().nth(results)?.split_once(' ')?;
+    Some(
+        json!({"index": 0, "id": format!("script_{results}"), "type": "function",
+        "function": {"name": tool, "arguments": arguments}}),
+    )
 }
 
 /// How many results a `REPEAT <n>` message has had, while fewer than n.
@@ -2240,7 +2264,315 @@ async fn a_plan_instruction_reaches_the_model_and_nowhere_a_person_reads() {
     assert_eq!(typed, ["fix the login bug"]);
 }
 
+/// A background command returns at once with its id, and its end reaches the model on its own, starting a turn.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_background_command_returns_at_once_and_its_end_reaches_the_model() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("background");
+    let chat = client.open(&folder).await;
+    client
+        .send(
+            &chat,
+            "BACKGROUND `sleep 2; echo finished-work; echo made > made.txt`",
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    assert_eq!(
+        observed["params"]["payload"]["status"], "running",
+        "{observed}"
+    );
+    assert!(
+        observed["params"]["payload"]["task_id"].is_string(),
+        "{observed}"
+    );
+    assert!(
+        !folder.join("made.txt").exists(),
+        "the call returned before the command ended"
+    );
+    client.until(|frame| kind(frame, "turn.done")).await;
+    // Nobody sends another message: the end itself starts the next turn.
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(folder.join("made.txt").exists());
+    let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    let raw = last["messages"].to_string();
+    assert!(raw.contains("[background command"), "{raw}");
+    assert!(
+        raw.contains("exit code 0") && raw.contains("finished-work"),
+        "{raw}"
+    );
+}
+
+/// `until` returns at a server's ready line, a command past its wait keeps going, and rewind restores what they wrote.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_work_can_be_waited_for_and_rewind_restores_what_it_wrote() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("background-undo");
+    std::fs::write(folder.join("note.txt"), "original\n").unwrap();
+    let chat = client.open(&folder).await;
+    // Each waits for a file the test creates, so the order never depends on how fast the machine is.
+    let server = json!({"command": "echo ready-now; while [ ! -e go-server ]; do sleep 0.1; done; echo changed > note.txt", "network": false, "background": true});
+    let late = json!({"command": "while [ ! -e go-late ]; do sleep 0.1; done; echo late > late.txt", "network": false, "timeout_s": 1});
+    let until = json!({"task_id": "t1", "until": "ready-now"});
+    client
+        .send(
+            &chat,
+            &format!("SCRIPT\nshell_exec {server}\ntask_output {until}\nshell_exec {late}"),
+        )
+        .await;
+    let mut seen = String::new();
+    let mut results = Vec::new();
+    loop {
+        let (_, frame) = client
+            .until(|frame| {
+                frame["method"] == "approval"
+                    || kind(frame, "tool.observation")
+                    || kind(frame, "turn.done")
+            })
+            .await;
+        if frame["method"] == "approval" {
+            let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+            client.ask("approval.respond", Some(&chat), gate).await;
+        } else if kind(&frame, "tool.observation") {
+            results.push(frame["params"]["payload"].clone());
+            if results.len() == 3 {
+                std::fs::write(folder.join("go-late"), "").unwrap();
+                std::fs::write(folder.join("go-server"), "").unwrap();
+            }
+        }
+        while let Ok(request) = world.provider.seen.try_recv() {
+            seen.push_str(&request["messages"].to_string());
+        }
+        if kind(&frame, "turn.done")
+            && seen.contains("[background command t1")
+            && seen.contains("[background command t2")
+        {
+            break;
+        }
+    }
+    assert_eq!(results[0]["status"], "running", "{results:?}");
+    // The first return may already have shown it; `until` returns only what is new.
+    let shown = format!("{}{}", results[0]["stdout"], results[1]["stdout"]);
+    assert!(shown.contains("ready-now"), "{results:?}");
+    assert_eq!(
+        results[1]["status"], "running",
+        "until returned at the ready line: {results:?}"
+    );
+    assert_eq!(
+        results[2]["status"], "running",
+        "past its wait it keeps going: {results:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("note.txt")).unwrap(),
+        "changed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("late.txt")).unwrap(),
+        "late\n"
+    );
+
+    let points = client
+        .ask("session.rewind.points", Some(&chat), json!({}))
+        .await;
+    let at = points["result"]["points"][0]["id"].clone();
+    let rewound = client
+        .ask(
+            "session.rewind",
+            Some(&chat),
+            json!({"at": at, "scope": "both"}),
+        )
+        .await;
+    assert!(rewound.get("error").is_none(), "{rewound}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("note.txt")).unwrap(),
+        "original\n"
+    );
+    assert!(
+        !folder.join("late.txt").exists(),
+        "rewind removes what it created"
+    );
+}
+
+/// Rewind restores a file a command changed, and never deletes one the backup could not copy.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rewind_restores_what_it_copied_and_keeps_what_it_could_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("rewind");
+    std::fs::write(folder.join("note.txt"), "original\n").unwrap();
+    std::fs::write(folder.join("locked.txt"), "locked\n").unwrap();
+    std::fs::set_permissions(
+        folder.join("locked.txt"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let chat = client.open(&folder).await;
+    client
+        .send(
+            &chat,
+            "RUN `chmod 600 locked.txt; echo changed > locked.txt; echo changed > note.txt`",
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    let note = observed["params"]["payload"]["backup_note"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        note.contains("locked.txt") && !note.contains("note.txt"),
+        "{observed}"
+    );
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let points = client
+        .ask("session.rewind.points", Some(&chat), json!({}))
+        .await;
+    let at = points["result"]["points"][0]["id"].clone();
+    let rewound = client
+        .ask(
+            "session.rewind",
+            Some(&chat),
+            json!({"at": at, "scope": "code"}),
+        )
+        .await;
+    assert!(rewound.get("error").is_none(), "{rewound}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("note.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("locked.txt")).unwrap(),
+        "changed\n"
+    );
+}
+
+/// `max_output` limits what the model reads while the person's record keeps it all; endings wake the chat three times.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_model_reads_less_when_it_asks_and_endings_stop_waking_it_after_three() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("limits");
+    let chat = client.open(&folder).await;
+    let short = json!({"command": "seq 1 500", "network": false, "max_output": 20});
+    let mut script = format!("SCRIPT\nshell_exec {short}");
+    for task in 1..=4 {
+        let wait = format!("while [ ! -e go-{task} ]; do sleep 0.1; done; echo ended-{task}");
+        let call = json!({"command": wait, "network": false, "background": true});
+        script.push_str(&format!("\nshell_exec {call}"));
+    }
+    client.send(&chat, &script).await;
+    let mut observed = Vec::new();
+    loop {
+        let (_, frame) = client
+            .until(|frame| {
+                frame["method"] == "approval"
+                    || kind(frame, "tool.observation")
+                    || kind(frame, "turn.done")
+            })
+            .await;
+        if frame["method"] == "approval" {
+            let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+            client.ask("approval.respond", Some(&chat), gate).await;
+        } else if kind(&frame, "tool.observation") {
+            observed.push(frame["params"]["payload"].clone());
+        } else {
+            break;
+        }
+    }
+    assert!(
+        observed[0]["stdout"].as_str().unwrap().starts_with("1\n"),
+        "{}",
+        observed[0]
+    );
+    let requests: Vec<Value> = std::iter::from_fn(|| world.provider.seen.try_recv().ok()).collect();
+    let shown = requests[1]["messages"].to_string();
+    assert!(
+        shown.contains("500") && !shown.contains("\\n250\\n"),
+        "{shown}"
+    );
+    for task in 1..=3 {
+        std::fs::write(folder.join(format!("go-{task}")), "").unwrap();
+        client.until(|frame| kind(frame, "turn.done")).await;
+    }
+    std::fs::write(folder.join("go-4"), "").unwrap();
+    while !client
+        .heard
+        .contains("background endings have started enough turns")
+    {
+        tokio::time::timeout(WAIT, client.event())
+            .await
+            .expect("no notice came");
+    }
+    assert!(
+        world
+            .provider
+            .seen
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok(),
+        "third wake"
+    );
+    while world.provider.seen.try_recv().is_ok() {}
+    client.send(&chat, "go on").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    assert!(
+        last["messages"].to_string().contains("ended-4"),
+        "the held note arrives"
+    );
+}
+
+/// Quiet useful work after a failed optional lookup is not killed: it finishes and reports its end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiet_work_after_a_failed_lookup_finishes() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("quiet");
+    let chat = client.open(&folder).await;
+    client
+        .send(&chat, "RUN `echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 4; echo quiet-work-done`")
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    assert_eq!(
+        observed["params"]["payload"]["status"], "running",
+        "{observed}"
+    );
+    client.until(|frame| kind(frame, "turn.done")).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    let raw = last["messages"].to_string();
+    assert!(
+        raw.contains("exit code 0") && raw.contains("quiet-work-done"),
+        "{raw}"
+    );
+}
+
 /// A huge output keeps its start, where a build usually says what went wrong first, as well as its end.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_huge_output_keeps_its_first_error_and_its_end() {
     let world = World::new();
@@ -2314,6 +2646,7 @@ async fn a_command_that_prints_the_provider_key_never_shows_it_to_the_model() {
 }
 
 /// The same failing command runs four times and the fifth is not run; a search that finds nothing is never stopped.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_that_keeps_failing_stops_running_but_a_search_with_no_match_does_not() {
     let world = World::new();

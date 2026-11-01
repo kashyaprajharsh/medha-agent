@@ -1725,10 +1725,28 @@ where
     let mut history_reader = crate::chat_history::Reader::default();
     let saved = Arc::new(tokio::sync::Notify::new());
     let mut outputs = crate::application_artifacts::Following::default();
+    // Taking this is what lets commands keep running: this chat will hear them end.
+    let mut task_ends = kernel.executor.task_endings();
+    let mut task_notes: Vec<String> = Vec::new();
+    // Turns started by endings since the person last spoke: unattended work must not spend without end.
+    let mut task_wakes = 0;
     loop {
-        if !running && (turn_requested || reports_ready) {
+        let wake = !task_notes.is_empty() && task_wakes < kernel.background_wakes();
+        if !running && (turn_requested || reports_ready || wake) {
             reports_ready = false;
             let mut messages = transcript.clone();
+            let noted = wake || (turn_requested && !task_notes.is_empty());
+            if noted {
+                messages.extend(task_notes.drain(..).map(|note| {
+                    kernel::Message::new(kernel::Role::User, note)
+                        .carrying(kernel::TrustLabel::Tool)
+                }));
+            }
+            task_wakes = if turn_requested {
+                0
+            } else {
+                task_wakes + u32::from(noted)
+            };
             let taken = match &agents {
                 Some(control) => {
                     crate::agents::collect_reports(
@@ -1741,7 +1759,7 @@ where
                 }
                 None => Vec::new(),
             };
-            if turn_requested || !taken.is_empty() {
+            if turn_requested || noted || !taken.is_empty() {
                 history_head = kernel
                     .log
                     .checked_history_record(session.id, 0, None, true)
@@ -2051,6 +2069,26 @@ where
             }
             Some(owner) = report_rx.recv(), if agents.is_some() => {
                 if owner.is_none() || owner == Some(session.id) { reports_ready = true; }
+            }
+            Some(end) = async {
+                match task_ends.as_mut() {
+                    Some(ends) => ends.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let notice = |text: String| writer.turn_event(protocol::TurnEvent::Notice { text });
+                match kernel.task_ended(&session, &end).await {
+                    Ok(note) => {
+                        notice(note.lines().next().unwrap_or_default().to_owned());
+                        task_notes.push(note);
+                        if task_wakes >= kernel.background_wakes() {
+                            notice("The model will read this with your next message; background endings have started enough turns on their own.".to_owned());
+                        }
+                    }
+                    Err(error) => {
+                        notice(format!("A background command ended, but it could not be recorded: {error}"));
+                    }
+                }
             }
             _ = saved.notified() => {
                 match outputs.added(kernel.log.as_ref()).await {

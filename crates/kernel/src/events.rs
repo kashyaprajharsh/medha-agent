@@ -127,6 +127,8 @@ pub enum EventKind {
     /// A patch merged into the working tree.
     AgentApplied,
     ProtectedApplied,
+    /// A command left running ended; its changed files belong to the call that started it.
+    TaskEnded,
 }
 
 impl EventKind {
@@ -160,6 +162,7 @@ impl EventKind {
             EventKind::AgentPatch => "agent.patch",
             EventKind::AgentApplied => "agent.applied",
             EventKind::ProtectedApplied => "protected.applied",
+            EventKind::TaskEnded => "task.ended",
         }
     }
 
@@ -192,6 +195,7 @@ impl EventKind {
             "agent.patch" => EventKind::AgentPatch,
             "agent.applied" => EventKind::AgentApplied,
             "protected.applied" => EventKind::ProtectedApplied,
+            "task.ended" => EventKind::TaskEnded,
             _ => return None,
         })
     }
@@ -419,6 +423,16 @@ impl Event {
             EventKind::AgentApplied,
             json!({ "dispatch": dispatch.to_string() }),
             TrustLabel::System,
+        )
+    }
+
+    /// A background command's end, against the call that started it (`intent_id`).
+    pub fn task_ended(s: &Session, intent_id: &str, result: Value) -> Self {
+        Self::new(
+            s,
+            EventKind::TaskEnded,
+            json!({"intent_id": intent_id, "payload": result}),
+            TrustLabel::Tool,
         )
     }
 
@@ -973,11 +987,35 @@ pub fn rollback_plan_in(
         })
         .filter_map(|event| event.payload["intent_id"].as_str())
         .collect();
+    // A command that ran on in the background records its files when it ends; they are read where it
+    // started, so the backup from before it ran wins over later ones that hold its half-written files.
+    let ended: std::collections::HashMap<&str, &Value> = events[idx..]
+        .iter()
+        .filter(|event| event.kind == EventKind::TaskEnded)
+        .filter_map(|event| {
+            Some((
+                event.payload["intent_id"].as_str()?,
+                &event.payload["payload"],
+            ))
+        })
+        .collect();
+    let started: std::collections::HashSet<&str> = events[idx..]
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolObs)
+        .filter_map(|event| event.payload["intent_id"].as_str())
+        .collect();
     for e in &events[idx..] {
         if !matches!(
             e.kind,
-            EventKind::ToolObs | EventKind::ToolEffectPrepared | EventKind::ProtectedApplied
+            EventKind::ToolObs
+                | EventKind::ToolEffectPrepared
+                | EventKind::ProtectedApplied
+                | EventKind::TaskEnded
         ) {
+            continue;
+        }
+        let intent = e.payload["intent_id"].as_str();
+        if e.kind == EventKind::TaskEnded && intent.is_some_and(|id| started.contains(id)) {
             continue;
         }
         if e.kind == EventKind::ToolEffectPrepared
@@ -996,12 +1034,23 @@ pub fn rollback_plan_in(
         .and_then(Value::as_object) else {
             continue;
         };
-        let rows: Vec<_> = result
-            .get("_checkpoint_files")
-            .and_then(Value::as_array)
+        let later = (e.kind == EventKind::ToolObs)
+            .then(|| intent.and_then(|id| ended.get(id)))
+            .flatten()
+            .and_then(|end| end["_checkpoint_files"].as_array())
             .cloned()
-            .or_else(|| manifest_rows(result.get("_checkpoint_manifest")?.as_str()?))
-            .unwrap_or_else(|| vec![Value::Object(result.clone())]);
+            .unwrap_or_default();
+        let rows: Vec<_> = later
+            .into_iter()
+            .chain(
+                result
+                    .get("_checkpoint_files")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .or_else(|| manifest_rows(result.get("_checkpoint_manifest")?.as_str()?))
+                    .unwrap_or_else(|| vec![Value::Object(result.clone())]),
+            )
+            .collect();
         for row in rows {
             let Some(result) = row.as_object() else {
                 continue;

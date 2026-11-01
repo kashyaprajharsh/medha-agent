@@ -601,6 +601,7 @@ fn kill_process_tree(pid: u32) {
 /// supervised and group-killed. Background tasks clear `kill_on_drop`.
 fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool, pipe_stdin: bool) {
     // A new session also leads its own process group, and has no terminal, so a prompt on /dev/tty fails at once.
+    // SAFETY: `new_session` only calls `setsid`, which is async-signal-safe, and touches no shared state.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(new_session);
@@ -1053,11 +1054,6 @@ enum CapturedStream {
     Stderr,
 }
 
-/// The first bytes of a stream, where a build or test usually reports its first error, are kept
-/// up to this share of the buffer; the rest of it holds the end, where the run says how it finished.
-const HEAD_SHARE: usize = 16;
-const HEAD_MAX: usize = 64 * 1024;
-
 /// A fixed-memory buffer of a stream's start and end, counting what it dropped between them.
 /// `VecDeque` avoids moving a megabyte of retained output for every 8 KiB read once full.
 struct TailBuf {
@@ -1066,18 +1062,21 @@ struct TailBuf {
     data: VecDeque<u8>,
     cap: usize,
     dropped: u64,
+    /// Every byte ever pushed, so a reader can ask for what came after its last read.
+    seen: u64,
     truncated: bool,
 }
 
 impl TailBuf {
     fn new(cap: usize) -> Self {
-        let head_cap = (cap / HEAD_SHARE).min(HEAD_MAX);
+        let head_cap = kernel::kept_start(cap);
         Self {
             head: Vec::new(),
             head_cap,
             data: VecDeque::with_capacity((cap - head_cap).min(64 * 1024)),
             cap: cap - head_cap,
             dropped: 0,
+            seen: 0,
             truncated: false,
         }
     }
@@ -1086,7 +1085,35 @@ impl TailBuf {
         self.head.len() + self.data.len()
     }
 
+    /// What came after the first `from` bytes, with any part no longer held marked.
+    fn since(&self, from: u64) -> String {
+        let new = self.seen.saturating_sub(from);
+        let tail_len = self.data.len() as u64;
+        if new <= tail_len {
+            let tail: Vec<u8> = self
+                .data
+                .iter()
+                .skip((tail_len - new) as usize)
+                .copied()
+                .collect();
+            return String::from_utf8_lossy(&tail).into_owned();
+        }
+        let head = self.head.get(from as usize..).unwrap_or_default();
+        let gap = new - tail_len - head.len() as u64;
+        let tail: Vec<u8> = self.data.iter().copied().collect();
+        let marker = match gap {
+            0 => String::new(),
+            gap => format!("\n[… {gap} bytes of output dropped …]\n"),
+        };
+        format!(
+            "{}{marker}{}",
+            String::from_utf8_lossy(head),
+            String::from_utf8_lossy(&tail)
+        )
+    }
+
     fn push(&mut self, bytes: &[u8]) {
+        self.seen += bytes.len() as u64;
         let into_head = bytes.len().min(self.head_cap - self.head.len());
         self.head.extend_from_slice(&bytes[..into_head]);
         let bytes = &bytes[into_head..];
@@ -1251,6 +1278,19 @@ impl BgProc {
             .lock()
             .map(|capture| (capture.stdout.text(), capture.stderr.text()))
             .unwrap_or_default()
+    }
+    /// Stdout and stderr after the given positions, and the positions to read from next.
+    pub fn output_since(&self, from: (u64, u64)) -> (String, String, (u64, u64)) {
+        self.capture
+            .lock()
+            .map(|capture| {
+                (
+                    capture.stdout.since(from.0),
+                    capture.stderr.since(from.1),
+                    (capture.stdout.seen, capture.stderr.seen),
+                )
+            })
+            .unwrap_or((String::new(), String::new(), from))
     }
     /// Whether this command has been seen trying, and failing, to reach the
     /// network. The kernel watcher is exact and fires before any output exists;

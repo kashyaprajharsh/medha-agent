@@ -12,6 +12,17 @@ pub struct BackgroundTask {
     pub running: bool,
 }
 
+/// A command that was left running has ended.
+#[derive(Debug, Clone)]
+pub struct TaskEnd {
+    /// The call that started it, where its changed files belong.
+    pub intent_id: String,
+    /// What the chat records: the task, its exit code and `_checkpoint_files`.
+    pub result: serde_json::Value,
+    /// What the model reads: one line and the end of the output.
+    pub note: String,
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync {
     /// Tool specs exposed for this session.
@@ -152,6 +163,11 @@ pub trait Executor: Send + Sync {
     /// Default: none (executors without a task table).
     fn background_tasks(&self) -> Vec<BackgroundTask> {
         Vec::new()
+    }
+
+    /// Where commands that were left running report their end; handed out once, to the chat that owns them.
+    fn task_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<TaskEnd>> {
+        None
     }
 
     /// Whether an image can reach the model (it reads them, or one is described

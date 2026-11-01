@@ -21,9 +21,10 @@ pub(crate) fn shell_run(payload: &Value) -> Option<String> {
     let mut view = format!("$ {command}\n");
     match payload["exit_code"].as_i64() {
         Some(code) => view.push_str(&format!("exit code: {code}\n")),
+        None if payload["status"] == "running" => {}
         None => view.push_str("exit code: none (the command did not finish)\n"),
     }
-    const SHOWN: [&str; 7] = [
+    const SHOWN: [&str; 8] = [
         "command",
         "workdir",
         "exit_code",
@@ -31,6 +32,7 @@ pub(crate) fn shell_run(payload: &Value) -> Option<String> {
         "stderr",
         "stdout_truncated",
         "stderr_truncated",
+        "max_output",
     ];
     for (key, value) in object
         .iter()
@@ -49,7 +51,18 @@ pub(crate) fn shell_run(payload: &Value) -> Option<String> {
         }
         // A cut stream marks its own gap, between the start and the end it kept.
         view.push_str(&format!("--- {stream} ---\n"));
-        view.push_str(text.trim_end_matches('\n'));
+        let text = text.trim_end_matches('\n');
+        match payload["max_output"].as_u64().map(|limit| limit as usize) {
+            Some(limit) if limit < text.len() => {
+                let mut from = text.len() - limit;
+                while !text.is_char_boundary(from) {
+                    from += 1;
+                }
+                view.push_str(&format!("[… first {from} bytes not shown, as asked …]\n"));
+                view.push_str(&text[from..]);
+            }
+            _ => view.push_str(text),
+        }
         view.push('\n');
     }
     Some(view.trim_end().to_owned())

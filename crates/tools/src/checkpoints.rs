@@ -15,10 +15,7 @@ use std::{
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
-    if !root
-        .ancestors()
-        .any(|folder| std::fs::symlink_metadata(folder.join(".git")).is_ok())
-    {
+    if !root.ancestors().any(is_repository) {
         return folder_inventory(root);
     }
     let args = [
@@ -67,6 +64,12 @@ fn inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths.into_iter().collect())
 }
 
+/// A worktree's `.git` file, or a folder with `HEAD`; a running jailed command's placeholder `.git` has neither.
+fn is_repository(folder: &Path) -> bool {
+    let git = folder.join(".git");
+    std::fs::symlink_metadata(&git).is_ok_and(|meta| !meta.is_dir() || git.join("HEAD").exists())
+}
+
 fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
@@ -76,6 +79,7 @@ fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
         .git_global(false)
         .require_git(false)
         .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
         .build()
     {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -357,7 +361,10 @@ async fn capture(
                 bytes += size;
                 rows.push(json!({"path":path,"snapshot":id,"before":digest,"expected":"unknown","stat":stamp}));
             }
-            Err(_) => skipped.push(display(sandbox, &path)),
+            Err(_) => {
+                skipped.push(display(sandbox, &path));
+                rows.push(json!({"path":path,"skipped":true,"stat":stamp}));
+            }
         }
     }
     sandbox
@@ -420,7 +427,10 @@ fn plan(
                 sized += len;
                 planned.push((path, stamp, remaining));
             }
-            _ => skipped.push(display(sandbox, &path)),
+            _ => {
+                skipped.push(display(sandbox, &path));
+                rows.push(json!({"path":path,"skipped":true,"stat":stamp}));
+            }
         }
     }
     (rows, planned, skipped)
@@ -503,6 +513,26 @@ pub(crate) async fn finish(sandbox: &WorkspaceSandbox, observation: &mut Observa
     guard.remember_checkpoint(sandbox.root(), remembered);
 }
 
+/// The backup a command left running started from, kept for when it ends: later commands replace the guard's copy.
+pub(crate) fn backup(sandbox: &WorkspaceSandbox) -> Option<Value> {
+    let (guard, _) = kernel::egress::mutation_context()?;
+    guard.checkpoint(sandbox.root())
+}
+
+/// What changed since `backup`, for a command that ended after its call returned.
+pub(crate) fn changed_since(
+    sandbox: &WorkspaceSandbox,
+    backup: &Value,
+) -> Result<Vec<Value>, String> {
+    let mut rows: BTreeMap<String, Value> = backup["_checkpoint_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row["path"].as_str()?.to_owned(), row.clone())))
+        .collect();
+    changed(sandbox, &mut rows)
+}
+
 /// Rows whose current bytes differ from the backup; files new since it are added as missing before.
 fn changed(
     sandbox: &WorkspaceSandbox,
@@ -527,7 +557,8 @@ fn changed(
         let row = rows
             .entry(key)
             .or_insert_with(|| json!({"path":path,"snapshot":null,"before":"missing","stat":null}));
-        if row["stat"] == stamp(&meta) {
+        // It existed but has no copy: undo must leave it, not treat it as new and delete it.
+        if row["skipped"] == true || row["stat"] == stamp(&meta) {
             continue;
         }
         let expected = digest(&path)?;
@@ -541,7 +572,7 @@ fn changed(
         }
     }
     for (key, row) in rows.iter() {
-        if !present.contains(key) && row["before"] != "missing" {
+        if !present.contains(key) && row["before"] != "missing" && row["skipped"] != true {
             let mut row = row.clone();
             row["expected"] = json!("missing");
             changed.push(row);

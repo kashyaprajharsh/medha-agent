@@ -316,6 +316,7 @@ pub async fn start(
     .with_max_parallel_tools(max_parallel_tools)
     .with_server_waits(server_waits)
     .with_result_limits(lock.budget.tool_result_bytes, lock.budget.tool_round_bytes)
+    .with_background_wakes(lock.budget.background_wakes)
     .with_hooks(Arc::new(hook_runner))
     .with_image_shrinker(Arc::new(vision::Shrinker))
     .with_session_owner(Arc::new(Ownership::new(state.clone(), lease)));

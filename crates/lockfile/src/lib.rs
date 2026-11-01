@@ -574,6 +574,9 @@ pub struct BudgetConfig {
     /// Most bytes one round of tool results may put in front of the model
     /// together; `None` scales with the model's context window.
     pub tool_round_bytes: Option<usize>,
+    /// Background commands ending that may start a turn in a row with no message
+    /// from the person; `None` uses the kernel default.
+    pub background_wakes: Option<u32>,
 }
 
 impl Default for BudgetConfig {
@@ -587,6 +590,7 @@ impl Default for BudgetConfig {
             max_parallel_tools: None,
             tool_result_bytes: None,
             tool_round_bytes: None,
+            background_wakes: None,
         }
     }
 }

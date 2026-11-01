@@ -253,5 +253,6 @@ pub(super) fn spawn(
         code,
         net_flag: None,
         owned_cancel: Some(owned_cancel),
+        terminal: None,
     })
 }

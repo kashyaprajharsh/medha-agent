@@ -1236,6 +1236,8 @@ pub struct CaptureLimits {
     stdout: usize,
     stderr: usize,
     aggregate: usize,
+    /// Give the command a pseudo-terminal instead of pipes.
+    terminal: bool,
 }
 
 impl CaptureLimits {
@@ -1244,6 +1246,14 @@ impl CaptureLimits {
             stdout: EXEC_STDOUT_CAP,
             stderr: EXEC_STDERR_CAP,
             aggregate: EXEC_AGGREGATE_CAP,
+            terminal: false,
+        }
+    }
+
+    pub fn with_terminal(self) -> Self {
+        Self {
+            terminal: true,
+            ..self
         }
     }
 
@@ -1252,8 +1262,59 @@ impl CaptureLimits {
             stdout: bytes,
             stderr: bytes,
             aggregate: bytes,
+            terminal: false,
         }
     }
+}
+
+/// Attaches a new pseudo-terminal to `cmd` as its stdio and controlling terminal, on the same
+/// command every backend built, so its sandbox still applies. Returns the side Medha holds.
+#[cfg(unix)]
+fn attach_terminal(cmd: &mut tokio::process::Command) -> Result<std::fs::File, ExecError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (mut main_fd, mut child_fd) = (-1, -1);
+    // SAFETY: both pointers are valid for the call and the optional arguments are null.
+    let opened = unsafe {
+        libc::openpty(
+            &mut main_fd,
+            &mut child_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if opened != 0 {
+        return Err(ExecError::Spawn(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    // SAFETY: openpty returned two open descriptors that nothing else owns.
+    let (main, child) = unsafe {
+        (
+            std::fs::File::from_raw_fd(main_fd),
+            std::fs::File::from_raw_fd(child_fd),
+        )
+    };
+    for file in [&main, &child] {
+        // SAFETY: the descriptor is open; other commands must not inherit either side.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let stdio = |file: &std::fs::File| {
+        file.try_clone()
+            .map(std::process::Stdio::from)
+            .map_err(|error| ExecError::Spawn(error.to_string()))
+    };
+    cmd.stdin(stdio(&child)?)
+        .stdout(stdio(&child)?)
+        .stderr(stdio(&child)?);
+    // SAFETY: only `ioctl`, async-signal-safe, runs after `new_session`, on stdin set up above.
+    unsafe {
+        cmd.pre_exec(|| match libc::ioctl(0, libc::TIOCSCTTY as _, 0) {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    Ok(main)
 }
 
 /// An owned command task: output streams into rolling buffers and the whole
@@ -1269,9 +1330,36 @@ pub struct BgProc {
     net_flag: Option<std::sync::Arc<AtomicBool>>,
     /// Container lifecycle cancellation, independent of the attached client.
     owned_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Medha's side of the command's terminal, when it was given one.
+    terminal: Option<std::sync::Mutex<std::fs::File>>,
 }
 
 impl BgProc {
+    /// Types into the command's terminal; an error says it has none or it has gone.
+    pub fn write_terminal(&self, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or("this command has no terminal; start it with tty: true")?;
+        let mut terminal = terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The shared descriptor is non-blocking for the reader, so a full buffer is retried briefly.
+        let mut rest = bytes;
+        let mut tries = 0;
+        while !rest.is_empty() {
+            match terminal.write(rest) {
+                Ok(written) => rest = &rest[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
     /// Current buffered stdout / stderr (tails, with a marker if truncated).
     pub fn snapshot(&self) -> (String, String) {
         self.capture
@@ -1467,6 +1555,7 @@ macro_rules! impl_pump_pipe {
 
 impl_pump_pipe!(std::process::ChildStdout);
 impl_pump_pipe!(std::process::ChildStderr);
+impl_pump_pipe!(std::fs::File);
 
 #[cfg(target_os = "macos")]
 fn process_snapshot() -> Vec<(i32, i32, i32)> {
@@ -1631,6 +1720,7 @@ fn spawn_background_with_limits(
             stdout: stdout_cap,
             stderr: stderr_cap,
             aggregate: aggregate_cap,
+            terminal: false,
         },
         watch_network,
         input,
@@ -1649,6 +1739,13 @@ fn spawn_background_captured(
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
     configure_for_spawn(&mut cmd, false, input.is_some());
+    #[cfg(unix)]
+    let terminal = limits
+        .terminal
+        .then(|| attach_terminal(&mut cmd))
+        .transpose()?;
+    #[cfg(not(unix))]
+    let terminal: Option<std::fs::File> = None;
     // Arm kernel-level detection before the fork. Armed here rather than by the
     // caller so the filter and the handle that reads it cannot be wired up
     // separately and drift.
@@ -1737,6 +1834,21 @@ fn spawn_background_captured(
         let stop = stop_pumps.clone();
         tokio::task::spawn_blocking(move || {
             pump(out, capture, CapturedStream::Stdout, stop);
+        })
+    });
+    // A terminal has one stream: everything the command prints, read from Medha's side of it.
+    let terminal_reader = terminal
+        .as_ref()
+        .map(std::fs::File::try_clone)
+        .transpose()
+        .map_err(|error| ExecError::Spawn(error.to_string()))?;
+    let out_handle = out_handle.or_else(|| {
+        terminal_reader.map(|reader| {
+            let capture = capture.clone();
+            let stop = stop_pumps.clone();
+            tokio::task::spawn_blocking(move || {
+                pump(reader, capture, CapturedStream::Stdout, stop);
+            })
         })
     });
     let err_handle = err_pipe.map(|err| {
@@ -1853,6 +1965,7 @@ fn spawn_background_captured(
         code,
         net_flag,
         owned_cancel: None,
+        terminal: terminal.map(Mutex::new),
     })
 }
 

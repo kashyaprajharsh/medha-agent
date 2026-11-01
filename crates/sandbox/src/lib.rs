@@ -1738,6 +1738,20 @@ impl<'a> ExecInvocation<'a> {
         )
     }
 
+    /// `spawn_background` with a pseudo-terminal for the command, on the same sandboxed command.
+    pub fn spawn_with_terminal(&self) -> Result<crate::exec::BgProc, ExecError> {
+        if self.outside_sandbox && self.sandbox.exec.requires_strict_cleanup() {
+            return Err(ExecError::Unavailable(
+                "strict cleanup cannot run a command outside its container".into(),
+            ));
+        }
+        self.backend().spawn_owned(
+            &self.request,
+            self.working_dir.as_deref(),
+            exec::CaptureLimits::standard().with_terminal(),
+        )
+    }
+
     pub fn with_working_dir(mut self, dir: PathBuf) -> Self {
         self.working_dir = Some(dir);
         self

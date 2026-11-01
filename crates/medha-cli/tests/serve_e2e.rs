@@ -2579,6 +2579,55 @@ async fn the_person_can_send_a_running_command_to_the_background() {
     );
 }
 
+/// A program gets a real terminal and a typed answer, and the sandbox still holds inside it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_program_in_a_terminal_reads_what_is_typed_and_stays_in_the_sandbox() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let root = world.folder("terminal");
+    let folder = root.join("work");
+    std::fs::create_dir(&folder).unwrap();
+    let chat = client.open(&folder).await;
+    let command =
+        "test -t 0 && echo has-terminal; echo x > ../outside.txt; read answer; echo got-$answer";
+    let start = json!({"command": command, "network": false, "background": true, "tty": true});
+    let until = json!({"task_id": "t1", "until": "has-terminal"});
+    let typed = json!({"op": "submit", "task_id": "t1", "text": "hello"});
+    let script = format!("SCRIPT\nshell_exec {start}\ntask_output {until}\ntask_control {typed}");
+    client.send(&chat, &script).await;
+    let mut seen = String::new();
+    loop {
+        let (_, frame) = client
+            .until(|frame| frame["method"] == "approval" || kind(frame, "turn.done"))
+            .await;
+        if frame["method"] == "approval" {
+            let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+            client.ask("approval.respond", Some(&chat), gate).await;
+            continue;
+        }
+        while let Ok(request) = world.provider.seen.try_recv() {
+            seen.push_str(&request["messages"].to_string());
+        }
+        if seen.contains("[background command t1") {
+            break;
+        }
+    }
+    assert!(
+        seen.contains("has-terminal"),
+        "the program saw a terminal: {seen}"
+    );
+    assert!(
+        seen.contains("got-hello"),
+        "the typed line reached it: {seen}"
+    );
+    assert!(
+        !root.join("outside.txt").exists(),
+        "the sandbox held inside the terminal"
+    );
+}
+
 /// Quiet useful work after a failed optional lookup is not killed: it finishes and reports its end.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

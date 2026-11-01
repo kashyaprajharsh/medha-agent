@@ -5269,6 +5269,7 @@ struct ShellPlan {
     timeout_s: u64,
     access: kernel::ExecutionAccess,
     background: bool,
+    tty: bool,
 }
 
 impl ShellPlan {
@@ -5278,6 +5279,16 @@ impl ShellPlan {
             .get("background")
             .map_or(Some(false), Value::as_bool)
             .ok_or_else(|| ToolError::Args("background must be a boolean".into()))?;
+        let tty = args
+            .get("tty")
+            .map_or(Some(false), Value::as_bool)
+            .ok_or_else(|| ToolError::Args("tty must be a boolean".into()))?;
+        if tty && (cfg!(windows) || !matches!(sbx.backend_label(), "host" | "native")) {
+            return Err(ToolError::Args(
+                "tty is not available here: it needs native or host execution on macOS or Linux"
+                    .into(),
+            ));
+        }
         let timeout_s = args
             .get("timeout_s")
             .map_or(Some(SHELL_TIMEOUT_SECS), Value::as_u64)
@@ -5355,6 +5366,7 @@ impl ShellPlan {
             timeout_s,
             access,
             background,
+            tty,
         })
     }
 }
@@ -5796,6 +5808,20 @@ impl TaskTable {
         self.evict_recent_locked(&mut state);
     }
 
+    /// Types into a running task's terminal.
+    fn type_into(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .active
+            .get(id)
+            .ok_or_else(|| format!("no running task '{id}'"))?
+            .proc
+            .write_terminal(bytes)
+    }
+
     /// Kill a task's process group; returns false if the id is unknown.
     fn kill(&self, id: &str) -> bool {
         let state = self
@@ -6208,7 +6234,7 @@ impl Tool for ShellExec {
                 "command": { "type": "string", "description": "Command line to run via the shell" },
                 "network": {
                     "type": "boolean",
-                    "description": "Set true when the command needs network access (npm/pip installs, downloads, git fetch). Requests approval before execution when access is denied; does not bypass approval."
+                    "description": "True if it needs the network (installs, downloads, git fetch). Asks approval if denied."
                 },
                 "workdir": {
                     "type": "string",
@@ -6236,6 +6262,10 @@ impl Tool for ShellExec {
                     "type": "boolean",
                     "description": "Return at once with a task_id, for a server or watcher. You are told when it ends."
                 },
+                "tty": {
+                    "type": "boolean",
+                    "description": "Give it a terminal; answer with task.control."
+                },
                 "max_output": {
                     "type": "integer",
                     "minimum": 1,
@@ -6249,6 +6279,7 @@ impl Tool for ShellExec {
         let plan = ShellPlan::parse(args, &self.sbx)?;
         let attended = self.tasks.attended();
         let background = plan.background;
+        let tty = plan.tty;
         if background && !attended {
             return Err(ToolError::Args(
                 "background commands cannot keep running here: nothing would report their end. Run it \
@@ -6297,9 +6328,11 @@ impl Tool for ShellExec {
         // can't exfiltrate them via `printenv`. The process is its own group
         // leader, so timeout, cancellation, or `task.kill` tears down the whole
         // tree.
-        let bg = invocation
-            .spawn_background()
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let bg = match tty {
+            true => invocation.spawn_with_terminal(),
+            false => invocation.spawn_background(),
+        }
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         let mut registered = reservation.attach(bg).map_err(|proc| {
             proc.kill();
@@ -6588,8 +6621,9 @@ impl Tool for TaskControl {
         json!({
             "type": "object",
             "properties": {
-                "op": { "type": "string", "enum": ["kill", "remove"] },
-                "task_id": { "type": "string", "description": "Task id, from task.output" }
+                "op": { "type": "string", "enum": ["kill", "remove", "write", "submit", "close"] },
+                "task_id": { "type": "string", "description": "Task id, from task.output" },
+                "text": { "type": "string", "description": "What to type: write sends it as is, submit adds Enter. close ends the input." }
             },
             "required": ["op", "task_id"]
         })
@@ -6604,6 +6638,19 @@ impl Tool for TaskControl {
                     Err(ToolError::Failed(format!("no such task '{id}'")))
                 }
             }
+            Some(op @ ("write" | "submit" | "close")) => {
+                let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
+                // Enter, and the end-of-input key, as a terminal sends them.
+                let typed = match op {
+                    "write" => text.to_owned(),
+                    "submit" => format!("{text}\n"),
+                    _ => "\u{4}".to_owned(),
+                };
+                self.tasks
+                    .type_into(&id, typed.as_bytes())
+                    .map_err(ToolError::Failed)?;
+                Ok(json!({ "task_id": id, "typed": true }))
+            }
             Some("remove") => {
                 if self.tasks.remove_recent(&id) {
                     Ok(json!({ "task_id": id, "removed": true }))
@@ -6616,7 +6663,7 @@ impl Tool for TaskControl {
                 }
             }
             other => Err(ToolError::Args(format!(
-                "task.control needs op = kill or remove; got {}",
+                "task.control needs op = kill, remove, write, submit or close; got {}",
                 other.unwrap_or("nothing")
             ))),
         }

@@ -70,6 +70,17 @@ fn is_repository(folder: &Path) -> bool {
     std::fs::symlink_metadata(&git).is_ok_and(|meta| !meta.is_dir() || git.join("HEAD").exists())
 }
 
+/// A folder a tool can make again. Judged by what it holds where it can be: the standard cache tag
+/// (cargo's `target`) and a virtualenv's config, so a person's own folder called `target` is kept.
+fn rebuildable(entry: &ignore::DirEntry) -> bool {
+    entry.file_type().is_some_and(|kind| kind.is_dir())
+        && (matches!(
+            entry.file_name().to_str(),
+            Some("node_modules" | "__pycache__")
+        ) || entry.path().join("CACHEDIR.TAG").is_file()
+            || entry.path().join("pyvenv.cfg").is_file())
+}
+
 fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
@@ -79,7 +90,7 @@ fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
         .git_global(false)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(|entry| entry.file_name() != ".git" && !rebuildable(entry))
         .build()
     {
         let entry = entry.map_err(|error| error.to_string())?;

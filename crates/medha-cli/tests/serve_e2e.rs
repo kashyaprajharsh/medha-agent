@@ -251,12 +251,17 @@ fn shell_call(body: &Value, asked: &str, id: &str) -> Vec<Value> {
 /// The next call of a `SCRIPT` message, by how many results have come back.
 fn script_call(body: &Value, asked: &str) -> Option<Value> {
     let lines = asked.strip_prefix("SCRIPT\n")?;
-    let results = body["messages"]
-        .as_array()?
+    let messages = body["messages"].as_array()?;
+    let is_tool = |message: &&Value| message["role"] == "tool";
+    let results = messages.iter().filter(is_tool).count();
+    // Steps count from this message, so a later script in the same chat starts at its own first line.
+    let step = messages
         .iter()
-        .filter(|message| message["role"] == "tool")
+        .rev()
+        .take_while(|message| message["role"] != "user")
+        .filter(is_tool)
         .count();
-    let (tool, arguments) = lines.lines().nth(results)?.split_once(' ')?;
+    let (tool, arguments) = lines.lines().nth(step)?.split_once(' ')?;
     Some(
         json!({"index": 0, "id": format!("script_{results}"), "type": "function",
         "function": {"name": tool, "arguments": arguments}}),
@@ -2308,6 +2313,191 @@ async fn a_background_command_returns_at_once_and_its_end_reaches_the_model() {
         raw.contains("exit code 0") && raw.contains("finished-work"),
         "{raw}"
     );
+}
+
+/// Everything the model was sent while one scripted message ran, with approvals answered.
+async fn scripted(client: &mut Client, world: &World, chat: &str, lines: &[String]) -> String {
+    client
+        .send(chat, &format!("SCRIPT\n{}", lines.join("\n")))
+        .await;
+    loop {
+        let (_, frame) = client
+            .until(|frame| frame["method"] == "approval" || kind(frame, "turn.done"))
+            .await;
+        if frame["method"] != "approval" {
+            break;
+        }
+        let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+        client.ask("approval.respond", Some(chat), gate).await;
+    }
+    std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string()
+}
+
+/// Backups leave out what a tool can rebuild, by what the folder is and not only by its name.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backup_leaves_out_rebuildable_folders_and_keeps_a_folder_merely_named_target() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("backup");
+    let blob = "rebuildable".repeat(100_000);
+    for dir in [
+        "node_modules/pkg",
+        "target/debug",
+        ".venv/lib",
+        "docs/target",
+    ] {
+        std::fs::create_dir_all(folder.join(dir)).unwrap();
+    }
+    std::fs::write(
+        folder.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(folder.join(".venv/pyvenv.cfg"), "home = /usr\n").unwrap();
+    std::fs::write(folder.join("node_modules/pkg/blob"), &blob).unwrap();
+    std::fs::write(folder.join("target/debug/blob"), &blob).unwrap();
+    std::fs::write(folder.join(".venv/lib/blob"), &blob).unwrap();
+    std::fs::write(folder.join("docs/target/mine-kept.txt"), "my own words").unwrap();
+    std::fs::write(folder.join("src.txt"), "before").unwrap();
+    let chat = client.open(&folder).await;
+    let command = json!({"command": "echo after > src.txt; echo after > docs/target/mine-kept.txt", "network": false});
+    scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("shell_exec {command}")],
+    )
+    .await;
+    fn stored(dir: &Path, found: &mut Vec<(u64, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stored(&path, found);
+            } else if path.to_string_lossy().contains("command-snapshots") {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                found.push((bytes.len() as u64, bytes));
+            }
+        }
+    }
+    let mut copies = Vec::new();
+    stored(&world.home(), &mut copies);
+    assert!(
+        copies.iter().any(|(_, bytes)| bytes == b"my own words"),
+        "a folder merely named target is still backed up"
+    );
+    let largest = copies.iter().map(|(size, _)| *size).max().unwrap_or(0);
+    assert!(
+        largest < blob.len() as u64,
+        "a rebuildable file was copied ({largest} bytes)"
+    );
+}
+
+/// A value deep inside a very long line can be found and read, not only its first bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_deep_in_a_long_line_is_found_and_read() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("long-line");
+    let line = format!("{}VALUE-HERE{}", "x".repeat(3_000), "y".repeat(57_000));
+    std::fs::write(folder.join("long.txt"), format!("{line}\nneedle\n")).unwrap();
+    std::fs::write(folder.join("note.md"), "a needle\nand a needle\n").unwrap();
+    let chat = client.open(&folder).await;
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[
+            format!("read {}", json!({"path": "long.txt"})),
+            format!("grep {}", json!({"pattern": "VALUE-HERE"})),
+            format!(
+                "read {}",
+                json!({"path": "long.txt", "offset": 1, "column": 3_001})
+            ),
+            format!(
+                "read {}",
+                json!({"path": "long.txt", "offset": 1, "column": 59_990})
+            ),
+            format!(
+                "grep {}",
+                json!({"pattern": "needle", "output_mode": "count"})
+            ),
+            format!(
+                "grep {}",
+                json!({"pattern": "needle", "output_mode": "files", "glob": "*.md"})
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        raw.contains("column=2001"),
+        "a cut line says how to go on: {raw}"
+    );
+    // The search shows the match itself and where it is; the column read shows it again.
+    assert!(
+        raw.contains("\\\"column\\\":3001") || raw.contains("column: 3001"),
+        "{raw}"
+    );
+    assert!(raw.matches("VALUE-HERE").count() >= 3, "{raw}");
+    assert!(
+        raw.contains("yyyyyyyyyy") && raw.contains("end of line"),
+        "{raw}"
+    );
+    assert!(raw.contains("note.md") && raw.contains("long.txt"), "{raw}");
+    assert!(
+        raw.contains("\\\"matches\\\":2") || raw.contains("note.md: 2"),
+        "{raw}"
+    );
+}
+
+/// A stored result can be searched, and a hit says which byte to read from.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("stored");
+    let chat = client.open(&folder).await;
+    let big = json!({"command": "seq 100000 160000", "network": false});
+    let first = scripted(&mut client, &world, &chat, &[format!("shell_exec {big}")]).await;
+    assert!(
+        first.contains("search it"),
+        "the note offers a search: {first}"
+    );
+    let hash = first
+        .split("hash=\\\"")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .unwrap_or_else(|| panic!("no stored hash: {first}"))
+        .to_owned();
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!(
+            "grep {}",
+            json!({"pattern": "^131337$", "hash": hash})
+        )],
+    )
+    .await;
+    assert!(!raw.contains("131338"), "only the hit is shown: {raw}");
+    let offset: u64 = raw
+        .split("\\\"offset\\\":")
+        .last()
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("a hit gives its byte: {raw}"));
+    // Reading from that byte lands on the hit: the next line comes back and nothing before it.
+    let read = json!({"hash": hash, "offset": offset, "length": 13});
+    let raw = scripted(&mut client, &world, &chat, &[format!("read {read}")]).await;
+    assert!(raw.contains("131338"), "{raw}");
+    assert!(!raw.contains("131336"), "{raw}");
 }
 
 /// A backend killed outright: the command works on, and the next backend reports its output and its end.

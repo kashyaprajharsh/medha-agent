@@ -41,7 +41,7 @@ fn a_page_is_numbered_exactly_and_says_where_the_next_one_starts() {
     let long = "x".repeat(5_000);
     let view = file_page(&json!({"content": long, "start_line": 1, "has_more": false})).unwrap();
     assert!(
-        view.ends_with(" … [line cut: 2000 of 5000 bytes shown]\n"),
+        view.ends_with(" … [line cut: 2000 of 5000 bytes shown; read on with column=2001]\n"),
         "{view}"
     );
     assert_eq!(

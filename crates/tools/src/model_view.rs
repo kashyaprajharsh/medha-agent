@@ -126,16 +126,32 @@ pub(crate) fn page_lines(content: &str) -> impl Iterator<Item = std::borrow::Cow
             cut -= 1;
         }
         std::borrow::Cow::Owned(format!(
-            "{} … [line cut: {} of {} bytes shown]",
+            "{} … [line cut: {} of {} bytes shown; read on with column={}]",
             &text[..cut],
             cut,
-            text.len()
+            text.len(),
+            cut + 1
         ))
     })
 }
 
 /// A page of a file as numbered lines, `N|text`, then where the next page
 /// starts. The numbers are not part of the file; lines are otherwise exact.
+/// Part of one long line, and how to go on.
+pub(crate) fn line_part(payload: &Value) -> Option<String> {
+    let part = payload["part"].as_str()?;
+    let (line, from) = (payload["line"].as_u64()?, payload["column"].as_u64()?);
+    let end = from - 1 + part.len() as u64;
+    let of = payload["line_bytes"].as_u64()?;
+    let next = match payload["next_column"].as_u64() {
+        Some(next) => format!("continue with column={next}"),
+        None => "end of line".to_owned(),
+    };
+    Some(format!(
+        "{part}\n[line {line}, bytes {from}-{end} of {of}; {next}]"
+    ))
+}
+
 pub(crate) fn file_page(payload: &Value) -> Option<String> {
     let content = payload["content"].as_str()?;
     let start = payload["start_line"].as_u64()?;

@@ -372,7 +372,9 @@ fn replayable(states: &[ProviderState], replay: &Replay) -> Result<Option<Value>
         }
         return Ok(None);
     }
-    if value.get("sealed_at").and_then(Value::as_u64).unwrap_or(0) < replay.after {
+    // At or before the refusal: one sealed in that same millisecond is just as stale.
+    let sealed_at = value.get("sealed_at").and_then(Value::as_u64).unwrap_or(0);
+    if replay.after > 0 && sealed_at <= replay.after {
         return Ok(None);
     }
     let summary = value

@@ -1090,6 +1090,7 @@ impl ToolRegistry {
         }));
         r.register(Arc::new(Grep {
             sbx: sandbox.clone(),
+            store: artifacts.clone(),
         }));
         r.register(Arc::new(Glob {
             sbx: sandbox.clone(),
@@ -1537,13 +1538,11 @@ struct Read {
 /// What `read` says of text to every model; images are added for those that see.
 macro_rules! read_text {
     () => {
-        "Read a file by `path`, or a stored result by `hash`. Text comes one page at a time: \
-         up to 2000 lines from `offset` (1-based, default 1), fewer with `limit`, each as \
-         `N|text`. The number and bar are not part of the file, so leave them out when you \
-         edit. When more remains, the result says which offset continues it. Pass \
-         `count: true` for words, lines and characters instead of contents. With `hash`, \
-         `offset` and `length` are byte positions into a stored tool result. Supports paths \
-         outside the workspace with permission."
+        "Read a file by `path`, or a stored result by `hash`. Text comes a page at a time: \
+         up to 2000 lines from `offset` (1-based), fewer with `limit`, each as `N|text`; \
+         leave the number and bar out when you edit. When more remains, the result says how \
+         to continue. `count: true` gives words, lines and characters. With `hash`, `offset` \
+         and `length` are bytes. A path outside the workspace asks permission."
     };
 }
 
@@ -1617,6 +1616,7 @@ impl Tool for Read {
                 "hash": { "type": "string", "description": "Artifact content hash, from a spilled tool result" },
                 "offset": { "type": "integer", "minimum": 0, "description": "With `path`: 1-based first line. With `hash`: start byte." },
                 "limit": { "type": "integer", "minimum": 1, "description": "With `path`: how many lines to return" },
+                "column": { "type": "integer", "minimum": 1, "description": "With `path`: start line `offset` at this byte" },
                 "length": { "type": "integer", "minimum": 1, "description": "With `hash`: how many bytes to return" },
                 "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" },
                 "render": { "type": "boolean", "description": "Screenshot the page at `path` (HTML file or URL)" }
@@ -1900,7 +1900,12 @@ impl Tool for FsRead {
             }
         };
         let offset = numeric_arg("offset")?;
-        let limit = numeric_arg("limit")?;
+        let column = numeric_arg("column")?;
+        let limit = if column.is_some() {
+            Some(1)
+        } else {
+            numeric_arg("limit")?
+        };
         // Resolve ONCE and reuse. Resolving is what prompts for a path outside
         // the workspace, so resolving per step asked the user to approve the
         // same file once per step — three dialogs for one whole-file read.
@@ -1953,9 +1958,33 @@ impl Tool for FsRead {
                 Err(error) => return Err(ToolError::Failed(format!("read failed: {error}"))),
             },
         };
+        let limit = page_limit();
+        // Part of one long line. It is not remembered as read: it is not a whole line to edit against.
+        if let Some(column) = column.filter(|_| !range.content.is_empty()) {
+            let line = range.content.trim_end_matches(['\r', '\n']);
+            let mut from = usize::try_from(column - 1)
+                .unwrap_or(usize::MAX)
+                .min(line.len());
+            while !line.is_char_boundary(from) {
+                from -= 1;
+            }
+            let mut to = from.saturating_add(limit).min(line.len());
+            while !line.is_char_boundary(to) {
+                to -= 1;
+            }
+            kernel::egress::file_read(&line[from..to]);
+            return Ok(json!({
+                "path": path,
+                "resolved_path": resolved,
+                "line": start,
+                "column": from + 1,
+                "part": &line[from..to],
+                "line_bytes": line.len(),
+                "next_column": (to < line.len()).then_some(to + 1),
+            }));
+        }
         // A page ends at the last whole line whose view, numbered, still fits; the next one
         // starts where it stopped. A single line too long for a page is cut, and still shown.
-        let limit = page_limit();
         let (mut shown, mut cut, mut lines) = (0, 0, 0u64);
         for line in range.content.split_inclusive('\n') {
             let number = (start + lines).to_string().len() + 1;
@@ -2002,6 +2031,9 @@ impl Tool for FsRead {
     /// The page as numbered lines, remembered as shown so that the same lines
     /// pasted back into a write or an edit are recognised.
     fn model_view(&self, payload: &Value) -> Option<String> {
+        if payload.get("part").is_some() {
+            return model_view::line_part(payload);
+        }
         let view = model_view::file_page(payload)?;
         if let (Some(content), Some(start)) =
             (payload["content"].as_str(), payload["start_line"].as_u64())
@@ -2742,6 +2774,7 @@ fn stream_text_counts(path: &std::path::Path) -> Result<TextCounts, String> {
 
 struct Grep {
     sbx: Arc<WorkspaceSandbox>,
+    store: Arc<dyn kernel::ArtifactStore>,
 }
 #[async_trait]
 impl Tool for Grep {
@@ -2752,10 +2785,9 @@ impl Tool for Grep {
         ToolCategory::Search
     }
     fn description(&self) -> &str {
-        "Search file contents by regular expression across the workspace, \
-         gitignore-aware (skips ignored/hidden files, target/, node_modules, binaries). \
-         Returns matching {path, line, text}. Use `context` to include surrounding \
-         lines, `case_insensitive` for loose matching, `path` to scope to a subtree."
+        "Search file contents by regular expression across the workspace, skipping ignored \
+         and hidden files, target/, node_modules and binaries, or one stored result by `hash`. \
+         Returns matching {path, line, text}; a stored result's hits give the byte to read from."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2765,16 +2797,29 @@ impl Tool for Grep {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax)" },
-                "path": { "type": "string", "description": "Workspace-relative dir to scope the search (default '.')" },
-                "case_insensitive": { "type": "boolean", "description": "Match ignoring case (default false)" },
-                "context": { "type": "integer", "description": "Lines of context to include around each match (default 0)" },
-                "max_results": { "type": "integer", "description": "Cap on matches returned (default 200)" }
+                "path": { "type": "string", "description": "Dir to search" },
+                "glob": { "type": "string", "description": "Only these files, e.g. *.rs" },
+                "hash": { "type": "string", "description": "Search this stored result" },
+                "output_mode": { "type": "string", "enum": ["content", "files", "count"] },
+                "case_insensitive": { "type": "boolean" },
+                "context": { "type": "integer", "description": "Lines around each match" },
+                "max_results": { "type": "integer", "description": "Default 200" }
             },
             "required": ["pattern"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let pattern = arg_str(args, "pattern")?;
+        let mode = args
+            .get("output_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("content")
+            .to_owned();
+        if !matches!(mode.as_str(), "content" | "files" | "count") {
+            return Err(ToolError::Args(
+                "output_mode must be content, files or count".into(),
+            ));
+        }
         let ci = args
             .get("case_insensitive")
             .and_then(Value::as_bool)
@@ -2790,6 +2835,27 @@ impl Tool for Grep {
             .case_insensitive(ci)
             .build()
             .map_err(|e| ToolError::Args(format!("bad regex: {e}")))?;
+        if let Some(hash) = args
+            .get("hash")
+            .and_then(Value::as_str)
+            .filter(|hash| !hash.is_empty())
+        {
+            let store = self.store.clone();
+            let hash = hash.to_owned();
+            return tokio::task::spawn_blocking(move || search_stored(&store, &hash, &re, max))
+                .await
+                .map_err(|e| ToolError::Failed(e.to_string()))?;
+        }
+        let only = args
+            .get("glob")
+            .and_then(Value::as_str)
+            .map(|glob| {
+                ignore::overrides::OverrideBuilder::new(self.sbx.root())
+                    .add(glob)
+                    .and_then(|builder| builder.build())
+                    .map_err(|e| ToolError::Args(format!("bad glob: {e}")))
+            })
+            .transpose()?;
         let start = self
             .sbx
             .resolve(rel_path)
@@ -2829,6 +2895,13 @@ impl Tool for Grep {
                 if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
+                // Checked here, not given to the walk: an override there would also let ignored files through.
+                if only
+                    .as_ref()
+                    .is_some_and(|only| !only.matched(dent.path(), false).is_whitelist())
+                {
+                    continue;
+                }
                 if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
                     skipped_large += 1;
                     continue;
@@ -2846,22 +2919,34 @@ impl Tool for Grep {
                 };
                 let rel = portable_rel(dent.path().strip_prefix(&root).unwrap_or(dent.path()));
                 let lines: Vec<&str> = content.lines().collect();
-                for (i, line) in lines.iter().enumerate() {
-                    if re.is_match(line) {
+                if mode != "content" {
+                    let found = lines.iter().filter(|line| re.is_match(line)).count();
+                    if found > 0 {
                         if matches.len() >= max {
                             truncated = true;
                             break 'outer;
                         }
-                        let mut m = json!({
-                            "path": rel,
-                            "line": i + 1,
-                            "text": clip_marked(line, 200)
+                        matches.push(match mode.as_str() {
+                            "files" => json!(rel),
+                            _ => json!({ "path": rel, "matches": found }),
                         });
+                    }
+                    continue;
+                }
+                for (i, line) in lines.iter().enumerate() {
+                    if let Some(found) = re.find(line) {
+                        if matches.len() >= max {
+                            truncated = true;
+                            break 'outer;
+                        }
+                        let mut m = json!({ "path": rel, "line": i + 1 });
+                        add_match_text(&mut m, line, found.start());
                         if context > 0 {
                             let lo = i.saturating_sub(context);
                             let hi = i.saturating_add(context).saturating_add(1).min(lines.len());
-                            let ctx: Vec<String> =
-                                (lo..hi).map(|j| format!("{}: {}", j + 1, lines[j])).collect();
+                            let ctx: Vec<String> = (lo..hi)
+                                .map(|j| format!("{}: {}", j + 1, clip_marked(lines[j], 200)))
+                                .collect();
                             m["context"] = json!(ctx);
                         }
                         matches.push(m);
@@ -2869,7 +2954,12 @@ impl Tool for Grep {
                 }
             }
             let count = matches.len();
-            let mut out = json!({ "matches": matches, "count": count, "truncated": truncated });
+            let key = match mode.as_str() {
+                "files" => "files",
+                "count" => "counts",
+                _ => "matches",
+            };
+            let mut out = json!({ key: matches, "count": count, "truncated": truncated });
             if error_count > 0 {
                 out["incomplete"] = json!(true);
                 out["error_count"] = json!(error_count);
@@ -2885,6 +2975,73 @@ impl Tool for Grep {
         .await
         .map_err(|e| ToolError::Failed(e.to_string()))?
     }
+}
+
+/// A hit's text: the whole line, or for a long one the part around the match and the column it is at.
+fn add_match_text(hit: &mut Value, line: &str, start: usize) {
+    const WINDOW: usize = 200;
+    if line.len() <= WINDOW {
+        hit["text"] = json!(line);
+        return;
+    }
+    let mut from = start.saturating_sub(WINDOW / 4);
+    while !line.is_char_boundary(from) {
+        from -= 1;
+    }
+    let mut to = (from + WINDOW).min(line.len());
+    while !line.is_char_boundary(to) {
+        to -= 1;
+    }
+    let before = if from > 0 { "… " } else { "" };
+    let after = if to < line.len() { " …" } else { "" };
+    hit["text"] = json!(format!("{before}{}{after}", &line[from..to]));
+    hit["column"] = json!(start + 1);
+}
+
+/// Searches one stored result line by line; a hit's `offset` is the byte to `read` it from.
+fn search_stored(
+    store: &Arc<dyn kernel::ArtifactStore>,
+    hash: &str,
+    re: &regex::Regex,
+    max: usize,
+) -> Result<Value, ToolError> {
+    const MAX_SEARCHED: usize = 64 * 1024 * 1024;
+    let failed = |error: String| {
+        ToolError::Failed(format!(
+            "no result stored under hash {hash} ({error}); use a hash a tool result printed"
+        ))
+    };
+    let size = store.size(hash).map_err(failed)?;
+    if size > MAX_SEARCHED {
+        return Err(ToolError::Failed(format!(
+            "this stored result is {size} bytes, too large to search; read it by offset"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(size);
+    while bytes.len() < size {
+        let part = store.get(hash, bytes.len(), None).map_err(failed)?;
+        if part.is_empty() {
+            break;
+        }
+        bytes.extend_from_slice(&part);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let (mut matches, mut truncated, mut offset) = (Vec::new(), false, 0);
+    for (index, raw) in text.split_inclusive('\n').enumerate() {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if let Some(found) = re.find(line) {
+            if matches.len() >= max {
+                truncated = true;
+                break;
+            }
+            let mut hit = json!({ "line": index + 1, "offset": offset });
+            add_match_text(&mut hit, line, found.start());
+            matches.push(hit);
+        }
+        offset += raw.len();
+    }
+    let count = matches.len();
+    Ok(json!({ "hash": hash, "matches": matches, "count": count, "truncated": truncated }))
 }
 
 /// Clip a line to `max` chars with an explicit marker (never silently truncate).
@@ -8825,6 +8982,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tool = Grep {
             sbx: Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+            store: mem_artifacts(),
         };
         let result = tool
             .execute(&json!({"pattern": "needle", "path": "missing"}))
@@ -8843,6 +9001,7 @@ mod tests {
         std::fs::write(dir.join("sample.txt"), "before\nneedle\nafter\n").unwrap();
         let tool = Grep {
             sbx: Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+            store: mem_artifacts(),
         };
         let out = tool
             .execute(&json!({"pattern": "needle", "context": u64::MAX}))

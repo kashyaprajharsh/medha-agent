@@ -659,8 +659,9 @@ fn spilled_preview(content: &str, hash: &str) -> String {
         tail += newline + 1;
     }
     format!(
-        "{}\n[… {} of {} bytes not shown, bytes {}–{}. The whole result is stored: read \
-         hash=\"{hash}\" with offset (a byte) and length to see any part of it.]\n{}",
+        "{}\n[… {} of {} bytes not shown, bytes {}–{}. The whole result is stored: \
+         read hash=\"{hash}\" with offset (a byte) and length, or search it first with grep \
+         and that hash. Read every page only if you need all of it.]\n{}",
         content[..head].trim_end_matches('\n'),
         tail - head,
         content.len(),

@@ -137,6 +137,57 @@ pub(crate) fn page_lines(content: &str) -> impl Iterator<Item = std::borrow::Cow
 
 /// A page of a file as numbered lines, `N|text`, then where the next page
 /// starts. The numbers are not part of the file; lines are otherwise exact.
+/// Search results as plain lines; the same facts as one JSON object per hit, for fewer tokens.
+pub(crate) fn grep(payload: &Value) -> Option<String> {
+    let mut view = String::new();
+    if let Some(files) = payload["files"].as_array() {
+        for file in files {
+            view.push_str(file.as_str()?);
+            view.push('\n');
+        }
+    } else if let Some(counts) = payload["counts"].as_array() {
+        for count in counts {
+            view.push_str(&format!(
+                "{}: {}\n",
+                count["path"].as_str()?,
+                count["matches"]
+            ));
+        }
+    } else {
+        for hit in payload["matches"].as_array()? {
+            let line = &hit["line"];
+            match hit["path"].as_str() {
+                Some(path) => view.push_str(&format!("{path}:{line}")),
+                None => view.push_str(&format!("byte {} line {line}", hit["offset"])),
+            }
+            if let Some(column) = hit["column"].as_u64() {
+                view.push_str(&format!(" column {column}"));
+            }
+            view.push_str(&format!(": {}\n", hit["text"].as_str()?));
+            for near in hit["context"].as_array().into_iter().flatten() {
+                view.push_str(&format!("  {}\n", near.as_str()?));
+            }
+        }
+    }
+    if view.is_empty() {
+        view.push_str("No matches.\n");
+    }
+    if payload["truncated"] == true {
+        view.push_str("[more not shown: narrow the search or raise max_results]\n");
+    }
+    if payload["incomplete"] == true {
+        view.push_str(&format!(
+            "[incomplete, {} could not be searched: {}]\n",
+            payload["error_count"], payload["errors"]
+        ));
+    }
+    if let Some(note) = payload["note"].as_str() {
+        view.push_str(note);
+        view.push('\n');
+    }
+    Some(view)
+}
+
 /// Part of one long line, and how to go on.
 pub(crate) fn line_part(payload: &Value) -> Option<String> {
     let part = payload["part"].as_str()?;

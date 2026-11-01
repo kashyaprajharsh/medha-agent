@@ -2407,6 +2407,8 @@ async fn a_value_deep_in_a_long_line_is_found_and_read() {
     let line = format!("{}VALUE-HERE{}", "x".repeat(3_000), "y".repeat(57_000));
     std::fs::write(folder.join("long.txt"), format!("{line}\nneedle\n")).unwrap();
     std::fs::write(folder.join("note.md"), "a needle\nand a needle\n").unwrap();
+    std::fs::write(folder.join("odd.txt"), "the text a.b(c itself\n").unwrap();
+    std::fs::write(folder.join(".secretly-hidden.txt"), "hidden-word\n").unwrap();
     let chat = client.open(&folder).await;
     let raw = scripted(
         &mut client,
@@ -2431,6 +2433,8 @@ async fn a_value_deep_in_a_long_line_is_found_and_read() {
                 "grep {}",
                 json!({"pattern": "needle", "output_mode": "files", "glob": "*.md"})
             ),
+            format!("grep {}", json!({"pattern": "a.b(c", "literal": true})),
+            format!("grep {}", json!({"pattern": "hidden-word", "hidden": true})),
         ],
     )
     .await;
@@ -2439,20 +2443,18 @@ async fn a_value_deep_in_a_long_line_is_found_and_read() {
         "a cut line says how to go on: {raw}"
     );
     // The search shows the match itself and where it is; the column read shows it again.
-    assert!(
-        raw.contains("\\\"column\\\":3001") || raw.contains("column: 3001"),
-        "{raw}"
-    );
+    assert!(raw.contains("long.txt:1 column 3001:"), "{raw}");
     assert!(raw.matches("VALUE-HERE").count() >= 3, "{raw}");
     assert!(
         raw.contains("yyyyyyyyyy") && raw.contains("end of line"),
         "{raw}"
     );
     assert!(raw.contains("note.md") && raw.contains("long.txt"), "{raw}");
-    assert!(
-        raw.contains("\\\"matches\\\":2") || raw.contains("note.md: 2"),
-        "{raw}"
-    );
+    assert!(raw.contains("the text a.b(c itself"), "{raw}");
+    assert!(raw.contains(".secretly-hidden.txt"), "{raw}");
+    assert!(raw.contains("note.md: 2"), "{raw}");
+    // Plain lines, not one JSON object per hit: the same facts cost fewer tokens.
+    assert!(raw.contains("odd.txt:1: the text"), "{raw}");
 }
 
 /// A stored result can be searched, and a hit says which byte to read from.
@@ -2488,7 +2490,7 @@ async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
     .await;
     assert!(!raw.contains("131338"), "only the hit is shown: {raw}");
     let offset: u64 = raw
-        .split("\\\"offset\\\":")
+        .split("byte ")
         .last()
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|digits| digits.parse().ok())
@@ -2498,6 +2500,265 @@ async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
     let raw = scripted(&mut client, &world, &chat, &[format!("read {read}")]).await;
     assert!(raw.contains("131338"), "{raw}");
     assert!(!raw.contains("131336"), "{raw}");
+}
+
+/// Starts a chat, leaves one background command running, then kills the backend outright.
+#[cfg(unix)]
+async fn crash_with_a_command_running(world: &World, folder: &Path, command: &str) -> String {
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(folder).await;
+    client.send(&chat, &format!("BACKGROUND `{command}`")).await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    chat
+}
+
+#[cfg(unix)]
+async fn reopen(backend: &Backend, folder: &Path, chat: &str) -> Client {
+    let mut client = backend.connect().await;
+    let resumed = client.create(folder, Some(chat)).await;
+    let head = resumed["result"]["head"].as_u64().unwrap();
+    client
+        .ask("session.attach", Some(chat), json!({"after": head}))
+        .await;
+    client
+}
+
+#[cfg(unix)]
+fn process_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The chat's folder of records for commands left running.
+#[cfg(unix)]
+fn task_records(world: &World, chat: &str) -> PathBuf {
+    fn find(dir: &Path, chat: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.ends_with(format!("tasks/{chat}")) {
+                return Some(path);
+            }
+            if let Some(found) = find(&path, chat) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find(&world.home(), chat).expect("the chat has a records folder")
+}
+
+/// A command found again after a crash can still be stopped.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_found_after_a_crash_can_be_stopped() {
+    let world = World::new();
+    let folder = world.folder("found-stop");
+    let chat =
+        crash_with_a_command_running(&world, &folder, "echo $$ > pid.txt; exec sleep 987").await;
+    let pid = std::fs::read_to_string(folder.join("pid.txt")).unwrap();
+    assert!(process_alive(&pid), "the crash left it running");
+    let backend = world.backend();
+    let mut client = reopen(&backend, &folder, &chat).await;
+    let stop = json!({"op": "kill", "task_id": "t1"});
+    scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("task_control {stop}")],
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(&pid) {
+        assert!(Instant::now() < deadline, "the stop did not reach it");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A number now used by another process is never adopted or signalled, and the chat hears it stopped.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_process_number_is_left_alone() {
+    let world = World::new();
+    let folder = world.folder("reused");
+    let chat = crash_with_a_command_running(&world, &folder, "exec sleep 1").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut stranger = Command::new("sleep").arg("60").spawn().unwrap();
+    let record = json!({
+        "id": "t1",
+        "command": "the old command",
+        "pid": stranger.id(),
+        "started": "a start time that is not this process's",
+        "intent_id": "old-call",
+    });
+    std::fs::write(
+        task_records(&world, &chat).join("t1.json"),
+        record.to_string(),
+    )
+    .unwrap();
+    while world.provider.seen.try_recv().is_ok() {}
+    let backend = world.backend();
+    let mut client = reopen(&backend, &folder, &chat).await;
+    // The note is filed moments after the chat opens; it reaches the model with the next message.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let stop = json!({"op": "kill", "task_id": "t1"});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("task_control {stop}")],
+    )
+    .await;
+    assert!(raw.contains("not running any more"), "{raw}");
+    assert!(
+        stranger.try_wait().unwrap().is_none(),
+        "someone else's process was killed"
+    );
+    stranger.kill().unwrap();
+    stranger.wait().unwrap();
+}
+
+/// Rewind after a restart still undoes what the command wrote, from the backup taken at its start.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rewind_after_a_crash_undoes_what_a_found_command_wrote() {
+    let world = World::new();
+    let folder = world.folder("found-rewind");
+    std::fs::write(folder.join("note.txt"), "original\n").unwrap();
+    let chat =
+        crash_with_a_command_running(&world, &folder, "sleep 6; echo changed > note.txt").await;
+    let backend = world.backend();
+    let mut client = reopen(&backend, &folder, &chat).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert_eq!(
+        std::fs::read_to_string(folder.join("note.txt")).unwrap(),
+        "changed\n"
+    );
+    let points = client
+        .ask("session.rewind.points", Some(&chat), json!({}))
+        .await;
+    let at = points["result"]["points"][0]["id"].clone();
+    let rewound = client
+        .ask(
+            "session.rewind",
+            Some(&chat),
+            json!({"at": at, "scope": "both"}),
+        )
+        .await;
+    assert!(rewound.get("error").is_none(), "{rewound}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("note.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+/// A command printing without end cannot fill the disk, and its last line still arrives.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_huge_background_output_stays_within_its_file_cap() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("huge-file");
+    let chat = client.open(&folder).await;
+    client
+        .send(
+            &chat,
+            "BACKGROUND `head -c 100000000 /dev/zero | tr '\\0' x; echo; touch printed; sleep 8; echo last-$((1+1))`",
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !folder.join("printed").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the command never finished printing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A writer can outrun the reader for a moment; once read past the cap the file restarts.
+    let out = task_records(&world, &chat).join("t1.out");
+    let size = || std::fs::metadata(&out).map_or(0, |meta| meta.len());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while size() > 70_000_000 {
+        assert!(
+            Instant::now() < deadline,
+            "the file stayed at {} bytes",
+            size()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(raw.contains("last-2"), "the end still arrives");
+    assert!(
+        !task_records(&world, &chat).join("t1.out").exists(),
+        "the file goes when the command ends"
+    );
+}
+
+/// Runs one reporting background command to its end and returns the request its end started.
+#[cfg(unix)]
+async fn reported_end(folder: &str, lock: Option<&str>, command: &str) -> String {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder(folder);
+    if let Some(lock) = lock {
+        std::fs::write(folder.join("medha.lock"), lock).unwrap();
+    }
+    let chat = client.open(&folder).await;
+    let args =
+        json!({"command": command, "network": false, "background": true, "notify_every": 60});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {args}")]).await;
+    tokio::time::sleep(Duration::from_secs(50)).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string()
+}
+
+/// With one wake left, progress does not spend it and is replaced by the end, which uses it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progress_leaves_the_last_wake_for_the_end() {
+    let raw = reported_end(
+        "chatty",
+        Some("[budget]\nbackground_wakes = 1\n"),
+        "echo a-$((1+1)); sleep 64; echo b-$((1+2))",
+    )
+    .await;
+    assert!(!raw.contains("still running"), "{raw}");
+    assert!(
+        raw.contains("exit code 0") && raw.contains("a-2") && raw.contains("b-3"),
+        "{raw}"
+    );
+}
+
+/// A quiet interval sends no note, so the first turn it starts is its end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiet_background_work_sends_no_progress_note() {
+    let raw = reported_end("quiet", None, "sleep 64; echo q-$((3+4))").await;
+    assert!(!raw.contains("still running"), "{raw}");
+    assert!(raw.contains("exit code 0") && raw.contains("q-7"), "{raw}");
 }
 
 /// A backend killed outright: the command works on, and the next backend reports its output and its end.

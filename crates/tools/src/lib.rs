@@ -2781,6 +2781,9 @@ impl Tool for Grep {
     fn name(&self) -> &str {
         "grep"
     }
+    fn model_view(&self, payload: &Value) -> Option<String> {
+        model_view::grep(payload)
+    }
     fn category(&self) -> ToolCategory {
         ToolCategory::Search
     }
@@ -2797,13 +2800,15 @@ impl Tool for Grep {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax)" },
-                "path": { "type": "string", "description": "Dir to search" },
-                "glob": { "type": "string", "description": "Only these files, e.g. *.rs" },
+                "path": { "type": "string", "description": "Dir" },
+                "glob": { "type": "string", "description": "Only these files" },
                 "hash": { "type": "string", "description": "Search this stored result" },
                 "output_mode": { "type": "string", "enum": ["content", "files", "count"] },
                 "case_insensitive": { "type": "boolean" },
+                "literal": { "type": "boolean" },
+                "hidden": { "type": "boolean" },
                 "context": { "type": "integer", "description": "Lines around each match" },
-                "max_results": { "type": "integer", "description": "Default 200" }
+                "max_results": { "type": "integer" }
             },
             "required": ["pattern"]
         })
@@ -2831,6 +2836,12 @@ impl Tool for Grep {
             .unwrap_or(200) as usize;
         let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
 
+        let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+        let hidden = flag("hidden");
+        let pattern = match flag("literal") {
+            true => regex::escape(&pattern),
+            false => pattern,
+        };
         let re = RegexBuilder::new(&pattern)
             .case_insensitive(ci)
             .build()
@@ -2878,6 +2889,7 @@ impl Tool for Grep {
             let mut error_count = 0usize;
             let walk = WalkBuilder::new(&start)
                 .standard_filters(true)
+                .hidden(!hidden)
                 .filter_entry(|e| !skip_dir(e))
                 .build();
 
@@ -3054,12 +3066,14 @@ fn clip_marked(line: &str, max: usize) -> String {
     s
 }
 
-/// Skip build dirs that may not be gitignored (`.git`/hidden/.medha are already
-/// excluded by `standard_filters`).
+/// Skip build dirs that may not be gitignored, and `.git`/`.medha` even when hidden files are searched.
 fn skip_dir(e: &ignore::DirEntry) -> bool {
     sandbox::is_protected(e.path())
         || (e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-            && matches!(e.file_name().to_str(), Some("target" | "node_modules")))
+            && matches!(
+                e.file_name().to_str(),
+                Some("target" | "node_modules" | ".git" | ".medha")
+            ))
 }
 
 struct Glob {

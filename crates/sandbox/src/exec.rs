@@ -1287,6 +1287,7 @@ pub struct OutputFiles {
 
 /// A chatty server must not fill the disk: past this the file restarts, and memory keeps the start and end.
 const OUTPUT_FILE_CAP: u64 = 64 * 1024 * 1024;
+const OUTPUT_FILE_BEHIND: u64 = 1024 * 1024;
 
 impl OutputFiles {
     /// Appending, so emptying the file at the cap cannot leave the command writing past a hole.
@@ -1308,7 +1309,7 @@ fn follow_output(
     stream: CapturedStream,
     gone: std::sync::Arc<AtomicBool>,
 ) {
-    use std::io::{Read, Seek};
+    use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1329,13 +1330,33 @@ fn follow_output(
                     pair.push(stream, &chunk[..count]);
                 }
                 read += count as u64;
-                if read > OUTPUT_FILE_CAP && file.set_len(0).is_ok() {
-                    let _ = file.rewind();
-                    read = 0;
-                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
+        }
+        let size = file.metadata().map_or(0, |meta| meta.len());
+        if size <= OUTPUT_FILE_CAP {
+            continue;
+        }
+        // The end matters most: skip what is far behind, and empty the file only once caught up.
+        if read >= size {
+            if file.set_len(0).is_ok() {
+                let _ = file.rewind();
+                read = 0;
+            }
+        } else if size - read > OUTPUT_FILE_BEHIND
+            && file
+                .seek(SeekFrom::Start(size - OUTPUT_FILE_BEHIND))
+                .is_ok()
+        {
+            if let Ok(mut pair) = capture.lock() {
+                let skipped = size - OUTPUT_FILE_BEHIND - read;
+                pair.push(
+                    stream,
+                    format!("\n[… {skipped} bytes skipped …]\n").as_bytes(),
+                );
+            }
+            read = size - OUTPUT_FILE_BEHIND;
         }
     }
 }
@@ -1344,6 +1365,14 @@ fn follow_output(
 pub fn process_start(pid: u32) -> Option<String> {
     if cfg!(windows) {
         return None;
+    }
+    // Linux says so directly, and small systems' `ps` has no `lstart`. A zombie has already ended.
+    if cfg!(target_os = "linux") {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+        return (fields.next()? != "Z")
+            .then(|| fields.nth(18).map(str::to_owned))
+            .flatten();
     }
     let out = std::process::Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])

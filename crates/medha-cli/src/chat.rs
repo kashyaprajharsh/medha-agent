@@ -485,6 +485,13 @@ impl PendingGate {
 
 pub(crate) type Pending = Arc<Mutex<HashMap<u64, PendingGate>>>;
 
+/// What a background command has to say that the model has not read yet.
+struct TaskNote {
+    intent_id: String,
+    ended: bool,
+    text: String,
+}
+
 fn lock_pending(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<u64, PendingGate>> {
     pending
         .lock()
@@ -1727,18 +1734,21 @@ where
     let mut outputs = crate::application_artifacts::Following::default();
     // Taking this is what lets commands keep running: this chat will hear them end.
     let mut task_ends = kernel.executor.task_endings();
-    let mut task_notes: Vec<String> = Vec::new();
+    let mut task_notes: Vec<TaskNote> = Vec::new();
     // Turns started by endings since the person last spoke: unattended work must not spend without end.
     let mut task_wakes = 0;
     loop {
-        let wake = !task_notes.is_empty() && task_wakes < kernel.background_wakes();
+        // Progress leaves the last wake free, so a chatty job cannot use up the one for its own end.
+        let wake = task_notes
+            .iter()
+            .any(|note| task_wakes + u32::from(!note.ended) < kernel.background_wakes());
         if !running && (turn_requested || reports_ready || wake) {
             reports_ready = false;
             let mut messages = transcript.clone();
             let noted = wake || (turn_requested && !task_notes.is_empty());
             if noted {
                 messages.extend(task_notes.drain(..).map(|note| {
-                    kernel::Message::new(kernel::Role::User, note)
+                    kernel::Message::new(kernel::Role::User, note.text)
                         .carrying(kernel::TrustLabel::Tool)
                 }));
             }
@@ -2084,8 +2094,11 @@ where
                 match kernel.task_ended(&session, &end).await {
                     Ok(note) => {
                         notice(note.lines().next().unwrap_or_default().to_owned());
-                        task_notes.push(note);
-                        if task_wakes >= kernel.background_wakes() {
+                        // News replaces unread news from the same command: the newest output is what counts.
+                        task_notes.retain(|unread| unread.intent_id != end.intent_id);
+                        let ended = end.result.is_some();
+                        task_notes.push(TaskNote { intent_id: end.intent_id, ended, text: note });
+                        if ended && task_wakes >= kernel.background_wakes() {
                             notice("The model will read this with your next message; background endings have started enough turns on their own.".to_owned());
                         }
                     }

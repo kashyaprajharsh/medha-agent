@@ -12,13 +12,13 @@ pub struct BackgroundTask {
     pub running: bool,
 }
 
-/// A command that was left running has ended.
+/// A command that was left running has ended, or has news on the way there.
 #[derive(Debug, Clone)]
 pub struct TaskEnd {
     /// The call that started it, where its changed files belong.
     pub intent_id: String,
-    /// What the chat records: the task, its exit code and `_checkpoint_files`.
-    pub result: serde_json::Value,
+    /// What the chat records: the task, its exit code and `_checkpoint_files`. `None` while it still runs.
+    pub result: Option<serde_json::Value>,
     /// What the model reads: one line and the end of the output.
     pub note: String,
 }

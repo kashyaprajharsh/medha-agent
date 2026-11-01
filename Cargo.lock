@@ -4070,6 +4070,7 @@ dependencies = [
  "landlock",
  "libc",
  "permissions",
+ "portable-pty",
  "serde_json",
  "sha2",
  "shell-reader",

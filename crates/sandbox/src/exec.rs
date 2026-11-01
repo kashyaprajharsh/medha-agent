@@ -1331,7 +1331,7 @@ pub struct BgProc {
     /// Container lifecycle cancellation, independent of the attached client.
     owned_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Medha's side of the command's terminal, when it was given one.
-    terminal: Option<std::sync::Mutex<std::fs::File>>,
+    terminal: Option<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
 }
 
 impl BgProc {
@@ -1738,6 +1738,10 @@ fn spawn_background_captured(
     resources: Option<CommandResources>,
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
+    #[cfg(windows)]
+    if limits.terminal {
+        return spawn_windows_terminal(cmd, limits, resources);
+    }
     configure_for_spawn(&mut cmd, false, input.is_some());
     #[cfg(unix)]
     let terminal = limits
@@ -1965,7 +1969,126 @@ fn spawn_background_captured(
         code,
         net_flag,
         owned_cancel: None,
-        terminal: terminal.map(Mutex::new),
+        terminal: terminal.map(|file| Mutex::new(Box::new(file) as Box<dyn std::io::Write + Send>)),
+    })
+}
+
+/// A command in a Windows pseudo-console. Windows has no OS sandbox to keep on the command, so the
+/// program, arguments, folder and environment the backend chose are handed to ConPTY as they are.
+#[cfg(windows)]
+fn spawn_windows_terminal(
+    cmd: tokio::process::Command,
+    limits: CaptureLimits,
+    resources: Option<CommandResources>,
+) -> Result<BgProc, ExecError> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::sync::{Arc, Mutex};
+    let spawn_error = |error: String| ExecError::Spawn(error);
+    let command = cmd.as_std();
+    let mut builder = CommandBuilder::new(command.get_program());
+    builder.args(command.get_args());
+    if let Some(folder) = command.get_current_dir() {
+        builder.cwd(folder);
+    }
+    // Only shell.exec asks for a terminal, and it always sets its allowlisted environment in full.
+    builder.env_clear();
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            builder.env(key, value);
+        }
+    }
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| {
+            spawn_error(format!(
+                "no Windows pseudo-console (it needs Windows 10 1809 or later): {error}"
+            ))
+        })?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| spawn_error(error.to_string()))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| spawn_error(error.to_string()))?;
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|error| spawn_error(error.to_string()))?;
+    drop(pair.slave);
+    let pid = child.process_id();
+    let capture: SharedCapture = Arc::new(Mutex::new(CapturePair::new(
+        limits.stdout,
+        limits.stderr,
+        limits.aggregate,
+        false,
+    )));
+    let code = Arc::new(Mutex::new(None));
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    let (read_done, reader_finished) = std::sync::mpsc::channel::<()>();
+    let reading = capture.clone();
+    std::thread::Builder::new()
+        .name("medha-conpty-read".into())
+        .spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(count) = std::io::Read::read(&mut reader, &mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                if let Ok(mut pair) = reading.lock() {
+                    pair.push(CapturedStream::Stdout, &chunk[..count]);
+                }
+            }
+            let _ = read_done.send(());
+        })
+        .map_err(|error| spawn_error(error.to_string()))?;
+    let master = pair.master;
+    let finished_code = code.clone();
+    let notices = capture.clone();
+    std::thread::Builder::new()
+        .name("medha-conpty-supervisor".into())
+        .spawn(move || {
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    Err(_) => break None,
+                }
+            };
+            if let Some(pid) = pid {
+                quiesce_process_tree(pid);
+            }
+            // The reader only sees the end once the console closes, and a stuck one must not hold `done`.
+            drop(master);
+            let _ = reader_finished.recv_timeout(std::time::Duration::from_secs(2));
+            if let Some(notice) = resources.and_then(CommandResources::finish)
+                && let Ok(mut capture) = notices.lock()
+            {
+                capture.push(
+                    CapturedStream::Stderr,
+                    format!("\nMedha: {notice}\n").as_bytes(),
+                );
+            }
+            if let Ok(mut code) = finished_code.lock() {
+                *code = status.map(|status| status.exit_code() as i32);
+            }
+            let _ = done_tx.send(true);
+        })
+        .map_err(|error| spawn_error(error.to_string()))?;
+    Ok(BgProc {
+        pid,
+        capture,
+        done_rx,
+        code,
+        net_flag: None,
+        owned_cancel: None,
+        terminal: Some(Mutex::new(writer)),
     })
 }
 

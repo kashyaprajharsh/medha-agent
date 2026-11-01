@@ -5270,6 +5270,7 @@ struct ShellPlan {
     access: kernel::ExecutionAccess,
     background: bool,
     tty: bool,
+    notify_every: Option<std::time::Duration>,
 }
 
 impl ShellPlan {
@@ -5283,10 +5284,23 @@ impl ShellPlan {
             .get("tty")
             .map_or(Some(false), Value::as_bool)
             .ok_or_else(|| ToolError::Args("tty must be a boolean".into()))?;
-        if tty && (cfg!(windows) || !matches!(sbx.backend_label(), "host" | "native")) {
+        let notify_every = match args.get("notify_every") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(0) => None,
+                Some(seconds) => Some(std::time::Duration::from_secs(
+                    seconds.max(TASK_NOTIFY_MIN_SECS),
+                )),
+                None => {
+                    return Err(ToolError::Args(
+                        "notify_every must be a whole number of seconds".into(),
+                    ));
+                }
+            },
+        };
+        if tty && !matches!(sbx.backend_label(), "host" | "native") {
             return Err(ToolError::Args(
-                "tty is not available here: it needs native or host execution on macOS or Linux"
-                    .into(),
+                "tty is not available here: it needs native or host execution".into(),
             ));
         }
         let timeout_s = args
@@ -5367,6 +5381,7 @@ impl ShellPlan {
             access,
             background,
             tty,
+            notify_every,
         })
     }
 }
@@ -5403,6 +5418,7 @@ const RECENT_SHELL_TASK_TTL: std::time::Duration = std::time::Duration::from_sec
 const MAX_TASK_COMMAND_BYTES: usize = 4096;
 /// The end of each stream carried in the note that a background command finished.
 const TASK_NOTE_OUTPUT: usize = 2_000;
+const TASK_NOTIFY_MIN_SECS: u64 = 60;
 /// How long `until` waits when no `wait_s` is given.
 const TASK_WAIT_DEFAULT_SECS: u64 = 30;
 const NETWORK_DISABLED_HINT: &str = "The active sandbox denies network access. Set network=true to \
@@ -5884,6 +5900,20 @@ impl TaskTable {
         sandbox::exec::wait_done(rx, dur).await
     }
 
+    /// Output after a position, or after the model's last read, leaving that read where it is.
+    fn output_after(
+        &self,
+        id: &str,
+        from: Option<(u64, u64)>,
+    ) -> Option<(String, String, (u64, u64))> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .get(id)
+            .map(|task| task.proc.output_since(from.unwrap_or(task.read)))
+    }
+
     fn done_receiver(&self, id: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
         self.inner
             .lock()
@@ -6083,6 +6113,22 @@ impl RegisteredTask {
     }
 }
 
+/// The end of what a command printed, as a note shows it. Empty when it printed nothing.
+fn task_note_output(stderr: &str, stdout: &str) -> String {
+    let mut output = String::new();
+    for (name, text) in [("stderr", stderr), ("stdout", stdout)] {
+        let text = model_view::clean_terminal(text);
+        if !text.trim().is_empty() {
+            let mut from = text.len().saturating_sub(TASK_NOTE_OUTPUT);
+            while !text.is_char_boundary(from) {
+                from += 1;
+            }
+            output.push_str(&format!("--- {name} ---\n{}\n", &text[from..]));
+        }
+    }
+    output
+}
+
 /// Waits for a command left running to end, then files it and reports it to the chat.
 /// Holds the table weakly: the table stopping every task when its chat ends must still happen.
 async fn report_task_end(
@@ -6092,7 +6138,38 @@ async fn report_task_end(
     id: String,
     intent_id: String,
     backup: Option<Value>,
+    notify_every: Option<std::time::Duration>,
 ) {
+    if let Some(every) = notify_every {
+        let mut from = None;
+        let mut elapsed = 0;
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        loop {
+            tokio::select! {
+                _ = done.wait_for(|finished| *finished) => break,
+                _ = ticks.tick() => {}
+            }
+            elapsed += every.as_secs();
+            let Some(tasks) = tasks.upgrade() else {
+                return;
+            };
+            let Some((stdout, stderr, read)) = tasks.output_after(&id, from) else {
+                return;
+            };
+            from = Some(read);
+            let output = task_note_output(&stderr, &stdout);
+            // A quiet interval is skipped: every note costs a model turn, and status is one read away.
+            if !output.is_empty() {
+                let _ = tasks.endings.send(kernel::TaskEnd {
+                    intent_id: intent_id.clone(),
+                    result: None,
+                    note: format!(
+                        "[background command {id} still running, {elapsed}s in]\n{output}"
+                    ),
+                });
+            }
+        }
+    }
     let _ = done.wait_for(|finished| *finished).await;
     let Some(tasks) = tasks.upgrade() else {
         return;
@@ -6127,23 +6204,14 @@ async fn report_task_end(
         "[background command {id} finished, {exit}]\n$ {}\n",
         task.command
     );
-    for (name, text) in [("stderr", &task.stderr), ("stdout", &task.stdout)] {
-        let text = model_view::clean_terminal(text);
-        if !text.trim().is_empty() {
-            let mut from = text.len().saturating_sub(TASK_NOTE_OUTPUT);
-            while !text.is_char_boundary(from) {
-                from += 1;
-            }
-            note.push_str(&format!("--- {name} ---\n{}\n", &text[from..]));
-        }
-    }
+    note.push_str(&task_note_output(&task.stderr, &task.stdout));
     note.push_str(&format!(
         "Read everything it printed with task.output, task_id \"{id}\", full: true."
     ));
     tasks.remember(id, task);
     let _ = tasks.endings.send(kernel::TaskEnd {
         intent_id,
-        result,
+        result: Some(result),
         note,
     });
 }
@@ -6234,19 +6302,19 @@ impl Tool for ShellExec {
                 "command": { "type": "string", "description": "Command line to run via the shell" },
                 "network": {
                     "type": "boolean",
-                    "description": "True if it needs the network (installs, downloads, git fetch). Asks approval if denied."
+                    "description": "True if it needs the network (installs, git fetch). Asks approval if denied."
                 },
                 "workdir": {
                     "type": "string",
-                    "description": "Working directory, absolute or relative to the workspace. Defaults to the workspace. Outside directories request read access; add write_paths when modifying them."
+                    "description": "Working directory (default: the workspace). Outside directories request read access; add write_paths when modifying them."
                 },
                 "read_paths": {
                     "type": "array", "maxItems": 16, "items": { "type": "string" },
-                    "description": "Existing absolute directories outside the workspace that this command needs to read. Requests native sandbox access before running."
+                    "description": "Existing absolute directories outside the workspace it needs to read. Requests sandbox access before running."
                 },
                 "write_paths": {
                     "type": "array", "maxItems": 16, "items": { "type": "string" },
-                    "description": "Existing absolute directories outside the workspace that this command needs to write (also permits reads). Requests native sandbox access before running."
+                    "description": "Existing absolute directories outside the workspace it needs to write (also permits reads). Requests sandbox access before running."
                 },
                 "outside_sandbox": {
                     "type": "boolean",
@@ -6256,20 +6324,24 @@ impl Tool for ShellExec {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": SHELL_TIMEOUT_MAX_SECS,
-                    "description": "Seconds to wait (default 300, maximum 600). Then it runs on in the background if this chat can report its end; else it stops."
+                    "description": "Seconds to wait (default 300, maximum 600). Then it runs on in the background if this chat can report its end, else stops."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Return at once with a task_id, for a server or watcher. You are told when it ends."
+                    "description": "Return at once with a task_id, for a server or watcher. You hear when it ends."
                 },
                 "tty": {
                     "type": "boolean",
-                    "description": "Give it a terminal; answer with task.control."
+                    "description": "Give it a terminal; use task.control."
+                },
+                "notify_every": {
+                    "type": "integer",
+                    "description": "In the background, report new output every N seconds (min 60)."
                 },
                 "max_output": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Read only the last N bytes of each stream."
+                    "description": "Read only the last N bytes per stream."
                 }
             },
             "required": ["command", "network"]
@@ -6387,6 +6459,7 @@ impl Tool for ShellExec {
                     id,
                     kernel::call_id().unwrap_or_default(),
                     backup,
+                    plan.notify_every,
                 ));
             }
             return Ok(payload);
@@ -6640,11 +6713,16 @@ impl Tool for TaskControl {
             }
             Some(op @ ("write" | "submit" | "close")) => {
                 let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
-                // Enter, and the end-of-input key, as a terminal sends them.
+                // Enter and end of input as each system's terminal sends them: a console takes CR and Ctrl+Z.
+                let (enter, end) = if cfg!(windows) {
+                    ("\r", "\u{1a}\r")
+                } else {
+                    ("\n", "\u{4}")
+                };
                 let typed = match op {
                     "write" => text.to_owned(),
-                    "submit" => format!("{text}\n"),
-                    _ => "\u{4}".to_owned(),
+                    "submit" => format!("{text}{enter}"),
+                    _ => end.to_owned(),
                 };
                 self.tasks
                     .type_into(&id, typed.as_bytes())

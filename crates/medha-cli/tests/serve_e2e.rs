@@ -2310,6 +2310,54 @@ async fn a_background_command_returns_at_once_and_its_end_reaches_the_model() {
     );
 }
 
+/// A long job asked to report on the way wakes the model with what it printed, then its end still does.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_background_command_reports_its_progress_and_still_its_end() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("progress");
+    let chat = client.open(&folder).await;
+    let start = json!({
+        // Printed values the command text does not contain, so only real output can match.
+        "command": "echo first-$((1+1)); sleep 66; echo last-$((2+1))",
+        "network": false,
+        "background": true,
+        "notify_every": 1,
+    });
+    client
+        .send(&chat, &format!("SCRIPT\nshell_exec {start}"))
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    // Too small an interval is raised to the minute: the first report comes at 60 s, not after 1 s.
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(50)).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(started.elapsed().as_secs() >= 55, "{:?}", started.elapsed());
+    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(
+        raw.contains("still running") && raw.contains("first-2"),
+        "{raw}"
+    );
+    assert!(!raw.contains("last-3"), "{raw}");
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(
+        raw.contains("exit code 0") && raw.contains("last-3"),
+        "{raw}"
+    );
+}
+
 /// `until` returns at a server's ready line, a command past its wait keeps going, and rewind restores what they wrote.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2576,6 +2624,48 @@ async fn the_person_can_send_a_running_command_to_the_background() {
     assert!(
         last["messages"].to_string().contains("sent-back-done"),
         "{last}"
+    );
+}
+
+/// On Windows a program reads a typed answer through the console. Encoded so any shell passes it unchanged:
+/// `$x = Read-Host; Write-Output "got-$x"`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_windows_program_in_a_console_reads_what_is_typed() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("console");
+    let chat = client.open(&folder).await;
+    let command = "powershell -NoProfile -EncodedCommand JAB4ACAAPQAgAFIAZQBhAGQALQBIAG8AcwB0ADsAIABXAHIAaQB0AGUALQBPAHUAdABwAHUAdAAgACIAZwBvAHQALQAkAHgAIgA=";
+    let start = json!({"command": command, "network": false, "background": true, "tty": true});
+    let typed = json!({"op": "submit", "task_id": "t1", "text": "hello"});
+    client
+        .send(
+            &chat,
+            &format!("SCRIPT\nshell_exec {start}\ntask_control {typed}"),
+        )
+        .await;
+    let mut seen = String::new();
+    loop {
+        let (_, frame) = client
+            .until(|frame| frame["method"] == "approval" || kind(frame, "turn.done"))
+            .await;
+        if frame["method"] == "approval" {
+            let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+            client.ask("approval.respond", Some(&chat), gate).await;
+            continue;
+        }
+        while let Ok(request) = world.provider.seen.try_recv() {
+            seen.push_str(&request["messages"].to_string());
+        }
+        if seen.contains("[background command t1") {
+            break;
+        }
+    }
+    assert!(
+        seen.contains("got-hello"),
+        "the typed line reached it: {seen}"
     );
 }
 

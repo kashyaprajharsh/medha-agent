@@ -1,4 +1,5 @@
 //! Reading a large file or a stored result to its end on a small model only ever pages: no page is stored again.
+#![cfg(unix)]
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -104,7 +105,6 @@ impl ContextEngine for Passthrough {
 struct NoopSink;
 impl StreamSink for NoopSink {}
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_small_model_pages_files_and_stored_results_to_the_end_without_storing_a_page() {
     // 8,000 tokens lands on the smallest result limit; 128,000 on the largest.
@@ -113,7 +113,6 @@ async fn a_small_model_pages_files_and_stored_results_to_the_end_without_storing
     }
 }
 
-#[cfg(unix)]
 async fn read_all(window: u32) {
     let dir = test_support::scratch("medha-paging-e2e");
     let workspace = dir.join("workspace");

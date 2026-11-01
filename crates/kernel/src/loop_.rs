@@ -1161,13 +1161,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         session: &Session,
         end: &crate::executor::TaskEnd,
     ) -> Result<String, KernelError> {
-        self.log
-            .append(Event::task_ended(
-                session,
-                &end.intent_id,
-                end.result.clone(),
-            ))
-            .await?;
+        if let Some(result) = &end.result {
+            self.log
+                .append(Event::task_ended(session, &end.intent_id, result.clone()))
+                .await?;
+        }
         let note = self.secrets.redact(&end.note).into_owned();
         Ok(self.egress.redact(&note).into_owned())
     }

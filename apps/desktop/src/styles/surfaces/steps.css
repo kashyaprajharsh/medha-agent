@@ -291,3 +291,9 @@ button.step-target code {
     display: none;
   }
 }
+.step-background {
+  flex: none;
+  min-height: 26px;
+  padding: 2px 10px;
+  font-size: var(--text-xs);
+}

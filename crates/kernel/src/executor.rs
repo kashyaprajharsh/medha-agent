@@ -170,6 +170,11 @@ pub trait Executor: Send + Sync {
         None
     }
 
+    /// The person asks that a running command stop holding its call; false when none is waiting.
+    fn send_to_background(&self) -> bool {
+        false
+    }
+
     /// Whether an image can reach the model (it reads them, or one is described
     /// for it); image-only tools decline when it cannot. Default: ignored.
     fn images_reach_model(&self, _reach: bool) {}

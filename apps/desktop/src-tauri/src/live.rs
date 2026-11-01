@@ -29,6 +29,7 @@ const REQUESTS: &[&str] = &[
     "message.send",
     "approval.respond",
     "cancel",
+    "task.background",
     "session.settings",
     "session.presentation",
     "session.configure",

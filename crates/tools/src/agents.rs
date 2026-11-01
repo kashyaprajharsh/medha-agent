@@ -113,6 +113,9 @@ impl kernel::Executor for Rebound {
     fn task_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>> {
         self.inner.task_endings()
     }
+    fn send_to_background(&self) -> bool {
+        self.inner.send_to_background()
+    }
 
     async fn prepare_effect(
         &self,

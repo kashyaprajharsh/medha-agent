@@ -53,6 +53,9 @@ fn summary(name: &str, out: &Value) -> Option<String> {
         ""
     };
     match name {
+        "shell.exec" if out.get("status").and_then(Value::as_str) == Some("running") => {
+            Some("Running in background".to_owned())
+        }
         "shell.exec" | "git" => out
             .get("exit_code")
             .and_then(Value::as_i64)

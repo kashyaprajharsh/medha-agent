@@ -2539,6 +2539,46 @@ async fn the_model_reads_less_when_it_asks_and_endings_stop_waking_it_after_thre
     );
 }
 
+/// The person can send a running command to the background: its call returns and the model goes on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_person_can_send_a_running_command_to_the_background() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("send-back");
+    let chat = client.open(&folder).await;
+    client
+        .send(
+            &chat,
+            "RUN `touch started; while [ ! -e go ]; do sleep 0.1; done; echo sent-back-done`",
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    while !folder.join("started").exists() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let sent = client.ask("task.background", Some(&chat), json!({})).await;
+    assert_eq!(sent["result"]["accepted"], true, "{sent}");
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    assert_eq!(
+        observed["params"]["payload"]["status"], "running",
+        "{observed}"
+    );
+    client.until(|frame| kind(frame, "turn.done")).await;
+    std::fs::write(folder.join("go"), "").unwrap();
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    assert!(
+        last["messages"].to_string().contains("sent-back-done"),
+        "{last}"
+    );
+}
+
 /// Quiet useful work after a failed optional lookup is not killed: it finishes and reports its end.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1299,6 +1299,12 @@ impl Executor for ToolRegistry {
         self.tasks.as_ref().and_then(|tasks| tasks.take_endings())
     }
 
+    fn send_to_background(&self) -> bool {
+        self.tasks
+            .as_ref()
+            .is_some_and(|tasks| tasks.send_to_background())
+    }
+
     fn images_reach_model(&self, reach: bool) {
         self.images_reach_model
             .store(reach, std::sync::atomic::Ordering::Relaxed);
@@ -5371,6 +5377,8 @@ enum ShellWait {
     /// Blocked on the network and no longer making progress.
     NetStalled,
     Deadline,
+    /// The person sent it to the background.
+    Released,
 }
 
 /// A process retains at most 1.5 MB across stdout/stderr in `sandbox::exec`.
@@ -5430,6 +5438,29 @@ struct TaskTable {
     endings: tokio::sync::mpsc::UnboundedSender<kernel::TaskEnd>,
     /// Until a chat takes this, nobody would hear a task end, so commands are not left running.
     endings_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>>>,
+    /// Foreground waits now running, and the signal that ends them when the person asks.
+    waiting: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+/// Counts one foreground wait for as long as it lasts, including when its future is dropped.
+struct ForegroundWait<'a>(&'a TaskTable);
+
+impl<'a> ForegroundWait<'a> {
+    fn new(tasks: &'a TaskTable) -> Self {
+        tasks
+            .waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(tasks)
+    }
+}
+
+impl Drop for ForegroundWait<'_> {
+    fn drop(&mut self) {
+        self.0
+            .waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -5562,7 +5593,19 @@ impl TaskTable {
             limits,
             endings,
             endings_rx: std::sync::Mutex::new(Some(endings_rx)),
+            waiting: Default::default(),
+            release: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Ends every foreground wait, leaving its command running; false when none is waiting.
+    fn send_to_background(&self) -> bool {
+        let waiting = self.waiting.load(std::sync::atomic::Ordering::SeqCst) > 0;
+        if waiting && self.attended() {
+            self.release.notify_waiters();
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -6269,16 +6312,18 @@ impl Tool for ShellExec {
         let waited = match background {
             true => ShellWait::Deadline,
             false => {
-                self.tasks
-                    .watch_until(registered.id(), deadline, denies_network)
-                    .await
+                let _waiting = ForegroundWait::new(&self.tasks);
+                tokio::select! {
+                    waited = self.tasks.watch_until(registered.id(), deadline, denies_network) => waited,
+                    () = self.tasks.release.notified() => ShellWait::Released,
+                }
             }
         };
         // Stop waiting and let the model go on; a browser never ends, so it is still stopped.
         let stalled = matches!(waited, ShellWait::NetStalled);
         if !matches!(waited, ShellWait::Finished)
             && attended
-            && !shell_hints::launches_browser(&command)
+            && (matches!(waited, ShellWait::Released) || !shell_hints::launches_browser(&command))
         {
             let id = registered.id().to_owned();
             let done = self.tasks.done_receiver(&id);
@@ -6293,6 +6338,11 @@ impl Tool for ShellExec {
                 true => "Started in the background; you will be told when it ends. Go on with other work; task.output reads it, task.control stops it.".to_owned(),
                 false => format!("Still running after {timeout_s}s, so it keeps going in the background; you will be told when it ends. task.output reads it, task.control stops it."),
             });
+            if matches!(waited, ShellWait::Released) {
+                payload["note"] = json!(
+                    "The person sent this to the background; you will be told when it ends. Go on with other work; task.output reads it, task.control stops it."
+                );
+            }
             let backup = (!lanes::shell_only_reads(&command))
                 .then(|| checkpoints::backup(&self.sbx))
                 .flatten();

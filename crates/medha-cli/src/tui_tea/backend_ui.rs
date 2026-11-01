@@ -139,6 +139,7 @@ pub(super) enum Effect {
     Question(protocol::AnswerQuestion),
     Cancel,
     Abort,
+    SendToBackground,
     Agent(protocol::AgentCommand, Option<String>),
     Discover(protocol::DiscoverModels),
     /// Look for a server on this computer; it not answering is not an error.
@@ -237,6 +238,7 @@ impl Effect {
                 | Self::Question(_)
                 | Self::Cancel
                 | Self::Abort
+                | Self::SendToBackground
                 | Self::Snapshot
                 | Self::Agent(protocol::AgentCommand::Stop { .. }, _)
                 | Self::SessionChange(protocol::SessionChange::StopAgents, _)
@@ -635,6 +637,10 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             .map(Answer::Cancelled),
         Effect::Abort => connection
             .call_chat(&chat, &protocol::AbortTurn {})
+            .await
+            .map(Answer::Accepted),
+        Effect::SendToBackground => connection
+            .call_chat(&chat, &protocol::SendToBackground {})
             .await
             .map(Answer::Accepted),
         Effect::Agent(p, _) => connection.call_chat(&chat, p).await.map(Answer::Accepted),

@@ -1660,7 +1660,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         " · stream off"
     };
     let hints = if model.running {
-        "esc interrupt"
+        "esc interrupt · ctrl-b background"
     } else {
         "/reasoning · /detail · /help"
     };

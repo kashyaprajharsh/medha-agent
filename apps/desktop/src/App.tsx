@@ -311,6 +311,16 @@ export function App() {
     window.addEventListener("medha-change", show);
     return () => window.removeEventListener("medha-change", show);
   }, [context.active]);
+  useEffect(() => {
+    const send = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspace: string }>).detail;
+      if (detail.workspace !== context.workspace.id || !context.active) return;
+      if (currentKey)
+        void api.liveCall(currentKey, "task.background").catch(() => undefined);
+    };
+    window.addEventListener("medha-background", send);
+    return () => window.removeEventListener("medha-background", send);
+  }, [api, context.active, currentKey]);
   useEffect(
     () => () => {
       if (peekTimer.current) clearTimeout(peekTimer.current);

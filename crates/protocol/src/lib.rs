@@ -575,6 +575,7 @@ pub struct AnswerApproval {
 }
 command!(AnswerApproval, "approval.respond", Chat, Accepted);
 empty_command!(AbortTurn, "turn.abort", Chat, Accepted);
+empty_command!(SendToBackground, "task.background", Chat, Accepted);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Answer {

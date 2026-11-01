@@ -130,6 +130,7 @@ export type LiveMethod =
   | "message.send"
   | "approval.respond"
   | "cancel"
+  | "task.background"
   | "session.settings"
   | "session.presentation"
   | "session.configure"

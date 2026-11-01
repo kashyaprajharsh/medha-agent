@@ -320,6 +320,15 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
         return;
     }
 
+    // The running command keeps going without holding its call, so the model can go on.
+    if key.code == KeyCode::Char('b')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && model.running
+    {
+        super::backend_ui::request(model, super::backend_ui::Effect::SendToBackground);
+        return;
+    }
+
     // With no modal owner, Esc gracefully cancels the turn rather than a prompt.
     if key.code == KeyCode::Esc && model.running {
         cancel_foreground(model);

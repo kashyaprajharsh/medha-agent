@@ -1938,6 +1938,10 @@ where
                         }
                         continue;
                     }
+                    if method == "task.background" {
+                        rpc_result(&writer, &request.get("id").cloned(), json!({"accepted": kernel.executor.send_to_background()}));
+                        continue;
+                    }
                     if method == "turn.abort" {
                         rpc_result(&writer, &request.get("id").cloned(), json!({"accepted": control.abort()}));
                         continue;

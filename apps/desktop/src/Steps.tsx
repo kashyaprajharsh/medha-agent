@@ -200,6 +200,21 @@ const StepRow = memo(
           <span className={`step-meta ${bad ? "bad" : ""}`}>
             {stepStatusLabel(step)}
           </span>
+          {step.status === "running" && step.tool === "shell.exec" && (
+            <button
+              className="btn-line step-background"
+              type="button"
+              onClick={() =>
+                window.dispatchEvent(
+                  new CustomEvent("medha-background", {
+                    detail: { workspace: context.workspace.id },
+                  }),
+                )
+              }
+            >
+              Run in background
+            </button>
+          )}
           <span className="step-dur">
             {took !== undefined && step.started !== undefined
               ? seconds(took - step.started)

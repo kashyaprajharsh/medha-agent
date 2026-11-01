@@ -829,6 +829,7 @@ pub struct ToolRegistry {
     /// Shared owned-process table giving cancellation a stable process-tree kill
     /// handle, plus a bounded TTL/LRU cache of recent settled output.
     tasks: Option<Arc<TaskTable>>,
+    task_records: Option<std::path::PathBuf>,
     /// Live web-search configuration shared with the `web.*` tools. The TUI's
     /// `/search` writes it; the tools read it per call, so a provider change
     /// takes effect mid-session. Defaults to keyless DuckDuckGo.
@@ -863,6 +864,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             sandbox: None,
             tasks: None,
+            task_records: None,
             search: Arc::new(Mutex::new(SearchSettings::default())),
             clarify: Arc::new(Mutex::new(None)),
             lsp: Arc::new(Mutex::new(None)),
@@ -1006,6 +1008,11 @@ impl ToolRegistry {
             stale_after_days,
         )));
         self
+    }
+
+    /// The folder under which each chat keeps a record of the commands it left running.
+    pub fn keep_task_records_in(&mut self, root: std::path::PathBuf) {
+        self.task_records = Some(root);
     }
 
     pub fn register_session_search(
@@ -1295,8 +1302,16 @@ impl Executor for ToolRegistry {
         self.tasks.as_ref().map(|t| t.info()).unwrap_or_default()
     }
 
-    fn task_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>> {
-        self.tasks.as_ref().and_then(|tasks| tasks.take_endings())
+    fn task_endings(
+        &self,
+        session: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<kernel::TaskEnd>> {
+        let tasks = self.tasks.as_ref()?;
+        let endings = tasks.take_endings()?;
+        if let (Some(root), Some(sbx)) = (&self.task_records, &self.sandbox) {
+            tasks.resume_running(root.join(session), sbx.clone());
+        }
+        Some(endings)
     }
 
     fn send_to_background(&self) -> bool {
@@ -5469,6 +5484,27 @@ struct TaskTable {
     /// Foreground waits now running, and the signal that ends them when the person asks.
     waiting: std::sync::atomic::AtomicUsize,
     release: tokio::sync::Notify,
+    /// This chat's folder for commands left running. Set only when a chat listens for their ends.
+    records: std::sync::OnceLock<std::path::PathBuf>,
+}
+
+/// What the watcher of a background command needs to know to report it.
+struct TaskReport {
+    id: String,
+    intent_id: String,
+    backup: Option<Value>,
+    notify_every: Option<std::time::Duration>,
+    origin: TaskOrigin,
+}
+
+/// How a background command came to be reported.
+#[derive(Clone, Copy)]
+enum TaskOrigin {
+    Started,
+    /// An earlier backend started it, and it was still alive when this one looked.
+    FoundRunning,
+    /// An earlier backend started it, and it had stopped by the time this one looked.
+    FoundStopped,
 }
 
 /// Counts one foreground wait for as long as it lasts, including when its future is dropped.
@@ -5623,6 +5659,7 @@ impl TaskTable {
             endings_rx: std::sync::Mutex::new(Some(endings_rx)),
             waiting: Default::default(),
             release: tokio::sync::Notify::new(),
+            records: Default::default(),
         }
     }
 
@@ -5646,6 +5683,136 @@ impl TaskTable {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    fn output_files(&self, id: &str) -> Option<sandbox::exec::OutputFiles> {
+        let dir = self.records.get()?;
+        Some(sandbox::exec::OutputFiles {
+            stdout: dir.join(format!("{id}.out")),
+            stderr: dir.join(format!("{id}.err")),
+        })
+    }
+
+    /// Notes a command left running, so a later backend can find it again or say that it stopped.
+    fn remember_running(
+        &self,
+        id: &str,
+        intent_id: &str,
+        backup: Option<&Value>,
+        notify_every: Option<std::time::Duration>,
+    ) {
+        let Some(dir) = self.records.get() else {
+            return;
+        };
+        let (command, pid) = {
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(task) = state.active.get(id) else {
+                return;
+            };
+            (task.command.clone(), task.proc.pid())
+        };
+        let record = json!({
+            "id": id,
+            "command": command,
+            "pid": pid,
+            "started": pid.and_then(sandbox::exec::process_start),
+            "intent_id": intent_id,
+            "backup": backup,
+            "notify_every": notify_every.map(|every| every.as_secs()),
+        });
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        // Best effort: with no record the command still runs and reports; only a restart loses track of it.
+        let _ = options
+            .open(dir.join(format!("{id}.json")))
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, record.to_string().as_bytes())
+            });
+    }
+
+    fn forget_running(&self, id: &str) {
+        let Some(dir) = self.records.get() else {
+            return;
+        };
+        for extension in ["json", "out", "err"] {
+            let _ = std::fs::remove_file(dir.join(format!("{id}.{extension}")));
+        }
+    }
+
+    /// Picks up what an earlier backend left in this chat's folder. One path for a crash and a normal
+    /// stop: a command still alive is followed to its end, and one that is gone is reported now.
+    fn resume_running(self: &Arc<Self>, dir: std::path::PathBuf, sbx: Arc<WorkspaceSandbox>) {
+        // Without the folder, commands use pipes as before and are simply not tracked across a restart.
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let _ = self.records.set(dir.clone());
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Some(record) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            else {
+                continue;
+            };
+            let Some(id) = record["id"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(number) = id.strip_prefix('t').and_then(|n| n.parse().ok()) {
+                self.seq
+                    .fetch_max(number, std::sync::atomic::Ordering::Relaxed);
+            }
+            let pid = record["pid"].as_u64().map(|pid| pid as u32);
+            let started = record["started"].as_str().unwrap_or_default();
+            let alive = pid.and_then(sandbox::exec::process_start).as_deref() == Some(started)
+                && !started.is_empty();
+            let output = self.output_files(&id).filter(|files| files.stdout.exists());
+            // With no process to watch, this ends at once, once what it wrote has been read.
+            let proc =
+                sandbox::exec::BgProc::found_again(pid.unwrap_or(0), started, output.as_ref());
+            let done = proc.done_receiver();
+            let command = record["command"].as_str().unwrap_or_default().to_owned();
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                .insert(
+                    id.clone(),
+                    TaskEntry {
+                        proc,
+                        command,
+                        read: (0, 0),
+                    },
+                );
+            tokio::spawn(report_task_end(
+                Arc::downgrade(self),
+                done,
+                sbx.clone(),
+                TaskReport {
+                    id,
+                    intent_id: record["intent_id"].as_str().unwrap_or_default().to_owned(),
+                    backup: Some(record["backup"].clone()).filter(|backup| !backup.is_null()),
+                    notify_every: record["notify_every"]
+                        .as_u64()
+                        .map(std::time::Duration::from_secs),
+                    origin: match alive {
+                        true => TaskOrigin::FoundRunning,
+                        false => TaskOrigin::FoundStopped,
+                    },
+                },
+            ));
+        }
     }
 
     /// Whether a chat is listening, so a command left running will be heard ending.
@@ -6135,11 +6302,15 @@ async fn report_task_end(
     tasks: std::sync::Weak<TaskTable>,
     mut done: tokio::sync::watch::Receiver<bool>,
     sbx: Arc<WorkspaceSandbox>,
-    id: String,
-    intent_id: String,
-    backup: Option<Value>,
-    notify_every: Option<std::time::Duration>,
+    report: TaskReport,
 ) {
+    let TaskReport {
+        id,
+        intent_id,
+        backup,
+        notify_every,
+        origin,
+    } = report;
     if let Some(every) = notify_every {
         let mut from = None;
         let mut elapsed = 0;
@@ -6163,6 +6334,7 @@ async fn report_task_end(
                 let _ = tasks.endings.send(kernel::TaskEnd {
                     intent_id: intent_id.clone(),
                     result: None,
+                    wake: true,
                     note: format!(
                         "[background command {id} still running, {elapsed}s in]\n{output}"
                     ),
@@ -6171,9 +6343,11 @@ async fn report_task_end(
         }
     }
     let _ = done.wait_for(|finished| *finished).await;
+    // A table gone means this chat ended, and its record stays for the chat to be told when reopened.
     let Some(tasks) = tasks.upgrade() else {
         return;
     };
+    tasks.forget_running(&id);
     let Some(entry) = tasks.take(&id) else {
         return;
     };
@@ -6200,10 +6374,16 @@ async fn report_task_end(
         .map_or("no exit code, it was stopped".to_owned(), |code| {
             format!("exit code {code}")
         });
-    let mut note = format!(
-        "[background command {id} finished, {exit}]\n$ {}\n",
-        task.command
-    );
+    let headline = match origin {
+        TaskOrigin::Started => format!("[background command {id} finished, {exit}]"),
+        TaskOrigin::FoundRunning => format!(
+            "[background command {id} finished, exit code unknown: Medha restarted while it ran]"
+        ),
+        TaskOrigin::FoundStopped => format!(
+            "[background command {id} is not running any more: it stopped when Medha last stopped or while Medha was down, so its work may be unfinished. Exit code unknown]"
+        ),
+    };
+    let mut note = format!("{headline}\n$ {}\n", task.command);
     note.push_str(&task_note_output(&task.stderr, &task.stdout));
     note.push_str(&format!(
         "Read everything it printed with task.output, task_id \"{id}\", full: true."
@@ -6212,6 +6392,8 @@ async fn report_task_end(
     let _ = tasks.endings.send(kernel::TaskEnd {
         intent_id,
         result: Some(result),
+        // Opening an old chat must not start a paid turn on its own.
+        wake: !matches!(origin, TaskOrigin::FoundStopped),
         note,
     });
 }
@@ -6400,9 +6582,16 @@ impl Tool for ShellExec {
         // can't exfiltrate them via `printenv`. The process is its own group
         // leader, so timeout, cancellation, or `task.kill` tears down the whole
         // tree.
-        let bg = match tty {
-            true => invocation.spawn_with_terminal(),
-            false => invocation.spawn_background(),
+        // A pipe dies with the backend, so a command meant to run on writes to files. A container has its own lifetime.
+        let output = reservation
+            .id
+            .as_deref()
+            .filter(|_| background && matches!(self.sbx.backend_label(), "host" | "native"))
+            .and_then(|id| self.tasks.output_files(id));
+        let bg = match (tty, output) {
+            (true, _) => invocation.spawn_with_terminal(),
+            (false, Some(output)) => invocation.spawn_with_output(output),
+            (false, None) => invocation.spawn_background(),
         }
         .map_err(|e| ToolError::Failed(e.to_string()))?;
 
@@ -6452,18 +6641,28 @@ impl Tool for ShellExec {
                 .then(|| checkpoints::backup(&self.sbx))
                 .flatten();
             if let (Some(done), Some(id)) = (done, registered.release()) {
+                self.tasks.remember_running(
+                    &id,
+                    &kernel::call_id().unwrap_or_default(),
+                    backup.as_ref(),
+                    plan.notify_every,
+                );
                 tokio::spawn(report_task_end(
                     Arc::downgrade(&self.tasks),
                     done,
                     Arc::clone(&self.sbx),
-                    id,
-                    kernel::call_id().unwrap_or_default(),
-                    backup,
-                    plan.notify_every,
+                    TaskReport {
+                        id,
+                        intent_id: kernel::call_id().unwrap_or_default(),
+                        backup,
+                        notify_every: plan.notify_every,
+                        origin: TaskOrigin::Started,
+                    },
                 ));
             }
             return Ok(payload);
         }
+        self.tasks.forget_running(registered.id());
         if let ShellWait::Finished = waited {
             let (task_id, entry) = registered
                 .take()

@@ -1726,30 +1726,30 @@ impl<'a> ExecInvocation<'a> {
     }
 
     pub fn spawn_background(&self) -> Result<crate::exec::BgProc, ExecError> {
-        if self.outside_sandbox && self.sandbox.exec.requires_strict_cleanup() {
-            return Err(ExecError::Unavailable(
-                "strict cleanup cannot run a command outside its container".into(),
-            ));
-        }
-        self.backend().spawn_owned(
-            &self.request,
-            self.working_dir.as_deref(),
-            exec::CaptureLimits::standard(),
-        )
+        self.spawn_limited(exec::CaptureLimits::standard())
     }
 
     /// `spawn_background` with a pseudo-terminal for the command, on the same sandboxed command.
     pub fn spawn_with_terminal(&self) -> Result<crate::exec::BgProc, ExecError> {
+        self.spawn_limited(exec::CaptureLimits::standard().with_terminal())
+    }
+
+    /// `spawn_background` with its output kept in files, on the same sandboxed command.
+    pub fn spawn_with_output(
+        &self,
+        output: exec::OutputFiles,
+    ) -> Result<crate::exec::BgProc, ExecError> {
+        self.spawn_limited(exec::CaptureLimits::standard().with_output(output))
+    }
+
+    fn spawn_limited(&self, limits: exec::CaptureLimits) -> Result<crate::exec::BgProc, ExecError> {
         if self.outside_sandbox && self.sandbox.exec.requires_strict_cleanup() {
             return Err(ExecError::Unavailable(
                 "strict cleanup cannot run a command outside its container".into(),
             ));
         }
-        self.backend().spawn_owned(
-            &self.request,
-            self.working_dir.as_deref(),
-            exec::CaptureLimits::standard().with_terminal(),
-        )
+        self.backend()
+            .spawn_owned(&self.request, self.working_dir.as_deref(), limits)
     }
 
     pub fn with_working_dir(mut self, dir: PathBuf) -> Self {

@@ -2310,6 +2310,114 @@ async fn a_background_command_returns_at_once_and_its_end_reaches_the_model() {
     );
 }
 
+/// A backend killed outright: the command works on, and the next backend reports its output and its end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_outlives_a_crashed_backend_and_its_end_still_reaches_the_model() {
+    let world = World::new();
+    let folder = world.folder("crash");
+    let chat = {
+        let backend = world.backend();
+        let mut client = backend.connect().await;
+        let chat = client.open(&folder).await;
+        // Printed values the command text does not contain, so only real output can match.
+        client
+            .send(
+                &chat,
+                "BACKGROUND `echo before-$((1+1)); sleep 8; echo after-$((2+1)); echo made > made.txt`",
+            )
+            .await;
+        let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+        let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+        client.ask("approval.respond", Some(&chat), gate).await;
+        client.until(|frame| kind(frame, "turn.done")).await;
+        chat
+    };
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let resumed = client.create(&folder, Some(&chat)).await;
+    let head = resumed["result"]["head"].as_u64().unwrap();
+    client
+        .ask("session.attach", Some(&chat), json!({"after": head}))
+        .await;
+    // Nobody sends a message: the end itself starts the turn.
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(folder.join("made.txt").exists());
+    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(raw.contains("exit code unknown"), "{raw}");
+    assert!(raw.contains("before-2") && raw.contains("after-3"), "{raw}");
+}
+
+/// A backend asked to stop leaves nothing running, and the model hears so with the next message.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_normal_stop_ends_the_command_and_the_reopened_chat_is_told() {
+    let world = World::new();
+    let folder = world.folder("stop");
+    let chat = {
+        let mut backend = world.backend();
+        let mut client = backend.connect().await;
+        let chat = client.open(&folder).await;
+        client
+            .send(&chat, "BACKGROUND `echo $$ > pid.txt; exec sleep 987`")
+            .await;
+        let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+        let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+        client.ask("approval.respond", Some(&chat), gate).await;
+        client.until(|frame| kind(frame, "turn.done")).await;
+        while !folder.join("pid.txt").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stopped = Command::new("kill")
+            .args(["-TERM", &backend.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(stopped.success());
+        backend.child.wait().unwrap();
+        chat
+    };
+    let pid = std::fs::read_to_string(folder.join("pid.txt")).unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive() {
+        assert!(
+            Instant::now() < deadline,
+            "the command outlived a normal stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    while world.provider.seen.try_recv().is_ok() {}
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let resumed = client.create(&folder, Some(&chat)).await;
+    let head = resumed["result"]["head"].as_u64().unwrap();
+    client
+        .ask("session.attach", Some(&chat), json!({"after": head}))
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        world.provider.seen.try_recv().is_err(),
+        "reopening a chat must not start a paid turn"
+    );
+    client.send(&chat, "go on").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .next()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(raw.contains("not running any more"), "{raw}");
+}
+
 /// A long job asked to report on the way wakes the model with what it printed, then its end still does.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

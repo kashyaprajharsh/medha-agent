@@ -175,6 +175,7 @@ pub async fn start(
     )
     .await?;
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
+    registry.keep_task_records_in(state.join("tasks"));
     let lsp_manager = services::language_servers(&setup, &sbx_cfg, &mut registry);
     let services::Mcp {
         mcp_manager,

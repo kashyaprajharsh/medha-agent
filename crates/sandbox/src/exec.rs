@@ -1231,13 +1231,15 @@ impl CapturePair {
 
 type SharedCapture = std::sync::Arc<std::sync::Mutex<CapturePair>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CaptureLimits {
     stdout: usize,
     stderr: usize,
     aggregate: usize,
     /// Give the command a pseudo-terminal instead of pipes.
     terminal: bool,
+    /// Send its output to files, which outlive the backend as pipes do not.
+    output: Option<std::sync::Arc<OutputFiles>>,
 }
 
 impl CaptureLimits {
@@ -1247,6 +1249,7 @@ impl CaptureLimits {
             stderr: EXEC_STDERR_CAP,
             aggregate: EXEC_AGGREGATE_CAP,
             terminal: false,
+            output: None,
         }
     }
 
@@ -1257,13 +1260,151 @@ impl CaptureLimits {
         }
     }
 
+    pub fn with_output(self, output: OutputFiles) -> Self {
+        Self {
+            output: Some(std::sync::Arc::new(output)),
+            ..self
+        }
+    }
+
     fn combined(bytes: usize) -> Self {
         Self {
             stdout: bytes,
             stderr: bytes,
             aggregate: bytes,
             terminal: false,
+            output: None,
         }
+    }
+}
+
+/// Where a command's output is kept while it runs.
+#[derive(Clone)]
+pub struct OutputFiles {
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+}
+
+/// A chatty server must not fill the disk: past this the file restarts, and memory keeps the start and end.
+const OUTPUT_FILE_CAP: u64 = 64 * 1024 * 1024;
+
+impl OutputFiles {
+    /// Appending, so emptying the file at the cap cannot leave the command writing past a hole.
+    fn writer(path: &Path) -> Result<std::fs::File, ExecError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
+            .open(path)
+            .map_err(|error| ExecError::Spawn(format!("{}: {error}", path.display())))
+    }
+}
+
+/// Copies a growing output file into the capture until the command is gone and the file is read.
+fn follow_output(
+    path: PathBuf,
+    capture: SharedCapture,
+    stream: CapturedStream,
+    gone: std::sync::Arc<AtomicBool>,
+) {
+    use std::io::{Read, Seek};
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    let mut read = 0u64;
+    loop {
+        // Checked before the read: nothing is missed when that read then finds the end.
+        let ended = gone.load(Ordering::Acquire);
+        match file.read(&mut chunk) {
+            Ok(0) if ended => break,
+            Ok(0) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Ok(count) => {
+                if let Ok(mut pair) = capture.lock() {
+                    pair.push(stream, &chunk[..count]);
+                }
+                read += count as u64;
+                if read > OUTPUT_FILE_CAP && file.set_len(0).is_ok() {
+                    let _ = file.rewind();
+                    read = 0;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// When a process started, to tell it from a later one given the same number. `None` when it is gone.
+pub fn process_start(pid: u32) -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let started = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !started.is_empty()).then_some(started)
+}
+
+impl BgProc {
+    /// A command an earlier backend started, found again. It is not this process's child, so it
+    /// has no exit code, and a process that is gone or is someone else's now is never signalled.
+    pub fn found_again(pid: u32, started: &str, output: Option<&OutputFiles>) -> Self {
+        use std::sync::{Arc, Mutex};
+        let limits = CaptureLimits::standard();
+        let capture: SharedCapture = Arc::new(Mutex::new(CapturePair::new(
+            limits.stdout,
+            limits.stderr,
+            limits.aggregate,
+            false,
+        )));
+        let gone = Arc::new(AtomicBool::new(false));
+        let mut followers = Vec::new();
+        for (path, stream) in output.into_iter().flat_map(|files| {
+            [
+                (files.stdout.clone(), CapturedStream::Stdout),
+                (files.stderr.clone(), CapturedStream::Stderr),
+            ]
+        }) {
+            let (capture, gone) = (capture.clone(), gone.clone());
+            followers.push(std::thread::spawn(move || {
+                follow_output(path, capture, stream, gone);
+            }));
+        }
+        let is_ours = process_start(pid).as_deref() == Some(started);
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let started = started.to_owned();
+        std::thread::spawn(move || {
+            while process_start(pid).as_deref() == Some(started.as_str()) {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            gone.store(true, Ordering::Release);
+            for follower in followers {
+                let _ = follower.join();
+            }
+            let _ = done_tx.send(true);
+        });
+        Self {
+            pid: is_ours.then_some(pid),
+            capture,
+            done_rx,
+            code: Arc::new(Mutex::new(None)),
+            net_flag: None,
+            owned_cancel: None,
+            terminal: None,
+        }
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 
@@ -1721,6 +1862,7 @@ fn spawn_background_with_limits(
             stderr: stderr_cap,
             aggregate: aggregate_cap,
             terminal: false,
+            output: None,
         },
         watch_network,
         input,
@@ -1750,6 +1892,10 @@ fn spawn_background_captured(
         .transpose()?;
     #[cfg(not(unix))]
     let terminal: Option<std::fs::File> = None;
+    if let Some(output) = &limits.output {
+        cmd.stdout(OutputFiles::writer(&output.stdout)?);
+        cmd.stderr(OutputFiles::writer(&output.stderr)?);
+    }
     // Arm kernel-level detection before the fork. Armed here rather than by the
     // caller so the filter and the handle that reads it cannot be wired up
     // separately and drift.
@@ -1862,6 +2008,18 @@ fn spawn_background_captured(
             pump(err, capture, CapturedStream::Stderr, stop);
         })
     });
+    let command_gone = Arc::new(AtomicBool::new(false));
+    let follow = |path: &Path, stream| {
+        let (path, capture, gone) = (path.to_owned(), capture.clone(), command_gone.clone());
+        tokio::task::spawn_blocking(move || follow_output(path, capture, stream, gone))
+    };
+    let (out_handle, err_handle) = match &limits.output {
+        Some(output) => (
+            Some(follow(&output.stdout, CapturedStream::Stdout)),
+            Some(follow(&output.stderr, CapturedStream::Stderr)),
+        ),
+        None => (out_handle, err_handle),
+    };
     // A native supervisor thread, not an async poll: under high fan-out a
     // starved runtime worker lets an orphaned helper work on after the leader dies.
     let child_slot = Arc::new(Mutex::new(Some(child)));
@@ -1930,6 +2088,7 @@ fn spawn_background_captured(
     let code2 = code.clone();
     tokio::spawn(async move {
         let status = status_rx.await.unwrap_or(None);
+        command_gone.store(true, Ordering::Release);
 
         // A killed group should close both pipes promptly. If an escaped fd
         // holder does not, ask the nonblocking pumps to close their descriptors

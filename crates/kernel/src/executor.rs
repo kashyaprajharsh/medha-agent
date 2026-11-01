@@ -19,6 +19,8 @@ pub struct TaskEnd {
     pub intent_id: String,
     /// What the chat records: the task, its exit code and `_checkpoint_files`. `None` while it still runs.
     pub result: Option<serde_json::Value>,
+    /// Whether this may start a turn by itself; if not, the model reads it with the next message.
+    pub wake: bool,
     /// What the model reads: one line and the end of the output.
     pub note: String,
 }
@@ -166,7 +168,10 @@ pub trait Executor: Send + Sync {
     }
 
     /// Where commands that were left running report their end; handed out once, to the chat that owns them.
-    fn task_endings(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<TaskEnd>> {
+    fn task_endings(
+        &self,
+        _session: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TaskEnd>> {
         None
     }
 

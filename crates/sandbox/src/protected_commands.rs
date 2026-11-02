@@ -8,6 +8,7 @@ use kernel::protected_paths::matters;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -20,25 +21,93 @@ const ALWAYS_WALKED: [&str; 3] = [".github/workflows", ".medha/prompts", ".vscod
 pub(crate) struct Snapshot {
     root: PathBuf,
     skipped: BTreeSet<PathBuf>,
-    before: BTreeMap<PathBuf, Node>,
+    before: BTreeMap<PathBuf, Entry>,
     digests: BTreeMap<PathBuf, [u8; 32]>,
     reviews: Arc<kernel::mutations::Guard>,
     done: bool,
 }
 
-fn contents(node: &Node) -> Option<&[u8]> {
-    if let Node::File(bytes, _) = node {
+/// A protected path as it stood: its content, or where it pointed when it was a link.
+#[derive(Clone, PartialEq)]
+enum Entry {
+    Node(Node),
+    Link(OsString),
+}
+
+const MISSING: Entry = Entry::Node(Node::Missing);
+
+fn contents(entry: &Entry) -> Option<&[u8]> {
+    if let Entry::Node(Node::File(bytes, _)) = entry {
         Some(bytes)
     } else {
         None
     }
 }
 
-fn digest(node: &Node) -> [u8; 32] {
+/// What a person reviewing the change reads for this entry.
+fn shown(entry: &Entry) -> Option<Vec<u8>> {
+    match entry {
+        Entry::Link(target) => {
+            Some(format!("(link to {})\n", target.to_string_lossy()).into_bytes())
+        }
+        _ => contents(entry).map(<[u8]>::to_vec),
+    }
+}
+
+fn digest(entry: &Entry) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update([u8::from(matches!(node, Node::File(..)))]);
-    hash.update(contents(node).unwrap_or_default());
+    hash.update([match entry {
+        Entry::Node(Node::File(..)) => 1,
+        Entry::Link(_) => 2,
+        Entry::Node(_) => 0,
+    }]);
+    hash.update(shown(entry).unwrap_or_default());
     hash.finalize().into()
+}
+
+#[cfg(unix)]
+fn link_at(root: &Path, relative: &Path) -> std::io::Result<Option<OsString>> {
+    crate::git_snapshot_unix::read_link(root, relative)
+}
+
+#[cfg(not(unix))]
+fn link_at(root: &Path, relative: &Path) -> std::io::Result<Option<OsString>> {
+    let path = root.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Ok(Some(std::fs::read_link(path)?.into_os_string()))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn put_link(root: &Path, relative: &Path, target: &OsStr) -> std::io::Result<()> {
+    crate::git_snapshot_unix::write_link(root, relative, Some(target))
+}
+
+#[cfg(not(unix))]
+fn put_link(root: &Path, relative: &Path, target: &OsStr) -> std::io::Result<()> {
+    let path = root.join(relative);
+    restore_below(root, relative, &Node::Missing)?;
+    std::os::windows::fs::symlink_file(target, path)
+}
+
+/// A link is read as a link, never followed; anything else as before.
+fn read_entry(root: &Path, relative: &Path, budget: &mut (usize, usize)) -> std::io::Result<Entry> {
+    match link_at(root, relative)? {
+        Some(target) => Ok(Entry::Link(target)),
+        None => read_below(root, relative, budget).map(Entry::Node),
+    }
+}
+
+fn write_entry(root: &Path, relative: &Path, entry: &Entry) -> std::io::Result<()> {
+    match entry {
+        Entry::Node(node) => restore_below(root, relative, node),
+        Entry::Link(target) => put_link(root, relative, target),
+    }
 }
 
 /// Directories Git ignores, listed once before the command so the command
@@ -98,7 +167,7 @@ fn inventory(
     skipped: &BTreeSet<PathBuf>,
     reviews: &kernel::mutations::Guard,
     tolerate_changed_entries: bool,
-) -> std::io::Result<BTreeMap<PathBuf, Node>> {
+) -> std::io::Result<BTreeMap<PathBuf, Entry>> {
     let mut files = BTreeMap::new();
     let mut pending = vec![(root.to_path_buf(), false)];
     let extra_patterns = !reviews.settings().protected_paths.is_empty();
@@ -150,12 +219,17 @@ fn inventory(
                 continue;
             }
             if !kind.is_dir() && reviews.classify(relative, true).is_some() {
-                let node = match read_below(root, relative, &mut budget) {
-                    Ok(node) => node,
-                    Err(_) if tolerate_changed_entries => Node::Missing,
-                    Err(error) => return Err(error),
+                let entry = match read_entry(root, relative, &mut budget) {
+                    Ok(entry) => entry,
+                    Err(_) if tolerate_changed_entries => MISSING,
+                    Err(error) => {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!("{} ({error})", relative.display()),
+                        ));
+                    }
                 };
-                files.insert(relative.to_path_buf(), node);
+                files.insert(relative.to_path_buf(), entry);
             }
         }
     }
@@ -184,15 +258,18 @@ impl Snapshot {
         };
         let skipped = ignored_directories(&root);
         let before = inventory(&root, &skipped, &reviews, false).map_err(|error| {
-            let reason =
-                format!("Protected content could not be backed up; command left unrun: {error}");
+            let reason = format!(
+                "Command not run. After outside content, Medha keeps a copy of instruction and CI files before each \
+                 command, and could not read {error}. Every command will fail the same way until that file can be \
+                 read; tell the person which file, do not retry."
+            );
             let _ = reviews.refuse(
                 format!("{root:?}\0{command}\0{reason}").as_bytes(),
                 &root.to_string_lossy(),
                 &reason,
                 command,
             );
-            ExecError::Unavailable(reason)
+            ExecError::Held(reason)
         })?;
         let digests = before
             .iter()
@@ -230,16 +307,16 @@ impl Snapshot {
         paths.dedup();
         let mut changes = Vec::new();
         for path in paths {
-            let before = self.before.get(&path).unwrap_or(&Node::Missing);
+            let before = self.before.get(&path).unwrap_or(&MISSING);
             let inspected = match after.get(&path) {
-                Some(node) if *node != Node::Missing => Ok(node.clone()),
-                _ => read_below(&self.root, &path, &mut (BYTES, ENTRIES)),
+                Some(entry) if *entry != MISSING => Ok(entry.clone()),
+                _ => read_entry(&self.root, &path, &mut (BYTES, ENTRIES)),
             };
             let current = match &inspected {
-                Ok(node) => node,
+                Ok(entry) => entry,
                 Err(error) => {
                     problem.get_or_insert_with(|| error.to_string());
-                    &Node::Missing
+                    &MISSING
                 }
             };
             let Some(kind) = self.reviews.classify(&path, true) else {
@@ -249,26 +326,28 @@ impl Snapshot {
                 .digests
                 .get(&path)
                 .copied()
-                .unwrap_or_else(|| digest(&Node::Missing));
+                .unwrap_or_else(|| digest(&MISSING));
+            // A link has no content to weigh, so any change to or from one matters.
+            let linked = matches!(before, Entry::Link(_)) || matches!(current, Entry::Link(_));
             if inspected.is_ok()
                 && (before_digest == digest(current)
-                    || !matters(kind, contents(before), contents(current)))
+                    || (!linked && !matters(kind, contents(before), contents(current))))
             {
                 continue;
             }
-            restore_below(&self.root, &path, before).map_err(|error| error.to_string())?;
+            write_entry(&self.root, &path, before).map_err(|error| error.to_string())?;
             changes.push((path, before.clone(), current.clone()));
         }
         if changes.is_empty() && problem.is_none() {
             return Ok(());
         }
-        let identity = serde_json::to_vec(&serde_json::json!({"root":self.root,"changes":changes.iter().map(|(path,before,after)|serde_json::json!([path,contents(before),contents(after)])).collect::<Vec<_>>()})).map_err(|error| error.to_string())?;
+        let identity = serde_json::to_vec(&serde_json::json!({"root":self.root,"changes":changes.iter().map(|(path,before,after)|serde_json::json!([path,shown(before),shown(after)])).collect::<Vec<_>>()})).map_err(|error| error.to_string())?;
         let mut preview = String::new();
         for (path, before, after) in &changes {
             preview.push_str(&format!("--- {}\n+++ {}\n", path.display(), path.display()));
-            for (prefix, node) in [("-", before), ("+", after)] {
-                for line in String::from_utf8_lossy(contents(node).unwrap_or_default())
-                    .split_inclusive('\n')
+            for (prefix, entry) in [("-", before), ("+", after)] {
+                for line in
+                    String::from_utf8_lossy(&shown(entry).unwrap_or_default()).split_inclusive('\n')
                 {
                     preview.push_str(prefix);
                     preview.push_str(line);
@@ -306,14 +385,14 @@ impl Drop for Snapshot {
 
 struct Change {
     root: PathBuf,
-    changes: Vec<(PathBuf, Node, Node)>,
+    changes: Vec<(PathBuf, Entry, Entry)>,
 }
 
 #[async_trait::async_trait]
 impl kernel::mutations::Apply for Change {
     async fn apply(&self) -> Result<serde_json::Value, String> {
         for (path, before, _) in &self.changes {
-            if read_below(&self.root, path, &mut (BYTES, ENTRIES))
+            if read_entry(&self.root, path, &mut (BYTES, ENTRIES))
                 .map_err(|error| error.to_string())?
                 != *before
             {
@@ -324,7 +403,7 @@ impl kernel::mutations::Apply for Change {
             }
         }
         for (path, _, after) in &self.changes {
-            restore_below(&self.root, path, after).map_err(|error| error.to_string())?;
+            write_entry(&self.root, path, after).map_err(|error| error.to_string())?;
         }
         Ok(
             serde_json::json!({"applied":true,"files":self.changes.iter().map(|(path,_,_)|path).collect::<Vec<_>>()}),

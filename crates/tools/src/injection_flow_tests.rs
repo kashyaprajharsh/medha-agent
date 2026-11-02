@@ -42,6 +42,185 @@ impl StreamSink for Notices {
     }
 }
 
+/// A protected file that is a link (`CLAUDE.md -> AGENTS.md`) must not stop every command after web,
+/// and a command that repoints it is undone like any other protected change.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn a_linked_instruction_file_does_not_block_commands_after_web_and_a_repoint_is_undone() {
+    let scratch = test_support::scratch("protected-kernel-link");
+    let root = scratch.canonicalize().unwrap();
+    std::fs::write(root.join("AGENTS.md"), "real instructions\n").unwrap();
+    std::fs::write(root.join("evil.md"), "planted\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+    let backend = sandbox::select_backend(
+        &sandbox::SandboxConfig::default(),
+        Vec::new(),
+        sandbox::ApprovedRoots::default(),
+        sandbox::NetworkGrant::default(),
+    );
+    let workspace = Arc::new(
+        sandbox::WorkspaceSandbox::new_jailed(&root)
+            .unwrap()
+            .with_exec_backend(backend),
+    );
+    let artifacts = Arc::new(store::FileArtifactStore::open(root.join(".artifacts")).unwrap());
+    let mut registry = crate::ToolRegistry::with_workspace(workspace, artifacts.clone());
+    registry.register(Arc::new(AttackerPage));
+    let gate = Arc::new(RememberingGate::default());
+    let log = Arc::new(InMemoryLog::new());
+    let sink = Notices::default();
+    let provider = Arc::new(Scripted::new(vec![
+        call("page", "attack.page"),
+        call_with(
+            "echo",
+            "shell.exec",
+            json!({"command":"echo hi > out.txt","network":false}),
+        ),
+        call_with(
+            "repoint",
+            "shell.exec",
+            json!({"command":"ln -sf evil.md CLAUDE.md","network":false}),
+        ),
+        done(),
+    ]));
+    let kernel = Kernel::new(
+        provider,
+        log.clone(),
+        Arc::new(registry),
+        Arc::new(Passthrough),
+        artifacts,
+        Arc::new(AllowAll),
+        gate.clone(),
+        Arc::new(NoVerify),
+    );
+    let session = Session {
+        autonomy: AutonomyLevel::Normal,
+        ..Session::new()
+    };
+    kernel
+        .run_session(
+            &session,
+            vec![Message::user("Review this page and tidy up")],
+            Budget::default(),
+            &sink,
+            None,
+        )
+        .await
+        .unwrap();
+    let events = log.events(session.id).await;
+    let result = |id: &str| {
+        events
+            .iter()
+            .find(|event| event.kind == EventKind::ToolObs && event.payload["intent_id"] == id)
+            .unwrap()
+            .payload
+            .clone()
+    };
+    assert_eq!(
+        result("echo")["payload"]["exit_code"],
+        0,
+        "{}",
+        result("echo")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("out.txt")).unwrap(),
+        "hi\n"
+    );
+    assert_eq!(
+        std::fs::read_link(root.join("CLAUDE.md")).unwrap(),
+        std::path::PathBuf::from("AGENTS.md"),
+        "the repointed link is put back"
+    );
+    assert_eq!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|text| text.starts_with("Protected change held:"))
+            .count(),
+        1
+    );
+}
+
+/// When a protected file cannot be read, the refusal names it and says what to do, instead of a sandbox error the
+/// model then spends turns investigating.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn an_unreadable_protected_file_is_named_in_the_refusal_not_reported_as_a_broken_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = test_support::scratch("protected-kernel-unreadable");
+    let root = scratch.canonicalize().unwrap();
+    std::fs::write(root.join("AGENTS.md"), "real instructions\n").unwrap();
+    std::fs::set_permissions(
+        root.join("AGENTS.md"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let backend = sandbox::select_backend(
+        &sandbox::SandboxConfig::default(),
+        Vec::new(),
+        sandbox::ApprovedRoots::default(),
+        sandbox::NetworkGrant::default(),
+    );
+    let workspace = Arc::new(
+        sandbox::WorkspaceSandbox::new_jailed(&root)
+            .unwrap()
+            .with_exec_backend(backend),
+    );
+    let artifacts = Arc::new(store::FileArtifactStore::open(root.join(".artifacts")).unwrap());
+    let mut registry = crate::ToolRegistry::with_workspace(workspace, artifacts.clone());
+    registry.register(Arc::new(AttackerPage));
+    let log = Arc::new(InMemoryLog::new());
+    let provider = Arc::new(Scripted::new(vec![
+        call("page", "attack.page"),
+        call_with(
+            "echo",
+            "shell.exec",
+            json!({"command":"echo hi","network":false}),
+        ),
+        done(),
+    ]));
+    let kernel = Kernel::new(
+        provider,
+        log.clone(),
+        Arc::new(registry),
+        Arc::new(Passthrough),
+        artifacts,
+        Arc::new(AllowAll),
+        Arc::new(RememberingGate::default()),
+        Arc::new(NoVerify),
+    );
+    let session = Session {
+        autonomy: AutonomyLevel::Normal,
+        ..Session::new()
+    };
+    kernel
+        .run_session(
+            &session,
+            vec![Message::user("Review this page")],
+            Budget::default(),
+            &Notices::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    std::fs::set_permissions(
+        root.join("AGENTS.md"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let events = log.events(session.id).await;
+    let refused = events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolObs && event.payload["intent_id"] == "echo")
+        .unwrap()
+        .payload
+        .to_string();
+    assert!(refused.contains("AGENTS.md"), "{refused}");
+    assert!(!refused.contains("sandbox unavailable"), "{refused}");
+    assert!(refused.contains("will fail the same way"), "{refused}");
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn a_web_tainted_python_in_a_denied_network_jail_repairs_ci_with_one_notice_and_zero_cards() {

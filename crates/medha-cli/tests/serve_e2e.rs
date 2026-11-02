@@ -3186,8 +3186,8 @@ async fn the_person_can_send_a_running_command_to_the_background() {
     );
 }
 
-/// On Windows a program reads a typed answer through the console. Encoded so any shell passes it unchanged:
-/// `$x = Read-Host; Write-Output "got-$x"`.
+/// On Windows a program reads a typed answer through the console. The script is a file, so any shell passes
+/// the command unchanged; an encoded command would be refused as dangerous.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_windows_program_in_a_console_reads_what_is_typed() {
@@ -3196,7 +3196,12 @@ async fn a_windows_program_in_a_console_reads_what_is_typed() {
     let mut client = backend.connect().await;
     let folder = world.folder("console");
     let chat = client.open(&folder).await;
-    let command = "powershell -NoProfile -EncodedCommand JAB4ACAAPQAgAFIAZQBhAGQALQBIAG8AcwB0ADsAIABXAHIAaQB0AGUALQBPAHUAdABwAHUAdAAgACIAZwBvAHQALQAkAHgAIgA=";
+    std::fs::write(
+        folder.join("ask.ps1"),
+        "$x = Read-Host\nWrite-Output \"got-$x\"\n",
+    )
+    .unwrap();
+    let command = "powershell -NoProfile -File ask.ps1";
     let start = json!({"command": command, "network": false, "background": true, "tty": true});
     let typed = json!({"op": "submit", "task_id": "t1", "text": "hello"});
     client

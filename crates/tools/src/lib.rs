@@ -2788,9 +2788,9 @@ impl Tool for Grep {
         ToolCategory::Search
     }
     fn description(&self) -> &str {
-        "Search file contents by regular expression across the workspace, skipping ignored \
-         and hidden files, target/, node_modules and binaries, or one stored result by `hash`. \
-         Returns matching {path, line, text}; a stored result's hits give the byte to read from."
+        "Search files by regular expression, skipping ignored and hidden files, target/, \
+         node_modules and binaries, or one stored result by `hash`, whose hits give the byte \
+         to read from."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read

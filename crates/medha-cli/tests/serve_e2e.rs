@@ -23,6 +23,8 @@ mod checkpoint_caps;
 
 #[path = "serve_e2e/real_use.rs"]
 mod real_use;
+#[path = "serve_e2e/stored.rs"]
+mod stored;
 
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut request = Vec::new();
@@ -2494,7 +2496,7 @@ async fn a_value_deep_in_a_long_line_is_found_and_read() {
     assert!(raw.contains("odd.txt:1: the text"), "{raw}");
 }
 
-/// A stored result can be searched, and a hit says which byte to read from.
+/// A stored result can be searched by the path its note names, and a hit says which line to read from.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
@@ -2509,11 +2511,11 @@ async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
         first.contains("search it"),
         "the note offers a search: {first}"
     );
-    let hash = first
-        .split("hash=\\\"")
+    let path = first
+        .split("read path=\\\"")
         .nth(1)
-        .and_then(|rest| rest.get(..64))
-        .unwrap_or_else(|| panic!("no stored hash: {first}"))
+        .and_then(|rest| rest.split("\\\"").next())
+        .unwrap_or_else(|| panic!("no stored path: {first}"))
         .to_owned();
     let raw = scripted(
         &mut client,
@@ -2521,21 +2523,22 @@ async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
         &chat,
         &[format!(
             "grep {}",
-            json!({"pattern": "^131337$", "hash": hash})
+            json!({"pattern": "^131337$", "path": path})
         )],
     )
     .await;
     assert!(!raw.contains("131338"), "only the hit is shown: {raw}");
-    let offset: u64 = raw
-        .split("byte ")
-        .last()
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+    let line: u64 = raw
+        .split(": 131337")
+        .nth(1)
+        .and(raw.split(": 131337").next())
+        .and_then(|before| before.rsplit(':').next())
         .and_then(|digits| digits.parse().ok())
-        .unwrap_or_else(|| panic!("a hit gives its byte: {raw}"));
-    // Reading from that byte lands on the hit: the next line comes back and nothing before it.
-    let read = json!({"hash": hash, "offset": offset, "length": 13});
+        .unwrap_or_else(|| panic!("a hit gives its line: {raw}"));
+    // Reading from that line lands on the hit: it and the next line come back, nothing before it.
+    let read = json!({"path": path, "offset": line, "limit": 2});
     let raw = scripted(&mut client, &world, &chat, &[format!("read {read}")]).await;
-    assert!(raw.contains("131338"), "{raw}");
+    assert!(raw.contains("131337") && raw.contains("131338"), "{raw}");
     assert!(!raw.contains("131336"), "{raw}");
 }
 

@@ -12,6 +12,7 @@ fn authorization_and_command_building_share_the_cached_backend() {
         options,
         MedhaLock::default(),
         sandbox::HomeScope::default(),
+        sandbox::StateAccess::default(),
         sandbox::ApprovedRoots::default(),
         sandbox::NetworkGrant::default(),
         None,

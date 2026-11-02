@@ -4462,6 +4462,7 @@ name = "store"
 version = "0.1.12"
 dependencies = [
  "async-trait",
+ "dunce",
  "file-ops",
  "kernel",
  "rusqlite",

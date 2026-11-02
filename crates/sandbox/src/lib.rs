@@ -2512,7 +2512,11 @@ impl WorkspaceSandbox {
     }
 
     pub async fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
-        refuse_git_control(refuse_protected(self.resolve_any_for_write(path).await?)?)
+        let path = refuse_protected(self.resolve_any_for_write(path).await?)?;
+        if let Some(refused) = permissions::refusal(&path, permissions::PermissionType::Write) {
+            return Err(refused.into());
+        }
+        refuse_git_control(path)
     }
 
     async fn resolve_any(&self, path: &str) -> Result<PathBuf, SandboxError> {

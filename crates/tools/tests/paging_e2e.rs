@@ -40,9 +40,11 @@ impl Reader {
         if *count == 1 {
             return Self::call(*count, "read", json!({"path": "big.txt"}));
         }
+        // A file and a stored result are paged alike: by path, from the offset each page names.
+        let paging = hash.clone().unwrap_or_else(|| "big.txt".into());
         if let Some(offset) = last.split("continue with offset=").nth(1) {
             let offset: u64 = offset.trim_end_matches(']').trim().parse().unwrap();
-            return Self::call(*count, "read", json!({"path": "big.txt", "offset": offset}));
+            return Self::call(*count, "read", json!({"path": paging, "offset": offset}));
         }
         if hash.is_none() && !last.contains(STORED) {
             return Self::call(
@@ -51,18 +53,14 @@ impl Reader {
                 json!({"command": "seq 1 30000", "network": false}),
             );
         }
-        if let Some(stored) = last.split("hash=\"").nth(1) {
+        if hash.is_none()
+            && let Some(stored) = last.split("read path=\"").nth(1)
+        {
             let stored = stored.split('"').next().unwrap().to_owned();
             *hash = Some(stored.clone());
-            return Self::call(*count, "read", json!({"hash": stored}));
+            return Self::call(*count, "read", json!({"path": stored}));
         }
-        let page: Value = serde_json::from_str(last).unwrap_or(Value::Null);
-        match (&*hash, page["next_offset"].as_u64()) {
-            (Some(stored), Some(offset)) => {
-                Self::call(*count, "read", json!({"hash": stored, "offset": offset}))
-            }
-            _ => vec![Block::Text("done".into())],
-        }
+        vec![Block::Text("done".into())]
     }
 }
 
@@ -121,7 +119,12 @@ async fn read_all(window: u32) {
     std::fs::write(workspace.join("big.txt"), line.repeat(6_000)).unwrap();
     let artifacts: Arc<dyn kernel::ArtifactStore> =
         Arc::new(store::FileArtifactStore::open(dir.join("artifacts")).unwrap());
-    let sandbox = Arc::new(sandbox::WorkspaceSandbox::new_jailed(&workspace).unwrap());
+    // As every chat's sandbox is set up: the store is readable, so a note's path can be followed.
+    let sandbox = Arc::new(
+        sandbox::WorkspaceSandbox::new_jailed(&workspace)
+            .unwrap()
+            .with_readable_roots(&[dir.join("artifacts")]),
+    );
     let reader = Arc::new(Reader {
         caps: ProviderCaps {
             images: kernel::ImageSupport::Unsupported,
@@ -167,9 +170,9 @@ async fn read_all(window: u32) {
         results.iter().any(|result| result.contains("6000|")),
         "the file was read to its last line"
     );
-    let last: Value = serde_json::from_str(results.last().unwrap()).unwrap();
+    let last = results.last().unwrap();
     assert!(
-        last["content"].as_str().unwrap().ends_with("\n30000"),
-        "{last}"
+        last.trim_end().ends_with("|30000"),
+        "the stored output was read to its last line: {last}"
     );
 }

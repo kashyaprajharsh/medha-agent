@@ -2105,7 +2105,7 @@ impl Tool for SkillSave {
         if let Some((path, old)) = self.store.existing_content(&spec) {
             let old_version = next_version(&path).saturating_sub(1).max(1);
             let new = spec.render(old_version + 1);
-            let diff = similar::TextDiff::from_lines(&old, &new)
+            let diff = crate::line_diff(&old, &new)
                 .unified_diff()
                 .context_radius(2)
                 .header("current", "proposed")

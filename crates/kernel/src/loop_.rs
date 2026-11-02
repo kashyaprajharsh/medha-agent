@@ -633,7 +633,7 @@ pub fn kept_start(total: usize) -> usize {
 
 /// A stored result in brief: its first and last lines, how much was left out,
 /// and how to read the rest. The whole text stays in the store, readable later.
-fn spilled_preview(content: &str, hash: &str) -> String {
+fn spilled_preview(content: &str, hash: &str, path: Option<&std::path::Path>) -> String {
     let head_budget = kept_start(SPILL_PREVIEW);
     let mut head = head_budget.min(content.len());
     while !content.is_char_boundary(head) {
@@ -658,10 +658,19 @@ fn spilled_preview(content: &str, hash: &str) -> String {
     {
         tail += newline + 1;
     }
+    // A store that keeps files is read like any file, by lines; one that does not is read by hash and bytes.
+    let how = match path {
+        Some(path) => format!(
+            "read path=\"{}\" with offset and limit in lines, or search it first with grep on that path",
+            path.display()
+        ),
+        None => format!(
+            "read hash=\"{hash}\" with offset (a byte) and length, or search it first with grep and that hash"
+        ),
+    };
     format!(
-        "{}\n[… {} of {} bytes not shown, bytes {}–{}. The whole result is stored: \
-         read hash=\"{hash}\" with offset (a byte) and length, or search it first with grep \
-         and that hash. Read every page only if you need all of it.]\n{}",
+        "{}\n[… {} of {} bytes not shown, bytes {}–{}. The whole result is stored: {how}. \
+         Read every page only if you need all of it.]\n{}",
         content[..head].trim_end_matches('\n'),
         tail - head,
         content.len(),
@@ -1141,7 +1150,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .put_async(content.as_bytes().to_vec())
             .await
         {
-            Ok(hash) => spilled_preview(&content, &hash),
+            Ok(hash) => spilled_preview(&content, &hash, self.artifacts.path(&hash).as_deref()),
             Err(_) => content, // spill failed → keep full rather than lose data
         }
     }
@@ -1258,7 +1267,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .await
         {
             Ok(hash) => {
-                let preview = spilled_preview(&text, &hash);
+                let preview = spilled_preview(&text, &hash, self.artifacts.path(&hash).as_deref());
                 *room = room.saturating_sub(preview.len());
                 obs.model_text = Some(preview);
                 Some(hash)
@@ -1991,7 +2000,7 @@ mod retry_tests {
     #[test]
     fn a_stored_result_is_previewed_by_its_first_and_last_lines() {
         let content: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
-        let preview = spilled_preview(&content, "abc");
+        let preview = spilled_preview(&content, "abc", None);
         let (head, rest) = preview.split_once("\n[… ").unwrap();
         let (note, tail) = rest.split_once("]\n").unwrap();
         assert!(head.starts_with("line 1\nline 2\n") && head.ends_with(char::is_numeric));

@@ -3,6 +3,14 @@
 /// Local ingestion limit, independent of any provider's advertised limit.
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
+/// The `read` argument that opens a stored artifact again: the file it is kept in, else its hash.
+pub fn read_arg(store: &dyn ArtifactStore, hash: &str) -> String {
+    match store.path(hash) {
+        Some(path) => format!("path=\"{}\"", path.display()),
+        None => format!("hash=\"{hash}\""),
+    }
+}
+
 /// Read a whole image artifact. The storage port caps a single read, so this
 /// walks bounded ranges rather than trusting one call to return everything.
 pub async fn read_all(
@@ -40,6 +48,10 @@ pub trait ArtifactStore: Send + Sync + 'static {
     fn get(&self, hash: &str, offset: usize, len: Option<usize>) -> Result<Vec<u8>, String>;
     /// Total size in bytes of a stored artifact.
     fn size(&self, hash: &str) -> Result<usize, String>;
+    /// Where a stored artifact is kept as a file the model's tools can read, if the store keeps files.
+    fn path(&self, _hash: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 
     /// Async-runtime-safe wrappers for file-backed implementations. The
     /// synchronous methods remain the small storage-port API used by tests and

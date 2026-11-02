@@ -13,6 +13,8 @@ pub struct LiveSettings {
     options: SessionOptions,
     lock: RwLock<SettingsState>,
     home: sandbox::HomeScope,
+    /// Folders inside Medha's state that the chat's commands may open, such as its stored results.
+    state: sandbox::StateAccess,
     approved: sandbox::ApprovedRoots,
     network: sandbox::NetworkGrant,
     scratch: Option<PathBuf>,
@@ -36,21 +38,24 @@ impl std::ops::Deref for SettingsState {
 }
 
 impl LiveSettings {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         folder: PathBuf,
         options: SessionOptions,
         lock: MedhaLock,
         home: sandbox::HomeScope,
+        opened: sandbox::StateAccess,
         approved: sandbox::ApprovedRoots,
         network: sandbox::NetworkGrant,
         scratch: Option<PathBuf>,
     ) -> Arc<Self> {
-        let state = Self::build_state(lock, &options, &home, &approved, &network);
+        let state = Self::build_state(lock, &options, &home, &opened, &approved, &network);
         Arc::new(Self {
             folder,
             options,
             lock: RwLock::new(state),
             home,
+            state: opened,
             approved,
             network,
             scratch,
@@ -74,6 +79,7 @@ impl LiveSettings {
             safe,
             &self.options,
             &self.home,
+            &self.state,
             &self.approved,
             &self.network,
         );
@@ -104,6 +110,7 @@ impl LiveSettings {
             self.options.clone(),
             crate::workspace::load_lock(&folder, &Quiet).unwrap_or_default(),
             self.home.clone(),
+            self.state.clone(),
             self.approved.clone(),
             self.network.clone(),
             self.scratch.clone(),
@@ -126,11 +133,13 @@ impl LiveSettings {
         lock: MedhaLock,
         options: &SessionOptions,
         home: &sandbox::HomeScope,
+        opened: &sandbox::StateAccess,
         approved: &sandbox::ApprovedRoots,
         network: &sandbox::NetworkGrant,
     ) -> SettingsState {
         let mut config = lock.sandbox.to_config();
         config.home = home.clone();
+        config.state = opened.clone();
         if let Some(backend) = options.sandbox {
             config.backend = backend;
         }

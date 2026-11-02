@@ -29,6 +29,7 @@ fn measure_real_project_refresh() {
         runtime::SessionOptions::default(),
         runtime::workspace::load_lock(&repo, &Quiet).unwrap(),
         sandbox::HomeScope::default(),
+        sandbox::StateAccess::default(),
         sandbox::ApprovedRoots::default(),
         sandbox::NetworkGrant::default(),
         None,

@@ -1235,8 +1235,8 @@ pub(super) enum DiffRow {
 
 /// Collapses unchanged diff runs outside the configured hunk context.
 pub(super) fn hunk_rows(old: &str, new: &str) -> Vec<DiffRow> {
-    use similar::{ChangeTag, TextDiff};
-    let diff = TextDiff::from_lines(old, new);
+    use similar::ChangeTag;
+    let diff = tools::line_diff(old, new);
     let raw: Vec<(ChangeTag, Option<usize>, Option<usize>, String)> = diff
         .iter_all_changes()
         .map(|c| {

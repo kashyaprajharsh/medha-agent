@@ -6,7 +6,7 @@
 use kernel::{Event, EventKind};
 use serde::Serialize;
 use serde_json::Value;
-use similar::{ChangeTag, TextDiff};
+use similar::ChangeTag;
 use std::collections::HashMap;
 
 const WRITE_TOOLS: [&str; 4] = ["edit", "write", "fs.edit", "fs.write"];
@@ -148,7 +148,7 @@ pub(crate) fn session_changes(events: &[Event]) -> Vec<FileChange> {
 
 /// Lines added and removed, and a unified diff cut to `limit` bytes.
 fn diff_of(before: &str, after: &str, path: &str, limit: usize) -> (usize, usize, String) {
-    let diff = TextDiff::from_lines(before, after);
+    let diff = tools::line_diff(before, after);
     let (added, removed) = diff
         .iter_all_changes()
         .fold((0, 0), |(added, removed), change| match change.tag() {

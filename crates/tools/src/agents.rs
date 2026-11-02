@@ -310,39 +310,30 @@ impl Tool for AgentSpawn {
     /// report, so a session that never delegates does not pay for it on every
     /// turn. This description is re-sent on every request; those notes are not.
     fn description(&self) -> &str {
-        "Delegate a self-contained task to a child agent and get back a summary. \
-         The child works in its own context, so none of its searching lands in this conversation.\n\
+        "Delegate a self-contained task to a child agent, which works in its own context and \
+         reports a summary. Use your own judgement; you need not be asked. Delegate when:\n\
+         · reviewing a whole workspace: split subsystems into one `tasks` call and keep a slice;\n\
+         · a broad sweep's intermediate output will not be needed again ('how is X used');\n\
+         · questions are independent, so children can run at once;\n\
+         · a side investigation would crowd out the context of the real task;\n\
+         · you want background gathered while you work: children report back on their own.\n\
          \n\
-         Reach for this on your own judgement — you do not need to be asked. Delegate when:\n\
-         · reviewing or auditing a whole workspace — split independent subsystems into one \
-         parallel `tasks` call and keep one slice for yourself;\n\
-         · answering needs a broad sweep whose intermediate output you will never need again — \
-         'how is X used across the codebase', 'what does this unfamiliar module do';\n\
-         · two or more questions are independent, so children can run at once;\n\
-         · a side investigation would otherwise crowd out the context you need for the real task;\n\
-         · you want background gathered while you keep working — every child runs in the \
-         background and reports back on its own.\n\
+         Do NOT delegate what a direct tool answers cheaper: a file you can name, a definition \
+         or usage (`grep`, `glob`, `code`), two or three known files, or work you already have \
+         context for; a child starts cold. Never hand over your whole task: that doubles the \
+         cost. Split off a part, or do it yourself.\n\
          \n\
-         Do NOT delegate what a direct tool answers faster and cheaper: a file you can name, a \
-         definition or usage (`grep`, `glob`, `code`), two or three known files, or work you \
-         already have the context for — a child starts cold and pays to rediscover what you \
-         know. Never hand over your whole task: that is pass-through, and it doubles the cost \
-         for nothing. Split off a *part*, or do it yourself.\n\
+         To run several, pass `tasks`: one call, all concurrent, better than one at a time.\n\
          \n\
-         To run several at once, pass `tasks` — one call, N children, all concurrent. That is \
-         strictly better than spawning them one at a time and waiting for each.\n\
+         Children are read-only by default. Set `write` for one that must change code: it gets \
+         a private checkout and returns a patch plus its build result. Writing children cannot \
+         see each other\'s changes.\n\
          \n\
-         Children are read-only by default. Set `write` for a child that must change code: it \
-         gets its own private checkout and hands back a patch plus the result of building it. \
-         Two writing children can safely run at once; they cannot see each other\'s changes.\n\
-         \n\
-         State the objective in full: the child cannot see this conversation and cannot ask you \
-         anything — put every path, error message and constraint it needs in the objective \
-         itself, including any language, tone or format the user asked for, or its summary comes \
-         back in the wrong one and contaminates your reply. Give `contract` when the answer must \
-         have a particular shape. A child can never use a tool you do not already have; it can \
-         message any running agent but only steer or stop the ones it started; a read-only child \
-         cannot delegate further."
+         A child cannot see this conversation or ask you anything: put every path, error and \
+         constraint in the objective, including any language, tone or format the user asked \
+         for. Give `contract` when the answer needs a shape. A child cannot use a tool you lack; \
+         it can message any running agent but only steer or stop its own; a read-only child \
+         cannot delegate."
     }
     fn blast_radius(&self) -> BlastRadius {
         // Read-only children: no mutation, but real model spend, so it stays
@@ -403,20 +394,20 @@ impl Tool for AgentSpawn {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Narrow the child to these tools. Omit this — inheriting your set is almost always right, and a child missing something it turns out to need cannot ask for it. Name tools exactly as they are registered, such as web, shell.exec, and read. Use this only to take a capability away deliberately. Cannot exceed yours, and reading files is always kept."
+                    "description": "Narrow the child to these tools, named as registered (web, shell.exec, read). Usually omit it: a child cannot ask for what it lacks. Cannot exceed yours; reading files is always kept."
                 },
                 "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
                 "wait": {
                     "type": "boolean",
-                    "description": "Hold this call until the child answers, and return its report here. Use it when you cannot take the next step without the result — a failure then comes back as an error on this call instead of as a report you have to notice later. Leave it off for a genuine fan-out you want to keep working alongside; those reports arrive on their own. Typing while it waits detaches it and the agent keeps running."
+                    "description": "Hold this call and return the report here, with a failure as this call's error. Use it when you cannot go on without the result; otherwise reports arrive on their own. The person typing detaches it and the agent keeps running."
                 },
                 "write": {
                     "type": "boolean",
-                    "description": "REQUIRED for any task that changes something — write, edit, add, fix, rename, create a file. Without it the child gets read-only tools, cannot edit anything, and will come back describing the change it would have made instead of making it. It works in a private checkout and returns a patch, so your files are never touched until you apply it with `agent.apply`. Refused if this workspace is not a git repository."
+                    "description": "REQUIRED for any task that changes a file. Without it the child can only describe the change. It works in a private checkout and returns a patch; your files change only when you run `agent.apply`. Refused outside a git repository."
                 },
                 "fork": {
                     "type": "string",
-                    "description": "How much of this conversation the child inherits: 'none' (default — it works from the objective alone), 'all', or a number of recent turns. Raise it only when the task genuinely depends on what was said earlier and you cannot restate it in the objective; the child pays for that history in its own context."
+                    "description": "How much of this conversation the child inherits: 'none' (default), 'all', or a number of recent turns. Raise it only when you cannot restate what it needs in the objective; it pays for that history."
                 },
                 // One entry per child, each taking the same fields as above. The
                 // meanings are not restated here: every one of them would be
@@ -424,7 +415,7 @@ impl Tool for AgentSpawn {
                 // never use.
                 "tasks": {
                     "type": "array",
-                    "description": "Run several independent investigations at once, each its own agent, and get every report back together. Use this instead of one call per question — they run concurrently rather than in sequence. Give `tasks` OR `objective`, not both. Each entry takes the same fields as a single spawn.",
+                    "description": "Run several independent investigations at once and get every report back together, instead of one call per question. Give `tasks` OR `objective`. Each entry takes the same fields as a single spawn.",
                     "items": {
                         "type": "object",
                         "properties": {

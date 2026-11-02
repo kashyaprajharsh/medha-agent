@@ -581,8 +581,7 @@ export function Extensions({
               What Medha may reach for in new chats. Chat mode controls approvals; every use is still checked by
               Medha’s policy, and asked about when it matters.
             </PageTop>
-            <ToolPreset available={tools.filter((tool) => !tool.off.length).length} locked={locked} />
-            {tools.length > 0 && (
+            <ToolPreset available={tools.filter((tool) => !tool.off.length).length} locked={locked} />            {tools.length > 0 && (
               <ToolAccess
                 tools={tools}
                 servers={mcp}

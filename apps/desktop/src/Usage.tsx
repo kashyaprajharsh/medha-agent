@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { hitRate } from "./cache";
 import { PageTop } from "./ExtensionParts";
+import { Limits } from "./Limits";
 import { Select } from "./Select";
 import { SLOTS, UsageChart, type Day, type Series } from "./UsageChart";
 import { useWorkspaceApi } from "./Workspace";
@@ -134,6 +135,7 @@ export function Usage() {
   return (
     <div className="usage-page">
       <PageTop title="Usage">Tokens and cost from each model call in this workspace, sub-agents included.</PageTop>
+      <Limits />
       <div className="usage-filters">
         <div className="ext-seg" aria-label="Time range">
           {RANGES.map((range) => (

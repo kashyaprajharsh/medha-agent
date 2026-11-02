@@ -4985,6 +4985,64 @@ async fn the_backend_saves_keys_reaches_out_and_installs_without_showing_a_key()
     }
 }
 
+/// The desktop can set what a person would otherwise edit by hand, and the rest of the file is left as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_are_saved_to_the_project_lock_through_the_backend() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("limits");
+    let original = "# my note\n[tools]\npreset = \"full\"\n";
+    std::fs::write(folder.join("medha.lock"), original).unwrap();
+    let save = |key: &str, value: Value| json!({"method": "settings.budget.save", "params": {"key": key, "value": value}});
+    client
+        .about(&folder, save("tool_result_bytes", json!(9000)))
+        .await
+        .unwrap();
+    client
+        .about(&folder, save("max_cost_usd", json!(2.5)))
+        .await
+        .unwrap();
+    let lock = std::fs::read_to_string(folder.join("medha.lock")).unwrap();
+    assert!(lock.starts_with(original), "{lock}");
+    assert!(lock.contains("tool_result_bytes = 9000"), "{lock}");
+    let limits = client
+        .about(&folder, json!({"method": "settings.budget"}))
+        .await
+        .unwrap();
+    assert_eq!(limits["limits"]["tool_result_bytes"], 9000, "{limits}");
+    assert_eq!(limits["limits"]["max_cost_usd"], 2.5, "{limits}");
+    assert_eq!(limits["limits"]["max_wall_s"], Value::Null, "{limits}");
+
+    // Clearing goes back to the automatic value, and leaves the rest alone.
+    client
+        .about(&folder, save("tool_result_bytes", Value::Null))
+        .await
+        .unwrap();
+    let lock = std::fs::read_to_string(folder.join("medha.lock")).unwrap();
+    assert!(!lock.contains("tool_result_bytes"), "{lock}");
+    assert!(
+        lock.contains("max_cost_usd = 2.5") && lock.starts_with(original),
+        "{lock}"
+    );
+
+    for bad in [
+        save("not_a_limit", json!(1)),
+        save("max_turns", json!(0)),
+        save("max_turns", json!(-1)),
+        save("max_turns", json!(1.5)),
+        save("max_cost_usd", json!("lots")),
+    ] {
+        assert!(client.about(&folder, bad.clone()).await.is_err(), "{bad}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(folder.join("medha.lock")).unwrap(),
+        lock
+    );
+    // A chat opens with what was saved.
+    client.open(&folder).await;
+}
+
 /// A new version of an output is linked by what the person's message names,
 /// sent as data. The model reads which output in words and never sees an ID,
 /// and nothing it writes back can name one.

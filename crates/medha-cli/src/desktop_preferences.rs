@@ -466,6 +466,19 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             })?;
             Ok(json!({"saved": true}))
         }
+        "settings.budget" => {
+            let lock = lockfile::MedhaLock::load(workspace.join("medha.lock"))?;
+            let budget = lock.map(|lock| lock.budget).unwrap_or_default();
+            Ok(json!({"limits": budget}))
+        }
+        "settings.budget.save" => {
+            let key = text(params, "key")?;
+            let value = params.get("value").filter(|value| !value.is_null());
+            edit_lock(workspace, |current| {
+                crate::lock_edit::set_budget_limit(current, key, value)
+            })?;
+            Ok(json!({"saved": true}))
+        }
         "settings.tools.switch" => {
             let tool = text(params, "tool")?;
             let on = params["on"]

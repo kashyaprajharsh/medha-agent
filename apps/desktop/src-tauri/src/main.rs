@@ -720,6 +720,8 @@ async fn settings_request(
         "settings.search.save",
         "settings.health",
         "settings.health.fix",
+        "settings.budget",
+        "settings.budget.save",
         "settings.tools",
         "settings.tools.save",
         "settings.tools.switch",

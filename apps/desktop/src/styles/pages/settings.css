@@ -276,6 +276,82 @@
   line-height: 1.5;
 }
 
+.limits {
+  margin: 0 0 var(--s-6);
+}
+.limits summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding: var(--s-1) 0;
+  cursor: pointer;
+}
+.limits summary b {
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+.limits summary span {
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.limits summary::before {
+  content: "›";
+  color: var(--dim);
+  transition: transform 120ms ease;
+}
+.limits[open] summary {
+  margin-bottom: var(--s-2);
+}
+.limits[open] > summary::before,
+.limits-more[open] > summary::before {
+  transform: rotate(90deg);
+}
+.limits-more > summary {
+  margin: var(--s-2) 0;
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.limits-list label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-4);
+  padding: var(--s-3) 0;
+  border-top: 1px solid var(--line);
+}
+.limits-list span {
+  display: grid;
+  gap: var(--s-1);
+  min-width: 0;
+}
+.limits-list b {
+  font-weight: 500;
+  font-size: var(--text-sm);
+}
+.limits-list small {
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.limits-list input {
+  flex: 0 0 132px;
+  width: 132px;
+  padding: var(--s-1) var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: right;
+}
+.limits-list input:focus-visible {
+  border-color: var(--gold);
+  outline: none;
+}
+.limits-list input:disabled {
+  color: var(--dim);
+}
+
 .hooks-state {
   display: flex;
   align-items: center;

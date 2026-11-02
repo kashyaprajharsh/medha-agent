@@ -2893,7 +2893,7 @@ async fn a_long_background_command_reports_its_progress_and_still_its_end() {
     let chat = client.open(&folder).await;
     let start = json!({
         // Printed values the command text does not contain, so only real output can match.
-        "command": "echo first-$((1+1)); sleep 66; echo last-$((2+1))",
+        "command": "while [ ! -f progress.ready ]; do sleep 0.05; done; echo first-$((1+1)); sleep 66; echo last-$((2+1))",
         "network": false,
         "background": true,
         "notify_every": 1,
@@ -2905,6 +2905,8 @@ async fn a_long_background_command_reports_its_progress_and_still_its_end() {
     let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
     client.ask("approval.respond", Some(&chat), gate).await;
     client.until(|frame| kind(frame, "turn.done")).await;
+    // Release output after the initial tool reply has advanced its read cursor.
+    std::fs::write(folder.join("progress.ready"), "ready").unwrap();
     // Too small an interval is raised to the minute: the first report comes at 60 s, not after 1 s.
     let started = std::time::Instant::now();
     tokio::time::sleep(Duration::from_secs(50)).await;

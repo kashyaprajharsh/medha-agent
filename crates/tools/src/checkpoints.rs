@@ -14,9 +14,16 @@ use std::{
 /// How long a command waits for another process's backup before going without one.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
+fn check_file_limit(count: usize, limit: usize) -> Result<(), String> {
+    if count > limit {
+        return Err(format!("the workspace has more than {limit} files"));
+    }
+    Ok(())
+}
+
+fn inventory(root: &Path, limit: usize) -> Result<Vec<PathBuf>, String> {
     if !root.ancestors().any(is_repository) {
-        return folder_inventory(root);
+        return folder_inventory(root, limit);
     }
     let args = [
         "ls-files",
@@ -60,6 +67,7 @@ fn inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
             return Err("a listed file escaped the workspace".into());
         }
         paths.insert(root.join(path));
+        check_file_limit(paths.len(), limit)?;
     }
     Ok(paths.into_iter().collect())
 }
@@ -81,7 +89,7 @@ fn rebuildable(entry: &ignore::DirEntry) -> bool {
             || entry.path().join("pyvenv.cfg").is_file())
 }
 
-fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
+fn folder_inventory(root: &Path, limit: usize) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -98,9 +106,7 @@ fn folder_inventory(root: &Path) -> Result<Vec<PathBuf>, String> {
             continue;
         }
         paths.push(entry.into_path());
-        if paths.len() > 100_000 {
-            return Err("the workspace has more than 100,000 files".into());
-        }
+        check_file_limit(paths.len(), limit)?;
     }
     Ok(paths)
 }
@@ -360,7 +366,8 @@ async fn capture(
     limits: &kernel::mutations::Settings,
 ) -> Result<(Value, Vec<String>), String> {
     let root = sandbox.root().to_owned();
-    let paths = tokio::task::spawn_blocking(move || inventory(&root))
+    let file_limit = limits.checkpoint_files;
+    let paths = tokio::task::spawn_blocking(move || inventory(&root, file_limit))
         .await
         .map_err(|error| error.to_string())??;
     std::fs::create_dir_all(sandbox.command_snapshots_dir()).map_err(|error| error.to_string())?;
@@ -418,7 +425,7 @@ async fn capture(
         return Err(error);
     }
     clean_orphans(sandbox)?;
-    let full = json!({"checkpoint":id,"_checkpoint_manifest":manifest,"_checkpoint_files":rows});
+    let full = json!({"checkpoint":id,"_checkpoint_manifest":manifest,"_checkpoint_files":rows,"_checkpoint_file_limit":file_limit});
     Ok((full, skipped))
 }
 
@@ -449,10 +456,11 @@ fn plan(
         let stamp = stamp(&meta);
         let key = path.to_string_lossy().into_owned();
         let len = meta.len() as usize;
-        if limits
-            .checkpoint_bytes
-            .checked_sub(sized)
-            .is_none_or(|remaining| len > remaining)
+        if len > limits.checkpoint_file_bytes
+            || limits
+                .checkpoint_bytes
+                .checked_sub(sized)
+                .is_none_or(|remaining| len > remaining)
         {
             skipped.push(display(sandbox, &path));
             rows.push(json!({"path":path,"skipped":true,"stat":stamp}));
@@ -536,7 +544,7 @@ pub(crate) async fn finish(sandbox: &WorkspaceSandbox, observation: &mut Observa
         .flatten()
         .filter_map(|row| Some((row["path"].as_str()?.to_owned(), row.clone())))
         .collect();
-    match changed(sandbox, &mut rows) {
+    match changed(sandbox, &mut rows, guard.settings().checkpoint_files) {
         Ok(changed) => observation.payload["_checkpoint_files"] = json!(changed),
         Err(error) => {
             observation.payload["_checkpoint_note"] = json!(format!(
@@ -567,17 +575,22 @@ pub(crate) fn changed_since(
         .flatten()
         .filter_map(|row| Some((row["path"].as_str()?.to_owned(), row.clone())))
         .collect();
-    changed(sandbox, &mut rows)
+    let limit = backup["_checkpoint_file_limit"]
+        .as_u64()
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or_else(|| kernel::mutations::Settings::default().checkpoint_files);
+    changed(sandbox, &mut rows, limit)
 }
 
 /// Rows whose current bytes differ from the backup; files new since it are added as missing before.
 fn changed(
     sandbox: &WorkspaceSandbox,
     rows: &mut BTreeMap<String, Value>,
+    limit: usize,
 ) -> Result<Vec<Value>, String> {
     let mut changed = Vec::new();
     let mut present = HashSet::new();
-    for path in inventory(sandbox.root())? {
+    for path in inventory(sandbox.root(), limit)? {
         if path.starts_with(sandbox.snapshots_dir())
             || path.starts_with(sandbox.command_snapshots_dir())
         {

@@ -29,7 +29,10 @@ pub async fn collect_reports(
                 .ok();
             summary.truncate(cut);
             summary.push_str(&match spilled {
-                Some(hash) => format!("\n… truncated; read the rest with `read` hash={hash}"),
+                Some(hash) => format!(
+                    "\n… truncated; read the rest with `read` {}",
+                    kernel::artifacts::read_arg(artifacts.as_ref(), &hash)
+                ),
                 None => "\n… report truncated".into(),
             });
         }

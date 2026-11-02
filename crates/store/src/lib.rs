@@ -382,6 +382,13 @@ impl FileArtifactStore {
 }
 
 impl ArtifactStore for FileArtifactStore {
+    fn path(&self, hash: &str) -> Option<PathBuf> {
+        let path = self.safe_path(hash).ok()?;
+        // Plain form for the model; a Windows verbatim path is what an earlier fix kept from it.
+        path.is_file()
+            .then(|| dunce::simplified(&path).to_path_buf())
+    }
+
     fn put(&self, bytes: &[u8]) -> Result<String, String> {
         let mut h = Sha256::new();
         h.update(bytes);

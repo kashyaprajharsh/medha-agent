@@ -43,9 +43,17 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
+/// A line diff that stops refining after 100 ms: a file rewritten almost whole otherwise takes tens of seconds.
+/// The result stays exact, only coarser.
+pub fn line_diff<'a>(before: &'a str, after: &'a str) -> TextDiff<'a, 'a, 'a, str> {
+    TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(100))
+        .diff_lines(before, after)
+}
+
 /// Build a compact unified-style diff (with a few lines of context) for display.
 fn make_diff(path: &str, before: &str, after: &str) -> String {
-    let diff = TextDiff::from_lines(before, after);
+    let diff = line_diff(before, after);
     let mut out = format!("--- {path}\n+++ {path}\n");
     for change in diff.iter_all_changes() {
         let sign = match change.tag() {
@@ -1538,11 +1546,11 @@ struct Read {
 /// What `read` says of text to every model; images are added for those that see.
 macro_rules! read_text {
     () => {
-        "Read a file by `path`, or a stored result by `hash`. Text comes a page at a time: \
+        "Read a file by `path`, a stored result included. Text comes a page at a time: \
          up to 2000 lines from `offset` (1-based), fewer with `limit`, each as `N|text`; \
          leave the number and bar out when you edit. When more remains, the result says how \
-         to continue. `count: true` gives words, lines and characters. With `hash`, `offset` \
-         and `length` are bytes. A path outside the workspace asks permission."
+         to continue. `count: true` gives words, lines and characters. A path outside the \
+         workspace asks permission."
     };
 }
 
@@ -1550,6 +1558,18 @@ impl Read {
     fn sees_images(&self) -> bool {
         self.images_reach_model
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// An image kept without an extension, such as a stored result, told by its first bytes. Only a file the chat
+    /// may already read is looked at, so this never asks for approval before the read itself does.
+    async fn image_without_extension(&self, path: &str) -> bool {
+        if std::path::Path::new(path).extension().is_some() {
+            return false;
+        }
+        let Some(resolved) = self.text.sbx.resolve_if_permitted(path).await else {
+            return false;
+        };
+        resolved.is_file() && media::has_image_header(&header(&resolved).await.0)
     }
 
     /// Why an image would be wasted on this model, when it would be.
@@ -1612,12 +1632,10 @@ impl Tool for Read {
         let mut schema = json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File to read; omit when reading an artifact" },
-                "hash": { "type": "string", "description": "Artifact content hash, from a spilled tool result" },
-                "offset": { "type": "integer", "minimum": 0, "description": "With `path`: 1-based first line. With `hash`: start byte." },
-                "limit": { "type": "integer", "minimum": 1, "description": "With `path`: how many lines to return" },
-                "column": { "type": "integer", "minimum": 1, "description": "With `path`: start line `offset` at this byte" },
-                "length": { "type": "integer", "minimum": 1, "description": "With `hash`: how many bytes to return" },
+                "path": { "type": "string", "description": "File to read" },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based first line" },
+                "limit": { "type": "integer", "minimum": 1, "description": "How many lines to return" },
+                "column": { "type": "integer", "minimum": 1, "description": "Start line `offset` at this byte" },
                 "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" },
                 "render": { "type": "boolean", "description": "Screenshot the page at `path` (HTML file or URL)" }
             }
@@ -1630,6 +1648,7 @@ impl Tool for Read {
         schema
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        // Not advertised: an older chat's note reads by hash, with offset and length in bytes, and still works.
         // A model that fills every field sends `"hash": ""` beside a path; a real hash still wins as before.
         let hash = args.get("hash");
         let real = hash
@@ -1641,7 +1660,8 @@ impl Tool for Read {
         let path = arg_str(args, "path")
             .map_err(|_| ToolError::Args("read needs `path` or `hash`".into()))?;
         // An image is already a picture, so `render` on one just views it.
-        let image = media::has_image_extension(std::path::Path::new(&path));
+        let image = media::has_image_extension(std::path::Path::new(&path))
+            || self.image_without_extension(&path).await;
         if args.get("render").and_then(Value::as_bool) == Some(true) && !image {
             self.no_use_for_images(
                 "Check the page another way: read its source, or run a command that tests it.",
@@ -1731,20 +1751,25 @@ fn text_page(text: &str, start: u64, limit: u64) -> sandbox::LineRangeRead {
     }
 }
 
-/// Names a binary file's type and size instead of a UTF-8 error the model cannot act on.
-async fn binary_file(path: &str, resolved: &std::path::Path) -> ToolError {
+/// The first bytes of an already resolved file, and its size, enough to name its format.
+async fn header(resolved: &std::path::Path) -> (Vec<u8>, u64) {
     let resolved = resolved.to_path_buf();
-    let (sample, size) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut sample = Vec::new();
         let size = std::fs::metadata(&resolved).map_or(0, |found| found.len());
         if let Ok(file) = std::fs::File::open(&resolved) {
-            let _ = file.take(16).read_to_end(&mut sample);
+            let _ = file.take(32).read_to_end(&mut sample);
         }
         (sample, size)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_default()
+}
+
+/// Names a binary file's type and size instead of a UTF-8 error the model cannot act on.
+async fn binary_file(path: &str, resolved: &std::path::Path) -> ToolError {
+    let (sample, size) = header(resolved).await;
     ToolError::Failed(format!(
         "{path} is a binary file ({}), not text, so read cannot show it. Inspect it with a \
          command (its format, size or metadata) or a tool made for that format.",
@@ -1855,6 +1880,8 @@ fn page_limit() -> usize {
 /// left out is still reported, so truncation is visible rather than silent.
 const FS_LIST_MAX_ENTRIES: usize = 2_000;
 const FS_READ_MAX_RANGE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest one file `grep` searches when it is named, the store's largest result.
+const GREP_ONE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const FS_READ_MAX_RANGE_OUTPUT_BYTES: usize = 2_000_000;
 
 #[async_trait]
@@ -2806,8 +2833,8 @@ impl Tool for Grep {
     }
     fn description(&self) -> &str {
         "Search files by regular expression, skipping ignored and hidden files, target/, \
-         node_modules and binaries, or one stored result by `hash`, whose hits give the byte \
-         to read from."
+         node_modules and binaries. A file named in `path`, a stored result included, is \
+         searched whole."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2817,9 +2844,8 @@ impl Tool for Grep {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax)" },
-                "path": { "type": "string", "description": "Dir" },
+                "path": { "type": "string", "description": "Folder or file" },
                 "glob": { "type": "string", "description": "Only these files" },
-                "hash": { "type": "string", "description": "Search this stored result" },
                 "output_mode": { "type": "string", "enum": ["content", "files", "count"] },
                 "case_insensitive": { "type": "boolean" },
                 "literal": { "type": "boolean" },
@@ -2904,6 +2930,12 @@ impl Tool for Grep {
             let mut skipped_large = 0usize;
             let mut search_errors = Vec::new();
             let mut error_count = 0usize;
+            // A file asked for by name is searched whole, a stored result included; a folder skips large files.
+            let per_file = if start.is_file() {
+                GREP_ONE_FILE_BYTES
+            } else {
+                1_000_000
+            };
             let walk = WalkBuilder::new(&start)
                 .standard_filters(true)
                 .hidden(!hidden)
@@ -2931,7 +2963,7 @@ impl Tool for Grep {
                 {
                     continue;
                 }
-                if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
+                if dent.metadata().map(|m| m.len()).unwrap_or(0) > per_file {
                     skipped_large += 1;
                     continue;
                 }
@@ -3034,7 +3066,7 @@ fn search_stored(
     re: &regex::Regex,
     max: usize,
 ) -> Result<Value, ToolError> {
-    const MAX_SEARCHED: usize = 64 * 1024 * 1024;
+    const MAX_SEARCHED: usize = GREP_ONE_FILE_BYTES as usize;
     let failed = |error: String| {
         ToolError::Failed(format!(
             "no result stored under hash {hash} ({error}); use a hash a tool result printed"

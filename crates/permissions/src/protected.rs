@@ -160,6 +160,33 @@ fn is_state_control(path: &Path) -> bool {
             }))
 }
 
+/// What no tool may write, even approved: everything [`is_protected`] covers, and each project's records under
+/// the state's `projects` folder (history, stored results, backups), which only Medha's own code writes.
+/// A writer agent's worktree lives there too and stays writable: it is that agent's workspace.
+pub fn is_protected_for_write(path: &Path) -> bool {
+    let folded = fold(&lexical(path));
+    let states = dirs::home_dir()
+        .map(|home| home.join(".medha"))
+        .into_iter()
+        .chain(named_state_dir());
+    let record = |state: PathBuf| {
+        let projects = fold(&state.join("projects"));
+        let Ok(inside) = folded.strip_prefix(&projects) else {
+            return false;
+        };
+        let mut parts = inside.components();
+        parts.next().is_some()
+            && parts
+                .next()
+                .is_none_or(|part| part.as_os_str() != "worktrees")
+    };
+    is_protected(path)
+        || states
+            .flat_map(|state| [Some(lexical(&state)), state.canonicalize().ok()])
+            .flatten()
+            .any(record)
+}
+
 fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {

@@ -707,13 +707,13 @@ impl PipelineEngine {
                     };
                     if m.role == Role::Tool && toks >= floor {
                         let mut pm = m.clone();
-                        pm.content = match self
-                            .artifacts
-                            .as_ref()
-                            .and_then(|s| s.put(m.content.as_bytes()).ok())
-                        {
-                            Some(hash) => format!(
-                                "[tool output pruned to save context — {toks} tokens. Re-read with read hash=\"{hash}\"]"
+                        pm.content = match self.artifacts.as_ref().and_then(|s| {
+                            s.put(m.content.as_bytes())
+                                .ok()
+                                .map(|hash| kernel::artifacts::read_arg(s.as_ref(), &hash))
+                        }) {
+                            Some(at) => format!(
+                                "[tool output pruned to save context — {toks} tokens. Re-read with read {at}]"
                             ),
                             None => format!(
                                 "[earlier tool output pruned to save context — {toks} tokens]"
@@ -1053,8 +1053,9 @@ async fn stored_image_reference(
             return None;
         }
         references.push(format!(
-            "{}: read hash=\"{hash}\"",
-            image.label.as_deref().unwrap_or("screenshot")
+            "{}: read {}",
+            image.label.as_deref().unwrap_or("screenshot"),
+            kernel::artifacts::read_arg(store.as_ref(), hash)
         ));
     }
     let mut reference = message.clone();

@@ -20,6 +20,7 @@ ulid = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 tokio.workspace = true
+dunce = "1"
 
 [dev-dependencies]
 test-support = { path = "../test-support" }

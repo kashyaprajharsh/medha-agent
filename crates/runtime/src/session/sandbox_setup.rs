@@ -95,6 +95,11 @@ pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
         options.clone(),
         lock.clone(),
         sbx_cfg.home.clone(),
+        // Commands read stored results by path; nothing in the store is writable to them.
+        sandbox::StateAccess {
+            read: vec![state.join("artifacts")],
+            write: Vec::new(),
+        },
         approved.clone(),
         net_grant.clone(),
         scratch.as_ref().map(|scratch| scratch.path().to_path_buf()),
@@ -102,6 +107,8 @@ pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
     let exec_backend = live_settings.exec();
     let verifier_exec = Arc::clone(&exec_backend);
 
+    // Made now so the read grant below names its real path, not one through a link.
+    std::fs::create_dir_all(state.join("artifacts"))?;
     // Writers re-root this template in their isolated worktrees.
     let sandbox_template = agents::SandboxTemplate {
         trust: trust_path.clone(),
@@ -109,7 +116,7 @@ pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
         gate: surface.gate.clone(),
         exec: Arc::clone(&exec_backend),
         snapshots: state.join("snapshots"),
-        readable: vec![config::user_skills_dir()?],
+        readable: vec![config::user_skills_dir()?, state.join("artifacts")],
         approved: approved.clone(),
         net_grant: net_grant.clone(),
     };
@@ -123,8 +130,8 @@ pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
     )?
     .with_exec_backend(exec_backend)
     .with_network_grant(net_grant)?
-    // Bundled user-skill files are trusted configuration, not workspace data.
-    .with_readable_roots(&[config::user_skills_dir()?])
+    // Bundled user-skill files are trusted configuration, and stored results are read back by path; neither is writable.
+    .with_readable_roots(&[config::user_skills_dir()?, state.join("artifacts")])
     .with_snapshots_dir(state.join("snapshots"))
     .with_command_snapshots_dir(config::command_snapshots_dir(cwd)?);
     // Held to the end of the run; a temp directory that refuses it just means no scratch.

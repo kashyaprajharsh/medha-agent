@@ -3,7 +3,7 @@
 //! acts on, in the form it reads best, and never the same text twice.
 
 use serde_json::Value;
-use similar::{ChangeTag, TextDiff};
+use similar::ChangeTag;
 
 /// Lines of unchanged text kept around each change in a diff.
 const CONTEXT: usize = 3;
@@ -242,7 +242,7 @@ pub(crate) fn file_change(payload: &Value) -> Option<String> {
     let path = payload["path"].as_str()?;
     let before = payload["old"].as_str()?;
     let after = payload["new"].as_str()?;
-    let diff = TextDiff::from_lines(before, after);
+    let diff = crate::line_diff(before, after);
     let (mut added, mut removed) = (0, 0);
     for change in diff.iter_all_changes() {
         match change.tag() {

@@ -17,7 +17,8 @@ use tokio::sync::Mutex;
 mod audit;
 mod protected;
 pub use protected::{
-    CREDENTIAL_RELATIVE, is_protected, named_state_dir, protected_paths, state_secrets,
+    CREDENTIAL_RELATIVE, is_protected, is_protected_for_write, named_state_dir, protected_paths,
+    state_secrets,
 };
 
 #[derive(Debug, Error)]
@@ -33,6 +34,11 @@ pub enum PermissionError {
          and no approval changes that"
     )]
     Protected { path: PathBuf },
+    #[error(
+        "{path} is one of Medha's own project records (history, stored results or backups); only Medha \
+         writes there, and no approval changes that. Reading a stored result by path still works"
+    )]
+    Record { path: PathBuf },
     #[error("Human gate unavailable for approval")]
     NoHumanGate,
     #[error("Persistent trust file must be machine-local and outside the workspace: {path}")]
@@ -520,6 +526,20 @@ fn folder_to_offer(resolved: &Path) -> Option<PathBuf> {
     (depth >= 3 && !too_wide && !is_protected(folder)).then(|| folder.to_path_buf())
 }
 
+/// Why `path` is closed to `permission` whatever is approved: a write also never reaches a project's records.
+pub fn refusal(path: &Path, permission: PermissionType) -> Option<PermissionError> {
+    if is_protected(path) {
+        return Some(PermissionError::Protected {
+            path: path.to_path_buf(),
+        });
+    }
+    (permission == PermissionType::Write && is_protected_for_write(path)).then(|| {
+        PermissionError::Record {
+            path: path.to_path_buf(),
+        }
+    })
+}
+
 impl PermissionManager {
     /// Expand a user path and anchor relative paths to this manager's sandbox.
     /// File tools define relative paths in workspace coordinates; consulting
@@ -754,13 +774,19 @@ impl PermissionManager {
         detail: &str,
         escalated: bool,
     ) -> Result<NetworkDecision, PermissionError> {
-        if let Some(path) = access
+        let reads = access
             .read_paths
             .iter()
-            .chain(&access.write_paths)
-            .find(|path| is_protected(path))
+            .map(|path| (path, PermissionType::Read));
+        let writes = access
+            .write_paths
+            .iter()
+            .map(|path| (path, PermissionType::Write));
+        if let Some(refused) = reads
+            .chain(writes)
+            .find_map(|(path, permission)| refusal(path, permission))
         {
-            return Err(PermissionError::Protected { path: path.clone() });
+            return Err(refused);
         }
         let _guard = self.prompt_mutex.lock().await;
         let gate = self
@@ -1143,7 +1169,7 @@ impl PermissionManager {
         // canonicalizes existing targets and the parents of prospective ones;
         // the requested permission below still controls admission.
         let resolved = self.resolve_path_for_write(path).ok()?;
-        (!is_protected(&resolved)
+        (refusal(&resolved, permission).is_none()
             && (self.is_inside_workspace(&resolved) || self.is_trusted(&resolved, permission)))
         .then_some(resolved)
     }
@@ -1168,17 +1194,17 @@ impl PermissionManager {
     ) -> Result<PathBuf, PermissionError> {
         // Ahead of the workspace and trust checks, so neither can open a protected store.
         let requested = self.workspace_path(path)?;
-        if is_protected(&requested) {
+        if let Some(refused) = refusal(&requested, permission) {
             self.audit_log(path, &requested, permission, "refused (protected)")?;
-            return Err(PermissionError::Protected { path: requested });
+            return Err(refused);
         }
         let resolved = match permission {
             PermissionType::Read => self.resolve_path_for_read(path)?,
             PermissionType::Write => self.resolve_path_for_write(path)?,
         };
-        if is_protected(&resolved) {
+        if let Some(refused) = refusal(&resolved, permission) {
             self.audit_log(path, &resolved, permission, "refused (protected)")?;
-            return Err(PermissionError::Protected { path: resolved });
+            return Err(refused);
         }
 
         if self.is_inside_workspace(&resolved) {

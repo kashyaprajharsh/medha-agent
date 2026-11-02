@@ -3354,7 +3354,10 @@ fn apply_diagnostic_delta(
 }
 
 fn shift_diagnostic(diagnostic: &Diagnostic, old_text: &str, new_text: &str) -> Option<Diagnostic> {
-    let diff = TextDiff::from_lines(old_text, new_text);
+    // Bounded like every file diff: a coarser diff still maps lines exactly, only fewer of them.
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(100))
+        .diff_lines(old_text, new_text);
     let map_line = |line: u32| -> Option<u32> {
         let line = line as usize;
         for operation in diff.ops() {

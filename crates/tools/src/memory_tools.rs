@@ -711,9 +711,10 @@ impl SessionsSearch {
                 .put_async(text.into_bytes())
                 .await
             {
-                Ok(hash) => {
-                    format!("[oversized event stored as an artifact — read hash=\"{hash}\"]")
-                }
+                Ok(hash) => format!(
+                    "[oversized event stored as an artifact — read {}]",
+                    kernel::artifacts::read_arg(self.artifacts.as_ref(), &hash)
+                ),
                 Err(_) => "[oversized event; open it by event id from the session log]".into(),
             }
         } else {
@@ -1448,9 +1449,14 @@ mod tests {
             .await
             .unwrap();
         let text = result["sessions"][0]["window"][0]["text"].as_str().unwrap();
-        assert!(text.contains("read hash="), "{text}");
+        assert!(text.contains("read path="), "{text}");
         assert!(!text.contains(&"x".repeat(1_000)));
-        let hash = text.split('"').nth(1).unwrap();
+        let path = std::path::PathBuf::from(text.split('"').nth(1).unwrap());
+        let hash = path.file_name().unwrap().to_str().unwrap();
         assert!(artifacts.size(hash).unwrap() > 20_000);
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 20_000,
+            "the note names the stored file"
+        );
     }
 }

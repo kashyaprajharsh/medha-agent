@@ -189,6 +189,7 @@ fn settings_for(folder: &std::path::Path) -> Arc<LiveSettings> {
         runtime::SessionOptions::default(),
         runtime::workspace::load_lock(folder, &common::Quiet).unwrap(),
         sandbox::HomeScope::default(),
+        sandbox::StateAccess::default(),
         sandbox::ApprovedRoots::default(),
         sandbox::NetworkGrant::default(),
         None,

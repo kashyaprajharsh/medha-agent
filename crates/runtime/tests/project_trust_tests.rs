@@ -429,6 +429,7 @@ while True:
     );
     let subfolder = a.root.join("src");
     std::fs::create_dir_all(&subfolder).unwrap();
+    #[cfg(unix)]
     let pid = std::fs::read_to_string(a.root.join("server.pid"))
         .unwrap()
         .parse::<i32>()
@@ -484,6 +485,7 @@ while True:
     })
     .await
     .unwrap();
+    #[cfg(unix)]
     let starting_pid = std::fs::read_to_string(a.root.join("server.pid"))
         .unwrap()
         .parse::<i32>()

@@ -6793,7 +6793,7 @@ impl Tool for ShellExec {
             let id = registered.id().to_owned();
             let done = self.tasks.done_receiver(&id);
             let mut payload = self.tasks.read(&id, false).unwrap_or_default();
-            payload["workdir"] = json!(workdir);
+            payload["workdir"] = json!(sandbox::exec::plain_path(&workdir));
             if stalled {
                 payload["sandbox_hint"] = json!(format!(
                     "It reported a name-resolution failure and has gone quiet, which may be useful work or a retry wait, so it was not stopped. {NETWORK_DISABLED_HINT} Stop this task with task.control before rerunning it."
@@ -6856,7 +6856,7 @@ impl Tool for ShellExec {
                 network_disabled_hint(denies_network, &completed.stdout, &completed.stderr);
             let mut result = json!({
                 "command": command,
-                "workdir": workdir,
+                "workdir": sandbox::exec::plain_path(&workdir),
                 "exit_code": completed.exit_code,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
@@ -6922,7 +6922,7 @@ impl Tool for ShellExec {
         );
         let mut payload = json!({
             "command": command,
-            "workdir": workdir,
+            "workdir": sandbox::exec::plain_path(&workdir),
             "exit_code": completed.exit_code,
             "stdout": completed.stdout,
             "stderr": completed.stderr,

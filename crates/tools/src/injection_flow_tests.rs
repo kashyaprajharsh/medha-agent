@@ -6,7 +6,10 @@ use kernel::*;
 use serde_json::json;
 use std::sync::Arc;
 
+// Used only by the jail test below, which needs a native sandbox.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct AttackerPage;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[async_trait::async_trait]
 impl crate::Tool for AttackerPage {
     fn name(&self) -> &str {
@@ -29,8 +32,10 @@ impl crate::Tool for AttackerPage {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Default)]
 struct Notices(std::sync::Mutex<Vec<String>>);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl StreamSink for Notices {
     fn notice(&self, text: &str) {
         self.0.lock().unwrap().push(text.into());

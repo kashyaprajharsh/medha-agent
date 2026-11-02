@@ -2503,7 +2503,6 @@ async fn a_stored_result_can_be_searched_and_read_from_the_hit() {
 }
 
 /// Starts a chat, leaves one background command running, then kills the backend outright.
-#[cfg(unix)]
 async fn crash_with_a_command_running(world: &World, folder: &Path, command: &str) -> String {
     let backend = world.backend();
     let mut client = backend.connect().await;
@@ -2516,7 +2515,6 @@ async fn crash_with_a_command_running(world: &World, folder: &Path, command: &st
     chat
 }
 
-#[cfg(unix)]
 async fn reopen(backend: &Backend, folder: &Path, chat: &str) -> Client {
     let mut client = backend.connect().await;
     let resumed = client.create(folder, Some(chat)).await;
@@ -2537,8 +2535,24 @@ fn process_alive(pid: &str) -> bool {
         .success()
 }
 
+#[cfg(windows)]
+fn process_alive(pid: &str) -> bool {
+    let listed = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid.trim()), "/NH"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .any(|word| word == pid.trim())
+}
+
+/// The process Medha recorded for a command it left running, as the operating system numbers it.
+fn recorded_pid(world: &World, chat: &str, task: &str) -> String {
+    let record = std::fs::read(task_records(world, chat).join(format!("{task}.json"))).unwrap();
+    serde_json::from_slice::<Value>(&record).unwrap()["pid"].to_string()
+}
+
 /// The chat's folder of records for commands left running.
-#[cfg(unix)]
 fn task_records(world: &World, chat: &str) -> PathBuf {
     fn find(dir: &Path, chat: &str) -> Option<PathBuf> {
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -2559,14 +2573,12 @@ fn task_records(world: &World, chat: &str) -> PathBuf {
 }
 
 /// A command found again after a crash can still be stopped.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_found_after_a_crash_can_be_stopped() {
     let world = World::new();
     let folder = world.folder("found-stop");
-    let chat =
-        crash_with_a_command_running(&world, &folder, "echo $$ > pid.txt; exec sleep 987").await;
-    let pid = std::fs::read_to_string(folder.join("pid.txt")).unwrap();
+    let chat = crash_with_a_command_running(&world, &folder, "sleep 987").await;
+    let pid = recorded_pid(&world, &chat, "t1");
     assert!(process_alive(&pid), "the crash left it running");
     let backend = world.backend();
     let mut client = reopen(&backend, &folder, &chat).await;
@@ -2629,7 +2641,6 @@ async fn a_reused_process_number_is_left_alone() {
 }
 
 /// Rewind after a restart still undoes what the command wrote, from the backup taken at its start.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rewind_after_a_crash_undoes_what_a_found_command_wrote() {
     let world = World::new();
@@ -2762,7 +2773,6 @@ async fn quiet_background_work_sends_no_progress_note() {
 }
 
 /// A backend killed outright: the command works on, and the next backend reports its output and its end.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_outlives_a_crashed_backend_and_its_end_still_reaches_the_model() {
     let world = World::new();
@@ -2897,24 +2907,22 @@ async fn a_long_background_command_reports_its_progress_and_still_its_end() {
     tokio::time::sleep(Duration::from_secs(50)).await;
     client.until(|frame| kind(frame, "turn.done")).await;
     assert!(started.elapsed().as_secs() >= 55, "{:?}", started.elapsed());
-    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
-        .last()
-        .unwrap()["messages"]
-        .to_string();
-    assert!(
-        raw.contains("still running") && raw.contains("first-2"),
-        "{raw}"
-    );
-    assert!(!raw.contains("last-3"), "{raw}");
     client.until(|frame| kind(frame, "turn.done")).await;
-    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
-        .last()
-        .unwrap()["messages"]
-        .to_string();
+    // On a busy machine both turns may be in before this reads, so each is found, not assumed to be last.
+    let requests: Vec<String> = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .map(|request| request["messages"].to_string())
+        .collect();
+    let progress = requests
+        .iter()
+        .position(|raw| raw.contains("still running") && !raw.contains("last-3"));
+    let end = requests
+        .iter()
+        .position(|raw| raw.contains("exit code 0") && raw.contains("last-3"));
     assert!(
-        raw.contains("exit code 0") && raw.contains("last-3"),
-        "{raw}"
+        matches!((progress, end), (Some(progress), Some(end)) if progress < end),
+        "a progress note with only what was printed so far, then the end: {requests:?}"
     );
+    assert!(requests[progress.unwrap()].contains("first-2"));
 }
 
 /// `until` returns at a server's ready line, a command past its wait keeps going, and rewind restores what they wrote.

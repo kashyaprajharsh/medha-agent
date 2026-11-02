@@ -1363,9 +1363,51 @@ fn follow_output(
 
 /// When a process started, to tell it from a later one given the same number. `None` when it is gone.
 pub fn process_start(pid: u32) -> Option<String> {
-    if cfg!(windows) {
-        return None;
+    #[cfg(windows)]
+    return windows_process_start(pid);
+    #[cfg(not(windows))]
+    unix_process_start(pid)
+}
+
+/// A path as a person or a command would write it: without the `\\?\` prefix Windows paths get from canonicalize.
+pub fn plain_path(path: &Path) -> &Path {
+    #[cfg(windows)]
+    return dunce::simplified(path);
+    #[cfg(not(windows))]
+    path
+}
+
+/// The creation time of a running process. One that has exited, or cannot be opened, has none.
+#[cfg(windows)]
+fn windows_process_start(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is checked before use and closed on every path.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut code = 0u32;
+        let running = GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let mut created = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut exited, mut kernel, mut user) = (created, created, created);
+        let timed =
+            GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        CloseHandle(process);
+        (running && timed).then(|| {
+            (((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64).to_string()
+        })
     }
+}
+
+#[cfg(not(windows))]
+fn unix_process_start(pid: u32) -> Option<String> {
     // Linux says so directly, and small systems' `ps` has no `lstart`. A zombie has already ended.
     if cfg!(target_os = "linux") {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

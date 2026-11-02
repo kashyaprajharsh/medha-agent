@@ -1960,6 +1960,15 @@ fn spawn_background_captured(
     resources: Option<CommandResources>,
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
+    // A `\\?\` folder makes PowerShell treat a local script as untrusted and stop to ask.
+    #[cfg(windows)]
+    if let Some(folder) = cmd
+        .as_std()
+        .get_current_dir()
+        .map(|folder| dunce::simplified(folder).to_path_buf())
+    {
+        cmd.current_dir(folder);
+    }
     #[cfg(windows)]
     if limits.terminal {
         return spawn_windows_terminal(cmd, limits, resources);

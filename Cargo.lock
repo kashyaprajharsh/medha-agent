@@ -4064,6 +4064,7 @@ version = "0.1.12"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
+ "dunce",
  "errno",
  "git-safety",
  "kernel",

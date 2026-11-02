@@ -34,6 +34,7 @@ libc = "0.2"
 errno = "0.3"
 
 [target.'cfg(windows)'.dependencies]
+dunce = "1"
 portable-pty = "0.9"
 windows-sys = { version = "0.60", features = [
   "Win32_Foundation",

@@ -3198,16 +3198,18 @@ async fn a_windows_program_in_a_console_reads_what_is_typed() {
     let chat = client.open(&folder).await;
     std::fs::write(
         folder.join("ask.ps1"),
-        "$x = Read-Host\nWrite-Output \"got-$x\"\n",
+        "$x = Read-Host 'name'\nWrite-Output \"got-$x\"\n",
     )
     .unwrap();
     let command = "powershell -NoProfile -File ask.ps1";
     let start = json!({"command": command, "network": false, "background": true, "tty": true});
+    // Each stage leaves its result in what the test reports: the prompt shows whether the console runs at all.
+    let prompt = json!({"task_id": "t1", "until": "name"});
     let typed = json!({"op": "submit", "task_id": "t1", "text": "hello"});
     client
         .send(
             &chat,
-            &format!("SCRIPT\nshell_exec {start}\ntask_control {typed}"),
+            &format!("SCRIPT\nshell_exec {start}\ntask_output {prompt}\ntask_control {typed}"),
         )
         .await;
     let mut seen = String::new();
@@ -3230,6 +3232,31 @@ async fn a_windows_program_in_a_console_reads_what_is_typed() {
     assert!(
         seen.contains("got-hello"),
         "the typed line reached it: {seen}"
+    );
+}
+
+/// A program that asks its terminal where the cursor is gets an answer instead of waiting for ever.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_program_asking_its_terminal_a_question_is_answered() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("asks-terminal");
+    let chat = client.open(&folder).await;
+    // The question is built when it runs, so only real output can contain it.
+    let command = "stty raw -echo; printf '\\033[%sn' 6; r=$(dd bs=1 count=6 2>/dev/null); stty sane; echo answered-${#r}";
+    let start = json!({"command": command, "network": false, "background": true, "tty": true});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {start}")]).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let raw = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(raw.contains("answered-6"), "{raw}");
+    assert!(
+        !raw.contains("[6n"),
+        "the question is not shown to the model: {raw}"
     );
 }
 

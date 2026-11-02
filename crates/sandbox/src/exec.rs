@@ -1501,34 +1501,85 @@ pub struct BgProc {
     /// Container lifecycle cancellation, independent of the attached client.
     owned_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Medha's side of the command's terminal, when it was given one.
-    terminal: Option<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+    terminal: Option<TerminalInput>,
+}
+
+/// Medha's side of a command's terminal, shared by what is typed and what answers the terminal's questions.
+type TerminalInput = std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>;
+
+fn type_into(terminal: &TerminalInput, bytes: &[u8]) -> Result<(), String> {
+    let mut terminal = terminal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The shared descriptor is non-blocking for the reader, so a full buffer is retried briefly.
+    let mut rest = bytes;
+    let mut tries = 0;
+    while !rest.is_empty() {
+        match terminal.write(rest) {
+            Ok(written) => rest = &rest[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// What a real terminal would answer. Medha has no screen, so these only let a waiting program go on.
+const TERMINAL_ANSWERS: [(&[u8], &[u8]); 3] = [
+    (b"\x1b[5n", b"\x1b[0n"),
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b[18t", b"\x1b[8;24;120t"),
+];
+
+/// Takes the questions a program asks its terminal out of its output, including one split across reads.
+#[derive(Default)]
+struct TerminalQuestions {
+    partial: Vec<u8>,
+}
+
+impl TerminalQuestions {
+    /// Passes on `chunk` without its questions, and answers them.
+    fn read(&mut self, chunk: &[u8], capture: &SharedCapture, input: &TerminalInput) {
+        let mut output = Vec::with_capacity(chunk.len());
+        for &byte in chunk {
+            if self.partial.is_empty() && byte != 0x1b {
+                output.push(byte);
+                continue;
+            }
+            if byte == 0x1b {
+                output.append(&mut self.partial);
+            }
+            self.partial.push(byte);
+            if let Some((_, answer)) = TERMINAL_ANSWERS
+                .iter()
+                .find(|(question, _)| *question == self.partial)
+            {
+                let _ = type_into(input, answer);
+                self.partial.clear();
+            } else if !TERMINAL_ANSWERS
+                .iter()
+                .any(|(question, _)| question.starts_with(&self.partial))
+            {
+                output.append(&mut self.partial);
+            }
+        }
+        if let Ok(mut pair) = capture.lock() {
+            pair.push(CapturedStream::Stdout, &output);
+        }
+    }
 }
 
 impl BgProc {
     /// Types into the command's terminal; an error says it has none or it has gone.
     pub fn write_terminal(&self, bytes: &[u8]) -> Result<(), String> {
-        use std::io::Write;
         let terminal = self
             .terminal
             .as_ref()
             .ok_or("this command has no terminal; start it with tty: true")?;
-        let mut terminal = terminal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The shared descriptor is non-blocking for the reader, so a full buffer is retried briefly.
-        let mut rest = bytes;
-        let mut tries = 0;
-        while !rest.is_empty() {
-            match terminal.write(rest) {
-                Ok(written) => rest = &rest[written..],
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && tries < 100 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Ok(())
+        type_into(terminal, bytes)
     }
     /// Current buffered stdout / stderr (tails, with a marker if truncated).
     pub fn snapshot(&self) -> (String, String) {
@@ -1986,20 +2037,25 @@ fn spawn_background_captured(
         capture: SharedCapture,
         stream: CapturedStream,
         stop: std::sync::Arc<AtomicBool>,
+        terminal: Option<TerminalInput>,
     ) {
         pipe.make_nonblocking();
         let mut chunk = [0u8; 8192];
+        let mut questions = TerminalQuestions::default();
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
             }
             match pipe.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => {
-                    if let Ok(mut pair) = capture.lock() {
-                        pair.push(stream, &chunk[..n]);
+                Ok(n) => match &terminal {
+                    Some(input) => questions.read(&chunk[..n], &capture, input),
+                    None => {
+                        if let Ok(mut pair) = capture.lock() {
+                            pair.push(stream, &chunk[..n]);
+                        }
                     }
-                }
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2012,7 +2068,7 @@ fn spawn_background_captured(
         let capture = capture.clone();
         let stop = stop_pumps.clone();
         tokio::task::spawn_blocking(move || {
-            pump(out, capture, CapturedStream::Stdout, stop);
+            pump(out, capture, CapturedStream::Stdout, stop, None);
         })
     });
     // A terminal has one stream: everything the command prints, read from Medha's side of it.
@@ -2021,12 +2077,15 @@ fn spawn_background_captured(
         .map(std::fs::File::try_clone)
         .transpose()
         .map_err(|error| ExecError::Spawn(error.to_string()))?;
+    let terminal: Option<TerminalInput> =
+        terminal.map(|file| Arc::new(Mutex::new(Box::new(file) as Box<dyn std::io::Write + Send>)));
+    let answers = terminal.clone();
     let out_handle = out_handle.or_else(|| {
         terminal_reader.map(|reader| {
             let capture = capture.clone();
             let stop = stop_pumps.clone();
             tokio::task::spawn_blocking(move || {
-                pump(reader, capture, CapturedStream::Stdout, stop);
+                pump(reader, capture, CapturedStream::Stdout, stop, answers);
             })
         })
     });
@@ -2034,7 +2093,7 @@ fn spawn_background_captured(
         let capture = capture.clone();
         let stop = stop_pumps.clone();
         tokio::task::spawn_blocking(move || {
-            pump(err, capture, CapturedStream::Stderr, stop);
+            pump(err, capture, CapturedStream::Stderr, stop, None);
         })
     });
     let command_gone = Arc::new(AtomicBool::new(false));
@@ -2157,7 +2216,7 @@ fn spawn_background_captured(
         code,
         net_flag,
         owned_cancel: None,
-        terminal: terminal.map(|file| Mutex::new(Box::new(file) as Box<dyn std::io::Write + Send>)),
+        terminal,
     })
 }
 
@@ -2221,17 +2280,18 @@ fn spawn_windows_terminal(
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let (read_done, reader_finished) = std::sync::mpsc::channel::<()>();
     let reading = capture.clone();
+    let terminal: TerminalInput = Arc::new(Mutex::new(writer));
+    let answers = terminal.clone();
     std::thread::Builder::new()
         .name("medha-conpty-read".into())
         .spawn(move || {
             let mut chunk = [0u8; 8192];
+            let mut questions = TerminalQuestions::default();
             while let Ok(count) = std::io::Read::read(&mut reader, &mut chunk) {
                 if count == 0 {
                     break;
                 }
-                if let Ok(mut pair) = reading.lock() {
-                    pair.push(CapturedStream::Stdout, &chunk[..count]);
-                }
+                questions.read(&chunk[..count], &reading, &answers);
             }
             let _ = read_done.send(());
         })
@@ -2276,7 +2336,7 @@ fn spawn_windows_terminal(
         code,
         net_flag: None,
         owned_cancel: None,
-        terminal: Some(Mutex::new(writer)),
+        terminal: Some(terminal),
     })
 }
 

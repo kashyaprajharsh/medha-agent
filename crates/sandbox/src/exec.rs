@@ -95,6 +95,9 @@ pub enum ExecError {
     Spawn(String),
     #[error("sandbox unavailable: {0}")]
     Unavailable(String),
+    /// Medha held the command back on purpose; the sandbox itself is fine.
+    #[error("{0}")]
+    Held(String),
 }
 
 impl ExecError {

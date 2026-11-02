@@ -210,3 +210,51 @@ pub(crate) fn write(
     })?
     .ok_or_else(|| std::io::Error::other("snapshot parent disappeared"))
 }
+
+/// Where the link at `relative` points, or `None` when that entry is missing or not a link.
+pub(crate) fn read_link(root: &Path, relative: &Path) -> std::io::Result<Option<OsString>> {
+    below(root, relative, false, |parent, leaf| {
+        let name = crate::component_cstring(leaf).map_err(io)?;
+        let mut target = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: the buffer outlives the call and its length is passed with it.
+        let read = unsafe {
+            libc::readlinkat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::EINVAL | libc::ENOENT) => Ok(None),
+                _ => Err(error),
+            };
+        }
+        target.truncate(read as usize);
+        Ok(Some(OsStr::from_bytes(&target).to_owned()))
+    })
+    .map(Option::flatten)
+}
+
+/// Puts a link to `target` at `relative` in place of whatever is there, or removes it for `None`.
+pub(crate) fn write_link(
+    root: &Path,
+    relative: &Path,
+    target: Option<&OsStr>,
+) -> std::io::Result<()> {
+    below(root, relative, true, |parent, leaf| {
+        unlink(parent, leaf)?;
+        if let Some(target) = target {
+            let target = std::ffi::CString::new(target.as_bytes())?;
+            let name = crate::component_cstring(leaf).map_err(io)?;
+            // SAFETY: both strings are NUL-terminated and live across the call.
+            if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        parent.sync_all()
+    })?
+    .ok_or_else(|| std::io::Error::other("snapshot parent disappeared"))
+}

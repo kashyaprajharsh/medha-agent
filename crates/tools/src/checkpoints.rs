@@ -237,22 +237,47 @@ fn clean_orphans(sandbox: &WorkspaceSandbox) -> Result<(), String> {
 /// Drops the oldest manifests past the count or byte allowance; their unshared copies go with them.
 fn retain(
     sandbox: &WorkspaceSandbox,
-    incoming: usize,
+    incoming: &[Value],
     limits: &kernel::mutations::Settings,
 ) -> Result<(), String> {
     let kept = manifests(sandbox)?;
-    let mut total: usize = kept
+    let mut copies = BTreeMap::<String, (u64, usize)>::new();
+    for row in kept
         .iter()
-        .map(|(_, value)| value["bytes"].as_u64().unwrap_or(0) as usize)
-        .fold(0, usize::saturating_add);
+        .flat_map(|(_, value)| value["files"].as_array().into_iter().flatten())
+        .chain(incoming)
+    {
+        let Some(id) = row["snapshot"].as_str() else {
+            continue;
+        };
+        if let Some((_, references)) = copies.get_mut(id) {
+            *references += 1;
+        } else {
+            let size = sandbox
+                .snapshot_size(id)
+                .map_err(|error| error.to_string())?;
+            copies.insert(id.to_owned(), (size, 1));
+        }
+    }
+    let mut total = copies
+        .values()
+        .map(|(size, _)| *size)
+        .fold(0, u64::saturating_add);
     let mut count = kept.len();
     for (path, value) in kept {
-        if count < limits.checkpoint_count
-            && total.saturating_add(incoming) <= limits.checkpoint_bytes
-        {
+        if count < limits.checkpoint_count && total <= limits.checkpoint_bytes as u64 {
             break;
         }
-        total = total.saturating_sub(value["bytes"].as_u64().unwrap_or(0) as usize);
+        for row in value["files"].as_array().into_iter().flatten() {
+            if let Some((size, references)) =
+                row["snapshot"].as_str().and_then(|id| copies.get_mut(id))
+            {
+                *references -= 1;
+                if *references == 0 {
+                    total = total.saturating_sub(*size);
+                }
+            }
+        }
         count -= 1;
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
     }
@@ -381,7 +406,7 @@ async fn capture(
     sandbox
         .seal_command_snapshots()
         .map_err(|error| error.to_string())?;
-    retain(sandbox, bytes, limits)?;
+    retain(sandbox, &rows, limits)?;
     let id = ulid::Ulid::new().to_string();
     let directory = sandbox.command_snapshots_dir().join("commands").join(&id);
     let manifest = directory.join("manifest.json");
@@ -423,6 +448,17 @@ fn plan(
         }
         let stamp = stamp(&meta);
         let key = path.to_string_lossy().into_owned();
+        let len = meta.len() as usize;
+        if limits
+            .checkpoint_bytes
+            .checked_sub(sized)
+            .is_none_or(|remaining| len > remaining)
+        {
+            skipped.push(display(sandbox, &path));
+            rows.push(json!({"path":path,"skipped":true,"stat":stamp}));
+            continue;
+        }
+        sized += len;
         if let Some(row) = previous.get(&key)
             && row["stat"] == stamp
             && row["snapshot"]
@@ -432,17 +468,7 @@ fn plan(
             rows.push(row.clone());
             continue;
         }
-        let len = meta.len() as usize;
-        match limits.checkpoint_bytes.checked_sub(sized) {
-            Some(remaining) if len <= remaining => {
-                sized += len;
-                planned.push((path, stamp, remaining));
-            }
-            _ => {
-                skipped.push(display(sandbox, &path));
-                rows.push(json!({"path":path,"skipped":true,"stat":stamp}));
-            }
-        }
+        planned.push((path, stamp, len));
     }
     (rows, planned, skipped)
 }

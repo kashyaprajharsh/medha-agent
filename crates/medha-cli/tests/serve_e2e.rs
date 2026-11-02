@@ -17,6 +17,10 @@ const WAIT: Duration = Duration::from_secs(60);
 #[path = "common/editor_checks.rs"]
 mod editor_checks;
 
+#[cfg(unix)]
+#[path = "serve_e2e/checkpoint_caps.rs"]
+mod checkpoint_caps;
+
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut request = Vec::new();
     loop {

@@ -3094,6 +3094,13 @@ impl WorkspaceSandbox {
         self.snapshot_path(id).is_ok_and(|path| path.is_file())
     }
 
+    /// The size on disk of the copy a validated snapshot id names.
+    pub fn snapshot_size(&self, id: &str) -> Result<u64, SandboxError> {
+        std::fs::metadata(self.snapshot_path(id)?)
+            .map(|metadata| metadata.len())
+            .map_err(|error| SandboxError::Io(error.to_string()))
+    }
+
     /// Snapshot ids are ULIDs (Crockford base32); reject anything else so a
     /// restore can never read a path outside the snapshots directory.
     fn snapshot_path(&self, id: &str) -> Result<PathBuf, SandboxError> {

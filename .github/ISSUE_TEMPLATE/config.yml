@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and troubleshooting
+    url: https://github.com/kashyaprajharsh/medha-agent/discussions
+    about: Ask setup questions, get help, or discuss an idea before opening an issue.
+  - name: Report a security vulnerability privately
+    url: https://github.com/kashyaprajharsh/medha-agent/blob/main/SECURITY.md
+    about: Follow the security policy for suspected vulnerabilities. Do not disclose them in a public issue.

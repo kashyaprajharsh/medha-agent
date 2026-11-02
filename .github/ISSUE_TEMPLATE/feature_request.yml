@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose an improvement with a concrete use case.
+title: "Feature: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem you want to solve and the outcome that would help. Early ideas and open-ended questions are welcome in [Discussions](https://github.com/kashyaprajharsh/medha-agent/discussions).
+
+        This report is public. Use synthetic examples and remove secrets or confidential information.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Who encounters this problem, in which workflow, and what makes it difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome and acceptance criteria
+      description: Describe the behavior you would like and the observable conditions that would show the problem is solved. A concrete example is helpful.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested approach
+      description: If you have an implementation idea, explain it here. Mention permission, privacy, compatibility, or platform implications when relevant.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe existing features, workarounds, or other approaches you have tried, and their limitations.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples, mockups, or related issues. Let us know if you are interested in contributing an implementation.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: I removed secrets and private data from this request and its attachments.
+          required: true
+        - label: I agree to follow the [Code of Conduct](https://github.com/kashyaprajharsh/medha-agent/blob/main/CODE_OF_CONDUCT.md).
+          required: true

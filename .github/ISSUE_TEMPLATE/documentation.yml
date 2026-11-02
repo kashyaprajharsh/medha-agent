@@ -1,0 +1,42 @@
+name: Documentation improvement
+description: Report missing, incorrect, or unclear documentation.
+title: "Docs: "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us make Medha easier to understand and use. Small corrections can also go directly to a pull request; see the [contributing guide](https://github.com/kashyaprajharsh/medha-agent/blob/main/CONTRIBUTING.md).
+
+        This report is public. Remove secrets and confidential information from examples and attachments. Report sensitive security issues through the [security policy](https://github.com/kashyaprajharsh/medha-agent/blob/main/SECURITY.md).
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: Provide a URL, file path and section, or describe where the missing information belongs.
+      placeholder: "README.md: Getting started"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What needs to change?
+      description: Explain what is incorrect, missing, or unclear. Include the Medha version and OS if a documented command or workflow does not work.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested improvement
+      description: Suggest wording, an example, or the information you expected to find. A complete rewrite is not required.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this documentation problem.
+          required: true
+        - label: I removed secrets and private data from this report and its attachments.
+          required: true
+        - label: I agree to follow the [Code of Conduct](https://github.com/kashyaprajharsh/medha-agent/blob/main/CODE_OF_CONDUCT.md).
+          required: true

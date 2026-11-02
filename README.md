@@ -34,7 +34,7 @@ workflows, and code, in a desktop app or your terminal.*
 
 Most agents ask you to trust the model. MEDHA doesn't.
 
-Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied. Shell commands are read with a real bash grammar and run inside native OS isolation where available: work inside your folder runs, anything outside it asks, a command no approval makes safe (deleting your home folder, `sudo`, formatting a disk) is refused, and a command that writes is backed up first so you can undo it. Where no OS sandbox is available, Medha says so and falls back to host execution; the command reader and approval gate still apply. Nothing the model *says* causes an effect; only an authorized tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
+Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied. Shell commands are read with a real bash grammar and run inside native OS isolation where available: work inside your folder runs, anything outside it asks, a command no approval makes safe (deleting your home folder, `sudo`, formatting a disk) is refused, and a command that writes is backed up first so you can undo it. If native confinement is unavailable, Linux refuses command execution; macOS can fall back to host execution, and Windows runs without an OS sandbox. The command reader and approval gate still apply to host execution. Nothing the model *says* causes an effect; only an authorized tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
 
 It runs on whatever model you have: a local Ollama or vLLM server, any OpenAI-compatible provider, OpenAI's Responses API, your ChatGPT plan through **Continue with ChatGPT**, or Gemini natively.
 
@@ -347,19 +347,26 @@ graceful interrupts, the ACP editor bridge, and the Eval Gate.
 
 ## Contributing
 
-```bash
-cargo test --workspace     # full suite
-cargo clippy --workspace   # lint
-cargo fmt --all            # format
-```
+Contributions are welcome: bug reports, documentation, accessibility improvements,
+tests, and code. Read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup,
+the repository map, checks, and the pull request process.
 
-To cut a release, run `scripts/release.sh <version>` on a clean `main`. It sets the version, refreshes the lockfiles, commits and tags; push `main` and the tag it prints, and the release workflow builds, signs and publishes once approved.
+- [Commands and checklist before opening a pull request](CONTRIBUTING.md#checks-before-opening-a-pull-request)
+- [Rust writing, review, and porting standards](RUST_GUIDELINES.md)
+- [Report a bug or propose an improvement](https://github.com/kashyaprajharsh/medha-agent/issues/new/choose)
+- [Ask a question or discuss an idea](https://github.com/kashyaprajharsh/medha-agent/discussions)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy and private vulnerability reporting](SECURITY.md)
 
-Run `medha gate scenarios/` before proposing behavioral changes. It's the regression suite for cognition, not just code. Issues and pull requests at [kashyaprajharsh/medha-agent](https://github.com/kashyaprajharsh/medha-agent).
+Releases are coordinated by maintainers using `scripts/release.sh <version>` on a
+clean `main`. The script updates versions and lockfiles, commits, and tags; pushing
+`main` and the tag starts the release workflow, which checks CI, builds and signs
+assets, and publishes after the configured `release` environment requirements
+are met.
 
 ## License
 
-Apache-2.0.
+[Apache-2.0](LICENSE).
 
 <div align="center">
 <sub><i>मेधा सूक्ताय नमः: salutations to the hymn of sharp intelligence.</i></sub>

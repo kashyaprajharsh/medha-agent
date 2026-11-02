@@ -814,8 +814,11 @@ impl Outbox for MemoryOutbox {
             row.2 = true;
         }
     }
-    async fn transcript(&self, child: Ulid) -> Vec<String> {
-        vec![format!("transcript:{child}")]
+    async fn transcript(&self, child: Ulid) -> Transcript {
+        Transcript {
+            steps: vec![format!("transcript:{child}")],
+            trust: TrustLabel::Tool,
+        }
     }
     async fn recorded(
         &self,
@@ -1706,7 +1709,8 @@ async fn durable_session_ids_keep_transcripts_addressable_after_eviction_and_res
         control
             .transcript(&AgentPath::root(), &oldest)
             .await
-            .unwrap(),
+            .unwrap()
+            .steps,
         [format!("transcript:{oldest}")]
     );
 
@@ -1716,7 +1720,8 @@ async fn durable_session_ids_keep_transcripts_addressable_after_eviction_and_res
         restarted
             .transcript(&AgentPath::root(), &oldest)
             .await
-            .unwrap(),
+            .unwrap()
+            .steps,
         [format!("transcript:{oldest}")]
     );
     assert!(

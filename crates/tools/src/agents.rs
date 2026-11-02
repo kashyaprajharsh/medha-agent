@@ -1258,7 +1258,7 @@ impl Tool for AgentControlTool {
             }
             AgentAction::Transcript => {
                 let id = arg_str(args, "agent")?;
-                let mut steps = self
+                let orchestrator::Transcript { mut steps, trust } = self
                     .control
                     .transcript(&from, &id)
                     .await
@@ -1291,9 +1291,8 @@ impl Tool for AgentControlTool {
                     "steps": steps,
                     "showing": steps.len(),
                     "total": total,
-                    // Raw output from another agent's tools, verbatim. Whatever
-                    // it read, the caller is now reading.
-                    crate::RELAYED_TRUST: kernel::TrustLabel::Web,
+                    // Whatever the agent read, the caller is now reading: its least-trusted source, as with reports.
+                    crate::RELAYED_TRUST: trust,
                 }))
             }
         }

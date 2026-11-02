@@ -21,6 +21,9 @@ mod editor_checks;
 #[path = "serve_e2e/checkpoint_caps.rs"]
 mod checkpoint_caps;
 
+#[path = "serve_e2e/real_use.rs"]
+mod real_use;
+
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut request = Vec::new();
     loop {

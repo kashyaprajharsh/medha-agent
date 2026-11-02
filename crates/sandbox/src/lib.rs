@@ -78,6 +78,13 @@ pub struct GuardedInspection {
     pub bytes: Option<Vec<u8>>,
 }
 
+/// What a rewind put back, and what it left because the file's backup had expired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub restored: Vec<String>,
+    pub expired: Vec<String>,
+}
+
 /// Result of a bounded streaming line-range read. `total_lines` is `None` unless
 /// the scan reached EOF, keeping a small read independent of file size.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2161,7 +2168,7 @@ impl WorkspaceSandbox {
     /// per-workspace state dir (`~/.medha/projects/<enc>/snapshots`) so runtime
     /// state never lands in the working tree. The jail `root` is unchanged.
     pub fn with_snapshots_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.snapshots = dir.into();
+        self.snapshots = without_links(dir.into());
         self
     }
 
@@ -2288,46 +2295,65 @@ impl WorkspaceSandbox {
         file: &kernel::events::FileRollback,
     ) -> Result<(), SandboxError> {
         let guard = self.path_guard(&file.path).await?;
-        if let Some(expected) = &file.expected {
-            if guard.resolved() != self.root.join(&file.path) {
-                return Err(SandboxError::Conflict(
-                    "undo target now resolves through a different path; preserved it".into(),
-                ));
-            }
-            let inspection = self.inspect_guarded(&guard).await?;
-            let actual = inspection
-                .bytes
-                .as_ref()
-                .map(|bytes| format!("{:x}", sha2::Sha256::digest(bytes)));
-            if expected == "unknown" || actual.as_deref().unwrap_or("missing") != expected {
-                return Err(SandboxError::Io(format!(
-                    "{} changed after the command; preserved it",
-                    file.path
-                )));
-            }
-        }
+        self.check_revision(&guard, file).await?;
         self.restore_guarded(&guard, file.snapshot.as_deref()).await
     }
 
+    /// Whether a planned file still holds what its command left, so restoring it overwrites no later edit.
+    async fn check_revision(
+        &self,
+        guard: &WritePathGuard,
+        file: &kernel::events::FileRollback,
+    ) -> Result<(), SandboxError> {
+        let Some(expected) = &file.expected else {
+            return Ok(());
+        };
+        if guard.resolved() != self.root.join(&file.path) {
+            return Err(SandboxError::Conflict(
+                "undo target now resolves through a different path; preserved it".into(),
+            ));
+        }
+        let inspection = self.inspect_guarded(guard).await?;
+        let actual = inspection
+            .bytes
+            .as_ref()
+            .map(|bytes| format!("{:x}", sha2::Sha256::digest(bytes)));
+        if expected == "unknown" || actual.as_deref().unwrap_or("missing") != expected {
+            return Err(SandboxError::Io(format!(
+                "{} changed after the command; preserved it",
+                file.path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restores all the files it can, or none of them: every one is checked before any is written. A file whose
+    /// backup has expired is left as it is and named, so it cannot hold back the rest.
     pub async fn restore_plan(
         &self,
         files: &[kernel::events::FileRollback],
-    ) -> Result<usize, SandboxError> {
+    ) -> Result<RestoreReport, SandboxError> {
+        let mut report = RestoreReport::default();
+        let mut ready = Vec::new();
         for file in files {
-            if let Some(id) = &file.snapshot
-                && !self.snapshot_path(id)?.is_file()
-            {
-                return Err(SandboxError::Io(
-                    "A required checkpoint has expired; no files were restored".into(),
-                ));
+            match &file.snapshot {
+                Some(id) if !self.snapshot_path(id)?.is_file() => {
+                    report.expired.push(file.path.clone());
+                }
+                _ => ready.push(file),
             }
         }
-        let mut count = 0;
-        for file in files {
-            self.restore_revision(file).await?;
-            count += 1;
+        for file in &ready {
+            let guard = self.path_guard(&file.path).await?;
+            self.check_revision(&guard, file)
+                .await
+                .map_err(|error| SandboxError::Io(format!("{error}; no files were restored")))?;
         }
-        Ok(count)
+        for file in ready {
+            self.restore_revision(file).await?;
+            report.restored.push(file.path.clone());
+        }
+        Ok(report)
     }
 
     pub fn exec_backend_label(&self) -> &str {

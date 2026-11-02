@@ -133,6 +133,45 @@ impl Revisions {
             })
     }
 
+    /// Why this chat's copy of `content` may be out of date: no read of it, or a read before it changed.
+    pub fn stale(
+        &self,
+        path: &Path,
+        state: &GuardedFileState,
+        content: &str,
+    ) -> Option<&'static str> {
+        let GuardedFileState::Present { sha256, len, .. } = state else {
+            return None;
+        };
+        let files = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = kernel::egress::session_id();
+        let Some(entry) = files
+            .iter()
+            .find(|entry| entry.session == owner && entry.path == path)
+        else {
+            return Some("No read in this chat shows this file's current text.");
+        };
+        if entry.revision.known == Some((*sha256, *len)) {
+            return None;
+        }
+        let lines: Vec<&str> = content.split_inclusive('\n').collect();
+        let current = |start: u64, end: u64| -> Option<String> {
+            let from = usize::try_from(start.checked_sub(1)?).ok()?;
+            let to = usize::try_from(end).ok()?;
+            Some(lines.get(from..to.min(lines.len()))?.concat())
+        };
+        let changed = entry.revision.pages.is_empty()
+            || entry
+                .revision
+                .pages
+                .iter()
+                .any(|(&start, (end, text, _))| current(start, *end).as_deref() != Some(text));
+        changed.then_some("The file has changed since this chat last read it.")
+    }
+
     pub fn written(&self, path: &Path, text: &str) {
         let mut files = self
             .0

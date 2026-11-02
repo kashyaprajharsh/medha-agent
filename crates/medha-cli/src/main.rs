@@ -839,7 +839,10 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
             ),
         }
     }
-    sandbox.restore_plan(&plan).await?;
+    let report = sandbox.restore_plan(&plan).await?;
+    for path in &report.expired {
+        println!("  {path}: not restored, its backup has expired");
+    }
     Ok(())
 }
 

@@ -77,6 +77,10 @@ pub(crate) fn session_changes(events: &[Event]) -> Vec<FileChange> {
                     continue;
                 };
                 let old = result.get("old").and_then(Value::as_str);
+                // An edit found already made wrote nothing, so it is no change to list.
+                if old == Some(after) {
+                    continue;
+                }
                 let entry = touched.entry(path.to_owned()).or_insert_with(|| {
                     order.push(path.to_owned());
                     Touched {

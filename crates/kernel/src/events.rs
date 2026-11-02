@@ -968,6 +968,42 @@ fn manifest_rows(path: &str) -> Option<Vec<Value>> {
     manifest["files"].as_array().cloned()
 }
 
+/// A Git command that moves branches or history. Git undoes these itself, so rewind leaves their files to it.
+fn git_managed(command: &str) -> bool {
+    const MOVES: [&str; 12] = [
+        "checkout",
+        "switch",
+        "pull",
+        "merge",
+        "rebase",
+        "reset",
+        "cherry-pick",
+        "revert",
+        "am",
+        "stash",
+        "restore",
+        "clone",
+    ];
+    command.split(['&', '|', ';', '\n']).any(|part| {
+        let mut words = part
+            .split_whitespace()
+            .skip_while(|word| word.contains('='));
+        if words.next() != Some("git") {
+            return false;
+        }
+        while let Some(word) = words.next() {
+            match word {
+                "-C" | "-c" => {
+                    words.next();
+                }
+                flag if flag.starts_with('-') => {}
+                sub => return MOVES.contains(&sub),
+            }
+        }
+        false
+    })
+}
+
 /// Compute a rollback plan relative to the execution workspace.
 pub fn rollback_plan_in(
     events: &[Event],
@@ -1034,6 +1070,13 @@ pub fn rollback_plan_in(
         .and_then(Value::as_object) else {
             continue;
         };
+        let command = result
+            .get("command")
+            .or_else(|| result.get("args")?.get("command"))
+            .and_then(Value::as_str);
+        if command.is_some_and(git_managed) {
+            continue;
+        }
         let later = (e.kind == EventKind::ToolObs)
             .then(|| intent.and_then(|id| ended.get(id)))
             .flatten()
@@ -1063,6 +1106,10 @@ pub fn rollback_plan_in(
             let Some(path) = result.get("path").and_then(Value::as_str) else {
                 continue;
             };
+            // Rewind restores the project; a file elsewhere would need the person's approval mid-rewind.
+            if Path::new(path).is_absolute() && !Path::new(path).starts_with(workspace_root) {
+                continue;
+            }
             let identity = rollback_path_identity(path, workspace_root);
             let expected = result
                 .get("expected")

@@ -259,10 +259,38 @@ impl Tool for Memory {
             Some("update") => self.update.execute(args).await,
             Some("forget") => self.forget.execute(args).await,
             Some("search") => self.search.execute(args).await,
-            other => Err(ToolError::Args(format!(
-                "memory needs op = write, update, forget or search; got {}",
-                other.unwrap_or("nothing")
-            ))),
+            other => {
+                let jobs = [
+                    ("write", self.write.schema()),
+                    ("update", self.update.schema()),
+                    ("forget", self.forget.schema()),
+                    ("search", self.search.schema()),
+                ];
+                // The fields each op needs, from the schemas the ops are run with, so the retry can be whole.
+                let needs: Vec<String> = jobs
+                    .iter()
+                    .map(|(op, schema)| {
+                        let fields: Vec<&str> = schema["required"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        format!("{op} ({})", fields.join(", "))
+                    })
+                    .collect();
+                let named = jobs
+                    .iter()
+                    .map(|(op, _)| *op)
+                    .find(|op| args.get(*op).is_some())
+                    .map(|op| format!(" `{op}` was sent as a field; it belongs in op: \"{op}\"."))
+                    .unwrap_or_default();
+                Err(ToolError::Args(format!(
+                    "memory needs op = write, update, forget or search; got {}.{named} Each op needs: {}.",
+                    other.unwrap_or("nothing"),
+                    needs.join("; ")
+                )))
+            }
         }
     }
 }

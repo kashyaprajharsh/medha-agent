@@ -6,16 +6,28 @@ use std::ops::Range;
 
 pub(crate) const LOOSE_NOTE: &str =
     "Matched ignoring whitespace, indentation and quote or dash style.";
+pub(crate) const CR_NOTE: &str = "Removed carriage returns from old_string and new_string: the file has none, so they were damage, not text.";
+pub(crate) const APPLIED_NOTE: &str = "old_string is gone and new_string is already in the file once, so this edit was already made; nothing was changed.";
 
 pub(crate) struct Replaced {
     pub text: String,
     pub count: usize,
     pub loose: bool,
+    /// Why the result differs from a plain match: damage removed, or the edit found already made.
+    pub note: Option<&'static str>,
 }
 
 pub(crate) enum Miss {
     NotFound,
     Ambiguous(usize),
+}
+
+/// What the file holds where a missed `old_string` was probably meant, for the model to copy from.
+pub(crate) struct Help {
+    /// Numbered like a read: each region's first line number, then its lines.
+    pub regions: Vec<(u64, Vec<String>)>,
+    /// `old_string` matches once its backslash-escaped quotes are written plainly.
+    pub escaped: bool,
 }
 
 pub(crate) fn replace(
@@ -24,6 +36,135 @@ pub(crate) fn replace(
     new: &str,
     replace_all: bool,
 ) -> Result<Replaced, Miss> {
+    match matched(content, old, new, replace_all) {
+        Err(Miss::NotFound) => {}
+        done => return done,
+    }
+    // Carriage returns in a file that has none can only be damage from the model or its gateway.
+    if !content.contains('\r') && old.contains('\r') {
+        let (old, new) = (old.replace('\r', ""), new.replace('\r', ""));
+        let exact = content.matches(&old).count();
+        if !old.trim().is_empty() && (exact == 1 || exact > 1 && replace_all) {
+            let text = match replace_all {
+                true => content.replace(&old, &new),
+                false => content.replacen(&old, &new, 1),
+            };
+            return Ok(Replaced {
+                text,
+                count: if replace_all { exact } else { 1 },
+                loose: false,
+                note: Some(CR_NOTE),
+            });
+        }
+    }
+    if new.trim().len() >= 8 && content.matches(new).count() == 1 && !content.contains(old) {
+        return Ok(Replaced {
+            text: content.to_string(),
+            count: 0,
+            loose: false,
+            note: Some(APPLIED_NOTE),
+        });
+    }
+    Err(Miss::NotFound)
+}
+
+/// Lines nearest the copy's first line, and whether escaped quotes explain the miss.
+pub(crate) fn help(content: &str, old: &str) -> Help {
+    // Beyond these the search costs more than the hint is worth.
+    const FILE_LINES: usize = 20_000;
+    const COMPARED: usize = 400;
+    const REGIONS: usize = 3;
+    const AROUND: usize = 2;
+    const SPAN: usize = 30;
+    // All regions together, so a minified line cannot flood the model's context.
+    const BYTES: usize = 8 * 1024;
+    let plain = unescape_quotes(old);
+    let escaped = plain != old && content.contains(&plain);
+    let file: Vec<&str> = content.lines().collect();
+    let anchor = old.lines().map(str::trim).find(|line| !line.is_empty());
+    let (Some(anchor), true) = (anchor, file.len() <= FILE_LINES) else {
+        return Help {
+            regions: Vec::new(),
+            escaped,
+        };
+    };
+    let cut = |text: &str| -> String { fold_str(text).chars().take(COMPARED).collect() };
+    let anchor = cut(anchor);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let mut scored: Vec<(f32, usize)> = Vec::new();
+    for (at, line) in file.iter().enumerate() {
+        if std::time::Instant::now() > until {
+            break;
+        }
+        let line = cut(line.trim());
+        let (a, b) = (anchor.chars().count(), line.chars().count());
+        let (short, long) = (a.min(b), a.max(b));
+        // Ratio is at most 2·short/(short+long), so a far shorter or longer line cannot pass.
+        if line.is_empty() || short * 4 <= long {
+            continue;
+        }
+        let score = similar::TextDiff::configure()
+            .deadline(until)
+            .diff_chars(anchor.as_str(), line.as_str())
+            .ratio();
+        if score > 0.4 {
+            scored.push((score, at));
+        }
+    }
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let span = old.lines().count().clamp(1, SPAN);
+    let mut regions: Vec<(u64, Vec<String>)> = Vec::new();
+    let mut taken: Vec<Range<usize>> = Vec::new();
+    let mut used = 0;
+    for (_, at) in scored {
+        if regions.len() == REGIONS {
+            break;
+        }
+        let range = at.saturating_sub(AROUND)..(at + span + AROUND).min(file.len());
+        if taken
+            .iter()
+            .any(|seen| seen.start < range.end && range.start < seen.end)
+        {
+            continue;
+        }
+        let size: usize = file[range.clone()].iter().map(|line| line.len() + 8).sum();
+        if used + size > BYTES {
+            continue;
+        }
+        used += size;
+        let lines = file[range.clone()]
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        regions.push((range.start as u64 + 1, lines));
+        taken.push(range);
+    }
+    regions.sort_by_key(|(start, _)| *start);
+    Help { regions, escaped }
+}
+
+/// One level of `\\`, `\"` and `\'` escaping undone in a single pass; other backslashes stay.
+fn unescape_quotes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(next @ ('\\' | '"' | '\'')) => out.push(next),
+            Some(next) => {
+                out.push(c);
+                out.push(next);
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+fn matched(content: &str, old: &str, new: &str, replace_all: bool) -> Result<Replaced, Miss> {
     let crlf = content.contains("\r\n");
     let (old, new) = match crlf {
         true if content.contains(old) => (old.to_string(), to_crlf(new)),
@@ -45,6 +186,7 @@ pub(crate) fn replace(
             text,
             count,
             loose: false,
+            note: None,
         });
     }
     if old.trim().is_empty() {
@@ -73,6 +215,7 @@ pub(crate) fn replace(
                 text,
                 count,
                 loose: true,
+                note: None,
             })
         }
     }

@@ -596,6 +596,10 @@ fn written(payload: &Value) -> Option<ArtifactSnapshot> {
     if let Some(kept) = output.filter(|output| output["hash"].is_string()) {
         return serde_json::from_value(kept.clone()).ok();
     }
+    // An edit found already made has no snapshot and the same text before and after: no new version.
+    if payload.get("snapshot").is_none() && payload["old"] == payload["new"] {
+        return None;
+    }
     let text = payload["new"].as_str()?;
     let path = output
         .and_then(|output| output["path"].as_str())

@@ -81,6 +81,23 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
     if agents.is_some_and(|control| !control.adopt(session.id)) {
         return Err("An agent is still starting. Rewind was not applied.".into());
     }
+    // Files first: a restore that cannot finish then leaves no conversation branch behind.
+    let mut report = sandbox::RestoreReport::default();
+    if scope != "conversation" {
+        let files = kernel::rollback_plan_in(&events, at, resources.workspace.root());
+        report = resources
+            .workspace
+            .restore_plan(&files)
+            .await
+            .map_err(|error| format!("Code restore stopped: {error}. Conversation was kept."))?;
+        tracing::info!(
+            session = %session.id,
+            restored = ?report.restored,
+            expired = ?report.expired,
+            "rewind restored files"
+        );
+    }
+    let restored = report.restored.len();
     let (new_id, claim) = if scope != "code" {
         let id = Ulid::new();
         let claim = kernel.reserve_session(id)?;
@@ -93,15 +110,6 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
     } else {
         (None, None)
     };
-    let mut restored = 0;
-    if scope != "conversation" {
-        let files = kernel::rollback_plan_in(&events, at, resources.workspace.root());
-        restored = resources
-            .workspace
-            .restore_plan(&files)
-            .await
-            .map_err(|error| format!("Code restore stopped: {error}. Conversation was kept."))?;
-    }
     let source = session.id;
     if let Some(id) = new_id {
         let mut system = transcript
@@ -149,6 +157,6 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
         session.done = false;
     }
     Ok(
-        json!({"source": source.to_string(), "session": session.id.to_string(), "code_only": scope == "code", "restored": restored, "prefill": if scope == "code" { "" } else { selected.payload["text"].as_str().unwrap_or_default() }, "images": images }),
+        json!({"source": source.to_string(), "session": session.id.to_string(), "code_only": scope == "code", "restored": restored, "expired": report.expired, "prefill": if scope == "code" { "" } else { selected.payload["text"].as_str().unwrap_or_default() }, "images": images }),
     )
 }

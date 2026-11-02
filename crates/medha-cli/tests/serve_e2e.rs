@@ -2342,6 +2342,37 @@ async fn scripted(client: &mut Client, world: &World, chat: &str, lines: &[Strin
         .to_string()
 }
 
+/// A Medha home reached through a symlink, as macOS's `/var` and `/tmp` are, still lets a write replace a file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_home_behind_a_symlink_still_lets_a_write_replace_a_file() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let linked = world.root.path().join("linked-home");
+    std::os::unix::fs::symlink(world.home(), &linked).unwrap();
+    let backend = Backend::start(&linked, &world.provider, &[]);
+    let mut client = backend.connect().await;
+    let folder = world.folder("project");
+    std::fs::write(folder.join("a.txt"), "a0\n").unwrap();
+    let chat = client.open(&folder).await;
+    let edit = json!({"path": "a.txt", "content": "a1\n"});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[
+            format!("read {}", json!({"path": "a.txt"})),
+            format!("write {edit}"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(folder.join("a.txt")).unwrap(),
+        "a1\n",
+        "{raw}"
+    );
+}
+
 /// Backups leave out what a tool can rebuild, by what the folder is and not only by its name.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2568,9 +2568,26 @@ impl Tool for FsEdit {
         )
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         self.pins.check(args, &path, &inspection.state)?;
-        let done = edit_match::replace(&content, &old_s, &new_s, replace_all)
-            .map_err(|miss| ToolError::Failed(missed(miss, &path)))?;
+        let done = edit_match::replace(&content, &old_s, &new_s, replace_all).map_err(|miss| {
+            let help = match miss {
+                edit_match::Miss::NotFound => {
+                    let why =
+                        self.shown
+                            .revisions
+                            .stale(guard.resolved(), &inspection.state, &content);
+                    miss_help(&self.shown, edit_match::help(&content, &old_s), why)
+                }
+                edit_match::Miss::Ambiguous(_) => String::new(),
+            };
+            ToolError::Failed(format!("{}{help}", missed(miss, &path)))
+        })?;
+        let note = edit_note(done.loose, done.note.as_slice());
         let updated = done.text;
+        if updated == content {
+            return Ok(
+                json!({ "path": path, "replacements": 0, "old": content, "new": updated, "note": note }),
+            );
+        }
         protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &updated)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let known = self
@@ -2596,8 +2613,8 @@ impl Tool for FsEdit {
         });
         file_checks::annotate(&mut out, &path, &content, &updated);
         outputs::attach(&mut out, &self.sbx, guard.resolved(), &updated).await;
-        if done.loose {
-            out["note"] = json!(edit_match::LOOSE_NOTE);
+        if let Some(note) = note {
+            out["note"] = json!(note);
         }
         if let Some(report) = post_edit_lsp(
             &self.lsp,
@@ -7188,44 +7205,103 @@ fn missed(miss: edit_match::Miss, path: &str) -> String {
     }
 }
 
-/// The edited text, and whether any edit needed a loose match.
-fn apply_edits(content: &str, edits: &[Value]) -> Result<(String, bool), ToolError> {
-    apply_edits_inner(content, edits).map_err(|err| ToolError::Failed(format!(
-        "{err}. Entire batch aborted; no edits applied. Re-read the current file, correct the failing edit, and resubmit all intended edits."
-    )))
+/// What follows a miss in the model's error: why its copy may be old, and the file's nearest lines.
+fn miss_help(shown: &shown::ShownPages, help: edit_match::Help, why: Option<&str>) -> String {
+    let mut out = String::new();
+    if help.escaped {
+        out.push_str(
+            " old_string matches once its backslash-escaped quotes are written plainly: send \
+             old_string and new_string again without the extra backslashes.",
+        );
+    }
+    if let Some(why) = why {
+        out.push_str(&format!(" {why}"));
+    }
+    if !help.regions.is_empty() {
+        out.push_str(" The nearest current lines, numbered as a read shows them:");
+        for (start, lines) in help.regions {
+            out.push('\n');
+            for (i, line) in lines.iter().enumerate() {
+                out.push_str(&format!("\n{}|{line}", start + i as u64));
+            }
+            shown.remember(start, lines);
+        }
+        out.push_str("\n\nCopy from these lines without their `N|` numbers.");
+    }
+    out
 }
 
-fn apply_edits_inner(content: &str, edits: &[Value]) -> Result<(String, bool), ToolError> {
+/// The notes one edit result carries: a loose match, then how any edit landed.
+fn edit_note(loose: bool, notes: &[&str]) -> Option<String> {
+    let all: Vec<&str> = loose
+        .then_some(edit_match::LOOSE_NOTE)
+        .into_iter()
+        .chain(notes.iter().copied())
+        .collect();
+    (!all.is_empty()).then(|| all.join(" "))
+}
+
+/// The edited text, whether any edit needed a loose match, and any notes on how edits landed.
+type Edited = (String, bool, Vec<&'static str>);
+
+fn apply_edits(content: &str, edits: &[Value]) -> Result<Edited, ToolError> {
+    apply_edits_inner(content, edits).map_err(|(err, _)| batch_failed(err, ""))
+}
+
+fn batch_failed(err: ToolError, help: &str) -> ToolError {
+    ToolError::Failed(format!(
+        "{err}. Entire batch aborted; no edits applied. Re-read the current file, correct the failing edit, and resubmit all intended edits.{help}"
+    ))
+}
+
+/// On a miss, the error also carries the `old_string` that missed.
+fn apply_edits_inner(
+    content: &str,
+    edits: &[Value],
+) -> Result<Edited, (ToolError, Option<String>)> {
     let mut cur = content.to_string();
     let mut loose = false;
+    let mut notes = Vec::new();
     for (i, e) in edits.iter().enumerate() {
         let n = i + 1;
-        let old = e
-            .get("old_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::Args(format!("edit #{n}: missing 'old_string'")))?;
-        let new = e
-            .get("new_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::Args(format!("edit #{n}: missing 'new_string'")))?;
-        validate_edit(old, new).map_err(|err| ToolError::Failed(format!("edit #{n}: {err}")))?;
+        let old = e.get("old_string").and_then(Value::as_str).ok_or_else(|| {
+            (
+                ToolError::Args(format!("edit #{n}: missing 'old_string'")),
+                None,
+            )
+        })?;
+        let new = e.get("new_string").and_then(Value::as_str).ok_or_else(|| {
+            (
+                ToolError::Args(format!("edit #{n}: missing 'new_string'")),
+                None,
+            )
+        })?;
+        validate_edit(old, new)
+            .map_err(|err| (ToolError::Failed(format!("edit #{n}: {err}")), None))?;
         let replace_all = e
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let done = edit_match::replace(&cur, old, new, replace_all).map_err(|miss| {
-            ToolError::Failed(match miss {
-                edit_match::Miss::NotFound => format!("edit #{n}: old_string not found"),
-                edit_match::Miss::Ambiguous(count) => format!(
+        let done = edit_match::replace(&cur, old, new, replace_all).map_err(|miss| match miss {
+            edit_match::Miss::NotFound => (
+                ToolError::Failed(format!("edit #{n}: old_string not found")),
+                Some(old.to_string()),
+            ),
+            edit_match::Miss::Ambiguous(count) => (
+                ToolError::Failed(format!(
                     "edit #{n}: old_string matches {count} places; pass replace_all or include \
                      more surrounding lines so it matches one"
-                ),
-            })
+                )),
+                None,
+            ),
         })?;
         loose |= done.loose;
+        if let Some(note) = done.note.filter(|note| !notes.contains(note)) {
+            notes.push(note);
+        }
         cur = done.text;
     }
-    Ok((cur, loose))
+    Ok((cur, loose, notes))
 }
 
 #[async_trait]
@@ -7301,7 +7377,23 @@ impl Tool for MultiEdit {
         )
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         self.pins.check(args, &path, &inspection.state)?;
-        let (updated, loose) = apply_edits(&content, edits)?;
+        let (updated, loose, notes) =
+            apply_edits_inner(&content, edits).map_err(|(err, old)| {
+                let help = old.map(|old| {
+                    let why =
+                        self.shown
+                            .revisions
+                            .stale(guard.resolved(), &inspection.state, &content);
+                    miss_help(&self.shown, edit_match::help(&content, &old), why)
+                });
+                batch_failed(err, &help.unwrap_or_default())
+            })?;
+        let note = edit_note(loose, &notes);
+        if updated == content {
+            return Ok(
+                json!({ "path": path, "edits_applied": 0, "old": content, "new": updated, "note": note }),
+            );
+        }
         protected_writes::check(&self.sbx, guard.resolved(), &path, &inspection, &updated)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let known = self
@@ -7323,8 +7415,8 @@ impl Tool for MultiEdit {
         });
         file_checks::annotate(&mut out, &path, &content, &updated);
         outputs::attach(&mut out, &self.sbx, guard.resolved(), &updated).await;
-        if loose {
-            out["note"] = json!(edit_match::LOOSE_NOTE);
+        if let Some(note) = note {
+            out["note"] = json!(note);
         }
         if let Some(report) = post_edit_lsp(
             &self.lsp,
@@ -7349,7 +7441,7 @@ impl Tool for MultiEdit {
         self.pins.pin(args, &inspection.state);
         let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
         match apply_edits(&content, edits) {
-            Ok((updated, _)) => Some(cap_preview(&make_diff(path, &content, &updated))),
+            Ok((updated, ..)) => Some(cap_preview(&make_diff(path, &content, &updated))),
             Err(e) => Some(format!("({e} — this edit batch would fail)")),
         }
     }
@@ -9086,7 +9178,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(ok, ("1-2 three\n".to_string(), false));
+        assert_eq!(ok, ("1-2 three\n".to_string(), false, Vec::new()));
         // A missing old_string aborts the WHOLE batch (nothing applied).
         let err = apply_edits(
             src,
@@ -9107,7 +9199,7 @@ mod tests {
                 &[json!({ "old_string": "a", "new_string": "b", "replace_all": true })]
             )
             .unwrap(),
-            ("b b b".to_string(), false)
+            ("b b b".to_string(), false, Vec::new())
         );
     }
 

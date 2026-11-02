@@ -2270,7 +2270,6 @@ async fn a_plan_instruction_reaches_the_model_and_nowhere_a_person_reads() {
 }
 
 /// A background command returns at once with its id, and its end reaches the model on its own, starting a turn.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_background_command_returns_at_once_and_its_end_reaches_the_model() {
     let world = World::new();

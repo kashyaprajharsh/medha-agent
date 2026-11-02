@@ -1290,10 +1290,14 @@ const OUTPUT_FILE_CAP: u64 = 64 * 1024 * 1024;
 const OUTPUT_FILE_BEHIND: u64 = 1024 * 1024;
 
 impl OutputFiles {
-    /// Appending, so emptying the file at the cap cannot leave the command writing past a hole.
+    /// Appending on Unix, so emptying the file at the cap cannot leave the command writing past a hole.
+    /// Windows gives an append-only handle that a command's output may not reach, so it writes plainly there.
     fn writer(path: &Path) -> Result<std::fs::File, ExecError> {
         let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
         options.create(true).append(true);
+        #[cfg(not(unix))]
+        options.create(true).write(true).truncate(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         options
@@ -1339,7 +1343,8 @@ fn follow_output(
             continue;
         }
         // The end matters most: skip what is far behind, and empty the file only once caught up.
-        if read >= size {
+        // Not on Windows: a plain writer would carry on at its old position, past the emptied start.
+        if read >= size && cfg!(unix) {
             if file.set_len(0).is_ok() {
                 let _ = file.rewind();
                 read = 0;

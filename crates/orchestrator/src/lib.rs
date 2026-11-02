@@ -424,6 +424,13 @@ pub struct ChildOutcome {
     pub trust: TrustLabel,
 }
 
+/// A child's steps, and the least-trusted label among what it read, which a reader of the steps inherits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transcript {
+    pub steps: Vec<String>,
+    pub trust: TrustLabel,
+}
+
 /// A dispatched agent, recorded before any work starts. `parent` is captured
 /// here and never re-derived — the current session can change after a restart.
 #[derive(Debug, Clone)]
@@ -455,7 +462,7 @@ pub trait Outbox: Send + Sync {
 
     /// What a child actually did, newest last — the recourse when its summary
     /// is thin or wrong.
-    async fn transcript(&self, child: Ulid) -> Vec<String>;
+    async fn transcript(&self, child: Ulid) -> Transcript;
 
     /// Persist a writer's patch against `parent`. Returns false when the write
     /// failed: the worktree is reaped straight after, so a caller that ignores
@@ -1201,7 +1208,7 @@ impl AgentControl {
     /// Read back what a child did. Its transcript lives under its own session id
     /// and outlives the run, so this answers for a finished agent as well as a
     /// running one.
-    pub async fn transcript(&self, from: &AgentPath, child: &str) -> Result<Vec<String>, Error> {
+    pub async fn transcript(&self, from: &AgentPath, child: &str) -> Result<Transcript, Error> {
         let outbox = self.outbox.as_ref().ok_or(Error::Unavailable)?;
         // Session id is the durable address from spawn, usable by root surfaces
         // after eviction. Descendants still resolve through the registry, so a

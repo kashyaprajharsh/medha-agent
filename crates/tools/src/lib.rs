@@ -10860,8 +10860,11 @@ mod tests {
                 .map(|(_, result)| result.clone())
                 .collect()
         }
-        async fn transcript(&self, _child: ulid::Ulid) -> Vec<String> {
-            self.steps.lock().unwrap().clone()
+        async fn transcript(&self, _child: ulid::Ulid) -> orchestrator::Transcript {
+            orchestrator::Transcript {
+                steps: self.steps.lock().unwrap().clone(),
+                trust: kernel::TrustLabel::Web,
+            }
         }
         async fn recorded(
             &self,

@@ -695,12 +695,12 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
             .await;
     }
 
-    async fn transcript(&self, child: ulid::Ulid) -> Vec<String> {
+    async fn transcript(&self, child: ulid::Ulid) -> orchestrator::Transcript {
+        let events = self.log.events(child).await;
+        let trust = orchestrator::least_trusted(events.iter().map(|event| event.trust));
         // The first user message is the objective; later ones are steers.
         let mut objective_seen = false;
-        self.log
-            .events(child)
-            .await
+        let steps = events
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::UserMessage => {
@@ -724,7 +724,8 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                 )),
                 _ => None,
             })
-            .collect()
+            .collect();
+        orchestrator::Transcript { steps, trust }
     }
 
     async fn recorded(

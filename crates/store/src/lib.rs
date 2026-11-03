@@ -389,6 +389,12 @@ impl ArtifactStore for FileArtifactStore {
             .then(|| dunce::simplified(&path).to_path_buf())
     }
 
+    fn hash_of(&self, path: &Path) -> Option<String> {
+        let name = path.file_name()?.to_str()?;
+        let folder = std::fs::canonicalize(path.parent()?).ok()?;
+        (folder == self.dir && self.safe_path(name).is_ok()).then(|| name.to_ascii_lowercase())
+    }
+
     fn put(&self, bytes: &[u8]) -> Result<String, String> {
         let mut h = Sha256::new();
         h.update(bytes);
@@ -396,6 +402,10 @@ impl ArtifactStore for FileArtifactStore {
         let path = self.dir.join(&hash);
         if open_verified_artifact(&path, &hash).is_ok() {
             private_artifact(&path)?;
+            // Stored again counts as recent, so cleanup keeps output a chat is still producing.
+            if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_modified(std::time::SystemTime::now());
+            }
             return Ok(hash);
         }
 

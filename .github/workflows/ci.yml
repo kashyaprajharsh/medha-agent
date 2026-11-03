@@ -175,6 +175,11 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      # Runs test binaries in parallel, each test in its own process; settings in .config/nextest.toml.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest@0.9.149
+
       # Every failing test on this system is reported in one run, not just the first.
       # macOS and Linux runners must really enforce the native sandbox, so its tests
       # cannot pass by skipping.
@@ -182,7 +187,7 @@ jobs:
         env:
           MEDHA_REQUIRE_NATIVE_SANDBOX: ${{ runner.os != 'Windows' && '1' || '' }}
           MEDHA_REQUIRE_BROWSER: "1"
-        run: cargo test --workspace --all-targets --no-fail-fast
+        run: cargo nextest run --workspace --all-targets --profile ci
 
   # The desktop app has its own dependency graph: a window in TypeScript and a
   # shell in Rust that bundles the `medha` program. Each host OS builds and tests both.

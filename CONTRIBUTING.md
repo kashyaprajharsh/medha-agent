@@ -150,7 +150,12 @@ cargo fmt --all --check
 # Lint every workspace target; warnings fail the check.
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Run the workspace tests and report every failing target.
+# Run the workspace tests and report every failing test, as CI does.
+# Install the runner once with `brew install cargo-nextest` or
+# `cargo install cargo-nextest --locked`; settings are in .config/nextest.toml.
+cargo nextest run --workspace --all-targets --profile ci
+
+# Without nextest, this runs the same tests, one test binary at a time.
 cargo test --workspace --all-targets --no-fail-fast
 
 # Run the CI and release helper tests.

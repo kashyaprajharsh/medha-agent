@@ -268,9 +268,12 @@ For root-workspace Rust changes, run:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets --no-fail-fast
+cargo nextest run --workspace --all-targets --profile ci
 git diff --check
 ```
+
+Without nextest, `cargo test --workspace --all-targets --no-fail-fast` runs the
+same tests, one test binary at a time.
 
 Run `cargo fmt --all` to apply formatting and then inspect the result. During
 iteration, `cargo test -p kernel test_name` is a focused example; choose the

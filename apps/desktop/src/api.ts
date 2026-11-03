@@ -368,6 +368,8 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
       key: string,
       method: LiveMethod,
       params: Record<string, unknown> = {},
+      // null waits for the answer: a rewind putting back many files can take longer than any fixed limit.
+      confirmWithin: number | null = 120_000,
     ): Promise<Record<string, unknown>> => {
       let off: UnlistenFn | undefined;
       let requestId: number | undefined;
@@ -404,15 +406,16 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
             })
             .then(async (unlisten) => {
               off = unlisten;
-              timer = setTimeout(
-                () =>
-                  reject(
-                    new Error(
-                      "Medha has not confirmed this action. Check its status before trying again.",
+              if (confirmWithin !== null)
+                timer = setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        "Medha has not confirmed this action. Check its status before trying again.",
+                      ),
                     ),
-                  ),
-                120_000,
-              );
+                  confirmWithin,
+                );
               requestId = await api.liveRequest(key, method, params);
               early.forEach(finish);
             })

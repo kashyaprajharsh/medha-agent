@@ -150,7 +150,12 @@ async fn a_rewind_that_cannot_finish_changes_no_file_and_makes_no_branch() {
     std::fs::write(folder.join("b.txt"), "mine\n").unwrap();
     let chats_before = logged_chats(&world).await;
     let (_, rewound) = rewind_to_first(&mut client, &chat).await;
-    assert!(rewound.get("error").is_some(), "{rewound}");
+    assert_eq!(
+        rewound["error"]["message"],
+        "Nothing was rewound: b.txt changed after Medha's change, and putting it back would overwrite that. \
+         No file was changed and no branch was made.",
+        "{rewound}"
+    );
     assert_eq!(
         read(&folder, "a.txt"),
         "a1\n",

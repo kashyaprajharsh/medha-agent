@@ -55,6 +55,9 @@ pub enum SandboxError {
     Permission(#[from] permissions::PermissionError),
     #[error("write target changed after approval: {0}")]
     Conflict(String),
+    /// A restore that stopped before it wrote any file.
+    #[error("{0}")]
+    Untouched(String),
     #[error("file was published, but post-write verification failed: {message}")]
     Published {
         snapshot: Option<String>,
@@ -2309,19 +2312,24 @@ impl WorkspaceSandbox {
             return Ok(());
         };
         if guard.resolved() != self.root.join(&file.path) {
-            return Err(SandboxError::Conflict(
-                "undo target now resolves through a different path; preserved it".into(),
-            ));
+            return Err(SandboxError::Untouched(format!(
+                "{} now leads somewhere else through a link",
+                file.path
+            )));
         }
+        let shown = guard
+            .resolved()
+            .strip_prefix(&self.root)
+            .unwrap_or(guard.resolved());
         let inspection = self.inspect_guarded(guard).await?;
         let actual = inspection
             .bytes
             .as_ref()
             .map(|bytes| format!("{:x}", sha2::Sha256::digest(bytes)));
         if expected == "unknown" || actual.as_deref().unwrap_or("missing") != expected {
-            return Err(SandboxError::Io(format!(
-                "{} changed after the command; preserved it",
-                file.path
+            return Err(SandboxError::Untouched(format!(
+                "{} changed after Medha's change, and putting it back would overwrite that",
+                shown.display()
             )));
         }
         Ok(())
@@ -2344,10 +2352,14 @@ impl WorkspaceSandbox {
             }
         }
         for file in &ready {
-            let guard = self.path_guard(&file.path).await?;
-            self.check_revision(&guard, file)
-                .await
-                .map_err(|error| SandboxError::Io(format!("{error}; no files were restored")))?;
+            let checked = match self.path_guard(&file.path).await {
+                Ok(guard) => self.check_revision(&guard, file).await,
+                Err(error) => Err(error),
+            };
+            checked.map_err(|error| match error {
+                SandboxError::Untouched(_) => error,
+                other => SandboxError::Untouched(other.to_string()),
+            })?;
         }
         for file in ready {
             self.restore_revision(file).await?;

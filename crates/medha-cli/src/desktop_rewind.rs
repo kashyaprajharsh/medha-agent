@@ -89,7 +89,14 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
             .workspace
             .restore_plan(&files)
             .await
-            .map_err(|error| format!("Code restore stopped: {error}. Conversation was kept."))?;
+            .map_err(|error| match error {
+                sandbox::SandboxError::Untouched(why) => {
+                    format!("Nothing was rewound: {why}. No file was changed and no branch was made.")
+                }
+                other => format!(
+                    "The rewind stopped while putting files back: {other}. Files put back before it stopped stay so; no branch was made."
+                ),
+            })?;
         tracing::info!(
             session = %session.id,
             restored = ?report.restored,

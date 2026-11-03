@@ -58,10 +58,13 @@ impl Backend {
                     let mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> =
                         BufReader::new(Box::new(read));
                     let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(write);
-                    wire::greet(&mut reader, &mut writer, &token, ROLES)
+                    // A backend that took the address before writing its token refuses the last one's; read again.
+                    if wire::greet(&mut reader, &mut writer, &token, ROLES)
                         .await
-                        .expect("the backend did not admit a client holding its token");
-                    break (reader, writer);
+                        .is_ok()
+                    {
+                        break (reader, writer);
+                    }
                 }
                 assert!(Instant::now() < deadline, "the backend never listened");
                 tokio::time::sleep(Duration::from_millis(50)).await;

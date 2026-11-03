@@ -2783,6 +2783,37 @@ test("rewind restores both saved images and local files as removable draft attac
   assert.equal(restored.attachments[1].path, document.path);
 });
 
+test("closing a running rewind keeps it going, and its finish names the files whose backups expired", async () => {
+  const { Rewind } = await import(await moduleUrl("Rewind"));
+  let finish;
+  let closed = false;
+  let completed;
+  const holds = [];
+  globalThis.__medhaControlsTest.api.liveCall = async (_key, method, _params, confirmWithin) => {
+    if (method === "session.rewind.points") return { points: [{ id: "point", text: "Add FX", files: 2 }] };
+    assert.equal(confirmWithin, null, "a rewind is not given up on after a fixed time");
+    return new Promise((resolve) => { finish = resolve; });
+  };
+  await act(async () => root.render(h(Rewind, { sessionKey: "chat", ensureOpen: async () => {},
+    onHold: (hold) => holds.push(hold), onClose() { closed = true; }, onComplete(result) { completed = result; } })));
+  await click(document.querySelector('input[value="both"]'));
+  assert.match(document.querySelector('[role="dialog"]').textContent, /Puts back the 2 files Medha changed in this project\./);
+  await click(namedButton("Rewind"));
+  assert.deepEqual(holds, ["busy"]);
+  await key(document.querySelector('[role="dialog"]'), "Escape");
+  assert.equal(document.querySelector('[role="dialog"]'), null, "Escape hides a running rewind");
+  assert.equal(closed, false, "the rewind is still running");
+  await act(async () => finish({ source: "old", session: "new", prefill: "", code_only: false, images: [],
+    restored: 1, expired: ["tests/news.py"] }));
+  assert.ok(completed);
+  assert.equal(holds.at(-1), "report");
+  const report = document.querySelector('[role="dialog"]');
+  assert.match(report.textContent, /Put back 1 file and started a new branch of the conversation/);
+  assert.match(report.textContent, /tests\/news\.py/);
+  await click(namedButton("Done"));
+  assert.equal(closed, true);
+});
+
 test("a late file selection preserves token removals and non-image drops explain the native file chooser", async () => {
   const chat = await attachmentChat();
   const pdf = { id: "pdf", kind: "file", name: "Report.pdf", path: "/Users/test/Report.pdf" };

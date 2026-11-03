@@ -18,7 +18,7 @@ import { FileViewer } from "./FileViewer";
 import { FirstRun } from "./FirstRun";
 import { Extensions } from "./Extensions";
 import { Messaging } from "./Messaging";
-import { Rewind } from "./Rewind";
+import { Rewind, type RewindHold } from "./Rewind";
 import { Settings } from "./Settings";
 import { Composer, type Control } from "./Composer";
 import { Icon } from "./Icon";
@@ -63,7 +63,14 @@ export function App() {
   const appRoot = useRef<HTMLDivElement>(null);
   const { theme, setTheme } = context;
   const [page, setPage] = useState<"chat" | "extensions" | "messaging" | "settings">("chat");
-  const [rewind, setRewind] = useState<{ at?: string } | null>(null);
+  const [rewind, setRewind] = useState<{
+    at?: string;
+    key: string;
+    hold?: RewindHold;
+    reveal?: number;
+  } | null>(null);
+  // A running rewind, or its report, outlives a chat switch and Escape.
+  const dropRewind = () => setRewind((open) => (open?.hold ? open : null));
   const [preview, setPreview] = useState<string | null>(null);
   const [sidebarPeek, setSidebarPeek] = useState(false);
   const peekTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -345,7 +352,7 @@ export function App() {
   useEffect(() => {
     setRun(null);
     setPreview(null);
-    setRewind(null);
+    dropRewind();
     setControl(null);
     setAway(false);
     setEvents([]);
@@ -458,7 +465,7 @@ export function App() {
       if (event.key === "Escape") {
         setRun(null);
         setPreview(null);
-        setRewind(null);
+        dropRewind();
         setSidebarPeek(false);
         setSurface(null);
         if (window.innerWidth <= 780) setSidebarOpen(false);
@@ -598,7 +605,12 @@ export function App() {
   };
   const openRewind = useCallback(
     (at?: string) => {
-      if (!settingsLocked && currentKey) setRewind({ at });
+      if (!settingsLocked && currentKey)
+        setRewind((open) =>
+          open?.hold
+            ? { ...open, reveal: (open.reveal ?? 0) + 1 }
+            : { at, key: currentKey },
+        );
     },
     [settingsLocked, currentKey],
   );
@@ -1204,28 +1216,34 @@ export function App() {
         )
       )}
 
-      {rewind && currentKey && (
+      {rewind && (
         <Rewind
-          sessionKey={currentKey}
+          sessionKey={rewind.key}
           at={rewind.at}
+          reveal={rewind.reveal}
           ensureOpen={async () => {
-            await ensureOpen(currentKey, draftKey ? null : selected);
+            await ensureOpen(rewind.key, draftKey ? null : selected);
           }}
+          onHold={(hold) => setRewind((open) => open && { ...open, hold })}
           onClose={() => setRewind(null)}
           onComplete={(result) => {
+            const key = rewind.key;
             if (!result.code_only) {
               setKeyBySession((previous) => {
                 const next = { ...previous };
                 delete next[result.source];
-                next[result.session] = currentKey;
+                next[result.session] = key;
                 return next;
               });
-              setSelected(result.session);
-              setDraftKey(null);
-              setText((all) => ({ ...all, [currentKey]: result.prefill }));
+              // A rewind that finishes after the person moved to another chat does not pull them back.
+              if (context.scope.current.chatKey === key) {
+                setSelected(result.session);
+                setDraftKey(null);
+              }
+              setText((all) => ({ ...all, [key]: result.prefill }));
               setAttachments((all) => ({
                 ...all,
-                [currentKey]: result.attachments,
+                [key]: result.attachments,
               }));
             }
             setReload((value) => value + 1);

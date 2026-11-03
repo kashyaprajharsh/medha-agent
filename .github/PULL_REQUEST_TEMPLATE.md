@@ -26,7 +26,7 @@
 
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace --all-targets --no-fail-fast`
+- [ ] `cargo nextest run --workspace --all-targets --profile ci`
 - [ ] `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`
 
 ### Desktop frontend

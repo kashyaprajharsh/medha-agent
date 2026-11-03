@@ -3361,7 +3361,8 @@ async fn a_program_in_a_terminal_reads_what_is_typed_and_stays_in_the_sandbox() 
     );
 }
 
-/// Quiet useful work after a failed optional lookup is not killed: it finishes and reports its end.
+/// Quiet useful work after a failed optional lookup is not killed: past the 8 s window it is handed off, then
+/// finishes and reports its end.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quiet_work_after_a_failed_lookup_finishes() {
@@ -3371,7 +3372,7 @@ async fn quiet_work_after_a_failed_lookup_finishes() {
     let folder = world.folder("quiet");
     let chat = client.open(&folder).await;
     client
-        .send(&chat, "RUN `echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 4; echo quiet-work-done`")
+        .send(&chat, "RUN `echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 10; echo quiet-work-done`")
         .await;
     let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
     let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});

@@ -6858,9 +6858,10 @@ impl Tool for ShellExec {
                     "It reported a name-resolution failure and has gone quiet, which may be useful work or a retry wait, so it was not stopped. {NETWORK_DISABLED_HINT} Stop this task with task.control before rerunning it."
                 ));
             }
-            payload["note"] = json!(match background {
-                true => "Started in the background; you will be told when it ends. Go on with other work; task.output reads it, task.control stops it.".to_owned(),
-                false => format!("Still running after {timeout_s}s, so it keeps going in the background; you will be told when it ends. task.output reads it, task.control stops it."),
+            payload["note"] = json!(match (background, stalled) {
+                (true, _) => "Started in the background; you will be told when it ends. Go on with other work; task.output reads it, task.control stops it.".to_owned(),
+                (false, true) => format!("Quiet for {}s after a failed name lookup, so it keeps going in the background; you will be told when it ends. task.output reads it, task.control stops it.", NET_DENIAL_GRACE.as_secs()),
+                (false, false) => format!("Still running after {timeout_s}s, so it keeps going in the background; you will be told when it ends. task.output reads it, task.control stops it."),
             });
             if matches!(waited, ShellWait::Released) {
                 payload["note"] = json!(
@@ -7135,10 +7136,19 @@ impl Tool for TaskControl {
         match args.get("op").and_then(Value::as_str) {
             Some("kill") => {
                 if self.tasks.kill(&id) {
-                    Ok(json!({ "task_id": id, "killed": true }))
-                } else {
-                    Err(ToolError::Failed(format!("no such task '{id}'")))
+                    return Ok(json!({ "task_id": id, "killed": true }));
                 }
+                // A task that ended before the stop arrived is not an error: say so, with how it ended.
+                let mut ended = self
+                    .tasks
+                    .read(&id, false)
+                    .ok_or_else(|| ToolError::Failed(format!("no such task '{id}'")))?;
+                ended["killed"] = json!(false);
+                ended["status"] = json!("already_finished");
+                ended["note"] = json!(
+                    "It had already finished, so nothing was stopped; task.output reads its output."
+                );
+                Ok(ended)
             }
             Some(op @ ("write" | "submit" | "close")) => {
                 let text = args.get("text").and_then(Value::as_str).unwrap_or_default();

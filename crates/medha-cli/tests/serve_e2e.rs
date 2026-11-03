@@ -3362,7 +3362,7 @@ async fn a_program_in_a_terminal_reads_what_is_typed_and_stays_in_the_sandbox() 
 }
 
 /// Quiet useful work after a failed optional lookup is not killed: past the 8 s window it is handed off, then
-/// finishes and reports its end.
+/// finishes and reports its end, and stopping it after it ended says how it ended.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quiet_work_after_a_failed_lookup_finishes() {
@@ -3382,6 +3382,11 @@ async fn quiet_work_after_a_failed_lookup_finishes() {
         observed["params"]["payload"]["status"], "running",
         "{observed}"
     );
+    let note = observed["params"]["payload"]["note"].as_str().unwrap();
+    assert!(
+        note.contains("after a failed name lookup") && !note.contains("300s"),
+        "{note}"
+    );
     client.until(|frame| kind(frame, "turn.done")).await;
     client.until(|frame| kind(frame, "turn.done")).await;
     let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
@@ -3391,6 +3396,18 @@ async fn quiet_work_after_a_failed_lookup_finishes() {
     assert!(
         raw.contains("exit code 0") && raw.contains("quiet-work-done"),
         "{raw}"
+    );
+    let stop = json!({"op": "kill", "task_id": observed["params"]["payload"]["task_id"]});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("task_control {stop}")],
+    )
+    .await;
+    assert!(
+        raw.contains("already_finished") && !raw.contains("no such task"),
+        "a stop after the end is not an error: {raw}"
     );
 }
 

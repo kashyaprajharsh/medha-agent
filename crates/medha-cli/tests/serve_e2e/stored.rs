@@ -2,7 +2,7 @@
 use super::*;
 
 /// A 1×1 PNG, so a stored image can be told apart from text by its bytes alone.
-const PNG: [u8; 67] = [
+pub(super) const PNG: [u8; 67] = [
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
     0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
@@ -11,7 +11,7 @@ const PNG: [u8; 67] = [
 ];
 
 /// The project's store folder, where large results and images are kept by hash.
-fn store(world: &World) -> PathBuf {
+pub(super) fn store(world: &World) -> PathBuf {
     std::fs::read_dir(world.home().join("projects"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -40,7 +40,7 @@ async fn asked_while(client: &mut Client, chat: &str, lines: &[String]) -> usize
 }
 
 /// The chat's tool result `back` places from its last one, so 0 is the newest.
-async fn result(world: &World, chat: &str, back: usize) -> Value {
+pub(super) async fn result(world: &World, chat: &str, back: usize) -> Value {
     let state = store(world).parent().unwrap().to_path_buf();
     let log = store::SqliteLog::open(state.join("events.db")).unwrap();
     kernel::EventLog::events(&log, chat.parse().unwrap())

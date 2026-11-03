@@ -152,6 +152,23 @@ impl Workspace {
         let artifacts = Arc::new(store::FileArtifactStore::open(
             self.state.join("artifacts"),
         )?);
+        // Once per project per backend, off the start path: old stored text and edit backups past their limits go.
+        let limits = crate::config::load()
+            .ok()
+            .flatten()
+            .map(|config| config.security)
+            .unwrap_or_default();
+        let (stored, backups) = (self.state.join("artifacts"), self.state.join("snapshots"));
+        std::thread::spawn(move || {
+            use crate::state_sweep::{STORED_AGE, sweep};
+            sweep(
+                &stored,
+                limits.stored_bytes as u64,
+                Some(STORED_AGE),
+                media::has_image_header,
+            );
+            sweep(&backups, limits.checkpoint_bytes as u64, None, |_| false);
+        });
         Ok(slot.insert(Store { log, artifacts }).clone())
     }
 }

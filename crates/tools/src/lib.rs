@@ -1687,7 +1687,17 @@ impl Tool for Read {
             )?;
             return self.image.execute(args).await;
         }
-        self.text.execute(args).await
+        let read = self.text.execute(args).await;
+        // A stored result that is gone was cleaned up; saying so beats a bare "not found".
+        let gone = std::path::Path::new(&path);
+        if read.is_err() && !gone.exists() && self.artifact.store.hash_of(gone).is_some() {
+            return Err(ToolError::Failed(format!(
+                "{path} was a stored result that has been cleaned up: once the store passes its size \
+                 limit, text results older than 30 days are removed. Run the command again to get \
+                 its output."
+            )));
+        }
+        read
     }
 }
 
@@ -3844,7 +3854,8 @@ impl Tool for ReadArtifact {
                 ToolError::Failed(format!(
                     "no artifact stored under hash {hash} ({err}). Artifact hashes are only \
                      valid if a tool result printed one — they cannot be guessed or \
-                     constructed. To read a file from disk use `read`; to search it use \
+                     constructed. A result older than 30 days may have been cleaned up; run \
+                     its command again. To read a file from disk use `read`; to search it use \
                      `grep`."
                 ))
             })?;

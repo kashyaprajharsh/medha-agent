@@ -52,6 +52,10 @@ pub trait ArtifactStore: Send + Sync + 'static {
     fn path(&self, _hash: &str) -> Option<std::path::PathBuf> {
         None
     }
+    /// The hash a path names when it is one of this store's files, still kept or since cleaned up.
+    fn hash_of(&self, _path: &std::path::Path) -> Option<String> {
+        None
+    }
 
     /// Async-runtime-safe wrappers for file-backed implementations. The
     /// synchronous methods remain the small storage-port API used by tests and

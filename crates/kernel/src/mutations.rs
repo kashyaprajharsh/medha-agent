@@ -16,6 +16,8 @@ pub struct Settings {
     pub checkpoint_bytes: usize,
     pub checkpoint_file_bytes: usize,
     pub checkpoint_files: usize,
+    /// Size past which a project's stored results lose their oldest text, once older than 30 days.
+    pub stored_bytes: usize,
 }
 
 impl Default for Settings {
@@ -26,6 +28,7 @@ impl Default for Settings {
             checkpoint_bytes: 500 * 1024 * 1024,
             checkpoint_file_bytes: 10 * 1024 * 1024,
             checkpoint_files: 50_000,
+            stored_bytes: 500 * 1024 * 1024,
         }
     }
 }
@@ -59,8 +62,12 @@ impl Guard {
             || settings.checkpoint_bytes == 0
             || settings.checkpoint_file_bytes == 0
             || settings.checkpoint_files == 0
+            || settings.stored_bytes == 0
         {
-            return Err("Checkpoint count, byte allowances and file limit must be positive".into());
+            return Err(
+                "Checkpoint count, byte allowances, file limit and stored-result size must be positive"
+                    .into(),
+            );
         }
         for pattern in &settings.protected_paths {
             glob::Pattern::new(pattern)

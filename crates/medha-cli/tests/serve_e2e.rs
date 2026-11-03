@@ -21,6 +21,8 @@ mod editor_checks;
 #[path = "serve_e2e/checkpoint_caps.rs"]
 mod checkpoint_caps;
 
+#[path = "serve_e2e/cleanup.rs"]
+mod cleanup;
 #[path = "serve_e2e/real_use.rs"]
 mod real_use;
 #[path = "serve_e2e/stored.rs"]

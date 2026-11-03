@@ -21,6 +21,7 @@ pub mod reasoning;
 pub mod session;
 pub mod session_mcp;
 pub mod skill_judge;
+mod state_sweep;
 pub mod surface;
 pub mod verify;
 pub mod vision;

@@ -169,7 +169,7 @@ async fn a_link_is_named_and_never_followed() {
     std::fs::write(root.join("note"), "kept").unwrap();
     let guard = Arc::new(kernel::egress::Guard::default());
     let result = prepared(&guard, &sandbox, "rm link note").await;
-    assert!(result["checkpoint"].is_string());
+    assert!(result["checkpoint"].is_string(), "{result}");
     assert!(
         result["_checkpoint_note"]
             .as_str()
@@ -237,7 +237,8 @@ async fn a_backup_in_progress_is_waited_for() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(!waiting.is_finished());
     drop(held);
-    assert!(waiting.await.unwrap()["checkpoint"].is_string());
+    let result = waiting.await.unwrap();
+    assert!(result["checkpoint"].is_string(), "{result}");
 }
 
 /// Retention drops old backups; a file past the byte allowance is named and the command runs.

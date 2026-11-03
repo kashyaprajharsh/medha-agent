@@ -132,7 +132,8 @@ fn configured_arguments(
             .read_to_end(&mut bytes)
             .map(|_| bytes)
     });
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // A busy machine or a process scanner can take seconds to start Git; a stuck one is still stopped.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,

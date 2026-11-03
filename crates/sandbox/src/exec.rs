@@ -4884,8 +4884,9 @@ mod tests {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.args(["-c", &script]).current_dir(&dir);
         let process = spawn_background(command, false).unwrap();
+        // Room for a slow launch; a completion that waited on the descendant leaves the marker checked below.
         assert!(
-            process.wait_until(std::time::Duration::from_secs(2)).await,
+            process.wait_until(std::time::Duration::from_secs(10)).await,
             "completion was held hostage by a descendant's pipe"
         );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;

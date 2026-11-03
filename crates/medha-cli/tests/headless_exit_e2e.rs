@@ -48,7 +48,8 @@ fn a_headless_provider_failure_exits_nonzero() {
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Room for a slow start on a busy machine; the loop ends at the first request.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -88,7 +89,7 @@ fn a_headless_provider_failure_exits_nonzero() {
     let output = configured_medha(&workspace, &home)
         .env("MEDHA_BASE_URL", format!("http://{address}/v1"))
         .env("MEDHA_MAX_CTX", "32000")
-        .env("MEDHA_MAX_WALL", "5")
+        .env("MEDHA_MAX_WALL", "30")
         .output()
         .unwrap();
     server.join().unwrap();

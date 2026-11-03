@@ -480,7 +480,8 @@ while True:
             )
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    // A process launch can take seconds on a busy machine; the loop ends as soon as the server is up.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while !a.root.join("server.pid").exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

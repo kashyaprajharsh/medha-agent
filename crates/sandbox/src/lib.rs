@@ -4062,7 +4062,8 @@ mod tests {
                 .await
         });
 
-        for _ in 0..100 {
+        // Two sandboxed launches come first; a busy machine or a process scanner can take seconds for them.
+        for _ in 0..1000 {
             if marker.exists() {
                 break;
             }

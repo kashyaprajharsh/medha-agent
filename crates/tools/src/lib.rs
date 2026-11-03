@@ -5629,9 +5629,8 @@ const SHELL_TIMEOUT_MAX_SECS: u64 = 600;
 /// that the grant card arrives while the user is still watching the command.
 const NET_DENIAL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// Silence after a resolver failure before the command is treated as stuck.
-/// Package managers back off for tens of seconds between retries; anything
-/// still doing useful work writes something long before this elapses.
-const NET_DENIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Under npm's first 10 s retry back-off, yet long enough that a working command on a busy machine is not killed.
+const NET_DENIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Why a bounded foreground wait ended.
 enum ShellWait {

@@ -277,7 +277,8 @@ for file in "$MEDHA_PLUGIN_ROOT/changed" "$MEDHA_PROJECT_DIR/changed"; do
 done
 printf '{"decision":"continue"}'
 "#,
-            5_000,
+            // What it may touch is under test, not its speed: a busy machine must not time it out.
+            30_000,
             "workdir = \"workspace\"\n[permissions]\nread_paths = [\".\"]",
         );
         let store = Store::new(

@@ -374,17 +374,22 @@ impl Tool for AgentSpawn {
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "continue"],
+                    "description": "'start' (default) a new agent, or 'continue' one of your own with more work."
+                },
                 "objective": {
                     "type": "string",
                     "description": "The complete task. The child sees only this — not this conversation."
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Continue one of your own agents instead of starting a new one, by name or session id. Give `text` with it."
+                    "description": "continue: your agent's name or session id."
                 },
                 "text": {
                     "type": "string",
-                    "description": "With `agent`: the further work. Stands alone — it cannot see this conversation."
+                    "description": "continue: the further work. Stands alone — it cannot see this conversation."
                 },
                 "name": { "type": "string", "description": "Short label for the agent (optional)" },
                 "contract": {
@@ -444,9 +449,22 @@ impl Tool for AgentSpawn {
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        // Naming an agent means continuing that one, not starting another.
-        if crate::given(args, "agent") {
-            return self.followup.execute(args).await;
+        match args.get("action").and_then(Value::as_str) {
+            Some("continue") => return self.followup.execute(args).await,
+            None | Some("start") => {}
+            Some(other) => {
+                return Err(ToolError::Args(format!(
+                    "unknown action '{other}'; expected start or continue"
+                )));
+            }
+        }
+        if !crate::given(args, "objective")
+            && !crate::given(args, "tasks")
+            && crate::given(args, "agent")
+        {
+            return Err(ToolError::Args(
+                "to give one of your agents more work, set action: \"continue\" with `agent` and `text`".into(),
+            ));
         }
         // Batch: independent questions run at once rather than one call after
         // another. Capacity is already bounded per tree, so an over-large batch

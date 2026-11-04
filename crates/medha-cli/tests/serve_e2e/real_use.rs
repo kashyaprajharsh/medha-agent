@@ -517,3 +517,105 @@ async fn a_local_only_sub_agent_transcript_does_not_mark_the_chat_as_web() {
         read_back.payload
     );
 }
+
+/// A call to a misnamed shell tool is told which offered tool to use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_misnamed_shell_call_is_pointed_at_the_shell_tool() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("misnamed")).await;
+    let call = json!({"command": "echo hi", "network": false});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("shell_command {call}")],
+    )
+    .await;
+    assert!(raw.contains("Use `shell_exec`"), "{raw}");
+}
+
+/// A field the tool does not have is named in the result with the fields it does have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_field_a_tool_does_not_have_is_named_with_the_one_it_meant() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("unknown-field")).await;
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("task_output {}", json!({"timeout_s": 5}))],
+    )
+    .await;
+    assert!(
+        raw.contains("`timeout_s` is not a field of task.output") && raw.contains("`wait_s`"),
+        "{raw}"
+    );
+}
+
+/// Code assigning an expression to a variable named `key` is read and edited as written, not redacted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_with_a_variable_named_key_is_read_and_edited_as_written() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("code-key");
+    let code = "API_KEY = 'Zq81-vK2mPx9wLr7Tn'\n\n\ndef resolve(name):\n    key = name.upper()\n    return key\n\n\ndef pair_of(name):\n    pair = name.upper()\n    return pair\n";
+    std::fs::write(folder.join("client.py"), code).unwrap();
+    let chat = client.open(&folder).await;
+    let edit = json!({"path": "client.py", "edits": [
+        {"old_string": "    pair = name.upper()\n", "new_string": "    pair = name.upper().strip()\n"}]});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[
+            format!("read {}", json!({"path": "client.py"})),
+            format!("edit {edit}"),
+        ],
+    )
+    .await;
+    assert!(
+        raw.contains("key = name.upper()") && raw.contains("pair = name.upper()"),
+        "{raw}"
+    );
+    assert!(
+        !raw.contains("Zq81-vK2mPx9wLr7Tn"),
+        "a real key is still removed: {raw}"
+    );
+    assert!(read(&folder, "client.py").contains("pair = name.upper().strip()"));
+}
+
+/// An agent is continued only when the call says `continue`; a start that also names an agent still starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_is_continued_by_asking_for_it_and_never_by_a_stray_field() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("agents")).await;
+    let first = json!({"name": "inv", "objective": "first job", "wait": true});
+    let more = json!({"action": "continue", "agent": "inv", "text": "second job"});
+    let other = json!({"name": "other", "objective": "third job", "agent": "inv", "wait": true});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[
+            format!("agent_spawn {first}"),
+            format!("agent_spawn {more}"),
+            format!("agent_spawn {other}"),
+        ],
+    )
+    .await;
+    assert!(
+        raw.contains("Picked up where it left off"),
+        "continue reaches the agent: {raw}"
+    );
+    assert!(
+        raw.contains(r#"\"agent\":\"/other\""#),
+        "a start naming an agent still starts: {raw}"
+    );
+}

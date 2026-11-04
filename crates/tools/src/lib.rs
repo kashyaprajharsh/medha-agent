@@ -5512,7 +5512,7 @@ impl ShellExec {
 struct ShellPlan {
     command: String,
     workdir: std::path::PathBuf,
-    timeout_s: u64,
+    timeout_s: Option<u64>,
     access: kernel::ExecutionAccess,
     background: bool,
     tty: bool,
@@ -5551,9 +5551,15 @@ impl ShellPlan {
         }
         let timeout_s = args
             .get("timeout_s")
-            .map_or(Some(SHELL_TIMEOUT_SECS), Value::as_u64)
-            .filter(|seconds| (1..=SHELL_TIMEOUT_MAX_SECS).contains(seconds))
-            .ok_or_else(|| ToolError::Args("timeout_s must be an integer from 1 to 600".into()))?;
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|seconds| (1..=SHELL_TIMEOUT_MAX_SECS).contains(seconds))
+                    .ok_or_else(|| {
+                        ToolError::Args("timeout_s must be an integer from 1 to 600".into())
+                    })
+            })
+            .transpose()?;
         let network = args
             .get("network")
             .map_or(Some(false), Value::as_bool)
@@ -5632,8 +5638,9 @@ impl ShellPlan {
     }
 }
 
-/// Default and maximum foreground deadlines. On expiry the whole process tree
-/// is killed and awaited before the tool returns an error; it is never detached.
+/// Foreground waits: a watched chat hands a command to the background after the first, an unwatched run stops it
+/// at the second; a model's own `timeout_s` replaces either, up to the maximum.
+const SHELL_HANDOVER_SECS: u64 = 30;
 const SHELL_TIMEOUT_SECS: u64 = 300;
 const SHELL_TIMEOUT_MAX_SECS: u64 = 600;
 /// How often a running command is checked for a resolver failure. Short enough
@@ -6736,7 +6743,7 @@ impl Tool for ShellExec {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": SHELL_TIMEOUT_MAX_SECS,
-                    "description": "Seconds to wait (default 300, maximum 600). Then it runs on in the background if this chat can report its end, else stops."
+                    "description": "Seconds to wait (default 30, maximum 600). Then it runs on in the background if this chat can report its end, else stops (default 300 there)."
                 },
                 "background": {
                     "type": "boolean",
@@ -6785,7 +6792,10 @@ impl Tool for ShellExec {
             ));
         }
         let command = plan.command;
-        let timeout_s = plan.timeout_s;
+        let timeout_s = plan.timeout_s.unwrap_or(match attended {
+            true => SHELL_HANDOVER_SECS,
+            false => SHELL_TIMEOUT_SECS,
+        });
         let workdir = plan.workdir;
         let deadline = std::time::Duration::from_secs(timeout_s);
         let mut env = shell_env();

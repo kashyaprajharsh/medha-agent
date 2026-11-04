@@ -28,6 +28,20 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 tracing::info!(tool = %it.tool, arguments = ?paths, "tool call arguments repaired");
                 adjusted.insert(it.id.clone(), note);
             }
+            // A field a built-in does not have is named, not dropped unseen; a server may read fields it does not list.
+            let unknown = (!it.tool.starts_with("mcp__"))
+                .then(|| crate::arg_repair::unknown_fields(&spec.name, &it.args, &spec.schema))
+                .flatten();
+            if let Some(unknown) = unknown {
+                tracing::info!(tool = %it.tool, "tool call has fields its schema does not declare");
+                adjusted
+                    .entry(it.id.clone())
+                    .and_modify(|note: &mut String| {
+                        note.push(' ');
+                        note.push_str(&unknown);
+                    })
+                    .or_insert(unknown);
+            }
         }
         for it in &mut intents {
             if is_memory_tool(&it.tool) {

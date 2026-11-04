@@ -238,8 +238,16 @@ fn secret_name(name: &str) -> bool {
         })
 }
 
+/// Code on the right of `key = …`: a name called or indexed, or a dotted lowercase name.
+static CODE_EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:[A-Za-z_][A-Za-z0-9_.]*(?:\(.*\)|\[.*\])|[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+)$",
+    )
+    .expect("code expression")
+});
+
 /// A value that could be a credential: long, one word, and not a number, a
-/// path, a variable reference, a switch or a placeholder.
+/// path, a variable reference, a switch, a placeholder or code.
 fn looks_like_credential(value: &str) -> bool {
     let value = value.trim_matches(['"', '\'']);
     let kinds = [
@@ -249,6 +257,7 @@ fn looks_like_credential(value: &str) -> bool {
         value.bytes().any(|b| !b.is_ascii_alphanumeric()),
     ];
     value.len() >= 12
+        && !CODE_EXPRESSION.is_match(value)
         && !value.contains(char::is_whitespace)
         && !value.starts_with(['/', '~', '$', '.', '<', '{'])
         && !value.contains("://")

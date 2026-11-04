@@ -3361,8 +3361,39 @@ async fn a_program_in_a_terminal_reads_what_is_typed_and_stays_in_the_sandbox() 
     );
 }
 
-/// Quiet useful work after a failed optional lookup is not killed: past the 8 s window it is handed off, then
-/// finishes and reports its end, and stopping it after it ended says how it ended.
+/// A command still running after 30 s in a watched chat goes to the background instead of holding the chat.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_command_is_handed_to_the_background_after_thirty_seconds() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("handover")).await;
+    client
+        .send(&chat, "RUN `sleep 34; echo handed-over-done`")
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    let (_, observed) = client.until(|frame| kind(frame, "tool.observation")).await;
+    let payload = &observed["params"]["payload"];
+    assert_eq!(payload["status"], "running", "{observed}");
+    assert!(
+        payload["note"].as_str().unwrap().contains("after 30s"),
+        "{observed}"
+    );
+    client.until(|frame| kind(frame, "turn.done")).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let last = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    assert!(
+        last["messages"].to_string().contains("handed-over-done"),
+        "the end is still reported"
+    );
+}
+
+/// Quiet work after a failed lookup is handed off with its real reason, and stopping it once ended is no error.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quiet_work_after_a_failed_lookup_finishes() {

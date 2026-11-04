@@ -729,24 +729,46 @@ const FOREIGN_TOOL_NAMES: &[(&str, &str)] = &[
     ("todowrite", "update_plan"),
 ];
 
-/// The wire name of the tool a refused call most likely meant, when that tool
-/// is on offer: a differently cased name, or a well-known name for the same job.
+/// The offered tool a refused call most likely meant: the same name spelled differently,
+/// a well-known name for the same job, or the only offered tool sharing its first word.
 pub fn suggested_tool(
     requested: &str,
     wire_to_canonical: &HashMap<String, String>,
 ) -> Option<String> {
-    let lower = requested.to_ascii_lowercase();
+    let spelled = |name: &str| {
+        let name = name.to_ascii_lowercase().replace(['-', ' ', '.'], "_");
+        name.strip_suffix("_tool")
+            .map(str::to_owned)
+            .unwrap_or(name)
+    };
+    let wanted = spelled(requested);
     if let Some(wire) = wire_to_canonical
-        .keys()
-        .find(|wire| wire.to_ascii_lowercase() == lower)
+        .iter()
+        .find(|(wire, canonical)| spelled(wire) == wanted || spelled(canonical) == wanted)
+        .map(|(wire, _)| wire)
     {
         return Some(wire.clone());
     }
-    let (_, canonical) = FOREIGN_TOOL_NAMES.iter().find(|(name, _)| *name == lower)?;
-    wire_to_canonical
-        .iter()
-        .find(|(_, target)| target.as_str() == *canonical)
-        .map(|(wire, _)| wire.clone())
+    if let Some((_, canonical)) = FOREIGN_TOOL_NAMES.iter().find(|(name, _)| *name == wanted)
+        && let Some((wire, _)) = wire_to_canonical
+            .iter()
+            .find(|(_, target)| target.as_str() == *canonical)
+    {
+        return Some(wire.clone());
+    }
+    let first = |name: &str| {
+        spelled(name)
+            .split('_')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let word = first(requested);
+    let mut sharing = wire_to_canonical.keys().filter(|wire| first(wire) == word);
+    match (sharing.next(), sharing.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Why a model-supplied tool reference could not be made canonical.

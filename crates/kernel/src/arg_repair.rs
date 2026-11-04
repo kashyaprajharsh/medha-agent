@@ -66,6 +66,37 @@ pub fn note(repairs: &[Repair]) -> Option<String> {
     })
 }
 
+/// One sentence naming top-level arguments the schema does not declare, with the fields it does.
+/// A schema open to other fields, or one without fields, says nothing.
+pub fn unknown_fields(tool: &str, args: &Value, schema: &Value) -> Option<String> {
+    if schema
+        .get("additionalProperties")
+        .is_some_and(|open| open != &Value::Bool(false))
+    {
+        return None;
+    }
+    let fields = schema.get("properties")?.as_object()?;
+    let unknown: Vec<&String> = args
+        .as_object()?
+        .keys()
+        .filter(|key| !key.starts_with('_') && !fields.contains_key(*key))
+        .collect();
+    let named = |names: Vec<&String>| {
+        let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+        quoted.join(", ")
+    };
+    let verb = match unknown.len() {
+        0 => return None,
+        1 => "is not a field",
+        _ => "are not fields",
+    };
+    Some(format!(
+        "{} {verb} of {tool}; its fields are {}.",
+        named(unknown),
+        named(fields.keys().collect())
+    ))
+}
+
 fn article(kind: &str) -> String {
     match kind {
         "array" | "object" | "integer" => format!("an {kind}"),

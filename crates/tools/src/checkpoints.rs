@@ -41,9 +41,10 @@ fn inventory(root: &Path, limit: usize) -> Result<Vec<PathBuf>, String> {
         .current_dir(root)
         .env_clear()
         .envs(git_safety::environment());
+    // A busy machine or a process scanner can take seconds to start Git; a hung one is still stopped.
     let output = sandbox::exec::run_command_bounded_sync(
         command,
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(30),
         16 * 1024 * 1024,
         4096,
     )

@@ -39,7 +39,8 @@ const SCOPE_LINE: Record<Scope, string> = {
 function serverOf(name: string): [string, string] | undefined {
   if (!name.startsWith("mcp__")) return undefined;
   const rest = name.slice(5);
-  const at = rest.indexOf("__");
+  // A tool name never holds `__`, so the last one ends a server id that may.
+  const at = rest.lastIndexOf("__");
   return at > 0 ? [rest.slice(0, at), rest.slice(at + 2)] : undefined;
 }
 

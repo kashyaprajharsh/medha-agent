@@ -100,19 +100,12 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
         }
     }
     if lock.memory.enabled {
-        let session_events = log.events(session.id).await;
-        let forked = session_events
-            .first()
-            .is_some_and(|event| event.provenance.source == "fork");
-        if forked {
-            memory_store.rebuild_project(session_events.into_iter())?;
-        } else {
-            memory_store.rebuild_project(
-                log.all_events()?
-                    .into_iter()
-                    .filter(|event| event.provenance.source != "fork"),
-            )?;
-        }
+        // Project memory is every chat's, a branch's included; a fork's copies of its parent's events count once.
+        memory_store.rebuild_project(
+            log.all_events()?
+                .into_iter()
+                .filter(|event| event.provenance.source != "fork"),
+        )?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())

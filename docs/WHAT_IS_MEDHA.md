@@ -2251,10 +2251,11 @@ capped at 60 seconds; otherwise MEDHA uses capped, jittered exponential backoff.
 the provider has emitted reply content, retry is allowed only when the output surface
 can retract or explicitly reset that attempt: the TUI removes abandoned
 text/reasoning, resets its in-progress tool label, and shows a retry notice, while ACP
-emits `model.restarted` so the editor can discard the attempt. Plain REPL and headless
-stdout cannot rewind printed bytes, so they fail that turn instead of risking a
-duplicated answer. A retry also counts as liveness progress for sub-agent stall
-detection.
+emits `model.restarted` so the editor can discard the attempt. Headless output to a
+pipe or file holds each reply until its attempt ends, so a restart drops the partial
+text and the reply is written once. On a terminal, the plain REPL prints a line saying
+the response is restarting, then the new reply. A retry also counts as liveness
+progress for sub-agent stall detection.
 
 ---
 
@@ -3064,7 +3065,8 @@ output_per_mtok = 1.50  # USD per million output tokens
 [gate]
 scenarios_dir = "scenarios"
 pass_threshold = 1.0      # 100% pass for "promote" verdict
-seeds = 1                 # Runs per scenario (max 100; >10 requires --yes)
+seeds = 3                 # Runs per scenario (max 100; >10 requires --yes)
+min_seeds = 3             # Completed runs needed to PROMOTE; fewer can only HOLD
 regression_epsilon = 0.0  # Tolerance for regression
 ```
 
@@ -3532,6 +3534,21 @@ Three semantics that are easy to get wrong:
 dimensions — `max_turns`, `max_tokens`, `max_cost_usd`, `max_wall_s` — and any field
 left out keeps the harness default.
 
+**`command` checks need a container.** The default native sandbox can read the host, so
+the gate will not run repository code under it. A scenario with a `command` check
+stops the gate before any model call until `medha.lock` names a container:
+
+```toml
+[sandbox]
+backend = "container"
+image = "python:3.12-slim"   # any image holding the tools your checks run
+```
+
+**Hold some cases back.** A model sees the fixture, so a check that only re-runs the
+visible test can be passed by code written for that test alone. Add a `command` check
+with cases the task never shows, run so the workspace cannot shadow the tools it uses
+(for Python, `python3 -I` with the workspace appended to `sys.path`).
+
 Because `unchanged` and `tool_not_used` assert on *how* the answer was reached rather
 than only the answer, a scenario can fail a run that produced the right output the
 wrong way. That is the point: this is a behavior suite, not an output diff.
@@ -3560,8 +3577,8 @@ medha gate scenarios/ --json
 
 | Verdict | Condition | Action |
 |---------|-----------|--------|
-| **PROMOTE** ✅ | `pass_rate >= threshold` | Safe to deploy |
-| **HOLD** ⚠️ | Below threshold, but at least one seed passed | Flaky, or a run that errored/timed out — investigate |
+| **PROMOTE** ✅ | `pass_rate >= threshold` over at least `min_seeds` completed runs | Safe to deploy |
+| **HOLD** ⚠️ | Below threshold but at least one seed passed, too few runs, or a run the harness could not start; the report says which | Flaky or not enough evidence: investigate or raise `--seeds` |
 | **REJECT** ❌ | Zero seeds passed | Broken, don't deploy |
 
 Exit codes, for wiring into CI:

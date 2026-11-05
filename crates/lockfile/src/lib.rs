@@ -361,6 +361,8 @@ pub struct GateConfig {
     pub pass_threshold: f64,
     /// Repeats per scenario, capped at 100; values above 10 require `--yes`.
     pub seeds: u32,
+    /// Runs that must complete before a scenario can promote; fewer can only hold.
+    pub min_seeds: u32,
     /// Max tolerated per-scenario pass-rate drop vs a baseline before a
     /// regression is called (reserved for the global non-inferiority check).
     pub regression_epsilon: f64,
@@ -371,7 +373,8 @@ impl Default for GateConfig {
         Self {
             scenarios_dir: "scenarios".into(),
             pass_threshold: 1.0,
-            seeds: 1,
+            seeds: 3,
+            min_seeds: 3,
             regression_epsilon: 0.0,
         }
     }

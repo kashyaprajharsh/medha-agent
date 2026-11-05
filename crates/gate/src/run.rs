@@ -1,6 +1,6 @@
 //! Hermetic black-box scenario runner using isolated workspace and state roots.
 
-use kernel::{Event, EventLog};
+use kernel::Event;
 use sandbox::run_command_bounded;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -279,10 +279,7 @@ async fn supervise_agent_command_owned(
     }
 }
 
-/// Read the run's event log back from its isolated home. The unique temp home
-/// contains exactly one project → one `events.db` → one session, so there is no
-/// ambiguity about which run we're scoring. A missing/empty log yields no events
-/// (checks then fail honestly rather than the gate erroring).
+/// Every session in the run's isolated home is this run's, sub-agents included; a missing log yields none.
 async fn load_events(home: &Path) -> Vec<Event> {
     let pattern = format!("{}/projects/*/events.db", home.display());
     let Some(db) = glob::glob(&pattern)
@@ -294,15 +291,7 @@ async fn load_events(home: &Path) -> Vec<Event> {
     let Ok(log) = SqliteLog::open(&db) else {
         return Vec::new();
     };
-    let sessions = log.sessions().await;
-    let Some(latest) = sessions.iter().max_by(|a, b| {
-        a.last_ts
-            .partial_cmp(&b.last_ts)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) else {
-        return Vec::new();
-    };
-    log.events(latest.id).await
+    log.all_events_async().await.unwrap_or_default()
 }
 
 #[derive(Default)]

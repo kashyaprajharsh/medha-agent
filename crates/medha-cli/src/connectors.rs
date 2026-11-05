@@ -265,7 +265,7 @@ pub(crate) fn activity(calls: &[(String, f64)], now: f64, tally: &mut HashMap<St
     for (tool, ran) in calls {
         let Some((server, _)) = tool
             .strip_prefix(mcp::TOOL_PREFIX)
-            .and_then(|rest| rest.split_once("__"))
+            .and_then(|rest| rest.rsplit_once("__"))
         else {
             continue;
         };

@@ -390,6 +390,8 @@ impl Accounts {
 
     /// `refused` is a token OpenAI turned down, which a saved copy must not hand back.
     async fn renew_from(&self, client_id: &str, refused: Option<&str>) -> Result<String> {
+        // Held from the read through the save, so another process waits and then uses what this one saved.
+        let _renewal = renewal_lock(client_id).await?;
         let saved =
             saved(client_id).ok_or_else(|| anyhow!("Sign in to ChatGPT to use this model."))?;
         let live = self.live(client_id);
@@ -408,10 +410,47 @@ impl Accounts {
                 Ok(tokens.access_token)
             }
             Err(chatgpt::Error::SignInAgain(why)) => {
+                // A grant another process renewed meanwhile is still good; only the one this refresh used is gone.
+                if let Some(newer) =
+                    self::saved(client_id).filter(|now| now.refresh_token != saved.refresh_token)
+                {
+                    *live.tokens.lock().unwrap() = Some(newer.tokens());
+                    return Ok(newer.access_token);
+                }
                 self.forget(client_id)?;
                 Err(anyhow!(SignInAgain(why)))
             }
             Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// The account's renewal file, locked across Medha processes while open; waits up to a minute for another's.
+async fn renewal_lock(client_id: &str) -> Result<std::fs::File> {
+    let folder = config::medha_home()?;
+    std::fs::create_dir_all(&folder)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(folder.join(format!(
+            ".chatgpt-renew-{}.lock",
+            kernel::portable_tool_name(client_id)
+        )))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(anyhow!(
+                    "another Medha process is still renewing the ChatGPT sign-in"
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
 }
@@ -448,7 +487,8 @@ impl SignIn {
 
     /// Wait for the browser, check everything, then keep the account and make it the active one.
     pub async fn finish(self, within: Duration) -> Result<Status> {
-        let redirect = tokio::time::timeout(within, self.listener.redirect())
+        let state = loopback::state_of(&self.link).unwrap_or_default();
+        let redirect = tokio::time::timeout(within, self.listener.redirect(&state))
             .await
             .map_err(|_| anyhow!("The browser did not come back from ChatGPT sign-in in time."))?
             .context("the sign-in listener failed")?;

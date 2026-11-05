@@ -114,6 +114,7 @@ fn command_path(root: &Path, with_sha256sum: bool, use_wget: bool) -> PathBuf {
         write_executable(
             &bin.join("wget"),
             r#"#!/bin/sh
+[ -n "${TEST_ARGS_LOG:-}" ] && printf '%s\n' "$*" >> "$TEST_ARGS_LOG"
 out=
 headers=false
 url=
@@ -478,6 +479,80 @@ fn a_missing_checksum_is_refused_with_curl_and_with_wget() {
     assert!(!transient.path().join("installed/medha").exists());
 }
 
+/// Every wget download refuses a redirect to plain http, as curl's do.
+#[test]
+fn wget_downloads_are_https_only() {
+    let case = TempDir::new().unwrap();
+    let archive = case.path().join("valid.tar.gz");
+    make_archive(
+        &archive,
+        &[Entry {
+            name: "medha",
+            kind: EntryKind::Regular,
+            body: b"medha",
+            link: "",
+        }],
+    );
+    let log = case.path().join("wget-args");
+    let bin = command_path(case.path(), false, true);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+    let output = Command::new("/bin/sh")
+        .arg(script)
+        .env("MEDHA_REPO", "example/medha")
+        .env("MEDHA_VERSION", "v-test")
+        .env("MEDHA_INSTALL_DIR", case.path().join("installed"))
+        .env("TEST_ARCHIVE", &archive)
+        .env("TEST_CHECKSUM", &archive)
+        .env("TEST_CHECKSUM_MODE", "missing")
+        .env("TEST_ARGS_LOG", &log)
+        .env("HOME", case.path())
+        .env("PATH", OsString::from(bin))
+        .output()
+        .unwrap();
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(calls.lines().count() >= 2, "{calls}\n{}", stderr(&output));
+    for call in calls.lines() {
+        assert!(call.contains("--https-only"), "{call}");
+    }
+}
+
+/// A download cut off part way through runs none of the script.
+#[test]
+fn a_truncated_installer_runs_nothing() {
+    let case = TempDir::new().unwrap();
+    let full =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh")).unwrap();
+    let cut = full.find("mkdir -p \"$STORE/versions\"").unwrap();
+    let truncated = &full[..full[cut..].find('\n').unwrap() + cut + 1];
+    let bin = command_path(case.path(), true, false);
+    let mut shell = Command::new("/bin/sh")
+        .env("MEDHA_REPO", "example/medha")
+        .env("MEDHA_VERSION", "v-test")
+        .env("MEDHA_INSTALL_DIR", case.path().join("installed"))
+        .env("HOME", case.path())
+        .env("PATH", OsString::from(bin))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    shell
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(truncated.as_bytes())
+        .unwrap();
+    let output = shell.wait_with_output().unwrap();
+    assert!(!output.status.success(), "a cut-off script exited cleanly");
+    assert!(
+        !case.path().join("installed").exists(),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!case.path().join(".local").exists(), "{}", stderr(&output));
+}
+
 /// An update while medha runs as the backend must leave that process and its file untouched.
 #[test]
 fn an_update_never_writes_over_a_running_medha() {
@@ -509,6 +584,39 @@ fn an_update_never_writes_over_a_running_medha() {
         versions(&case),
         ["v-three", "v-two"],
         "only the current and previous version stay"
+    );
+}
+
+/// An update told the running copy's version store installs there, so the relaunch finds the new version.
+#[test]
+fn an_update_installs_into_the_version_store_it_is_given() {
+    let case = TempDir::new().unwrap();
+    let store = case.path().join("system-store");
+    let archive = case.path().join("v-one.tar.gz");
+    make_archive(
+        &archive,
+        &[Entry {
+            name: "medha",
+            kind: EntryKind::Regular,
+            body: b"one",
+            link: "",
+        }],
+    );
+    let checksum = format!("{}  medha-test.tar.gz\n", sha256(&archive));
+    let output = installer(&case, &archive, "present", &checksum, true)
+        .env("MEDHA_VERSION", "v-one")
+        .env("MEDHA_STORE", &store)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(store.join("versions/v-one/medha")).unwrap(),
+        b"one"
+    );
+    let link = fs::canonicalize(case.path().join("installed/medha")).unwrap();
+    assert!(
+        link.starts_with(fs::canonicalize(&store).unwrap()),
+        "{link:?}"
     );
 }
 

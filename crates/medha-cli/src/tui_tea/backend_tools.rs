@@ -37,7 +37,7 @@ fn reason(why: OffReason) -> (&'static str, Option<ToolScope>, &'static str) {
 
 /// An MCP tool's server and own name, split where the backend joins them.
 fn server_of(name: &str) -> Option<(&str, &str)> {
-    name.strip_prefix(mcp::TOOL_PREFIX)?.split_once("__")
+    name.strip_prefix(mcp::TOOL_PREFIX)?.rsplit_once("__")
 }
 
 fn shown_name(tool: &ToolSwitch) -> String {

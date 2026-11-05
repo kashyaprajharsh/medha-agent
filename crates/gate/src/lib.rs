@@ -7,6 +7,7 @@ pub mod scenario;
 pub mod verdict;
 
 pub use run::{PreserveRuns, RunConfig};
+use scenario::Check;
 pub use scenario::Scenario;
 pub use verdict::{RunStatus, ScenarioResult, Verdict};
 
@@ -33,6 +34,8 @@ pub const COSTLY_SEEDS: u32 = 10;
 pub struct GateOptions {
     pub path: PathBuf,
     pub seeds: u32,
+    /// Completed runs a scenario needs before it can promote.
+    pub min_seeds: u32,
     pub threshold: f64,
     /// Explicit acknowledgement for a seed count above [`COSTLY_SEEDS`].
     pub confirm_costly: bool,
@@ -69,11 +72,32 @@ pub fn validate_run_inputs(
 /// Run the gate over one or more scenarios and return their aggregated results.
 pub async fn run_gate(opts: GateOptions) -> Result<Vec<ScenarioResult>, GateError> {
     validate_run_inputs(opts.seeds, opts.threshold, opts.confirm_costly)?;
-    let paths = discover(&opts.path)?;
-    let mut results = Vec::with_capacity(paths.len());
-    for p in paths {
-        let scn = Scenario::load(&p)?;
-        results.push(run_scenario(&scn, &opts).await);
+    let scenarios = discover(&opts.path)?
+        .iter()
+        .map(|path| Scenario::load(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Refused before any model call, so a check that could never run spends no tokens.
+    if let Some(reason) = checks::CommandRunner::from_sandbox(&opts.run.check_sandbox).unavailable()
+    {
+        let needing: Vec<&str> = scenarios
+            .iter()
+            .filter(|scn| {
+                scn.checks
+                    .iter()
+                    .any(|check| matches!(check, Check::Command { .. }))
+            })
+            .map(|scn| scn.id.as_str())
+            .collect();
+        if !needing.is_empty() {
+            return Err(GateError::Options(format!(
+                "{} has `command:` checks, which cannot run: {reason}. Run them in a container by adding to medha.lock:\n  [sandbox]\n  backend = \"container\"\n  image = \"<an image with the tools the checks run>\"",
+                needing.join(", ")
+            )));
+        }
+    }
+    let mut results = Vec::with_capacity(scenarios.len());
+    for scn in &scenarios {
+        results.push(run_scenario(scn, &opts).await);
     }
     Ok(results)
 }
@@ -115,7 +139,7 @@ async fn run_scenario(scn: &Scenario, opts: &GateOptions) -> ScenarioResult {
         };
         seeds.push(seed);
     }
-    verdict::aggregate(scn.id.clone(), seeds, opts.threshold)
+    verdict::aggregate(scn.id.clone(), seeds, opts.threshold, opts.min_seeds)
 }
 
 /// Resolve a path into a list of scenario paths:
@@ -192,6 +216,7 @@ mod tests {
         let options = GateOptions {
             path: missing_path,
             seeds: u32::MAX,
+            min_seeds: 1,
             threshold: 1.0,
             confirm_costly: true,
             run: RunConfig {
@@ -226,6 +251,7 @@ mod tests {
         let options = GateOptions {
             path: scenario_dir,
             seeds: 1,
+            min_seeds: 1,
             threshold: 1.0,
             confirm_costly: false,
             run: RunConfig {

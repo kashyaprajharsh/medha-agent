@@ -299,6 +299,7 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
     let results = gate::run_gate(gate::GateOptions {
         path: gc.path,
         seeds,
+        min_seeds: lock.gate.min_seeds,
         threshold,
         confirm_costly: gc.yes,
         run,
@@ -1095,6 +1096,7 @@ async fn main() -> Result<()> {
             None,
         )
         .await;
+    sink.settle();
     let committed = run.is_ok();
     let outcome = match run {
         Ok((_t, kernel::StopReason::Budget(stop))) => Err(anyhow::anyhow!(
@@ -1634,6 +1636,9 @@ struct PrintSink {
     /// Accumulated rather than printed on arrival: usage lands mid-stream, and
     /// writing it there cuts the model's own sentence in half.
     cache: std::sync::Mutex<(u64, u64)>,
+    /// The reply being streamed, held when stdout is not a terminal, so a restart drops it instead of a
+    /// script reading it twice. A terminal shows it live and marks a restart.
+    pending: Option<std::sync::Mutex<String>>,
 }
 
 impl PrintSink {
@@ -1641,12 +1646,45 @@ impl PrintSink {
         Self {
             usage: None,
             cache: std::sync::Mutex::new((0, 0)),
+            pending: Self::held(),
         }
     }
     fn tracking(cell: Arc<std::sync::Mutex<Option<kernel::ContextPressure>>>) -> Self {
         Self {
             usage: Some(cell),
             cache: std::sync::Mutex::new((0, 0)),
+            pending: Self::held(),
+        }
+    }
+
+    fn held() -> Option<std::sync::Mutex<String>> {
+        use std::io::IsTerminal;
+        (!std::io::stdout().is_terminal()).then(Default::default)
+    }
+
+    fn write(&self, text: &str) {
+        match &self.pending {
+            Some(pending) => pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_str(text),
+            None => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    /// Writes out the held reply; called before anything else reaches stdout, and when the sink is dropped.
+    fn settle(&self) {
+        if let Some(pending) = &self.pending {
+            let text = std::mem::take(
+                &mut *pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            print!("{text}");
+            let _ = std::io::stdout().flush();
         }
     }
 
@@ -1671,22 +1709,29 @@ impl kernel::StreamSink for PrintSink {
     }
 
     fn restarted(&self) {
-        println!("\n[Previous response incomplete — restarting the response]\n");
-        let _ = std::io::stdout().flush();
+        match &self.pending {
+            Some(pending) => pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear(),
+            None => {
+                println!("\n[Previous response incomplete: restarting the response]\n");
+                let _ = std::io::stdout().flush();
+            }
+        }
     }
 
     fn notice(&self, text: &str) {
         eprintln!("· {text}");
     }
     fn text(&self, delta: &str) {
-        print!("{delta}");
-        let _ = std::io::stdout().flush();
+        self.write(delta);
     }
     fn reasoning(&self, delta: &str) {
-        print!("\x1b[2;3m{delta}\x1b[0m");
-        let _ = std::io::stdout().flush();
+        self.write(&format!("\x1b[2;3m{delta}\x1b[0m"));
     }
     fn tool_call(&self, tool: &str, args: &serde_json::Value) {
+        self.settle();
         println!("\n⏺ {tool}{}", salient_arg(tool, args));
     }
     /// Counted only when the route reports the bucket — a run must be able to
@@ -1698,6 +1743,7 @@ impl kernel::StreamSink for PrintSink {
         }
     }
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
+        self.settle();
         let failure = result_failure(tool, payload);
         if !ok || failure.is_some() {
             let err = failure.unwrap_or_else(|| "error".into());
@@ -1717,6 +1763,7 @@ impl kernel::StreamSink for PrintSink {
         }
     }
     fn compaction(&self, before: u32, after: u32, summarized: bool, _summary: Option<&str>) {
+        self.settle();
         let how = if summarized { "summarized" } else { "pruned" };
         println!("\n↯ {how} context {before}→{after} tokens");
     }
@@ -1726,11 +1773,18 @@ impl kernel::StreamSink for PrintSink {
         }
     }
     fn verify(&self, ok: bool, summary: &str) {
+        self.settle();
         if ok {
             println!("\n\x1b[32m✔ verify: {summary}\x1b[0m");
         } else {
             println!("\n\x1b[31m✗ verify: {summary}\x1b[0m");
         }
+    }
+}
+
+impl Drop for PrintSink {
+    fn drop(&mut self) {
+        self.settle();
     }
 }
 
@@ -2036,10 +2090,11 @@ where
                 transcript.push(Message::user(line));
                 let sink = PrintSink::tracking(usage.clone());
                 let budget = task_budget(&base_budget, &agent_budget);
-                match kernel
+                let ran = kernel
                     .run_session(&session, transcript.clone(), budget, &sink, None)
-                    .await
-                {
+                    .await;
+                sink.settle();
+                match ran {
                     Ok((updated, kernel::StopReason::Budget(stop))) => {
                         transcript = updated;
                         println!(

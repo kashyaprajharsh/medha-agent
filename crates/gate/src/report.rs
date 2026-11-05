@@ -24,6 +24,9 @@ pub fn human(results: &[ScenarioResult], seeds: u32) -> String {
     }
     for r in results {
         out.push_str(&format!("● {}  {}\n", r.id, r.verdict.as_str()));
+        if let Some(reason) = &r.reason {
+            out.push_str(&format!("    held: {reason}\n"));
+        }
         // Show the first seed's per-check breakdown (representative); multi-seed
         // adds the aggregate pass-rate line below.
         if let Some(first) = r.seeds.first() {
@@ -92,6 +95,7 @@ pub fn json(results: &[ScenarioResult]) -> String {
             json!({
                 "id": r.id,
                 "verdict": r.verdict.as_str(),
+                "reason": r.reason,
                 "pass_rate": r.pass_rate,
                 "ci": r.ci.map(|(lo, hi)| json!([lo, hi])),
                 "seeds": r.seeds.iter().map(|s| json!({
@@ -161,6 +165,7 @@ mod tests {
             pass_rate: 0.0,
             ci: None,
             verdict: Verdict::Reject,
+            reason: None,
         }
     }
 

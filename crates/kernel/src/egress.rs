@@ -23,9 +23,7 @@ struct State {
     files: Vec<String>,
     file_ids: HashSet<[u8; 32]>,
     bytes: usize,
-    file_secrets: Vec<String>,
-    secret_bytes: usize,
-    secret_full: bool,
+    file_secrets: crate::redact::HeldValues,
     blocked: BTreeMap<String, Blocked>,
 }
 
@@ -137,21 +135,8 @@ impl Guard {
             return;
         }
         for value in crate::redact::file_values(content) {
-            if state.file_secrets.contains(&value) {
-                continue;
-            }
-            if state.file_secrets.len() >= 4096
-                || state.secret_bytes.saturating_add(value.len()) > 1024 * 1024
-            {
-                state.secret_full = true;
-                break;
-            }
-            state.secret_bytes += value.len();
-            state.file_secrets.push(value);
+            state.file_secrets.hold(&value);
         }
-        state
-            .file_secrets
-            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         if content.len() < FILE_CHUNK || content.len() > FILE_BYTES {
             return;
         }
@@ -218,15 +203,11 @@ impl Guard {
         collect(payload, &mut strings);
         let reason = if encoded.len() > 1024 * 1024 {
             Some("exceeds the 1 MiB outbound inspection limit")
-        } else if crate::redact::known_saturated() {
-            Some("the process's known-secret tracking limit was reached")
-        } else if state.secret_full {
-            Some("the chat's file-secret tracking limit was reached")
         } else if crate::redact::contains_known(&encoded)
             || strings
                 .iter()
                 .any(|text| crate::redact::contains_known(text))
-            || state.file_secrets.iter().any(|value| {
+            || state.file_secrets.values().iter().any(|value| {
                 encoded.contains(value) || strings.iter().any(|text| text.contains(value))
             })
         {
@@ -249,9 +230,9 @@ impl Guard {
         if state.blocked.len() >= BLOCKS {
             return Err("Outbound payload blocked; the chat has reached its limit of 64 blocked payload reviews".into());
         }
-        let clean = crate::redact::outbound_preview(&encoded, &state.file_secrets);
+        let clean = crate::redact::outbound_preview(&encoded, state.file_secrets.values());
         let preview: String = clean.chars().take(2048).collect();
-        let review = json!({"id": id, "destination": crate::redact::outbound_preview(destination, &state.file_secrets), "reason": reason, "preview": preview});
+        let review = json!({"id": id, "destination": crate::redact::outbound_preview(destination, state.file_secrets.values()), "reason": reason, "preview": preview});
         *notice.lock().unwrap() = Some(review.clone());
         state.blocked.insert(
             id.clone(),
@@ -280,7 +261,7 @@ impl Guard {
     pub fn redact<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         let state = self.state.lock().unwrap();
         let mut output = std::borrow::Cow::Borrowed(text);
-        for value in &state.file_secrets {
+        for value in state.file_secrets.values() {
             if output.contains(value.as_str()) {
                 output = std::borrow::Cow::Owned(output.replace(value, "[secret removed]"));
             }

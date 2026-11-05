@@ -229,8 +229,7 @@ async fn an_expired_command_backup_still_lets_the_models_own_edit_be_rewound() {
     assert!(rewound.to_string().contains("b.txt"), "{rewound}");
 }
 
-/// `Personal`, rows 11582 and 168: `memory` called without `op`, once with `write` sent as a field; the retry that
-/// followed one of them failed again on a field the error had not named.
+/// A memory call without `op` is told each op's fields, and an op name sent as a field is pointed out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_memory_call_without_op_is_told_each_ops_fields() {
     let world = World::new();
@@ -276,8 +275,7 @@ async fn result_of(world: &World, chat: &str, step: usize) -> Value {
         .payload
 }
 
-/// `Personal`, row 10692: Qwen3.8-27B sent an edit with a carriage return between every token, in a file with
-/// none, and the edit missed three times.
+/// An edit sent with carriage returns the file does not have still lands, and says what was adjusted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_edit_damaged_with_carriage_returns_lands_in_a_file_that_has_none() {
     let world = World::new();
@@ -302,8 +300,7 @@ async fn an_edit_damaged_with_carriage_returns_lands_in_a_file_that_has_none() {
     assert!(result.to_string().contains("carriage returns"), "{result}");
 }
 
-/// `Personal`, row 3485: the model sent `old_string` with every backslash doubled, and the miss said only "not
-/// found", so it could not tell what was wrong.
+/// An edit whose `old_string` has every escape doubled is told so and shown the line it meant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_edit_with_doubled_escapes_is_told_so_and_shown_the_line() {
     let world = World::new();
@@ -343,8 +340,7 @@ async fn an_edit_with_doubled_escapes_is_told_so_and_shown_the_line() {
     );
 }
 
-/// `Personal`, row 18074: the model wrote `strategy.md` with a shell command, never read it, and edited a line from
-/// memory; the miss gave it nothing to correct from.
+/// A missed edit of a file never read says so and shows the nearest lines to copy from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missed_edit_of_an_unread_file_says_so_and_shows_the_nearest_lines() {
     let world = World::new();
@@ -382,7 +378,7 @@ async fn a_missed_edit_of_an_unread_file_says_so_and_shows_the_nearest_lines() {
     assert!(read(&folder, "strategy.md").contains("exact list"));
 }
 
-/// `Personal`, row 18074 again: the model copies the shown line back with its number; it is told to drop the number.
+/// The nearest lines pasted back with their line numbers are refused with a plain reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_nearest_lines_pasted_back_with_their_numbers_are_refused_plainly() {
     let world = World::new();
@@ -409,7 +405,7 @@ async fn the_nearest_lines_pasted_back_with_their_numbers_are_refused_plainly() 
     assert!(read(&folder, "strategy.md").contains("languages."));
 }
 
-/// `draft`, row 437: the model edited text it had read, but the file had changed twice since; the miss did not say.
+/// A missed edit of a file changed since it was read says the file changed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missed_edit_of_a_file_changed_since_its_read_says_so() {
     let world = World::new();
@@ -617,5 +613,101 @@ async fn an_agent_is_continued_by_asking_for_it_and_never_by_a_stray_field() {
     assert!(
         raw.contains(r#"\"agent\":\"/other\""#),
         "a start naming an agent still starts: {raw}"
+    );
+}
+
+/// A `medha.lock` broken mid-chat keeps the settings already in force and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lock_broken_mid_chat_keeps_its_settings_and_says_so() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("broken-lock");
+    std::fs::write(folder.join("notes.txt"), "kept\n").unwrap();
+    std::fs::write(
+        folder.join("medha.lock"),
+        "[policy]\napprove = [\"read\"]\n",
+    )
+    .unwrap();
+    let chat = client.open(&folder).await;
+    let (asked, _) = read_watching(&mut client, &chat).await;
+    assert!(asked, "the lock makes a read ask first");
+    std::fs::write(folder.join("medha.lock"), "[policy\napprove = [\"read\"]\n").unwrap();
+    let (asked, told) = read_watching(&mut client, &chat).await;
+    assert!(asked, "a broken lock does not drop the rule in force");
+    assert!(told, "the person is told the lock is broken");
+}
+
+/// Runs one scripted read, approving what it asks; whether it asked, and whether a lock notice was shown.
+async fn read_watching(client: &mut Client, chat: &str) -> (bool, bool) {
+    let read = json!({"path": "notes.txt"});
+    client.send(chat, &format!("SCRIPT\nread {read}")).await;
+    let (mut asked, mut told) = (false, false);
+    loop {
+        let (_, frame) = client.event().await;
+        told |= frame.to_string().contains("medha.lock could not be read");
+        if frame["method"] == "approval" {
+            asked = true;
+            let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+            client.ask("approval.respond", Some(chat), gate).await;
+        }
+        if kind(&frame, "turn.done") {
+            return (asked, told);
+        }
+    }
+}
+
+/// A rewound branch, and reopening it later, keep what every other chat in the project saved to memory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewound_branch_keeps_the_projects_shared_memory() {
+    let world = World::new();
+    let folder = world.folder("shared-memory");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let saver = client.open(&folder).await;
+    let fact = json!({"op": "write", "name": "deploy-target", "claim": "Deploys go to alpha-cluster-7.",
+        "description": "Deploys go to alpha-cluster-7", "kind": "project"});
+    scripted(&mut client, &world, &saver, &[format!("memory {fact}")]).await;
+    let written = result_of(&world, &saver, 0).await;
+    assert_eq!(written["status"], "ok", "the memory is saved: {written}");
+    let seen = |world: &World| {
+        std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+            .last()
+            .unwrap()["messages"]
+            .to_string()
+    };
+    let chat = client.open(&folder).await;
+    first_message(&mut client, &chat).await;
+    assert!(
+        seen(&world).contains("alpha-cluster-7"),
+        "another chat's memory reaches this one"
+    );
+    let points = client
+        .ask("session.rewind.points", Some(&chat), json!({}))
+        .await;
+    let at = points["result"]["points"][0]["id"].clone();
+    let rewound = client
+        .ask(
+            "session.rewind",
+            Some(&chat),
+            json!({"at": at, "scope": "conversation"}),
+        )
+        .await;
+    let branch = rewound["result"]["session"].as_str().unwrap().to_string();
+    // The live chat keeps its key; the rewind switched it onto the branch.
+    first_message(&mut client, &chat).await;
+    assert!(
+        seen(&world).contains("alpha-cluster-7"),
+        "the rewind kept the project's memory"
+    );
+    drop(client);
+    drop(backend);
+    let backend = world.backend();
+    let mut client = reopen(&backend, &folder, &branch).await;
+    first_message(&mut client, &branch).await;
+    assert!(
+        seen(&world).contains("alpha-cluster-7"),
+        "reopening the branch kept the project's memory"
     );
 }

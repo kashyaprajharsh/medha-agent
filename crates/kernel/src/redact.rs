@@ -12,34 +12,54 @@ const MARK: &str = "[secret removed]";
 /// Shorter values are too likely to occur by chance to remove everywhere.
 const MIN_HELD: usize = 8;
 
+/// Secret values held for removal, bounded: past 4096 values or 1 MiB the least recently seen is forgotten,
+/// so a long-running process never stops all outbound work. Seeing a value again makes it recent.
 #[derive(Default)]
-struct HeldValues {
+pub(crate) struct HeldValues {
+    /// Longest first, so a value containing another is removed whole.
     values: Vec<String>,
+    /// Least recently seen first.
+    order: std::collections::VecDeque<String>,
     bytes: usize,
-    full: bool,
 }
+
+impl HeldValues {
+    pub(crate) fn hold(&mut self, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        if let Some(at) = self.order.iter().position(|held| held == value) {
+            let seen = self.order.remove(at).unwrap_or_default();
+            self.order.push_back(seen);
+            return;
+        }
+        self.bytes += value.len();
+        self.order.push_back(value.to_owned());
+        self.values.push(value.to_owned());
+        while self.order.len() > 4096 || self.bytes > 1024 * 1024 {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.bytes -= oldest.len();
+            self.values.retain(|held| *held != oldest);
+        }
+        self.values
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    }
+
+    pub(crate) fn values(&self) -> &[String] {
+        &self.values
+    }
+}
+
 static KNOWN: std::sync::LazyLock<std::sync::RwLock<HeldValues>> =
     std::sync::LazyLock::new(Default::default);
 
 pub fn remember(value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    let mut known = KNOWN
+    KNOWN
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if known.values.iter().any(|held| held == value) {
-        return;
-    }
-    if known.values.len() >= 4096 || known.bytes.saturating_add(value.len()) > 1024 * 1024 {
-        known.full = true;
-        return;
-    }
-    known.bytes += value.len();
-    known.values.push(value.to_owned());
-    known
-        .values
-        .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hold(value);
 }
 
 pub(crate) fn contains_known(text: &str) -> bool {
@@ -47,29 +67,17 @@ pub(crate) fn contains_known(text: &str) -> bool {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A placeholder key such as "ollama" or "EMPTY" is an ordinary word, not a secret.
-    let values = known
+    known
         .values
         .iter()
-        .filter(|value| looks_like_credential(value));
-    known.full
-        || values
-            .into_iter()
-            .any(|value| text.contains(value.as_str()))
-}
-pub(crate) fn known_saturated() -> bool {
-    KNOWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .full
+        .filter(|value| looks_like_credential(value))
+        .any(|value| text.contains(value.as_str()))
 }
 
 pub(crate) fn outbound_preview(text: &str, file_values: &[String]) -> String {
     let known = KNOWN
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if known.full {
-        return "[payload hidden: secret tracking limit reached]".into();
-    }
     let mut output = String::new();
     let mut offset = 0;
     while offset < text.len() && output.len() < 2048 {

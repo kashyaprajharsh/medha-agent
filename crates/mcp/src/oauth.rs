@@ -412,7 +412,8 @@ pub(crate) async fn authorize(
     let _ = announce.send(authorize_url.clone());
     loopback::open_browser(&authorize_url);
 
-    let redirect = timeout(wait, listener.redirect())
+    let expected = loopback::state_of(&authorize_url).unwrap_or_default();
+    let redirect = timeout(wait, listener.redirect(&expected))
         .await
         .map_err(|_| Error::Auth("timed out waiting for the browser redirect".into()))?
         .map_err(|error| Error::Auth(format!("callback listener failed: {error}")))?;

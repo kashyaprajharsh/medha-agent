@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 type Backend = Arc<dyn sandbox::ExecBackend>;
 
-fn backend(state: StateAccess, approved: ApprovedRoots) -> Backend {
+pub fn backend(state: StateAccess, approved: ApprovedRoots) -> Backend {
     let config = SandboxConfig {
         state,
         ..SandboxConfig::default()
@@ -19,7 +19,7 @@ fn backend(state: StateAccess, approved: ApprovedRoots) -> Backend {
 }
 
 /// What a jailed shell command printed, or nothing when the jail refused it.
-async fn shell(backend: &Backend, cwd: &Path, script: &str) -> String {
+pub async fn shell(backend: &Backend, cwd: &Path, script: &str) -> String {
     let request = ExecRequest {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],

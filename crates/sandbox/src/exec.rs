@@ -3413,9 +3413,15 @@ impl LandlockBackend {
             return vec![];
         }
         let owned = self.approved.owned_roots();
+        // Medha's own state folders are shared by every Medha process and never a user's checkout.
         self.writable_paths(req)
             .into_iter()
-            .filter(|root| *root != self.home.path && !owned.contains(root) && root.is_dir())
+            .filter(|root| {
+                *root != self.home.path
+                    && !self.state.write.contains(root)
+                    && !owned.contains(root)
+                    && root.is_dir()
+            })
             .collect()
     }
     pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>, approved: ApprovedRoots) -> Self {

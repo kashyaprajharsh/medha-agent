@@ -293,3 +293,67 @@ fn required_completion_failure_exits_nonzero_but_plan_does_not_run_checks() {
     done.store(true, Ordering::SeqCst);
     server.join().unwrap();
 }
+
+/// A reply cut off and asked again reaches a piped stdout once, with no partial copy before it.
+#[test]
+fn a_restarted_reply_is_written_once_to_a_piped_stdout() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut replies = 0;
+        for mut stream in listener.incoming().flatten() {
+            let request = http::request(&mut stream);
+            if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            replies += 1;
+            let thought = serde_json::json!({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "thinking-shown-once"}}]});
+            if replies == 1 {
+                // The connection breaks after the thinking was streamed, as a dropped network does.
+                let body = format!("data: {thought}\n\n");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len() + 500
+                );
+                continue;
+            }
+            let body = format!(
+                "data: {thought}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"choices": [{"index": 0, "delta": {"content": "whole-answer-done"}}]}),
+                serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            );
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let output = configured_medha(&workspace, &home)
+        .env("MEDHA_BASE_URL", format!("http://{address}/v1"))
+        .env("MEDHA_MAX_CTX", "32000")
+        .output()
+        .unwrap();
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{printed}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(printed.matches("whole-answer-done").count(), 1, "{printed}");
+    assert_eq!(
+        printed.matches("thinking-shown-once").count(),
+        1,
+        "{printed}"
+    );
+    assert!(!printed.contains("restarting"), "{printed}");
+}

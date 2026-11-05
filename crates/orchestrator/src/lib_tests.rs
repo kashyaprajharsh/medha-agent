@@ -2073,3 +2073,71 @@ async fn an_unknown_requested_tool_refuses_the_spawn_instead_of_narrowing_silent
     ));
     assert!(control.active().is_empty(), "no crippled child was started");
 }
+
+/// Twenty numbered lines with line `at` replaced.
+fn lines_with(at: usize, text: &str) -> String {
+    (1..=20)
+        .map(|n| match n == at {
+            true => format!("{text}\n"),
+            false => format!("line {n}\n"),
+        })
+        .collect()
+}
+
+struct EditsLineTwo;
+
+#[async_trait]
+impl ChildRunner for EditsLineTwo {
+    async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+        let root = run.workspace.ok_or("no workspace")?;
+        std::fs::write(root.join("a.txt"), lines_with(2, "line 2 by the child"))
+            .map_err(|e| e.to_string())?;
+        Ok(ChildOutcome {
+            status: AgentStatus::Completed,
+            summary: "edited".into(),
+            turns: 1,
+            tool_calls: 1,
+            trust: TrustLabel::Tool,
+        })
+    }
+}
+
+/// A patch that needs a three-way merge into a file with unstaged edits is not offered as mergeable,
+/// and applying it says which file to stage, with the person's edits untouched.
+#[tokio::test]
+async fn a_three_way_merge_into_a_file_with_unstaged_edits_is_refused_up_front() {
+    let (_repo, state, root) = writable().await;
+    let git = |args: &[&str]| {
+        let done = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "git {args:?}: {done:?}");
+    };
+    std::fs::write(root.join("a.txt"), lines_with(0, "")).unwrap();
+    git(&["commit", "-qam", "twenty lines"]);
+    let control = deliverable(Arc::new(EditsLineTwo), CancellationToken::new())
+        .with_workspaces(isolation(&root, &state));
+    let patch = run(&control, writer("edit line 2"), 5)
+        .await
+        .unwrap()
+        .patch
+        .unwrap();
+    // The parent moves on next to the child's hunk, then leaves an edit unstaged further down.
+    std::fs::write(root.join("a.txt"), lines_with(4, "line 4 by the parent")).unwrap();
+    git(&["commit", "-qam", "parent edit"]);
+    let unstaged = lines_with(4, "line 4 by the parent").replace("line 18\n", "line 18 unstaged\n");
+    std::fs::write(root.join("a.txt"), &unstaged).unwrap();
+    assert_eq!(control.check(&patch).await, Some(MergeCheck::Conflict));
+    let refused = control.merge(&patch, false).await.unwrap_err().to_string();
+    assert!(
+        refused.contains("a.txt") && refused.contains("not staged"),
+        "{refused}"
+    );
+    assert_eq!(
+        read_text(root.join("a.txt")),
+        unstaged,
+        "the person's edits are untouched"
+    );
+}

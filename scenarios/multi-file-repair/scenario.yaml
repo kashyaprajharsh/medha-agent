@@ -8,6 +8,15 @@ contract:
   max_wall_s: 300
 checks:
   - command: { run: "python3 -B -m unittest -v", expect_exit: 0 }
+  # Held-out cases in an isolated interpreter that loads no workspace file before the standard library.
+  - command:
+      run: >-
+        python3 -I -B -c "import sys; sys.path.append('.');
+        from pricing import subtotal; from invoice import total;
+        cases = [(subtotal(7, 3), 21), (subtotal(5, 4), 20), (subtotal(7, 0), 0),
+        (total([(1, 1), (2, 2), (3, 3)]), 14), (total([(2, 3)]), 6), (total([]), 0)];
+        assert all(type(got) is int and got == want for got, want in cases), cases"
+      expect_exit: 0
   - changed: { pattern: "pricing.py", allow_zero_matches: false }
   - changed: { pattern: "invoice.py", allow_zero_matches: false }
   - unchanged: { pattern: "test_invoice.py", allow_zero_matches: false }

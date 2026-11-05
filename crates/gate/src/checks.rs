@@ -247,6 +247,14 @@ impl CommandRunner {
         }
     }
 
+    /// Why `command:` checks cannot run under this sandbox, if they cannot.
+    pub fn unavailable(&self) -> Option<&str> {
+        match &self.isolation {
+            CommandIsolation::Disabled(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     fn for_test(backend: Arc<dyn ExecBackend>, timeout: Duration, max_output: usize) -> Self {
         Self {
@@ -535,6 +543,11 @@ async fn eval_one(
         }
         Check::Absent(p) => {
             evaluate_path_check(&mut outcome, &art.workspace, p, false);
+        }
+        Check::ToolUsed(tool) | Check::ToolNotUsed(tool) if !offered(&art.events, tool) => {
+            outcome.passed = false;
+            outcome.detail =
+                format!("the run never offered a tool named `{tool}`; name it as the run does");
         }
         Check::ToolUsed(tool) => {
             let n = count_tool_intents(&art.events, tool);
@@ -1008,6 +1021,17 @@ fn diff_glob(pristine: &Path, workspace: &Path, pattern: &str) -> Result<GlobDif
         workspace_matches: after.len(),
         changed,
     })
+}
+
+/// Whether `tool` is one the run offered; a log without its tool list cannot say, so it counts as offered.
+fn offered(events: &[Event], tool: &str) -> bool {
+    let mut names = events
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolSnapshot)
+        .flat_map(|e| e.payload["specs"].as_array().cloned().unwrap_or_default())
+        .filter_map(|spec| spec["name"].as_str().map(str::to_owned))
+        .peekable();
+    names.peek().is_none() || names.any(|name| name == tool)
 }
 
 /// How many times the agent issued a tool intent for `tool`.

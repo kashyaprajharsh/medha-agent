@@ -679,25 +679,52 @@ pub fn portable_tool_name_map(available: &[String]) -> HashMap<String, String> {
     let mut ordered: Vec<&String> = available.iter().collect();
     ordered.sort();
     ordered.dedup();
+    let safe = |canonical: &str| {
+        portable_tool_name(canonical) == canonical && canonical.len() <= MAX_WIRE_NAME
+    };
     // Reserve canonical names that are already wire-safe before sanitizing any
     // dotted name. This guarantees a persisted canonical reference remains an
     // exact reference on follow-up instead of becoming another tool's alias.
     for canonical in &ordered {
-        if portable_tool_name(canonical) == canonical.as_str() {
+        if safe(canonical) {
             map.insert((*canonical).clone(), (*canonical).clone());
         }
     }
     for canonical in ordered {
-        if portable_tool_name(canonical) == canonical.as_str() {
+        if safe(canonical) {
             continue;
         }
         let mut wire = portable_tool_name(canonical);
         while map.contains_key(&wire) {
             wire.push('_');
         }
+        // Too long for a provider: its start, then a hash of the whole name, so it stays unique and stable.
+        let mut attempt = 0u32;
+        while wire.len() > MAX_WIRE_NAME || map.contains_key(&wire) {
+            wire = shortened_wire_name(canonical, attempt);
+            attempt += 1;
+        }
         map.insert(wire, canonical.clone());
     }
     map
+}
+
+/// The longest function name OpenAI-style providers accept.
+const MAX_WIRE_NAME: usize = 64;
+
+fn shortened_wire_name(canonical: &str, attempt: u32) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(format!("{canonical}\0{attempt}"));
+    let hex: String = hash
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let start: String = portable_tool_name(canonical)
+        .chars()
+        .take(MAX_WIRE_NAME - hex.len() - 1)
+        .collect();
+    format!("{start}_{hex}")
 }
 
 /// Names models carry over from other agents, and the tool that does that job

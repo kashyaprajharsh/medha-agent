@@ -104,10 +104,17 @@ fn repo() -> String {
     std::env::var("MEDHA_REPO").unwrap_or_else(|_| "kashyaprajharsh/medha-agent".into())
 }
 
-/// Checks are off in debug builds, by `MEDHA_NO_UPDATE_CHECK`, and by `[updates] check = false`.
+/// Checks are off in debug builds, by `MEDHA_NO_UPDATE_CHECK` set to anything but `0`, `false` or nothing,
+/// and by `[updates] check = false`.
 fn enabled() -> bool {
+    let switched_off = std::env::var("MEDHA_NO_UPDATE_CHECK").is_ok_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false"
+        )
+    });
     !cfg!(debug_assertions)
-        && std::env::var_os("MEDHA_NO_UPDATE_CHECK").is_none()
+        && !switched_off
         && runtime::config::load()
             .ok()
             .flatten()
@@ -354,7 +361,8 @@ fn installer(script: &Path, tag: &str, install: &Install) -> std::process::Comma
     };
     command
         .env("MEDHA_VERSION", tag)
-        .env_remove("MEDHA_INSTALL_DIR");
+        .env_remove("MEDHA_INSTALL_DIR")
+        .env("MEDHA_STORE", &install.root);
     if let Some(dir) = &install.install_dir {
         command.env("MEDHA_INSTALL_DIR", dir);
     }

@@ -49,41 +49,68 @@ impl Listener {
         self.port
     }
 
-    /// Answer requests until one carries the grant or an error; browsers also ask for `/favicon.ico`.
-    pub async fn redirect(self) -> std::io::Result<Redirect> {
+    /// Answer requests until one with this sign-in's `state` carries the grant or an error. Anything
+    /// else (a favicon, a stray page, another sign-in) is told to wait, and a silent connection is dropped.
+    pub async fn redirect(self, state: &str) -> std::io::Result<Redirect> {
+        let (found, mut arrived) = tokio::sync::mpsc::channel(1);
         loop {
-            let (stream, peer) = self.inner.accept().await?;
+            let (stream, peer) = tokio::select! {
+                accepted = self.inner.accept() => accepted?,
+                Some(redirect) = arrived.recv() => return Ok(redirect),
+            };
             // Bound to loopback already; anything else is refused rather than parsed.
             if !peer.ip().is_loopback() {
                 continue;
             }
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            if reader.read_line(&mut request).await.is_err() {
-                continue;
-            }
-            let target = request.split_whitespace().nth(1).unwrap_or_default();
-            let redirect = Redirect(query_pairs(target));
-            let granted = redirect.get("code").is_some() && redirect.get("state").is_some();
-            let failed = redirect.get("error").is_some();
-            let body = match (failed, granted) {
-                (true, _) => FAILED,
-                (false, true) => DONE,
-                (false, false) => WAITING,
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let mut stream = reader.into_inner();
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-            if failed || granted {
-                return Ok(redirect);
-            }
+            let (found, state) = (found.clone(), state.to_owned());
+            tokio::spawn(async move {
+                if let Some(redirect) = answer(stream, &state).await {
+                    let _ = found.send(redirect).await;
+                }
+            });
         }
     }
+}
+
+/// One connection: its redirect when it ends this sign-in, after the browser is answered.
+async fn answer(stream: tokio::net::TcpStream, state: &str) -> Option<Redirect> {
+    let mut reader = BufReader::new(stream);
+    let mut request = String::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut request),
+    );
+    if !matches!(read.await, Ok(Ok(_))) {
+        return None;
+    }
+    let target = request.split_whitespace().nth(1).unwrap_or_default();
+    let redirect = Redirect(query_pairs(target));
+    let ours = redirect.get("state") == Some(state);
+    let granted = ours && redirect.get("code").is_some();
+    let failed = ours && redirect.get("error").is_some();
+    let body = match (failed, granted) {
+        (true, _) => FAILED,
+        (false, true) => DONE,
+        (false, false) => WAITING,
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = reader.into_inner();
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+    (failed || granted).then_some(redirect)
+}
+
+/// The `state` an authorization link carries, which only its own redirect brings back.
+pub fn state_of(link: &str) -> Option<String> {
+    url::Url::parse(link)
+        .ok()?
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .map(|(_, value)| value.into_owned())
 }
 
 /// Percent-decoded query pairs from a raw request target (`/callback?a=b`).

@@ -1765,3 +1765,154 @@ async fn hook_payloads_are_redacted_and_audited_around_real_execution() {
         ]
     );
 }
+
+/// A model that accepts an output cap, so a run out of budget can send its wrap-up.
+struct CappedProvider(Arc<LimitProvider>);
+
+#[async_trait]
+impl Provider for CappedProvider {
+    fn capabilities(&self) -> &ProviderCaps {
+        self.0.capabilities()
+    }
+    fn requested_output_tokens(&self) -> Option<u64> {
+        self.0.requested_output_tokens()
+    }
+    async fn count_input_tokens(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<Option<InputTokenCount>, TokenCountError> {
+        self.0.count_input_tokens(request).await
+    }
+    async fn stream(
+        &self,
+        ctx: &CompiledContext,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        self.0.stream(ctx).await
+    }
+    fn with_output_limit(
+        &self,
+        request: &PreparedModelRequest,
+        _max_output_tokens: u64,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        Ok(Some(request.clone()))
+    }
+}
+
+/// A sub-agent's wrap-up on a shared budget leaves the main chat its own wrap-up.
+#[tokio::test]
+async fn a_child_wrapping_up_on_a_shared_budget_does_not_take_its_parents_wrap_up() {
+    let spent = |total: u32| {
+        Block::Usage(kernel::Usage {
+            prompt_tokens: total,
+            total_tokens: total,
+            ..kernel::Usage::default()
+        })
+    };
+    let provider = Arc::new(LimitProvider::new(vec![
+        Turn::Blocks(vec![intent(0), spent(9_480)]),
+        Turn::Blocks(vec![Block::Text("child handover".into()), spent(100)]),
+        Turn::Blocks(vec![Block::Text("parent handover".into()), spent(100)]),
+    ]));
+    let kernel = Kernel::new(
+        Arc::new(CappedProvider(provider.clone())),
+        Arc::new(InMemoryLog::new()),
+        Arc::new(CountingExecutor::default()),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let budget = Budget {
+        max_turns: None,
+        max_tokens: Some(10_000),
+        max_cost_usd: None,
+        max_wall_s: None,
+        pooled: Some(kernel::Pooled::new()),
+    };
+    for session in [Session::new(), Session::new()] {
+        let (_, stop) = kernel
+            .run_session(
+                &session,
+                vec![Message::user("go")],
+                budget.clone(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop, StopReason::Budget(BudgetStop::Tokens));
+    }
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        3,
+        "the parent got its own wrap-up"
+    );
+}
+
+/// A memory tool that writes its store, then is slow to return what it applied.
+struct SlowMemory;
+
+#[async_trait]
+impl Executor for SlowMemory {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "memory".into(),
+            description: String::new(),
+            schema: json!({}),
+            blast_radius: BlastRadius::ReversibleLocal,
+            category: kernel::ToolCategory::Other,
+            icon: String::new(),
+        }]
+    }
+    fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {
+        Some(BlastRadius::ReversibleLocal)
+    }
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        Observation::ok(
+            intent.id.clone(),
+            json!({"applied": {"op": "write", "name": "kept"}}),
+        )
+    }
+}
+
+/// A memory write the wall clock runs out on mid-call still reaches the log, so the store and log agree.
+#[tokio::test]
+async fn a_memory_write_caught_by_the_deadline_is_still_logged() {
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
+        Block::ToolIntent(ToolIntent {
+            id: "remember".into(),
+            tool: "memory".into(),
+            args: json!({"op": "write"}),
+        }),
+    ])]));
+    let log = Arc::new(InMemoryLog::new());
+    let kernel = Kernel::new(
+        provider,
+        log.clone(),
+        Arc::new(SlowMemory),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let session = Session::new();
+    let _ = kernel
+        .run_session(
+            &session,
+            vec![Message::user("go")],
+            one_second_wall_budget(),
+            &kernel::NullSink,
+            None,
+        )
+        .await;
+    let events = log.events(session.id).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == EventKind::MemoryWrite),
+        "the applied memory op was not logged"
+    );
+}

@@ -37,7 +37,6 @@ pub struct Pooled {
     reserved_tokens: u64,
     reserved_cost_usd: f64,
     started: Option<Instant>,
-    finish_claimed: bool,
     startup_pending: bool,
     indicative: bool,
 }
@@ -257,14 +256,15 @@ impl Governor {
         }
     }
 
+    /// Each session wraps up once; its size comes from what the shared pool still holds.
     pub fn begin_wrap_up(&mut self, prompt: u64, price: Option<Pricing>) -> Option<u64> {
-        let mut allowance = self
+        if self.finishing || !self.capped_requests() {
+            return None;
+        }
+        let allowance = self
             .allowance
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if allowance.finish_claimed || !self.capped_requests() {
-            return None;
-        }
         let mut cap = 512;
         if let Some(max) = self.budget.max_tokens {
             cap = cap.min(
@@ -288,7 +288,7 @@ impl Governor {
         if cap == 0 {
             return None;
         }
-        allowance.finish_claimed = true;
+        drop(allowance);
         self.finishing = true;
         Some(cap)
     }

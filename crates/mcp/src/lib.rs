@@ -2480,8 +2480,9 @@ fn parse_qualified(name: &str) -> Result<(String, String), Error> {
     let rest = name
         .strip_prefix(TOOL_PREFIX)
         .ok_or_else(|| Error::BadToolName(name.to_string()))?;
+    // A tool name never holds `__` (see `valid_tool_name`), so the last one separates it from a server id that may.
     let (server, tool) = rest
-        .split_once("__")
+        .rsplit_once("__")
         .ok_or_else(|| Error::BadToolName(name.to_string()))?;
     if server.is_empty() || tool.is_empty() {
         return Err(Error::BadToolName(name.to_string()));

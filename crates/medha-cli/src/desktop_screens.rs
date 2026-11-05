@@ -25,7 +25,10 @@ pub(crate) fn offered(mcp: &Manager) -> Result<Value, String> {
         .tool_specs()
         .into_iter()
         .filter_map(|spec| {
-            let (server, tool) = spec.name.strip_prefix(mcp::TOOL_PREFIX)?.split_once("__")?;
+            let (server, tool) = spec
+                .name
+                .strip_prefix(mcp::TOOL_PREFIX)?
+                .rsplit_once("__")?;
             Some(json!({
                 "name": spec.name, "server": server, "tool": tool, "resource": spec.screen?,
                 // A call shown while it is written is shown as it will run.

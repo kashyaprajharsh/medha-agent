@@ -39,6 +39,123 @@ impl VerifiedVersion {
     }
 }
 
+/// Where this connection's authenticated chain ends: its last row, its length and its head hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Verified {
+    version: VerifiedVersion,
+    rowid: i64,
+    count: u64,
+    head: [u8; 32],
+    /// Every row proven at this version, with no commit by anyone else since; reads then need no row checks.
+    whole: bool,
+}
+
+impl Verified {
+    fn empty() -> Self {
+        Self {
+            version: VerifiedVersion {
+                data_version: 0,
+                total_changes: 0,
+            },
+            rowid: 0,
+            count: 0,
+            head: [0u8; 32],
+            whole: false,
+        }
+    }
+
+    /// The whole chain checked from its first row.
+    fn full(conn: &Connection, version: VerifiedVersion) -> Result<Self, StoreError> {
+        let end = validated_chain_after(conn, &Self::empty())?;
+        check_anchor(conn, end.count, &end.head)?;
+        Ok(Self {
+            version,
+            whole: true,
+            ..end
+        })
+    }
+
+    /// Only what was appended since: the row this chain ended on must still hash to its head,
+    /// then each newer row must link on. Older rows are checked as they are read.
+    fn extended(self, conn: &Connection, version: VerifiedVersion) -> Result<Self, StoreError> {
+        if self.count > 0 {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                            prev_hash, hash, hash_version, ts
+                     FROM events WHERE rowid = ?1",
+                )
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            let mut rows = stmt
+                .query([self.rowid])
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            let row = rows
+                .next()
+                .map_err(|error| StoreError::Db(error.to_string()))?
+                .ok_or_else(|| StoreError::Db("the verified chain's last event is gone".into()))?;
+            let HashRow {
+                event,
+                kind,
+                payload,
+                stored_hash,
+            } = hashing_row(row)
+                .map_err(|error| StoreError::Db(error.to_string()))?
+                .ok_or_else(|| {
+                    StoreError::Db("the verified chain's last event is corrupt".into())
+                })?;
+            let recomputed = chain_hash_stored(&event.prev_hash, &event, kind, payload);
+            if stored_hash != self.head || recomputed != self.head {
+                return Err(StoreError::Db(
+                    "the verified chain's last event was changed".into(),
+                ));
+            }
+        }
+        let end = validated_chain_after(conn, &self)?;
+        check_anchor(conn, end.count, &end.head)?;
+        Ok(Self {
+            version,
+            whole: false,
+            ..end
+        })
+    }
+}
+
+thread_local! {
+    /// Set only while a read runs on a snapshot whose every row is proven, so its rows need no recheck.
+    static WHOLE_SNAPSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the snapshot proven for one read, and clears the mark however the read ends.
+struct ProvenRead;
+
+impl ProvenRead {
+    fn start(whole: bool) -> Self {
+        WHOLE_SNAPSHOT.with(|mark| mark.set(whole));
+        Self
+    }
+}
+
+impl Drop for ProvenRead {
+    fn drop(&mut self) {
+        WHOLE_SNAPSHOT.with(|mark| mark.set(false));
+    }
+}
+
+fn check_anchor(conn: &Connection, count: u64, head: &[u8; 32]) -> Result<(), StoreError> {
+    let (anchored_count, anchored_head) = read_chain_anchor(conn)?.ok_or_else(|| {
+        StoreError::Db("event-chain anchor is missing; refusing unanchored log".into())
+    })?;
+    if anchored_count != count || anchored_head != *head {
+        return Err(StoreError::Db(format!(
+            "event-chain anchor mismatch: expected {anchored_count} rows/head {}, \
+             found {count} rows/head {}",
+            hash_hex(&anchored_head),
+            hash_hex(head)
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SessionSearchHit {
     pub session_id: Ulid,
@@ -171,18 +288,7 @@ fn backfill_event_fts(conn: &mut Connection) -> Result<(), StoreError> {
 
 fn verify_chain_anchor(conn: &Connection) -> Result<(), StoreError> {
     let (count, head) = validated_chain(conn)?;
-    let (anchored_count, anchored_head) = read_chain_anchor(conn)?.ok_or_else(|| {
-        StoreError::Db("event-chain anchor is missing; refusing unanchored log".into())
-    })?;
-    if anchored_count != count || anchored_head != head {
-        return Err(StoreError::Db(format!(
-            "event-chain anchor mismatch: expected {anchored_count} rows/head {}, \
-             found {count} rows/head {}",
-            hash_hex(&anchored_head),
-            hash_hex(&head)
-        )));
-    }
-    Ok(())
+    check_anchor(conn, count, &head)
 }
 
 /// Reconstruct the search index only from a chain-verified snapshot. The
@@ -192,7 +298,10 @@ fn rebuild_verified_event_fts(conn: &Connection) -> Result<(), StoreError> {
     verify_chain_anchor(conn)?;
     // Retain the authenticated rows before any index DML. Even a shadow-table
     // trigger must not make us decode history changed by our own FTS writes.
-    let events = decode_events(load_chain_rows(conn)?)?;
+    let events = {
+        let _proven = ProvenRead::start(true);
+        decode_events(conn, load_chain_rows(conn)?)?
+    };
     conn.execute("DELETE FROM events_fts", [])
         .map_err(|error| StoreError::Db(error.to_string()))?;
     for event in events {
@@ -480,7 +589,7 @@ pub struct SqliteLog {
     conn: Arc<Mutex<Connection>>,
     /// Always lock conn before this cache. Clones share both the connection and
     /// its verification stamp; no event payloads are retained in memory.
-    verified_version: Arc<Mutex<Option<VerifiedVersion>>>,
+    verified_version: Arc<Mutex<Option<Verified>>>,
     #[cfg(test)]
     verification_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Async callers acquire this permit before entering the blocking pool.
@@ -665,10 +774,11 @@ impl SqliteLog {
     }
 
     /// Pin one WAL read snapshot before reading the version, so the version,
-    /// the verified chain and the query all describe the same commit. An
-    /// external commit after the pin is invisible here and changes the version
-    /// the next read sees, which verifies again. Readers never hold the write
-    /// lock, so a long verification cannot make a live turn's append time out.
+    /// the verified chain and the query all describe the same commit. The whole
+    /// chain is checked once per connection; after a commit by anyone else only
+    /// the rows added since are, and each row a read returns is checked as it is
+    /// read. Readers never hold the write lock, so a long verification cannot
+    /// make a live turn's append time out.
     fn with_verified_snapshot<T>(
         &self,
         force: bool,
@@ -678,29 +788,31 @@ impl SqliteLog {
             .conn
             .lock()
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|error| StoreError::Db(error.to_string()))?;
-        tx.query_row("SELECT 1 FROM sqlite_schema LIMIT 1", [], |_| Ok(()))
-            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let tx = read_snapshot(&mut conn)?;
         let version = VerifiedVersion::read(&tx)?;
         let mut cached = self
             .verified_version
             .lock()
             .map_err(|_| StoreError::Db("verification cache poisoned".into()))?;
-        if force || *cached != Some(version) {
-            *cached = None;
-            verify_chain_anchor(&tx)?;
-            #[cfg(test)]
-            self.verification_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Fail closed: nothing stays cached unless this read succeeds.
+        let state = match cached.take() {
+            Some(known) if !force && known.version == version => known,
+            Some(known) if !force => known.extended(&tx, version)?,
+            _ => {
+                #[cfg(test)]
+                self.verification_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Verified::full(&tx, version)?
+            }
+        };
+        let proven = ProvenRead::start(state.whole);
         let result = read(&tx)?;
+        drop(proven);
         tx.commit()
             .map_err(|error| StoreError::Db(error.to_string()))?;
         // Retain the version sampled *inside* the transaction. Reading a newer
         // version after COMMIT could bless an external write we never verified.
-        *cached = Some(version);
+        *cached = Some(state);
         Ok(result)
     }
 
@@ -808,7 +920,7 @@ impl SqliteLog {
 
     /// Read and verify a single SQLite snapshot before trusting serialized events.
     pub fn all_events(&self) -> Result<Vec<Event>, StoreError> {
-        self.with_verified_snapshot(false, |conn| decode_events(load_chain_rows(conn)?))
+        self.with_verified_snapshot(false, |conn| decode_events(conn, load_chain_rows(conn)?))
     }
 
     fn session_events(&self, session: Ulid) -> Result<Vec<Event>, StoreError> {
@@ -825,7 +937,7 @@ impl SqliteLog {
                 .map_err(|error| StoreError::Db(error.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| StoreError::Db(error.to_string()))?;
-            decode_events(rows)
+            decode_events(conn, rows)
         })
     }
 
@@ -927,10 +1039,11 @@ impl SqliteLog {
         around_event_id: Ulid,
         radius: usize,
     ) -> Result<Vec<Event>, StoreError> {
-        let conn = self
+        let mut guard = self
             .conn
             .lock()
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let conn = read_snapshot(&mut guard)?;
         let anchor = conn
             .query_row(
                 "SELECT rowid FROM events WHERE session_id = ?1 AND id = ?2",
@@ -941,95 +1054,66 @@ impl SqliteLog {
         let mut stmt = conn
             .prepare(
                 "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
-                        prev_hash, hash_version, ts
+                        prev_hash, hash, hash_version, ts
                  FROM events
                  WHERE session_id = ?1
                  ORDER BY ABS(rowid - ?2), rowid
                  LIMIT ?3",
             )
             .map_err(|error| StoreError::Db(error.to_string()))?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(
                 rusqlite::params![
                     session_id.to_string(),
                     anchor,
                     radius.saturating_mul(2).saturating_add(1) as i64
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        Row {
-                            id: row.get(1)?,
-                            session_id: row.get(2)?,
-                            parent_id: row.get(3)?,
-                            kind: row.get(4)?,
-                            payload: row.get(5)?,
-                            trust: row.get(6)?,
-                            provenance: row.get(7)?,
-                            prev_hash: row.get(8)?,
-                            hash_version: row.get(9)?,
-                            ts: row.get(10)?,
-                        },
-                    ))
-                },
+                chain_row,
             )
+            .map_err(|error| StoreError::Db(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Db(error.to_string()))?;
-        let mut events = rows
-            .filter_map(Result::ok)
-            .filter_map(|(rowid, row)| row.into_event().map(|event| (rowid, event)))
-            .collect::<Vec<_>>();
-        events.sort_by_key(|(rowid, _)| *rowid);
-        Ok(events.into_iter().map(|(_, event)| event).collect())
+        rows.sort_by_key(|(rowid, _, _)| *rowid);
+        drop(stmt);
+        let events = decode_events(&conn, rows)?;
+        conn.commit()
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        Ok(events)
     }
 
     /// First and last text-bearing user/model events for discover-mode context.
     pub fn bookends(&self, session_id: Ulid, count: usize) -> Result<Vec<Event>, StoreError> {
-        let conn = self
+        let mut guard = self
             .conn
             .lock()
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
-        let read = |direction: &str| -> Result<Vec<(i64, Event)>, StoreError> {
+        let conn = read_snapshot(&mut guard)?;
+        let read = |direction: &str| -> Result<Vec<(i64, Row, Vec<u8>)>, StoreError> {
             let sql = format!(
                 "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
-                        prev_hash, hash_version, ts
+                        prev_hash, hash, hash_version, ts
                  FROM events WHERE session_id = ?1 AND kind IN ('user.message', 'model.text')
                  ORDER BY rowid {direction} LIMIT ?2"
             );
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|error| StoreError::Db(error.to_string()))?;
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![session_id.to_string(), count as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            Row {
-                                id: row.get(1)?,
-                                session_id: row.get(2)?,
-                                parent_id: row.get(3)?,
-                                kind: row.get(4)?,
-                                payload: row.get(5)?,
-                                trust: row.get(6)?,
-                                provenance: row.get(7)?,
-                                prev_hash: row.get(8)?,
-                                hash_version: row.get(9)?,
-                                ts: row.get(10)?,
-                            },
-                        ))
-                    },
-                )
-                .map_err(|error| StoreError::Db(error.to_string()))?;
-            Ok(rows
-                .filter_map(Result::ok)
-                .filter_map(|(rowid, row)| row.into_event().map(|event| (rowid, event)))
-                .collect())
+            stmt.query_map(
+                rusqlite::params![session_id.to_string(), count as i64],
+                chain_row,
+            )
+            .map_err(|error| StoreError::Db(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Db(error.to_string()))
         };
-        let mut events = read("ASC")?;
-        events.extend(read("DESC")?);
-        events.sort_by_key(|(rowid, _)| *rowid);
-        events.dedup_by_key(|(rowid, _)| *rowid);
-        Ok(events.into_iter().map(|(_, event)| event).collect())
+        let mut rows = read("ASC")?;
+        rows.extend(read("DESC")?);
+        rows.sort_by_key(|(rowid, _, _)| *rowid);
+        rows.dedup_by_key(|(rowid, _, _)| *rowid);
+        let events = decode_events(&conn, rows)?;
+        conn.commit()
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        Ok(events)
     }
 
     pub async fn verify_async(&self) -> Result<(), StoreError> {
@@ -1122,9 +1206,12 @@ impl SqliteLog {
                 |row| row.get(0),
             )
             .map_err(|error| KernelError::Log(error.to_string()))?;
-        let extend_verified = *cached == Some(version) && !has_triggers;
-        // Fail closed on any error or rollback after this point.
-        *cached = None;
+        // Fail closed on any error or rollback after this point: nothing stays cached unless the append lands.
+        let verified = match cached.take() {
+            Some(known) if !has_triggers && known.version == version => Some(known),
+            Some(known) if !has_triggers => known.extended(&tx, version).ok(),
+            _ => None,
+        };
 
         let head: Option<Vec<u8>> = tx
             .query_row(
@@ -1179,6 +1266,8 @@ impl SqliteLog {
             ],
         )
         .map_err(|err| KernelError::Log(err.to_string()))?;
+        // Taken before the search index insert below, which would replace it.
+        let rowid = tx.last_insert_rowid();
         if let Some(text) = search_text(&e.kind, &e.payload) {
             tx.execute(
                 "INSERT INTO events_fts (event_id, session_id, kind, text, source, ts)
@@ -1198,12 +1287,18 @@ impl SqliteLog {
             .map_err(|error| KernelError::Log(error.to_string()))?;
         tx.commit()
             .map_err(|err| KernelError::Log(err.to_string()))?;
-        if extend_verified {
+        if let Some(known) = verified.filter(|known| known.count == count && known.head == prev) {
             // FTS can perform internal writes during COMMIT. Sample only the
             // connection-local counter afterward, never the external version.
-            *cached = Some(VerifiedVersion {
-                total_changes: conn.total_changes(),
-                ..version
+            *cached = Some(Verified {
+                version: VerifiedVersion {
+                    total_changes: conn.total_changes(),
+                    ..known.version
+                },
+                rowid,
+                count: count.saturating_add(1),
+                head: hash,
+                whole: known.whole,
             });
         }
         Ok(e)
@@ -1237,7 +1332,7 @@ impl EventLog for SqliteLog {
                 let rows = query.query_map(rusqlite::params![session.to_string(), id.to_string()], chain_row)
                     .map_err(|e| StoreError::Db(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>().map_err(|e| StoreError::Db(e.to_string()))?;
-                Ok(decode_events(rows)?.pop())
+                Ok(decode_events(conn, rows)?.pop())
             })
         }).await.map_err(|e| KernelError::Log(e.to_string()))
     }
@@ -1273,7 +1368,7 @@ impl EventLog for SqliteLog {
                     .map_err(|e| StoreError::Db(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| StoreError::Db(e.to_string()))?;
-                decode_events(rows)
+                decode_events(conn, rows)
             })
         })
         .await
@@ -1323,7 +1418,7 @@ impl EventLog for SqliteLog {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| StoreError::Db(e.to_string()))?;
                 let position = rows.first().map(|row| row.0 as u64);
-                let event = decode_events(rows)?.pop();
+                let event = decode_events(conn, rows)?.pop();
                 Ok((head, position.zip(event)))
             })
         })
@@ -1497,9 +1592,23 @@ fn chain_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Row, Vec<u8>)> {
     ))
 }
 
+/// One read transaction pinned to a single commit, so a row and its neighbours are read from the same log.
+fn read_snapshot(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, StoreError> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    tx.query_row("SELECT 1 FROM sqlite_schema LIMIT 1", [], |_| Ok(()))
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    Ok(tx)
+}
+
 /// Verified events this build understands. A kind written by a newer build is
 /// passed over, so its chat still opens here; any other undecodable row fails.
-fn decode_events(rows: Vec<(i64, Row, Vec<u8>)>) -> Result<Vec<Event>, StoreError> {
+fn decode_events(
+    conn: &Connection,
+    rows: Vec<(i64, Row, Vec<u8>)>,
+) -> Result<Vec<Event>, StoreError> {
+    checked_rows(conn, &rows)?;
     rows.into_iter()
         .filter(|(_, row, _)| EventKind::parse(&row.kind).is_some())
         .map(|(_, row, _)| {
@@ -1507,6 +1616,95 @@ fn decode_events(rows: Vec<(i64, Row, Vec<u8>)>) -> Result<Vec<Event>, StoreErro
                 .ok_or_else(|| StoreError::Db("verified event could not be decoded".into()))
         })
         .collect()
+}
+
+/// Each row a read returns, in rowid order, is proven where it sits: its content matches its stored hash,
+/// it links to the row before it, and the row after it links to it. Neighbours in the same read need no
+/// lookup, so a whole-log read costs one lookup at each end.
+fn checked_rows(conn: &Connection, rows: &[(i64, Row, Vec<u8>)]) -> Result<(), StoreError> {
+    use rusqlite::OptionalExtension;
+    if WHOLE_SNAPSHOT.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let corrupt =
+        |rowid: &i64| StoreError::Db(format!("event row {rowid} does not match the chain"));
+    for (at, (rowid, row, stored)) in rows.iter().enumerate() {
+        if row_hash(row).as_ref().map(|hash| hash.as_slice()) != Some(stored.as_slice()) {
+            return Err(corrupt(rowid));
+        }
+        let linked_before = at > 0 && rows[at - 1].2 == row.prev_hash;
+        if !linked_before {
+            let before: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT hash FROM events WHERE rowid < ?1 ORDER BY rowid DESC LIMIT 1",
+                    [rowid],
+                    |found| found.get(0),
+                )
+                .optional()
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            if before.unwrap_or_else(|| vec![0u8; 32]) != row.prev_hash {
+                return Err(corrupt(rowid));
+            }
+        }
+        let linked_after = rows
+            .get(at + 1)
+            .is_some_and(|next| next.1.prev_hash == *stored);
+        if !linked_after {
+            let after: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT prev_hash FROM events WHERE rowid > ?1 ORDER BY rowid ASC LIMIT 1",
+                    [rowid],
+                    |found| found.get(0),
+                )
+                .optional()
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            let linked = match after {
+                Some(after) => after == *stored,
+                // The newest row is the chain's head, which the anchor names.
+                None => read_chain_anchor(conn)?
+                    .is_some_and(|(_, head)| head.as_slice() == stored.as_slice()),
+            };
+            if !linked {
+                return Err(corrupt(rowid));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `row`'s stored hash must be, from its own fields; `None` for a row that cannot be read as one.
+fn row_hash(row: &Row) -> Option<[u8; 32]> {
+    if !matches!(row.hash_version, 1 | EVENT_HASH_VERSION) {
+        return None;
+    }
+    let mut prev_hash = [0u8; 32];
+    if row.prev_hash.len() == 32 {
+        prev_hash.copy_from_slice(&row.prev_hash);
+    }
+    let event = Event {
+        id: Ulid::from_string(&row.id).ok()?,
+        session_id: Ulid::from_string(&row.session_id).ok()?,
+        parent_id: row
+            .parent_id
+            .as_ref()
+            .and_then(|parent| Ulid::from_string(parent).ok()),
+        // Never hashed: the chain covers `kind` as stored.
+        kind: EventKind::Session,
+        payload: serde_json::Value::Null,
+        trust: TrustLabel::parse(&row.trust)?,
+        provenance: Provenance {
+            source: row.provenance.clone(),
+        },
+        prev_hash,
+        hash_version: row.hash_version,
+        ts: row.ts,
+    };
+    Some(chain_hash_stored(
+        &prev_hash,
+        &event,
+        &row.kind,
+        row.payload.as_bytes(),
+    ))
 }
 
 /// A borrowed SQLite row for hashing. The canonical encoder takes raw payload
@@ -1562,14 +1760,24 @@ fn hashing_row<'a>(row: &'a rusqlite::Row<'_>) -> rusqlite::Result<Option<HashRo
 }
 
 fn validated_chain(conn: &Connection) -> Result<(u64, [u8; 32]), StoreError> {
+    validated_chain_after(conn, &Verified::empty()).map(|end| (end.count, end.head))
+}
+
+/// The chain continued from `from`: every later row must link from its head and match its stored hash.
+fn validated_chain_after(conn: &Connection, from: &Verified) -> Result<Verified, StoreError> {
     let mut stmt = conn
-        .prepare(CHAIN_ROWS_SQL)
+        .prepare(
+            "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                    prev_hash, hash, hash_version, ts
+             FROM events WHERE rowid > ?1 ORDER BY rowid ASC",
+        )
         .map_err(|error| StoreError::Db(error.to_string()))?;
     let mut rows = stmt
-        .query([])
+        .query([from.rowid])
         .map_err(|error| StoreError::Db(error.to_string()))?;
-    let mut count = 0u64;
-    let mut prev = [0u8; 32];
+    let mut count = from.count;
+    let mut prev = from.head;
+    let mut rowid = from.rowid;
     while let Some(row) = rows
         .next()
         .map_err(|error| StoreError::Db(error.to_string()))?
@@ -1599,10 +1807,18 @@ fn validated_chain(conn: &Connection) -> Result<(u64, [u8; 32]), StoreError> {
                 "hash chain broken at event index {count}: content does not match stored hash"
             )));
         }
+        rowid = row
+            .get(0)
+            .map_err(|error| StoreError::Db(error.to_string()))?;
         prev = computed;
         count += 1;
     }
-    Ok((count, prev))
+    Ok(Verified {
+        rowid,
+        count,
+        head: prev,
+        ..*from
+    })
 }
 
 /// Upgrade a valid legacy chain in one SQLite transaction. Logical events are
@@ -1737,10 +1953,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // The external append is checked from where verification ended, not by a second full pass.
         assert_eq!(
             log.verification_count
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            1
         );
         let attacker = Connection::open(&db).unwrap();
         attacker
@@ -1790,6 +2007,146 @@ mod tests {
             drop(log);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// Another process's appends are checked from where verification ended, never the whole log again.
+    #[tokio::test]
+    async fn an_external_append_checks_only_the_new_rows() {
+        let (dir, db, log) = seeded_chain("extend").await;
+        let writer = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::new();
+        for turn in 0..3 {
+            writer
+                .append(Event::model_text(&session, &format!("turn {turn}")))
+                .await
+                .unwrap();
+            assert_eq!(
+                log.checked_events(session.id).await.unwrap().len(),
+                turn + 1
+            );
+        }
+        assert_eq!(log.all_events().unwrap().len(), 6);
+        assert_eq!(
+            log.verification_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the whole chain was checked once, at the first read"
+        );
+        drop((writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Appends from two connections in turn, each with a search entry, keep both readable.
+    #[tokio::test]
+    async fn two_connections_appending_in_turn_keep_reading_each_others_rows() {
+        let (dir, db, log) = seeded_chain("turns").await;
+        let other = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::new();
+        for turn in 0..3 {
+            log.append(Event::user_message(&session, &format!("mine {turn}")))
+                .await
+                .unwrap();
+            other
+                .append(Event::model_text(&session, &format!("theirs {turn}")))
+                .await
+                .unwrap();
+            assert_eq!(
+                log.checked_events(session.id).await.unwrap().len(),
+                2 * turn + 2
+            );
+            assert_eq!(
+                other.checked_events(session.id).await.unwrap().len(),
+                2 * turn + 2
+            );
+        }
+        drop((other, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Reading a chat's newest rows while another program appends to it never mistakes the append for tampering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_newest_rows_read_during_another_programs_append_are_not_refused() {
+        let (dir, db, log) = seeded_chain("race").await;
+        let session = kernel::Session::new();
+        let first = log
+            .append(Event::model_text(&session, "start"))
+            .await
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (db, stop, session) = (db.clone(), stop.clone(), session.clone());
+            std::thread::spawn(move || {
+                let other = SqliteLog::open(&db).unwrap();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    other
+                        .append_sync(Event::model_text(&session, "more"))
+                        .unwrap();
+                }
+            })
+        };
+        let mut refused = Vec::new();
+        for _ in 0..2000 {
+            if let Err(error) = log.bookends(session.id, 1) {
+                refused.push(error.to_string());
+            }
+            if let Err(error) = log.window(session.id, first.id, 1) {
+                refused.push(error.to_string());
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            refused.is_empty(),
+            "{} refused: {:?}",
+            refused.len(),
+            refused.first()
+        );
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An old row another program edits after the first check is refused when it is read.
+    #[tokio::test]
+    async fn an_old_row_edited_mid_run_is_refused_when_read() {
+        let (dir, db, log) = seeded_chain("mid-run").await;
+        let old = log.all_events().unwrap().remove(0);
+        let writer = SqliteLog::open(&db).unwrap();
+        writer
+            .append(Event::model_text(&kernel::Session::new(), "later"))
+            .await
+            .unwrap();
+        let attacker = Connection::open(&db).unwrap();
+        // Content alone, then content with its own hash recomputed; both break a link.
+        attacker
+            .execute(
+                "UPDATE events SET payload = '{\"text\":\"forged\"}' WHERE id = ?1",
+                [old.id.to_string()],
+            )
+            .unwrap();
+        assert!(log.checked_events(old.session_id).await.is_err());
+        assert!(log.window(old.session_id, old.id, 2).is_err());
+        assert!(log.bookends(old.session_id, 1).is_err());
+        let mut forged = old.clone();
+        forged.payload = serde_json::json!({"text": "forged"});
+        let rehashed = chain_hash_with_payload(
+            &forged.prev_hash,
+            &forged,
+            forged.payload.to_string().as_bytes(),
+        );
+        attacker
+            .execute(
+                "UPDATE events SET payload = ?1, hash = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    forged.payload.to_string(),
+                    rehashed.to_vec(),
+                    old.id.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(log.checked_events(old.session_id).await.is_err());
+        assert!(log.checked_event(old.session_id, old.id).await.is_err());
+        drop((attacker, writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

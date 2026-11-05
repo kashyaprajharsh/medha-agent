@@ -27,7 +27,7 @@ fn callback_query_is_decoded() {
 async fn the_listener_waits_past_other_requests_for_the_grant() {
     let listener = bind(None).await.unwrap();
     let port = listener.port();
-    let caught = tokio::spawn(listener.redirect());
+    let caught = tokio::spawn(listener.redirect("s"));
     assert!(ask(port, "/favicon.ico").await.contains("Waiting"));
     assert!(
         ask(port, "/auth/callback?code=c&state=s&client_id=oaiapp_1")

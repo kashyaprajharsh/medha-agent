@@ -124,15 +124,8 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
             .cloned()
             .unwrap_or_else(|| Message::system(""));
         let mut updated_memory = None;
+        // A branch adds only copies of events already counted, so the project's memory stays as it is.
         if let Some(memory) = &resources.memory {
-            let fork_events = kernel
-                .log
-                .checked_events(id)
-                .await
-                .map_err(|e| e.to_string())?;
-            memory
-                .rebuild_project(fork_events.into_iter())
-                .map_err(|e| e.to_string())?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|value| value.as_secs_f64())

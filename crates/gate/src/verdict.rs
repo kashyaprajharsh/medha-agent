@@ -115,24 +115,57 @@ pub struct ScenarioResult {
     /// Wilson 95% interval on the pass-rate; `None` for a single seed.
     pub ci: Option<(f64, f64)>,
     pub verdict: Verdict,
+    /// Why a scenario that met the threshold still only holds.
+    pub reason: Option<String>,
 }
 
-/// Combine seeds into a verdict against `threshold` (from `[gate] pass_threshold`).
-pub fn aggregate(id: String, seeds: Vec<SeedResult>, threshold: f64) -> ScenarioResult {
-    let n = seeds.len().max(1);
-    let passed = seeds.iter().filter(|s| s.passed()).count();
+/// Combine seeds into a verdict against `threshold`; promoting also needs `min_seeds` completed runs.
+pub fn aggregate(
+    id: String,
+    seeds: Vec<SeedResult>,
+    threshold: f64,
+    min_seeds: u32,
+) -> ScenarioResult {
+    // A seed the harness failed to run is left out of the rate and caps the verdict at HOLD.
+    let scored: Vec<&SeedResult> = seeds
+        .iter()
+        .filter(|seed| {
+            !matches!(
+                seed.status,
+                RunStatus::LaunchError(_) | RunStatus::HarnessError(_)
+            )
+        })
+        .collect();
+    let incomplete = scored.len() < seeds.len();
+    let n = scored.len().max(1);
+    let passed = scored.iter().filter(|s| s.passed()).count();
     let pass_rate = passed as f64 / n as f64;
-    let ci = if seeds.len() > 1 {
-        Some(wilson(passed, seeds.len()))
+    let ci = if scored.len() > 1 {
+        Some(wilson(passed, scored.len()))
     } else {
         None
     };
-    let verdict = if pass_rate + 1e-9 >= threshold {
-        Verdict::Promote
+    let needed = min_seeds.max(1) as usize;
+    let (verdict, reason) = if incomplete {
+        let missing = seeds.len() - scored.len();
+        (
+            Verdict::Hold,
+            Some(format!("{missing} run(s) could not be started or scored")),
+        )
     } else if passed == 0 {
-        Verdict::Reject
+        (Verdict::Reject, None)
+    } else if pass_rate + 1e-9 < threshold {
+        (Verdict::Hold, None)
+    } else if scored.len() < needed {
+        (
+            Verdict::Hold,
+            Some(format!(
+                "{} of {needed} runs needed to promote; raise --seeds",
+                scored.len()
+            )),
+        )
     } else {
-        Verdict::Hold
+        (Verdict::Promote, None)
     };
     ScenarioResult {
         id,
@@ -140,6 +173,7 @@ pub fn aggregate(id: String, seeds: Vec<SeedResult>, threshold: f64) -> Scenario
         pass_rate,
         ci,
         verdict,
+        reason,
     }
 }
 
@@ -183,11 +217,11 @@ mod tests {
     #[test]
     fn single_pass_promotes_single_fail_rejects() {
         assert_eq!(
-            aggregate("s".into(), vec![seed(true)], 1.0).verdict,
+            aggregate("s".into(), vec![seed(true)], 1.0, 1).verdict,
             Verdict::Promote
         );
         assert_eq!(
-            aggregate("s".into(), vec![seed(false)], 1.0).verdict,
+            aggregate("s".into(), vec![seed(false)], 1.0, 1).verdict,
             Verdict::Reject
         );
     }
@@ -195,7 +229,7 @@ mod tests {
     #[test]
     fn flaky_multi_seed_holds() {
         let seeds = vec![seed(true), seed(true), seed(false)];
-        let r = aggregate("s".into(), seeds, 1.0);
+        let r = aggregate("s".into(), seeds, 1.0, 3);
         assert_eq!(r.verdict, Verdict::Hold);
         assert!((r.pass_rate - 2.0 / 3.0).abs() < 1e-9);
         assert!(r.ci.is_some());
@@ -204,7 +238,10 @@ mod tests {
     #[test]
     fn threshold_below_one_can_promote_a_flaky_scenario() {
         let seeds = vec![seed(true), seed(true), seed(true), seed(false)];
-        assert_eq!(aggregate("s".into(), seeds, 0.7).verdict, Verdict::Promote);
+        assert_eq!(
+            aggregate("s".into(), seeds, 0.7, 3).verdict,
+            Verdict::Promote
+        );
     }
 
     #[test]

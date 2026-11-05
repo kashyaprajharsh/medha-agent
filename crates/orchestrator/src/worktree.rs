@@ -1252,6 +1252,10 @@ pub async fn check(repo: &Path, patch: &Patch) -> MergeCheck {
     if apply(repo, patch, &["--check"], None).await.is_ok() {
         return MergeCheck::Clean;
     }
+    // A real three-way apply refuses a file whose edits are not staged ("does not match index").
+    if !unstaged(repo, patch).await.is_empty() {
+        return MergeCheck::Conflict;
+    }
     let Ok(scratch) = ScratchIndex::new(repo).await else {
         // Without a scratch index there is no non-destructive way to ask, and
         // guessing "mergeable" would be guessing in the direction that damages
@@ -1273,16 +1277,40 @@ pub async fn merge(repo: &Path, patch: &Patch) -> Result<MergeCheck, WorktreeErr
     let check = check(repo, patch).await;
     match check {
         MergeCheck::Empty => Ok(check),
-        MergeCheck::Conflict => Err(WorktreeError::Git {
-            command: "apply --3way".into(),
-            message: "the patch conflicts with the current tree".into(),
-        }),
+        MergeCheck::Conflict => {
+            let unstaged = unstaged(repo, patch).await;
+            Err(WorktreeError::Git {
+                command: "apply --3way".into(),
+                message: match unstaged.is_empty() {
+                    true => "the patch conflicts with the current tree".into(),
+                    false => format!(
+                        "{} {} edits that are not staged, which git cannot merge into; stage or \
+                         commit them, then apply again",
+                        unstaged.join(", "),
+                        if unstaged.len() == 1 { "has" } else { "have" }
+                    ),
+                },
+            })
+        }
         // A clean patch is applied strictly. Reaching for `--3way` here would
         // buy nothing and cost the guarantee that a merge which passed a strict
         // check cannot leave conflict markers behind.
         MergeCheck::Clean => apply(repo, patch, &[], None).await.map(|()| check),
         MergeCheck::ThreeWay => apply(repo, patch, &["--3way"], None).await.map(|()| check),
     }
+}
+
+/// The patch's files whose working copy differs from the index; a failed listing counts as none.
+async fn unstaged(repo: &Path, patch: &Patch) -> Vec<String> {
+    if patch.files.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec!["diff", "--name-only", "--"];
+    args.extend(patch.files.iter().map(String::as_str));
+    git(repo, &args)
+        .await
+        .map(|listed| listed.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// A throwaway copy of the repository index, so a three-way apply can be

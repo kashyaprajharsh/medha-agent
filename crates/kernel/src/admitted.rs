@@ -87,27 +87,33 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 obs
             };
             tokio::pin!(fut);
-            tokio::select! {
-                biased;
-                _ = wait_for_deadline(wall_deadline) => {
-                    Observation::error(
-                        &intent.id,
-                        "[interrupted] task wall-clock deadline elapsed during tool execution",
-                    )
-                }
-                obs = &mut fut => obs,
-                _ = cancel.cancelled() => {
-                    let shared_settle_deadline = *settle_deadline
-                        .get_or_init(|| tokio::time::Instant::now() + self.settle_grace);
-                    let settle_deadline = wall_deadline
-                        .map(|deadline| deadline.min(shared_settle_deadline))
-                        .unwrap_or(shared_settle_deadline);
-                    match tokio::time::timeout_at(settle_deadline, &mut fut).await {
-                        Ok(obs) => obs,
-                        Err(_) => Observation::error(
+            // A memory call writes its store before its result reaches the log; cut off between the two,
+            // they disagree. It is a short local write, so it finishes first.
+            if is_memory_tool(&intent.tool) {
+                (&mut fut).await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_deadline(wall_deadline) => {
+                        Observation::error(
                             &intent.id,
-                            "[interrupted] cancelled by user; tool did not settle within the grace window",
-                        ),
+                            "[interrupted] task wall-clock deadline elapsed during tool execution",
+                        )
+                    }
+                    obs = &mut fut => obs,
+                    _ = cancel.cancelled() => {
+                        let shared_settle_deadline = *settle_deadline
+                            .get_or_init(|| tokio::time::Instant::now() + self.settle_grace);
+                        let settle_deadline = wall_deadline
+                            .map(|deadline| deadline.min(shared_settle_deadline))
+                            .unwrap_or(shared_settle_deadline);
+                        match tokio::time::timeout_at(settle_deadline, &mut fut).await {
+                            Ok(obs) => obs,
+                            Err(_) => Observation::error(
+                                &intent.id,
+                                "[interrupted] cancelled by user; tool did not settle within the grace window",
+                            ),
+                        }
                     }
                 }
             }

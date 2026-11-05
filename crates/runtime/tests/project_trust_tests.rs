@@ -219,7 +219,7 @@ while True:
         container_lock.replace("accepted-image", "unaccepted-image"),
     )
     .unwrap();
-    container_settings.refresh();
+    container_settings.refresh().unwrap();
     assert_eq!(
         container_settings.exec().label(),
         "unavailable",
@@ -228,7 +228,7 @@ while True:
     let review = container_trust.review(&container.root).unwrap();
     assert_eq!(review.ignored, ["sandbox.image"]);
     container_trust.accept(&review).unwrap();
-    container_settings.refresh();
+    container_settings.refresh().unwrap();
     assert_eq!(container_settings.exec().label(), "container");
     let settings = runtime::project_session::LiveSettings::new(
         a.root.clone(),

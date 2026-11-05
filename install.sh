@@ -10,6 +10,8 @@
 #     | MEDHA_VERSION="$version" sh
 set -eu
 
+# Everything runs from main, called on the last line, so a download cut off part way runs nothing.
+main() {
 REPO="${MEDHA_REPO:-kashyaprajharsh/medha-agent}"
 VERSION="${MEDHA_VERSION:-latest}"
 INSTALL_DIR="${MEDHA_INSTALL_DIR:-}"
@@ -63,8 +65,8 @@ if command -v curl >/dev/null 2>&1; then
     esac
   }
 elif command -v wget >/dev/null 2>&1; then
-  NET_OPTS="--connect-timeout=5 --tries=3"
-  ONCE_OPTS="--connect-timeout=5 --tries=1"
+  NET_OPTS="--connect-timeout=5 --tries=3 --https-only"
+  ONCE_OPTS="--connect-timeout=5 --tries=1 --https-only"
   fetch() { wget $NET_OPTS -qO- "$1"; }
   fetch_once() { wget $ONCE_OPTS -qO- "$1"; }
   fetch_optional_to() {
@@ -214,8 +216,9 @@ mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 
 # Each version keeps its own folder, so an update never writes over a medha that is running.
 # `.local/lib` is readable inside Medha's sandbox, so the command still works there.
-STORE="$HOME/.local/lib/medha"
-if [ "$INSTALL_DIR" = "/usr/local/bin" ] && mkdir -p /usr/local/lib/medha 2>/dev/null; then
+# An update names the store its running copy lives in, so the new version lands beside it.
+STORE="${MEDHA_STORE:-$HOME/.local/lib/medha}"
+if [ -z "${MEDHA_STORE:-}" ] && [ "$INSTALL_DIR" = "/usr/local/bin" ] && mkdir -p /usr/local/lib/medha 2>/dev/null; then
   STORE="/usr/local/lib/medha"
 fi
 mkdir -p "$STORE/versions" || die "cannot create $STORE"
@@ -333,3 +336,6 @@ case ":$PATH:" in
     printf '    %sexport PATH="%s:$PATH"%s\n\n' "$c_dim" "$INSTALL_DIR" "$c_reset"
     ;;
 esac
+}
+
+main "$@"

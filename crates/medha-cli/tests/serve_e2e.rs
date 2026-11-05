@@ -4458,6 +4458,160 @@ fn remote_mcp_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     (url, connected)
 }
 
+/// A remote MCP server offering `tools`, recording the name of each tool called.
+fn recording_mcp_server(tools: &[&str]) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let listed: Vec<Value> = tools
+        .iter()
+        .map(|name| json!({"name": name, "description": "A tool", "inputSchema": {"type": "object"}}))
+        .collect();
+    let called = Arc::new(Mutex::new(Vec::new()));
+    let calls = called.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let Some((_, body)) = read_request(&mut stream) else {
+                continue;
+            };
+            let asked: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let result = match asked["method"].as_str() {
+                Some("initialize") => {
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "recording", "version": "0.0.1"}})
+                }
+                Some("tools/list") => json!({"tools": listed}),
+                Some("tools/call") => {
+                    let name = asked["params"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    calls.lock().unwrap().push(name);
+                    json!({"content": [{"type": "text", "text": "called"}]})
+                }
+                _ => json!({}),
+            };
+            let reply = json!({"jsonrpc": "2.0", "id": asked["id"], "result": result});
+            respond(&mut stream, "application/json", &reply.to_string());
+        }
+    });
+    (url, called)
+}
+
+/// The wire names a chat offers once `server` is ready, from a message sent after.
+async fn offered_once_ready(
+    client: &mut Client,
+    world: &World,
+    chat: &str,
+    server: &str,
+) -> Vec<String> {
+    loop {
+        let frame = client.next().await;
+        let said = &frame["params"]["frame"];
+        let ready = said["params"]["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| entry["server"] == server && entry["state"] == "ready");
+        if said["method"] == "mcp.status" && ready {
+            break;
+        }
+    }
+    client.send(chat, "Hi").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let request = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    request["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// An MCP tool whose full name is past a provider's 64-character limit is offered short, and still reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_mcp_tool_name_is_shortened_on_the_wire_and_still_called() {
+    let world = World::new();
+    let long = "fetch_the_quarterly_revenue_report_for_every_region_and_currency";
+    let (url, called) = recording_mcp_server(&[long]);
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    std::fs::write(world.home().join("config.toml"), config).unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("long-name")).await;
+    let offered = offered_once_ready(&mut client, &world, &chat, "hosted").await;
+    assert!(offered.iter().all(|name| name.len() <= 64), "{offered:?}");
+    let wire = offered
+        .iter()
+        .find(|name| name.starts_with("mcp__hosted__fetch"))
+        .expect("the tool is offered");
+    scripted(&mut client, &world, &chat, &[format!("{wire} {{}}")]).await;
+    assert_eq!(called.lock().unwrap().as_slice(), [long]);
+}
+
+/// A server id containing `__` still routes its tools' calls to that server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_id_with_a_double_underscore_routes_to_its_own_tools() {
+    let world = World::new();
+    let (url, called) = recording_mcp_server(&["ping"]);
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = format!("[mcp.team__tools]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    std::fs::write(world.home().join("config.toml"), config).unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("double-underscore")).await;
+    let offered = offered_once_ready(&mut client, &world, &chat, "team__tools").await;
+    assert!(
+        offered.iter().any(|name| name == "mcp__team__tools__ping"),
+        "{offered:?}"
+    );
+    scripted(
+        &mut client,
+        &world,
+        &chat,
+        &["mcp__team__tools__ping {}".to_string()],
+    )
+    .await;
+    assert_eq!(called.lock().unwrap().as_slice(), ["ping"]);
+}
+
+/// A backend that has seen more secrets than its list holds forgets the oldest instead of refusing all outbound calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_secret_list_forgets_its_oldest_and_outbound_calls_still_run() {
+    let world = World::new();
+    let (url, called) = recording_mcp_server(&["ping"]);
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    std::fs::write(world.home().join("config.toml"), config).unwrap();
+    let filled: Vec<(String, String)> = (0..4200)
+        .map(|i| {
+            (
+                format!("MEDHA_FILL_{i}_TOKEN"),
+                format!("Fill-{i}-aB9xQ7zR"),
+            )
+        })
+        .collect();
+    let env: Vec<(&str, &str)> = filled
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let backend = world.backend_in(&env);
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("many-secrets")).await;
+    offered_once_ready(&mut client, &world, &chat, "hosted").await;
+    // The first result is outside content, so the second call is checked against the list.
+    let ping = "mcp__hosted__ping {}".to_string();
+    scripted(&mut client, &world, &chat, &[ping.clone(), ping]).await;
+    assert_eq!(
+        called.lock().unwrap().as_slice(),
+        ["ping", "ping"],
+        "a call was refused for a full list"
+    );
+}
+
 /// Harmless implementation of the drawing app's documented checkpoint protocol.
 /// Both the model and server are loopback fixtures; nothing is sent to a provider.
 struct DrawingServer {

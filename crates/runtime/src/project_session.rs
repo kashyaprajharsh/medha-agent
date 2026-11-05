@@ -64,10 +64,10 @@ impl LiveSettings {
         })
     }
 
-    pub fn refresh(&self) {
+    /// Re-reads `medha.lock`; one that cannot be read keeps the settings in force, and the error is returned.
+    pub fn refresh(&self) -> Result<(), String> {
         let raw = MedhaLock::load(self.folder.join("medha.lock"))
-            .ok()
-            .flatten()
+            .map_err(|error| error.to_string())?
             .unwrap_or_default();
         let safe = match ProjectTrust::for_folder(&self.folder) {
             Ok(Some(trust)) => trust.filter(&self.folder, &raw),
@@ -90,6 +90,7 @@ impl LiveSettings {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         next.generation = current.generation.wrapping_add(1);
         *current = next;
+        Ok(())
     }
 
     fn scoped(self: &Arc<Self>, folder: &Path) -> Arc<Self> {
@@ -448,7 +449,12 @@ impl kernel::context::RequestContext for LiveContext {
         events: &[kernel::Event],
         sink: &dyn StreamSink,
     ) -> Vec<(String, serde_json::Value)> {
-        self.settings.refresh();
+        if let Err(why) = self.settings.refresh() {
+            let text = format!(
+                "medha.lock could not be read ({why}); the settings already in force stay until it is fixed."
+            );
+            self.notice_once(format!("lock:{why}"), &text, sink);
+        }
         {
             let mut seen = self
                 .notices

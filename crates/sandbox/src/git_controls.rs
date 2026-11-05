@@ -2,10 +2,12 @@ use crate::exec::ExecError;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, PoisonError, Weak},
 };
 
+// A folder's entry stays until its cleanup has finished, so a new command waits instead of reusing half-removed files.
 static ACTIVE: Mutex<BTreeMap<PathBuf, Weak<Protected>>> = Mutex::new(BTreeMap::new());
+static CLEANED: Condvar = Condvar::new();
 
 pub(crate) struct Protected {
     pub _entry: PathBuf,
@@ -15,31 +17,54 @@ pub(crate) struct Protected {
 
 impl Drop for Protected {
     fn drop(&mut self) {
-        let created_entry = self
-            .created
-            .first()
-            .is_some_and(|(path, contents)| *path == self._entry && contents.is_none());
-        for (path, contents) in self.created.iter().rev() {
-            match contents {
-                Some(contents)
-                    if std::fs::symlink_metadata(path)
-                        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
-                        && std::fs::read(path).is_ok_and(|current| current == *contents) =>
-                {
-                    let _ = std::fs::remove_file(path);
-                }
-                None => {
-                    let _ = std::fs::remove_dir(path);
-                }
-                _ => {}
-            }
-        }
-        if created_entry
-            && std::fs::symlink_metadata(&self._entry)
-                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
+        remove_created(&self._entry, &self.created);
+        if active
+            .get(&self._entry)
+            .is_some_and(|known| known.strong_count() == 0)
         {
-            let _ = std::fs::remove_dir_all(&self._entry);
+            active.remove(&self._entry);
         }
+        CLEANED.notify_all();
+    }
+}
+
+/// Files set up for a command that failed before it could be handed out; the caller holds the lock.
+struct Pending<'a> {
+    entry: &'a Path,
+    created: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        remove_created(self.entry, &self.created);
+    }
+}
+
+fn remove_created(entry: &Path, created: &[(PathBuf, Option<Vec<u8>>)]) {
+    let created_entry = created
+        .first()
+        .is_some_and(|(path, contents)| path == entry && contents.is_none());
+    for (path, contents) in created.iter().rev() {
+        match contents {
+            Some(contents)
+                if std::fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+                    && std::fs::read(path).is_ok_and(|current| current == *contents) =>
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            None => {
+                let _ = std::fs::remove_dir(path);
+            }
+            _ => {}
+        }
+    }
+    if created_entry
+        && std::fs::symlink_metadata(entry)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+    {
+        let _ = std::fs::remove_dir_all(entry);
     }
 }
 
@@ -73,31 +98,38 @@ fn targets(roots: &[PathBuf]) -> Result<Vec<PathBuf>, ExecError> {
 pub(crate) fn held(roots: &[PathBuf]) -> Result<Vec<Arc<Protected>>, ExecError> {
     let roots = targets(roots)?;
     let active = ACTIVE.lock().unwrap();
-    roots.iter().map(|root| {
+    let found: Vec<Result<Arc<Protected>, ExecError>> = roots.iter().map(|root| {
         let root = root.canonicalize().map_err(unavailable)?;
         active.get(&root.join(".git")).and_then(Weak::upgrade).ok_or_else(|| ExecError::Unavailable("Git protection must be retained for the command's lifetime; prepare command resources before building".into()))
-    }).collect()
+    }).collect();
+    // Anything found is released after the lock, since its cleanup takes the lock.
+    drop(active);
+    found.into_iter().collect()
 }
 
 fn prepare_one(root: &Path) -> Result<Arc<Protected>, ExecError> {
     let root = root.canonicalize().map_err(unavailable)?;
     let entry = root.join(".git");
     let mut active = ACTIVE.lock().unwrap();
-    active.retain(|_, value| value.strong_count() > 0);
-    if let Some(known) = active.get(&entry).and_then(Weak::upgrade) {
-        validate_aliases(&known.readonly)?;
-        return Ok(known);
+    while let Some(known) = active.get(&entry) {
+        let Some(known) = known.upgrade() else {
+            active = CLEANED.wait(active).unwrap();
+            continue;
+        };
+        let checked = validate_aliases(&known.readonly);
+        drop(active);
+        return checked.map(|()| known);
     }
     if active.len() >= 128 {
         return Err(ExecError::Unavailable(
             "Git protection exceeds 128 active folders".into(),
         ));
     }
-    let mut protected = Protected {
-        _entry: entry.clone(),
-        readonly: vec![],
+    let mut protected = Pending {
+        entry: &entry,
         created: vec![],
     };
+    let mut readonly = vec![];
     if !entry.try_exists().map_err(unavailable)? {
         std::fs::create_dir(&entry).map_err(unavailable)?;
         protected.created.push((entry.clone(), None));
@@ -109,7 +141,7 @@ fn prepare_one(root: &Path) -> Result<Arc<Protected>, ExecError> {
         ));
     }
     if metadata.is_file() {
-        protected.readonly.push(entry.clone());
+        readonly.push(entry.clone());
     } else if metadata.is_dir() {
         for (name, contents) in [
             ("config", Some(b"".as_slice())),
@@ -141,15 +173,21 @@ fn prepare_one(root: &Path) -> Result<Arc<Protected>, ExecError> {
                     path.display()
                 )));
             }
-            protected.readonly.push(path);
+            readonly.push(path);
         }
     } else {
         return Err(ExecError::Unavailable(
             "Git protection needs a regular .git entry".into(),
         ));
     }
-    validate_aliases(&protected.readonly)?;
-    let protected = Arc::new(protected);
+    validate_aliases(&readonly)?;
+    let created = std::mem::take(&mut protected.created);
+    drop(protected);
+    let protected = Arc::new(Protected {
+        _entry: entry.clone(),
+        readonly,
+        created,
+    });
     active.insert(entry, Arc::downgrade(&protected));
     Ok(protected)
 }

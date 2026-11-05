@@ -167,6 +167,52 @@ async fn native_commands_cannot_reenter_a_mount_namespace() {
     );
 }
 
+/// A command that starts while the last one's cleanup runs still gets its Git protection.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn back_to_back_commands_in_one_folder_each_get_the_git_protection() {
+    let scratch = test_support::scratch("medha-git-overlap");
+    let root = scratch.canonicalize().unwrap();
+    let backend = select_backend(
+        &SandboxConfig::default(),
+        vec![],
+        ApprovedRoots::default(),
+        NetworkGrant::default(),
+    );
+    let check =
+        "test -f .git/config && test -d .git/hooks && ! (printf x >> .git/config) 2>/dev/null";
+    let runs = (0..2).map(|_| {
+        let (backend, root) = (backend.clone(), root.clone());
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let output = backend
+                    .run(ExecRequest {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), check.into()],
+                        cwd: root.clone(),
+                        env: vec![],
+                        clear_env: true,
+                        read_roots: vec![],
+                        write_roots: vec![],
+                    })
+                    .await;
+                match output {
+                    Ok(output) if output.status == Some(0) => {}
+                    Ok(output) => panic!("ran without protection: {:?}", output.status),
+                    Err(error) => panic!("refused: {error}"),
+                }
+            }
+        })
+    });
+    for run in runs.collect::<Vec<_>>() {
+        run.await.unwrap();
+    }
+    assert!(
+        !root.join(".git").exists(),
+        "temporary controls were left behind"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_preexisting_hardlink_cannot_bypass_the_readonly_mount() {

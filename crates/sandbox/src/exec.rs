@@ -2946,42 +2946,45 @@ fn native_intrinsic_read_roots() -> Vec<PathBuf> {
 }
 
 /// Out-of-workspace roots a failed command was plausibly denied on — the input
-/// to the escalation prompt. Only paths named in output; files widen to their
-/// parent; credential paths and already-approved roots are never offered.
+/// to the escalation prompt. Only paths named in output, or `refused_in` when the
+/// refusal names no full path; files widen to their parent; credential paths and
+/// already-approved roots are never offered.
 pub(crate) fn escalation_candidates(
     output: &ExecOutput,
     workspace: &Path,
     approved: &ApprovedRoots,
     permission: permissions::PermissionType,
+    refused_in: Option<&Path>,
 ) -> Vec<PathBuf> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Programs word it in either case: Node and zsh write "operation not permitted", "permission denied".
     let denial_lines: Vec<&str> = stderr
         .lines()
         .chain(stdout.lines())
         .filter(|line| {
-            line.contains("Operation not permitted") || line.contains("Permission denied")
+            let line = line.to_ascii_lowercase();
+            line.contains("operation not permitted") || line.contains("permission denied")
         })
         .collect();
     if denial_lines.is_empty() {
         return Vec::new();
     }
-    let tokens: Vec<PathBuf> = denial_lines
+    let mut tokens: Vec<PathBuf> = denial_lines
         .iter()
         .flat_map(|line| {
-            // `/bin/sh: /blocked/file: Permission denied` names the reporter
-            // first. Do not mistake its executable for the denied write target.
+            // `program: target: refused` names the program first; the program is never the target.
             let line = line
                 .split_once(": ")
-                .filter(|(reporter, rest)| {
-                    Path::new(reporter).is_absolute()
-                        && Path::new(reporter).is_file()
-                        && absolute_path_tokens(rest).next().is_some()
-                })
+                .filter(|(_, rest)| rest.contains(": "))
                 .map_or(*line, |(_, rest)| rest);
             absolute_path_tokens(line)
         })
         .collect();
+    // A refusal naming no full path happened in the folder the command ran in.
+    if tokens.is_empty() {
+        tokens.extend(refused_in.map(Path::to_path_buf));
+    }
     // If the denial itself did not identify a path, there is no evidence that
     // approving an argv path could change the result. Falling back to argv made
     // unrelated application-level "Permission denied" failures raise cards.
@@ -5232,6 +5235,7 @@ mod tests {
                     &ws,
                     &ApprovedRoots::default(),
                     permission,
+                    None,
                 );
                 assert!(
                     offered.is_empty(),
@@ -5512,6 +5516,7 @@ mod tests {
             &ws,
             &ApprovedRoots::default(),
             permissions::PermissionType::Read,
+            None,
         );
         assert_eq!(
             candidates,
@@ -5525,6 +5530,7 @@ mod tests {
                 &ws,
                 &ApprovedRoots::default(),
                 permissions::PermissionType::Write,
+                None,
             ),
             vec![outside.canonicalize().unwrap()],
             "a reporter executable already readable by the native profile is not a candidate"
@@ -5537,6 +5543,7 @@ mod tests {
                 &ws,
                 &ApprovedRoots::default(),
                 permissions::PermissionType::Read,
+                None,
             )
             .is_empty()
         );
@@ -5551,6 +5558,7 @@ mod tests {
                 &ws,
                 &ApprovedRoots::default(),
                 permissions::PermissionType::Read,
+                None,
             )
             .is_empty()
         );
@@ -5565,6 +5573,7 @@ mod tests {
                 &ws,
                 &approved,
                 permissions::PermissionType::Read,
+                None,
             )
             .is_empty()
         );
@@ -5592,6 +5601,7 @@ mod tests {
                 &ws,
                 &ApprovedRoots::default(),
                 permissions::PermissionType::Read,
+                None,
             )
             .is_empty(),
             "credential paths must never reach an approval card"
@@ -5608,6 +5618,7 @@ mod tests {
                 &ws,
                 &ApprovedRoots::default(),
                 permissions::PermissionType::Write,
+                None,
             )
             .is_empty()
         );
@@ -5629,6 +5640,7 @@ mod tests {
                 &ws,
                 &ApprovedRoots::default(),
                 permissions::PermissionType::Write,
+                None,
             ),
             vec![outside.canonicalize().unwrap()]
         );

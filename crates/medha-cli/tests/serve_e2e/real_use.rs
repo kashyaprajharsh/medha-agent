@@ -777,3 +777,83 @@ async fn a_wait_longer_than_a_minute_on_a_background_command_returns_its_end() {
         "the wait did not return the command's end: {waited}"
     );
 }
+
+/// A write refused to a relative path names the folder it was refused in, never the shell that reported it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_relative_write_names_its_folder_not_the_shell() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("project");
+    let elsewhere = world.folder("elsewhere");
+    let chat = client.open(&folder).await;
+    let write = json!({"command": "echo x > made.txt", "network": false,
+        "workdir": elsewhere, "read_paths": [elsewhere]});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {write}")]).await;
+    let refused = result_of(&world, &chat, 0).await;
+    assert!(
+        !elsewhere.join("made.txt").exists(),
+        "the write was not refused, so nothing was tested: {refused}"
+    );
+    assert_eq!(
+        refused["payload"]["denied_paths"],
+        json!([elsewhere]),
+        "the refusal named the wrong folder: {refused}"
+    );
+}
+
+/// A refusal whose message names no full path, as `mkdir` prints it, still names the folder the command ran in.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_naming_no_full_path_names_the_folder_the_command_ran_in() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("project");
+    let elsewhere = world.folder("elsewhere");
+    let chat = client.open(&folder).await;
+    let make = json!({"command": "mkdir newdir", "network": false,
+        "workdir": elsewhere, "read_paths": [elsewhere]});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {make}")]).await;
+    let refused = result_of(&world, &chat, 0).await;
+    assert!(
+        !elsewhere.join("newdir").exists(),
+        "the folder was made, so nothing was tested: {refused}"
+    );
+    assert_eq!(
+        refused["payload"]["denied_paths"],
+        json!([elsewhere]),
+        "the refusal named the wrong folder: {refused}"
+    );
+}
+
+/// A command that changes folder itself names no refused folder, and is told to use workdir so the next refusal can.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_after_cd_names_no_folder_and_asks_for_workdir() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("project");
+    let elsewhere = world.folder("elsewhere");
+    let chat = client.open(&folder).await;
+    let command = format!("cd {} && echo x > made.txt", elsewhere.display());
+    let write = json!({"command": command, "network": false, "read_paths": [elsewhere]});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {write}")]).await;
+    let refused = result_of(&world, &chat, 0).await;
+    assert!(
+        !elsewhere.join("made.txt").exists(),
+        "the write was not refused, so nothing was tested: {refused}"
+    );
+    assert!(
+        refused["payload"].get("denied_paths").is_none(),
+        "a folder was named without proof: {refused}"
+    );
+    assert!(
+        refused["payload"]["sandbox_blocked"]
+            .as_str()
+            .is_some_and(|note| note.contains("workdir")),
+        "the note did not point to workdir: {refused}"
+    );
+}

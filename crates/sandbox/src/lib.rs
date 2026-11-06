@@ -1697,6 +1697,13 @@ fn add_request_grant(
     }
 }
 
+/// Whether a shell command changes its own folder (`cd`, `pushd`), so a relative path in it is not under its workdir.
+pub fn changes_folder(command: &str) -> bool {
+    command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}'))
+        .any(|word| word == "cd" || word == "pushd")
+}
+
 /// Invocation-local admission shared by fixed-program and owned shell runners.
 /// Call `approve_retry` only after the previous process has fully settled.
 pub struct ExecInvocation<'a> {
@@ -1777,7 +1784,14 @@ impl<'a> ExecInvocation<'a> {
             &self.sandbox.root,
             &self.sandbox.permission_manager.approved_roots(),
             permissions::PermissionType::Write,
+            self.refused_in(),
         )
+    }
+
+    /// Where a refusal naming no full path happened: the command's folder, unless the command changes folder itself.
+    fn refused_in(&self) -> Option<&Path> {
+        let moves = self.request.args.iter().any(|arg| changes_folder(arg));
+        self.working_dir.as_deref().filter(|_| !moves)
     }
 
     /// Ask for the minimum missing path capability supported by a native-jail
@@ -1796,12 +1810,14 @@ impl<'a> ExecInvocation<'a> {
             &self.sandbox.root,
             &approved,
             permissions::PermissionType::Read,
+            self.refused_in(),
         );
         for candidate in exec::escalation_candidates(
             output,
             &self.sandbox.root,
             &approved,
             permissions::PermissionType::Write,
+            self.refused_in(),
         ) {
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);

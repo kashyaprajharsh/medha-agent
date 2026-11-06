@@ -6948,8 +6948,9 @@ impl Tool for ShellExec {
             }
             let denied_filesystem = !net_denied
                 && [&completed.stdout, &completed.stderr].iter().any(|text| {
-                    text.contains("Operation not permitted")
-                        || text.contains("Permission denied")
+                    let text = text.to_ascii_lowercase();
+                    text.contains("operation not permitted")
+                        || text.contains("permission denied")
                         || text.contains("blocked by sandbox")
                         || text.contains("uv_cwd")
                 });

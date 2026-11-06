@@ -103,6 +103,16 @@ pub(crate) fn sandbox_blocked(
                 .into(),
         );
     }
+    // After a cd the refused folder is unknown; the same work with workdir lets it be named and granted.
+    if sandbox::changes_folder(command) && sandbox_refused(output) {
+        return Some(
+            "Medha's sandbox refused part of this command, but it changes folder with cd, so \
+             Medha cannot tell which folder was refused. Run it again with workdir set to that \
+             folder instead of cd; a refusal then names the folder, and adding it to write_paths \
+             (read_paths if it only reads) lets the user approve it."
+                .into(),
+        );
+    }
     sandbox_refused(output).then(|| {
         "Medha's sandbox blocked this command and no narrower grant applies. Do not try \
          variations or workarounds; they hit the same sandbox. If the task needs this \
@@ -129,9 +139,10 @@ pub(crate) fn local_socket_refused(output: &str) -> bool {
 
 /// Seatbelt refuses with EPERM, Landlock with EACCES; macOS EACCES is the file's own mode.
 fn sandbox_refused(output: &str) -> bool {
-    output.contains("Operation not permitted")
+    let output = output.to_ascii_lowercase();
+    output.contains("operation not permitted")
         || output.contains("blocked by sandbox")
-        || (!cfg!(target_os = "macos") && output.contains("Permission denied"))
+        || (!cfg!(target_os = "macos") && output.contains("permission denied"))
 }
 
 #[cfg(test)]

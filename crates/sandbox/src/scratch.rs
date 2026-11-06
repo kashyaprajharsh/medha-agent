@@ -1,11 +1,28 @@
-//! A throwaway folder owned by one Medha process: empty at start, removed at exit.
+//! A throwaway folder: one per chat, kept while the chat is in use, or one per process, removed at exit.
 
 use std::path::{Path, PathBuf};
+
+/// A chat's scratch folder unused for this long is removed; macOS clears its temp files at the same age.
+pub const IDLE_DAYS: u64 = 3;
+const IDLE: std::time::Duration = std::time::Duration::from_secs(IDLE_DAYS * 24 * 60 * 60);
+/// Chat folders are named for the chat, so reopening it finds the same files.
+const CHAT: &str = "chat-";
 
 pub struct Scratch {
     path: PathBuf,
     lock: PathBuf,
     held: Option<std::fs::File>,
+    /// A chat's folder outlives the session that opened it.
+    kept: bool,
+}
+
+/// Whether a released lock was last used longer ago than [`IDLE`].
+fn idle(lock: &std::fs::File) -> bool {
+    lock.metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|used| used.elapsed().ok())
+        .is_some_and(|age| age > IDLE)
 }
 
 /// Holds an exclusive advisory lock on `path` without blocking.
@@ -44,6 +61,14 @@ pub(crate) fn sweep_unlocked(root: &Path) {
             continue;
         }
         if let Some(released) = try_lock_file(lock) {
+            // A chat's folder waits for the chat to come back, until it has gone unused too long.
+            let chat = lock
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(CHAT));
+            if chat && !idle(&released) {
+                continue;
+            }
             let _ = std::fs::remove_dir_all(lock.with_extension(""));
             drop(released);
             let _ = std::fs::remove_file(lock);
@@ -123,6 +148,46 @@ impl Scratch {
             path,
             lock,
             held: Some(held),
+            kept: false,
+        })
+    }
+
+    /// The chat's own folder, the same whenever the chat is opened, so paths in its history stay valid.
+    pub fn for_chat(chat: &str) -> std::io::Result<Self> {
+        Self::for_chat_in(&std::env::temp_dir(), chat)
+    }
+
+    fn for_chat_in(temp: &Path, chat: &str) -> std::io::Result<Self> {
+        if chat.is_empty() || !chat.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(std::io::Error::other("a chat id names its scratch folder"));
+        }
+        let root = user_root(temp)?;
+        sweep_unlocked(&root);
+        let name = format!("{CHAT}{chat}");
+        let lock = root.join(format!("{name}.lock"));
+        let held = try_lock_file(&lock)
+            .ok_or_else(|| std::io::Error::other("the chat's scratch folder is open elsewhere"))?;
+        // The lock's time is the chat's last use, which the sweep reads.
+        let _ = held.set_modified(std::time::SystemTime::now());
+        let path = root.join(name);
+        if let Err(error) = std::fs::create_dir(&path)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(error);
+        }
+        if !std::fs::symlink_metadata(&path)?.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{} is not a folder",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        let path = path.canonicalize()?;
+        Ok(Self {
+            path,
+            lock,
+            held: Some(held),
+            kept: true,
         })
     }
 
@@ -133,6 +198,11 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        if self.kept {
+            // Its lock file stays: its time is the chat's last use.
+            self.held.take();
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
         // Windows refuses to delete a file that is still open.
         self.held.take();

@@ -857,3 +857,57 @@ async fn a_refusal_after_cd_names_no_folder_and_asks_for_workdir() {
         "the note did not point to workdir: {refused}"
     );
 }
+
+/// The scratch folder the model was last shown, read from what it was sent.
+fn scratch_shown(world: &World) -> String {
+    let sent: Vec<Value> = std::iter::from_fn(|| world.provider.seen.try_recv().ok()).collect();
+    let system = sent.last().expect("the model was sent nothing")["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let (_, rest) = system
+        .split_once("Scratch folder: ")
+        .unwrap_or_else(|| panic!("no scratch folder in the brief: {system}"));
+    rest.split_once(" (").unwrap().0.to_owned()
+}
+
+/// A reopened chat keeps its scratch folder, so the files its history names are still there and allowed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopened_chat_keeps_its_scratch_folder_and_its_files() {
+    let world = World::new();
+    let folder = world.folder("project");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    first_message(&mut client, &chat).await;
+    let scratch = scratch_shown(&world);
+    let write =
+        json!({"command": "echo kept-in-scratch > note.txt", "network": false, "workdir": scratch});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {write}")]).await;
+    drop(client);
+    drop(backend);
+
+    let backend = world.backend();
+    let mut client = reopen(&backend, &folder, &chat).await;
+    first_message(&mut client, &chat).await;
+    assert_eq!(
+        scratch_shown(&world),
+        scratch,
+        "the reopened chat was shown another scratch folder"
+    );
+    let read = json!({"command": "cat note.txt", "network": false, "workdir": scratch});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {read}")]).await;
+    let logged = logged(&world, &chat).await;
+    let last = logged
+        .iter()
+        .rev()
+        .find(|event| event.kind == kernel::EventKind::ToolObs)
+        .expect("the read left no result")
+        .payload
+        .to_string();
+    assert!(
+        last.contains("kept-in-scratch") && last.contains("\"exit_code\":0"),
+        "the reopened chat could not read its own scratch file: {last}"
+    );
+}

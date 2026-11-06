@@ -8,6 +8,8 @@ pub(super) struct Input<'a> {
     pub persona_file: &'a Option<context::ctxfiles::CtxFile>,
     pub startup_context: &'a [context::ctxfiles::CtxFile],
     pub scratch: &'a Option<sandbox::Scratch>,
+    /// The chat's command backend, as `WorkspaceSandbox::backend_label` names it.
+    pub sandbox: &'a str,
     pub live_context: &'a crate::project_session::LiveContext,
     pub agent_session: &'a tools::SessionHandle,
     pub agent_control: &'a Option<Arc<orchestrator::AgentControl>>,
@@ -29,6 +31,7 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
         persona_file,
         startup_context,
         scratch,
+        sandbox,
         live_context,
         agent_session,
         agent_control,
@@ -56,14 +59,18 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
     let scratch_line = scratch.as_ref().map_or_else(String::new, |scratch| {
         format!(
-            "\n- Scratch folder: {} (yours, empty, deleted when this session ends). Put \
-             throwaway files, test repositories and experiments here, never in the workspace \
-             or /tmp; file tools and shell commands can use it without asking.",
-            file_ops::shown(scratch.path()).display()
+            "\n- Scratch folder: {} (this chat's own; removed after {} days unused, and the system \
+             may clear it sooner, on restart or by its own temp cleanup, so keep anything that \
+             must last in the workspace). Put throwaway files, test repositories and experiments \
+             here, never in the workspace or /tmp; file tools and shell commands can use it \
+             without asking.",
+            file_ops::shown(scratch.path()).display(),
+            sandbox::scratch::IDLE_DAYS
         )
     });
+    let sandbox_line = format!("\n- Sandbox: {}", sandbox_text(sandbox));
     system.push_str(&format!(
-        "\n\nEnvironment:\n- Today's date: {today}\n- Workspace: {}{scratch_line}\n\nFor anything \
+        "\n\nEnvironment:\n- Today's date: {today}\n- Workspace: {}{scratch_line}{sandbox_line}\n\nFor anything \
          time-sensitive (news, prices, \"latest\"/\"recent\"/\"today\"), use the current \
          date above — do not assume an older year in your searches or answers.",
         file_ops::shown(cwd).display()
@@ -148,4 +155,26 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
         });
     }
     Ok(system)
+}
+
+/// What shell commands may reach, said for the backend this chat really has, never assumed.
+fn sandbox_text(backend: &str) -> &'static str {
+    match backend {
+        "native" => {
+            "shell commands may write the workspace, the scratch folder and a private home ($HOME, \
+             $TMPDIR and tool caches point there), and read those plus system and installed-tool \
+             folders. All else, the user's home and the system temp folder included, is closed \
+             until named in `read_paths` or `write_paths` and approved by the user."
+        }
+        "container" => {
+            "shell commands run inside a container that sees the workspace at /workspace; nothing \
+             else of the user's machine is shared with it."
+        }
+        "ssh" => "shell commands run on a remote machine over SSH, not on the user's own.",
+        "unavailable" => "none available here, so shell commands cannot run.",
+        _ => {
+            "none; shell commands run with the user's own access to this machine, so anything \
+             outside the workspace is theirs to approve before you change it."
+        }
+    }
 }

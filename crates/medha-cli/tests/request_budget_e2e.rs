@@ -146,10 +146,8 @@ fn full_and_minimal_wire_requests_obey_their_capabilities_and_budgets() {
     let minimal_system = system(&minimal);
     assert!(full_system.contains("test-procedure"));
     assert!(full_system.contains("`update_plan`"));
-    // The model learns which folders are closed, and to use workdir, before its first command fails.
-    assert!(
-        full_system.contains("closed until named") && full_system.contains("set `workdir`, not cd")
-    );
+    // Before its first command the model knows what its commands may reach, and to use workdir.
+    assert!(full_system.contains("\n- Sandbox: ") && full_system.contains("set `workdir`, not cd"));
     for absent in [
         "test-procedure",
         "`update_plan`",

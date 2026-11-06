@@ -9,7 +9,7 @@ pub(super) struct Built {
     pub scratch: Option<sandbox::Scratch>,
 }
 
-pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
+pub(super) fn build(setup: &Setup<'_>, surface: &Surface, chat: &str) -> Result<Built> {
     let Setup {
         lock,
         options,
@@ -89,7 +89,8 @@ pub(super) fn build(setup: &Setup<'_>, surface: &Surface) -> Result<Built> {
     // Shared network grant: the exec backend enforces it, the permission manager
     // flips and persists it. One handle so a session/persistent grant reaches both.
     let net_grant = sandbox::NetworkGrant::default();
-    let scratch = sandbox::Scratch::create().ok();
+    // The chat's own folder: reopening the chat finds the files its history names.
+    let scratch = sandbox::Scratch::for_chat(chat).ok();
     let live_settings = crate::project_session::LiveSettings::new(
         cwd.to_path_buf(),
         options.clone(),

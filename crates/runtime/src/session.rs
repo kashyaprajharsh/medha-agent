@@ -153,7 +153,8 @@ pub async fn start(
         sandbox_template,
         sbx_cfg,
         scratch,
-    } = sandbox_setup::build(&setup, &surface)?;
+    } = sandbox_setup::build(&setup, &surface, &session.id.to_string())?;
+    let sandbox_kind = workspace.backend_label().to_owned();
     // An idle start reviews instructions in its own capped pool, so flagged
     // files are still judged rather than blocked for the whole session.
     let startup_budget = if has_task {
@@ -357,6 +358,7 @@ pub async fn start(
             persona_file: &persona_file,
             startup_context: &startup_context,
             scratch: &scratch,
+            sandbox: &sandbox_kind,
             live_context: &live_context,
             agent_session: &agent_session,
             agent_control: &agent_control,

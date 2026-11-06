@@ -7046,6 +7046,19 @@ struct TaskOutput {
     tasks: Arc<TaskTable>,
 }
 
+/// Seconds a `task.output` call waits: as asked, else 30 with `until`, else none, never past the shell maximum.
+fn task_wait_secs(args: &Value) -> u64 {
+    let default = if args.get("until").and_then(Value::as_str).is_some() {
+        TASK_WAIT_DEFAULT_SECS
+    } else {
+        0
+    };
+    args.get("wait_s")
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+        .min(SHELL_TIMEOUT_MAX_SECS)
+}
+
 #[async_trait]
 impl Tool for TaskOutput {
     fn name(&self) -> &str {
@@ -7076,20 +7089,16 @@ impl Tool for TaskOutput {
             }
         })
     }
+    // The wait it was asked for bounds the call, so a long wait returns instead of failing at the default limit.
+    fn timeout(&self, args: &Value) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(task_wait_secs(args)) + TOOL_TIMEOUT)
+    }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let Some(id) = args.get("task_id").and_then(Value::as_str) else {
             return Ok(json!({ "tasks": self.tasks.list() }));
         };
         let until = args.get("until").and_then(Value::as_str);
-        let wait = args
-            .get("wait_s")
-            .and_then(Value::as_u64)
-            .unwrap_or(if until.is_some() {
-                TASK_WAIT_DEFAULT_SECS
-            } else {
-                0
-            })
-            .min(SHELL_TIMEOUT_MAX_SECS);
+        let wait = task_wait_secs(args);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
         while std::time::Instant::now() < deadline && !self.tasks.has_news(id, until) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

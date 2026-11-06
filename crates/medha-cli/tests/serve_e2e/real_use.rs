@@ -730,3 +730,50 @@ async fn a_reply_streamed_in_thousands_of_pieces_keeps_the_chat_alive() {
     client.send(&chat, "Hi").await;
     client.until(|frame| kind(frame, "turn.done")).await;
 }
+
+/// Waiting longer than a minute on a background command returns its end, never a tool timeout.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_longer_than_a_minute_on_a_background_command_returns_its_end() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("long-wait")).await;
+    let start =
+        json!({"command": "sleep 65; echo slow-work-done", "network": false, "background": true});
+    let wait = json!({"task_id": "t1", "wait_s": 90});
+    client
+        .send(
+            &chat,
+            &format!("SCRIPT\nshell_exec {start}\ntask_output {wait}"),
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    // The wait itself is quiet for over a minute, longer than the client's usual patience.
+    loop {
+        let frame = match client.events.pop_front() {
+            Some(frame) => frame,
+            None => tokio::time::timeout(
+                Duration::from_secs(150),
+                wire::read_frame(&mut client.reader),
+            )
+            .await
+            .expect("the backend went quiet during the wait")
+            .expect("the backend closed the connection"),
+        };
+        if frame["method"] == "session.event" && kind(&frame["params"]["frame"], "turn.done") {
+            break;
+        }
+    }
+    let waited = result_of(&world, &chat, 1).await.to_string();
+    assert!(
+        !waited.contains("timed out after"),
+        "the wait failed as a timeout: {waited}"
+    );
+    assert!(
+        waited.contains("slow-work-done"),
+        "the wait did not return the command's end: {waited}"
+    );
+}

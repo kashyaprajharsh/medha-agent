@@ -146,6 +146,11 @@ pub async fn start(
 
     let surface = surface(&cwd, &prompt);
     let has_task = !options.first_run_setup && !prompt.trim().is_empty();
+    // A rewound branch works in its first chat's scratch folder, where its history's paths point.
+    let root = log
+        .root_chat_async(session.id)
+        .await
+        .unwrap_or(session.id);
     let sandbox_setup::Built {
         workspace,
         live_settings,
@@ -153,7 +158,7 @@ pub async fn start(
         sandbox_template,
         sbx_cfg,
         scratch,
-    } = sandbox_setup::build(&setup, &surface, &session.id.to_string())?;
+    } = sandbox_setup::build(&setup, &surface, &root.to_string())?;
     let sandbox_kind = workspace.backend_label().to_owned();
     // An idle start reviews instructions in its own capped pool, so flagged
     // files are still judged rather than blocked for the whole session.

@@ -840,7 +840,7 @@ impl SqliteLog {
                      WHERE child = e1.session_id AND parent <> e1.session_id LIMIT 1)
                  FROM events e1
                  GROUP BY e1.session_id
-                 HAVING SUM(e1.kind NOT IN ('context.file_loaded', 'context.file_blocked')) > 0
+                 HAVING SUM(e1.kind NOT IN ('context.file_loaded', 'context.file_blocked', 'session')) > 0
                  ORDER BY MAX(e1.ts) DESC",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -1137,6 +1137,33 @@ impl SqliteLog {
 
     pub async fn touched_web_async(&self, session_id: Ulid) -> Result<bool, StoreError> {
         self.run_store_task(move |log| log.touched_web(session_id))
+            .await
+    }
+
+    /// The first chat this one was rewound from, or the chat itself when it is no branch.
+    pub fn root_chat(&self, session_id: Ulid) -> Result<Ulid, StoreError> {
+        use rusqlite::OptionalExtension;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let root: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(payload, '$.root') FROM events
+                 WHERE session_id = ?1 AND kind = 'session' ORDER BY rowid LIMIT 1",
+                rusqlite::params![session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Db(error.to_string()))?
+            .flatten();
+        Ok(root
+            .and_then(|root| Ulid::from_string(&root).ok())
+            .unwrap_or(session_id))
+    }
+
+    pub async fn root_chat_async(&self, session_id: Ulid) -> Result<Ulid, StoreError> {
+        self.run_store_task(move |log| log.root_chat(session_id))
             .await
     }
 
@@ -2778,12 +2805,14 @@ mod tests {
         // Fork before "two": the branch keeps only "one".
         let branch_id = log.fork(s.id, cut.id).await.unwrap();
         let branch = log.events(branch_id).await;
-        assert_eq!(branch.len(), 1);
+        assert_eq!(branch.len(), 2);
+        assert_eq!(log.root_chat(branch_id).unwrap(), s.id);
+        assert_eq!(log.root_chat(s.id).unwrap(), s.id);
         assert_eq!(
-            branch[0].payload.get("text").and_then(|v| v.as_str()),
+            branch[1].payload.get("text").and_then(|v| v.as_str()),
             Some("one")
         );
-        assert_eq!(branch[0].session_id, branch_id);
+        assert_eq!(branch[1].session_id, branch_id);
 
         // Original session untouched; whole log still verifies (fork appended a
         // valid continuation of the global chain, tamper-evidence intact).

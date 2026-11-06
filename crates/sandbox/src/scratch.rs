@@ -165,8 +165,13 @@ impl Scratch {
         sweep_unlocked(&root);
         let name = format!("{CHAT}{chat}");
         let lock = root.join(format!("{name}.lock"));
-        let held = try_lock_file(&lock)
-            .ok_or_else(|| std::io::Error::other("the chat's scratch folder is open elsewhere"))?;
+        // Shared: a chat, its branches and its other windows use the folder together; the sweep's exclusive try waits for all.
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)?;
+        held.lock_shared()?;
         // The lock's time is the chat's last use, which the sweep reads.
         let _ = held.set_modified(std::time::SystemTime::now());
         let path = root.join(name);

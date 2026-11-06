@@ -887,12 +887,32 @@ pub trait EventLog: Send + Sync {
         // Fresh timestamps keep the branch visible in newest-first session
         // lists; the increment preserves intra-fork order.
         let forked_at = now_ts();
-        for (i, e) in events[..idx].iter().enumerate() {
+        let root = root_chat(&events).unwrap_or(session);
+        self.append(Event {
+            id: Ulid::new(),
+            session_id: new_id,
+            parent_id: None,
+            kind: EventKind::Session,
+            payload: json!({"forked_from": session.to_string(), "root": root.to_string()}),
+            trust: TrustLabel::System,
+            provenance: Provenance {
+                source: "fork".into(),
+            },
+            prev_hash: [0u8; 32],
+            hash_version: EVENT_HASH_VERSION,
+            ts: forked_at,
+        })
+        .await?;
+        // The source's own lineage record is replaced by the one above.
+        let kept = events[..idx]
+            .iter()
+            .filter(|event| event.kind != EventKind::Session);
+        for (i, e) in kept.enumerate() {
             let mut clone = e.clone();
             clone.id = Ulid::new();
             clone.session_id = new_id;
             clone.parent_id = None;
-            clone.ts = forked_at + i as f64 * 1e-6;
+            clone.ts = forked_at + (i + 1) as f64 * 1e-6;
             clone.provenance = Provenance {
                 source: "fork".into(),
             };
@@ -900,6 +920,15 @@ pub trait EventLog: Send + Sync {
         }
         Ok(())
     }
+}
+
+/// The first chat a rewound branch came from, as its lineage record names it; `None` for a chat that is no branch.
+pub fn root_chat(events: &[Event]) -> Option<Ulid> {
+    events
+        .iter()
+        .find(|event| event.kind == EventKind::Session)
+        .and_then(|event| event.payload["root"].as_str())
+        .and_then(|root| Ulid::from_string(root).ok())
 }
 
 /// Cut point for rewind/fork: everything below the returned index is retained,
@@ -2949,15 +2978,22 @@ mod tests {
         assert_ne!(new_id, s.id, "fork is a new session");
 
         let branch = block_on(log.events(new_id));
-        assert_eq!(branch.len(), 1, "prefix before the cut event only");
+        assert_eq!(branch.len(), 2, "lineage record + prefix before the cut event only");
+        assert_eq!(root_chat(&branch), Some(s.id), "the branch names its chat");
         assert_eq!(
-            branch[0].payload.get("text").and_then(Value::as_str),
+            branch[1].payload.get("text").and_then(Value::as_str),
             Some("one")
         );
         assert_eq!(
-            branch[0].session_id, new_id,
+            branch[1].session_id, new_id,
             "events re-homed onto the branch"
         );
+
+        // A branch of the branch still names the first chat, and carries one lineage record.
+        let again = block_on(log.fork(new_id, branch[1].id)).unwrap();
+        let twice = block_on(log.events(again));
+        assert_eq!(root_chat(&twice), Some(s.id));
+        assert_eq!(twice.len(), 1);
 
         assert_eq!(block_on(log.events(s.id)).len(), 3);
 

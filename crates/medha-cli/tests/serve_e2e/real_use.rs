@@ -911,3 +911,64 @@ async fn a_reopened_chat_keeps_its_scratch_folder_and_its_files() {
         "the reopened chat could not read its own scratch file: {last}"
     );
 }
+
+/// A rewound branch reopens on its chat's scratch folder, alongside the chat itself.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopened_branch_shares_its_chats_scratch_folder() {
+    let world = World::new();
+    let folder = world.folder("project");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    first_message(&mut client, &chat).await;
+    let scratch = scratch_shown(&world);
+    let write =
+        json!({"command": "echo kept-in-scratch > note.txt", "network": false, "workdir": scratch});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {write}")]).await;
+    let points = client
+        .ask("session.rewind.points", Some(&chat), json!({}))
+        .await;
+    let at = points["result"]["points"][0]["id"].clone();
+    let rewound = client
+        .ask(
+            "session.rewind",
+            Some(&chat),
+            json!({"at": at, "scope": "conversation"}),
+        )
+        .await;
+    let branch = rewound["result"]["session"].as_str().unwrap().to_string();
+    drop(client);
+    drop(backend);
+
+    let backend = world.backend();
+    let mut client = reopen(&backend, &folder, &branch).await;
+    first_message(&mut client, &branch).await;
+    assert_eq!(
+        scratch_shown(&world),
+        scratch,
+        "the reopened branch was shown another scratch folder"
+    );
+    let read = json!({"command": "cat note.txt", "network": false, "workdir": scratch});
+    scripted(&mut client, &world, &branch, &[format!("shell_exec {read}")]).await;
+    let last = logged(&world, &branch)
+        .await
+        .iter()
+        .rev()
+        .find(|event| event.kind == kernel::EventKind::ToolObs)
+        .expect("the read left no result")
+        .payload
+        .to_string();
+    assert!(
+        last.contains("kept-in-scratch") && last.contains("\"exit_code\":0"),
+        "the branch could not read its chat's scratch file: {last}"
+    );
+
+    let mut original = reopen(&backend, &folder, &chat).await;
+    first_message(&mut original, &chat).await;
+    assert_eq!(
+        scratch_shown(&world),
+        scratch,
+        "the chat opened beside its branch was shown another scratch folder"
+    );
+}

@@ -238,7 +238,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (writer, output_task) = crate::chat::output_writer(output, 256);
+    let (writer, output_task) = crate::chat::output_writer(output);
     let mut input = BufReader::new(input).take(wire::MAX_FRAME as u64);
     let mut partial = Vec::new();
     let mut initialized = false;

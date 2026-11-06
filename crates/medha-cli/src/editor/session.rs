@@ -701,7 +701,7 @@ mod approval_tests {
 
     async fn offered(prompt: protocol::ApprovalPrompt) -> Value {
         let (output, input) = tokio::io::duplex(4096);
-        let (writer, task) = crate::chat::output_writer(output, 8);
+        let (writer, task) = crate::chat::output_writer(output);
         approval(&writer, "session", "stream", &prompt, &mut HashMap::new());
         let mut line = String::new();
         tokio::time::timeout(

@@ -14,7 +14,6 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-const OUTBOUND_FRAMES: usize = 256;
 // Leave room for the backend's session-event envelope.
 const MAX_OUTBOUND_FRAME: usize = wire::MAX_FRAME - 1024;
 const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
@@ -27,10 +26,10 @@ enum Outbound {
     Close(oneshot::Sender<io::Result<()>>),
 }
 
-/// Byte-bounded output queue for synchronous kernel callbacks; saturation
-/// closes the connection.
+/// Output queue for synchronous kernel callbacks, bounded by bytes only, so a burst of tiny frames never ends a chat;
+/// 32 MB left unread closes the connection.
 pub struct Writer {
-    tx: mpsc::Sender<Outbound>,
+    tx: mpsc::UnboundedSender<Outbound>,
     queued_bytes: Arc<AtomicUsize>,
     cancelled: CancellationToken,
     progress: Arc<Notify>,
@@ -56,19 +55,15 @@ impl Writer {
         self.cancelled.cancel();
     }
 
-    /// Synchronous stream callbacks cannot wait, but incoming RPCs can. Leave
-    /// headroom for their notifications and reply instead of ending a healthy
-    /// chat when a fast reader supplies a burst of small requests.
+    /// Incoming RPCs wait until a largest frame fits, so a fast reader's burst of requests never fills the queue.
     pub(crate) async fn wait_for_room(&self) {
-        let spare = 8.min(self.tx.max_capacity().div_ceil(2));
         loop {
             let changed = self.progress.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             if self.cancelled.is_cancelled()
-                || (self.tx.capacity() >= spare
-                    && self.queued_bytes.load(Ordering::Acquire)
-                        <= MAX_QUEUED_BYTES - MAX_OUTBOUND_FRAME)
+                || self.queued_bytes.load(Ordering::Acquire)
+                    <= MAX_QUEUED_BYTES - MAX_OUTBOUND_FRAME
             {
                 return;
             }
@@ -117,9 +112,9 @@ impl Writer {
             self.fail("The chat's output queue is full; its viewer could not keep up.");
             return false;
         }
-        if self.tx.try_send(Outbound::Frame(frame)).is_err() {
+        if self.tx.send(Outbound::Frame(frame)).is_err() {
             self.queued_bytes.fetch_sub(frame_len, Ordering::AcqRel);
-            self.fail("The chat's output queue is full or disconnected.");
+            self.fail("The chat's output connection closed.");
             return false;
         }
         true
@@ -292,7 +287,7 @@ impl Writer {
 
 async fn writer_loop<W>(
     mut output: W,
-    mut rx: mpsc::Receiver<Outbound>,
+    mut rx: mpsc::UnboundedReceiver<Outbound>,
     queued_bytes: Arc<AtomicUsize>,
     cancelled: CancellationToken,
     progress: Arc<Notify>,
@@ -360,12 +355,7 @@ impl WriterTask {
     pub(crate) async fn finish(mut self, writer: &Writer) {
         if !self.cancelled.is_cancelled() {
             let (ack_tx, ack_rx) = oneshot::channel();
-            let close = tokio::time::timeout(
-                WRITER_SHUTDOWN_GRACE,
-                writer.tx.send(Outbound::Close(ack_tx)),
-            )
-            .await;
-            if matches!(close, Ok(Ok(()))) {
+            if writer.tx.send(Outbound::Close(ack_tx)).is_ok() {
                 let _ = tokio::time::timeout(WRITER_SHUTDOWN_GRACE, ack_rx).await;
             } else {
                 self.cancelled.cancel();
@@ -680,14 +670,14 @@ pub(crate) fn bridge_to<W>(output: W) -> Bridge
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    bridge_with_output(output, OUTBOUND_FRAMES)
+    bridge_with_output(output)
 }
 
-fn bridge_with_output<W>(output: W, capacity: usize) -> Bridge
+fn bridge_with_output<W>(output: W) -> Bridge
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (writer, writer_task) = output_writer(output, capacity);
+    let (writer, writer_task) = output_writer(output);
     Bridge {
         writer,
         pending: Arc::default(),
@@ -697,11 +687,11 @@ where
     }
 }
 
-pub(crate) fn output_writer<W>(output: W, capacity: usize) -> (Arc<Writer>, WriterTask)
+pub(crate) fn output_writer<W>(output: W) -> (Arc<Writer>, WriterTask)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel(capacity.max(1));
+    let (tx, rx) = mpsc::unbounded_channel();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let cancelled = CancellationToken::new();
     let progress = Arc::new(Notify::new());
@@ -2214,8 +2204,8 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
 
-    fn capture_writer(capacity: usize) -> (Arc<Writer>, mpsc::Receiver<Outbound>) {
-        let (tx, rx) = mpsc::channel(capacity);
+    fn capture_writer() -> (Arc<Writer>, mpsc::UnboundedReceiver<Outbound>) {
+        let (tx, rx) = mpsc::unbounded_channel();
         (
             Arc::new(Writer {
                 tx,
@@ -2230,7 +2220,7 @@ mod tests {
         )
     }
 
-    fn captured_values(rx: &mut mpsc::Receiver<Outbound>) -> Vec<Value> {
+    fn captured_values(rx: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<Value> {
         let mut values = Vec::new();
         while let Ok(outbound) = rx.try_recv() {
             match outbound {
@@ -2267,7 +2257,7 @@ mod tests {
         interrupt: Option<&kernel::InterruptHandle>,
         pending: &Pending,
     ) -> (RpcAction, Vec<Value>) {
-        let (writer, mut rx) = capture_writer(32);
+        let (writer, mut rx) = capture_writer();
         let action = dispatch_rpc(message, "test-model", running, interrupt, pending, &writer);
         (action, captured_values(&mut rx))
     }
@@ -2275,7 +2265,7 @@ mod tests {
     #[test]
     fn read_steers_leave_the_ledger_and_unread_ones_wait_for_the_run_loop() {
         use kernel::StreamSink;
-        let (writer, mut rx) = capture_writer(8);
+        let (writer, mut rx) = capture_writer();
         let unread = Unread::default();
         unread
             .lock()
@@ -2297,7 +2287,7 @@ mod tests {
     #[test]
     fn desktop_waiting_and_retry_notices_are_emitted_without_extending_standard_acp() {
         use kernel::StreamSink;
-        let (writer, mut rx) = capture_writer(8);
+        let (writer, mut rx) = capture_writer();
         let sink = Sink {
             writer,
             unread: Unread::default(),
@@ -2319,7 +2309,7 @@ mod tests {
     #[test]
     fn turn_callbacks_preserve_the_typed_stream_contract_and_tui_progress() {
         use kernel::StreamSink;
-        let (writer, mut rx) = capture_writer(32);
+        let (writer, mut rx) = capture_writer();
         let sink = Sink {
             writer,
             unread: Unread::default(),
@@ -2404,7 +2394,7 @@ mod tests {
 
     #[test]
     fn a_legacy_initialize_does_not_switch_dialects() {
-        let (writer, mut rx) = capture_writer(8);
+        let (writer, mut rx) = capture_writer();
         dispatch_rpc(
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
             "m",
@@ -2557,7 +2547,7 @@ mod tests {
         assert_exactly_one_response(&values, json!(16));
         assert!(values[0].get("error").is_some());
 
-        let (writer, mut rx) = capture_writer(4);
+        let (writer, mut rx) = capture_writer();
         assert_eq!(
             dispatch_line(
                 "{not json",
@@ -2582,7 +2572,7 @@ mod tests {
 
     #[test]
     fn valid_notifications_never_receive_a_response() {
-        let (writer, mut rx) = capture_writer(32);
+        let (writer, mut rx) = capture_writer();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (approval_tx, mut approval_rx) = oneshot::channel();
         lock_pending(&pending).insert(7, approval_tx.into());
@@ -2643,7 +2633,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_entries_are_raii_scoped_and_disconnect_denies_them() {
-        let (writer, mut rx) = capture_writer(8);
+        let (writer, mut rx) = capture_writer();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
 
@@ -2675,7 +2665,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_unanswered_approval_is_denied_at_its_limit_and_every_viewer_is_told() {
-        let (writer, mut rx) = capture_writer(8);
+        let (writer, mut rx) = capture_writer();
         let pending: Pending = Arc::default();
         let gate = Arc::new(
             Gate::new(Arc::clone(&writer), Arc::clone(&pending))
@@ -2703,7 +2693,7 @@ mod tests {
     #[tokio::test]
     async fn command_access_preserves_every_tui_grant_tier_and_settles_all_viewers() {
         use kernel::NetworkDecision as N;
-        let (writer, mut output) = capture_writer(32);
+        let (writer, mut output) = capture_writer();
         let pending: Pending = Arc::default();
         let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
         for (choice, expected) in [
@@ -2768,7 +2758,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_is_asked_about_with_its_folder_as_a_choice_of_its_own() {
         use kernel::PathApproval as P;
-        let (writer, mut output) = capture_writer(32);
+        let (writer, mut output) = capture_writer();
         let pending: Pending = Arc::default();
         let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
         let folder = Path::new("/work/proj/src");
@@ -2842,7 +2832,7 @@ mod tests {
 
     #[tokio::test]
     async fn escalated_access_refuses_remembering_without_consuming_the_prompt() {
-        let (writer, mut output) = capture_writer(16);
+        let (writer, mut output) = capture_writer();
         let pending: Pending = Arc::default();
         let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
         let asked =
@@ -2876,7 +2866,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_question_settles_the_form_once_and_releases_its_response() {
-        let (writer, mut output) = capture_writer(8);
+        let (writer, mut output) = capture_writer();
         let pending: crate::chat_questions::Questions = Arc::default();
         let asker = crate::chat_questions::Asker {
             writer,
@@ -2905,7 +2895,7 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_error_and_shutdown_drain_pending_approvals() {
-        let (writer, mut rx) = capture_writer(8);
+        let (writer, mut rx) = capture_writer();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (malformed_tx, mut malformed_rx) = oneshot::channel();
         lock_pending(&pending).insert(1, malformed_tx.into());
@@ -3046,7 +3036,7 @@ mod tests {
     #[test]
     fn child_streams_keep_parent_identity_tool_ids_and_returned_text() {
         use runtime::agents::AgentWatcher;
-        let (writer, mut output) = capture_writer(32);
+        let (writer, mut output) = capture_writer();
         let watch = crate::chat_agents::Watch { writer };
         let session = ulid::Ulid::new();
         let path = orchestrator::AgentPath::root().child("reviewer").unwrap();
@@ -3097,7 +3087,7 @@ mod tests {
 
     #[test]
     fn oversized_result_and_error_replies_are_bounded_and_keep_their_id() {
-        let (writer, mut rx) = capture_writer(4);
+        let (writer, mut rx) = capture_writer();
         let huge = "x".repeat(MAX_OUTBOUND_FRAME);
         assert!(writer.respond(json!(7), json!(huge)));
         assert!(writer.error(json!(8), -32000, huge));
@@ -3147,15 +3137,16 @@ mod tests {
             questions: _,
             writer_task: blocked_task,
             control: _,
-        } = bridge_with_output(blocked_output, 2);
+        } = bridge_with_output(blocked_output);
 
         let heartbeat = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             "runtime alive"
         });
         let mut saturated = false;
-        for sequence in 0..32 {
-            if !blocked_writer.notify("event", json!({"sequence": sequence})) {
+        let megabyte = "x".repeat(1024 * 1024);
+        for sequence in 0..64 {
+            if !blocked_writer.notify("event", json!({"sequence": sequence, "text": megabyte})) {
                 saturated = true;
                 break;
             }
@@ -3180,7 +3171,7 @@ mod tests {
             questions: _,
             writer_task: healthy_task,
             control: _,
-        } = bridge_with_output(healthy_output, 2);
+        } = bridge_with_output(healthy_output);
         assert!(healthy_writer.notify("healthy", json!({"ok": true})));
         healthy_task.finish(&healthy_writer).await;
         let mut bytes = Vec::new();
@@ -3199,7 +3190,7 @@ mod tests {
             questions: _,
             writer_task,
             control: _,
-        } = bridge_with_output(BrokenOutput, 2);
+        } = bridge_with_output(BrokenOutput);
         assert!(writer.notify("event", json!({"delta": "x"})));
         tokio::time::timeout(Duration::from_millis(250), writer.cancelled())
             .await

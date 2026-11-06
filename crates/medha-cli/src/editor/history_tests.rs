@@ -15,7 +15,7 @@ fn record(id: &str, kind: &str, payload: Value) -> protocol::HistoryRecord {
 #[tokio::test]
 async fn canonical_text_reasoning_and_tool_calls_are_replayed_once_across_compaction() {
     let (output, input) = tokio::io::duplex(1024 * 1024);
-    let (writer, output_task) = crate::chat::output_writer(output, 256);
+    let (writer, output_task) = crate::chat::output_writer(output);
     let reader = tokio::spawn(async move {
         let mut input = tokio::io::BufReader::new(input).lines();
         let mut frames = Vec::new();

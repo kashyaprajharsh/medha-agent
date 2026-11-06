@@ -216,6 +216,16 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
         ]
+    } else if let Some(pieces) = asked
+        .strip_prefix("BURST ")
+        .and_then(|n| n.trim().parse::<usize>().ok())
+    {
+        // BURST <n> streams the reply in n tiny pieces, as a fast model does.
+        let mut pieces: Vec<Value> = (0..pieces)
+            .map(|i| json!({"choices": [{"index": 0, "delta": {"content": format!("{i} ")}}]}))
+            .collect();
+        pieces.push(json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+        pieces
     } else if let Some(results) = repeat_left(&body, &asked) {
         // REPEAT <n> sends the same command again until n results came back.
         shell_call(&body, &asked, &format!("repeat_{results}"))

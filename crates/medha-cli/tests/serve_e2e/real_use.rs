@@ -711,3 +711,22 @@ async fn a_rewound_branch_keeps_the_projects_shared_memory() {
         "reopening the branch kept the project's memory"
     );
 }
+
+/// A reply streamed in thousands of tiny pieces, as a fast model sends it, never ends the chat it belongs to.
+#[tokio::test]
+async fn a_reply_streamed_in_thousands_of_pieces_keeps_the_chat_alive() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("burst")).await;
+    client.send(&chat, "BURST 6000").await;
+    let (_, end) = client
+        .until(|frame| kind(frame, "turn.done") || frame["method"] == "session.ended")
+        .await;
+    assert_ne!(
+        end["method"], "session.ended",
+        "the chat ended mid-reply: {end}"
+    );
+    client.send(&chat, "Hi").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+}

@@ -558,7 +558,19 @@ fn a_truncated_installer_runs_nothing() {
 fn an_update_never_writes_over_a_running_medha() {
     let case = TempDir::new().unwrap();
     let link = case.path().join("installed/medha");
-    let sleeper = fs::read(find_command("sleep")).unwrap();
+    let sleeper = case.path().join("sleeper");
+    fs::copy(find_command("sleep"), &sleeper).unwrap();
+    // macOS kills a copied system program until it carries its own signature.
+    #[cfg(target_os = "macos")]
+    assert!(
+        Command::new("codesign")
+            .args(["-s", "-", "-f"])
+            .arg(&sleeper)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sleeper = fs::read(&sleeper).unwrap();
     let first = install_version(&case, "v-one", &sleeper);
     assert!(first.status.success(), "{}", stderr(&first));
     let mut running = Command::new(&link).arg("30").spawn().unwrap();

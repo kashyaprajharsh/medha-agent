@@ -396,6 +396,69 @@ async fn attach_artifact(
     }
 }
 
+/// Most of one MCP result's images shown to the model; the rest are stored for `read`.
+const MCP_IMAGES_SHOWN: usize = 4;
+
+/// An MCP result's images, sized for the conversation and stored: the parts to show, and a line per image.
+async fn mcp_images(
+    images: Vec<mcp::McpImage>,
+    store: &Arc<dyn kernel::ArtifactStore>,
+) -> (Vec<kernel::MediaPart>, Vec<String>) {
+    use base64::Engine;
+    let (mut shown, mut lines) = (Vec::new(), Vec::new());
+    for (index, image) in images.into_iter().enumerate() {
+        let number = index + 1;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(image.data.trim()) else {
+            lines.push(format!("[image {number}: not readable ({})]", image.mime));
+            continue;
+        };
+        let Ok((width, height)) = media::dimensions(&raw) else {
+            lines.push(format!(
+                "[image {number}: not a picture Medha can read ({})]",
+                image.mime
+            ));
+            continue;
+        };
+        if shown.len() == MCP_IMAGES_SHOWN {
+            match Arc::clone(store).put_async(raw).await {
+                Ok(hash) => lines.push(format!(
+                    "[image {number}: {width}×{height}, not shown; to see it, read with hash {hash}]"
+                )),
+                Err(_) => lines.push(format!("[image {number}: {width}×{height}, not shown]")),
+            }
+            continue;
+        }
+        let fitted = tokio::task::spawn_blocking(move || media::for_history(raw)).await;
+        let Ok(Ok(fitted)) = fitted else {
+            lines.push(format!(
+                "[image {number}: {width}×{height}, could not be prepared]"
+            ));
+            continue;
+        };
+        let (shown_width, shown_height, mime) = (fitted.width, fitted.height, fitted.mime);
+        let byte_size = fitted.bytes.len();
+        let Ok(hash) = Arc::clone(store).put_async(fitted.bytes).await else {
+            lines.push(format!(
+                "[image {number}: {width}×{height}, could not be stored]"
+            ));
+            continue;
+        };
+        lines.push(format!(
+            "[image {number}: {width}×{height} shown at {shown_width}×{shown_height}]"
+        ));
+        shown.push(kernel::MediaPart {
+            mime_type: mime.to_string(),
+            source: kernel::MediaSource::Artifact(hash),
+            label: Some(format!("image {number}")),
+            width: Some(shown_width),
+            height: Some(shown_height),
+            byte_size: Some(byte_size),
+            provider_state: Vec::new(),
+        });
+    }
+    (shown, lines)
+}
+
 async fn lsp_query_value<T: serde::Serialize>(
     report: lsp::QueryReport<T>,
     artifacts: &Arc<dyn kernel::ArtifactStore>,
@@ -1439,7 +1502,8 @@ impl Executor for ToolRegistry {
                     );
                 };
                 return match mcp.call(&intent.tool, &intent.args).await {
-                    Ok(out) => {
+                    Ok(mut out) => {
+                        let images = std::mem::take(&mut out.images);
                         // Bound what reaches the model; the full result is preserved
                         // losslessly in the artifact store rather than discarded.
                         let cap = mcp.max_text_chars();
@@ -1464,19 +1528,19 @@ impl Executor for ToolRegistry {
                         if let (Some(_), Some(store)) = (cut, &self.artifacts) {
                             attach_artifact(&mut payload, out.text.into_bytes(), store).await;
                         }
-                        if out.is_error {
-                            Observation {
-                                intent_id: intent.id.clone(),
-                                status: kernel::ObsStatus::Error,
-                                payload,
-                                media: Vec::new(),
-                                relayed_trust: None,
-                                net_denied: false,
-                                model_text: None,
-                            }
-                        } else {
-                            Observation::ok(&intent.id, payload)
+                        // A server's images reach the model sized like any other tool's.
+                        let mut media = Vec::new();
+                        if let (false, Some(store)) = (images.is_empty(), &self.artifacts) {
+                            let (shown, lines) = mcp_images(images, store).await;
+                            payload["images"] = json!(lines);
+                            media = shown;
                         }
+                        let mut obs = Observation::ok(&intent.id, payload);
+                        if out.is_error {
+                            obs.status = kernel::ObsStatus::Error;
+                        }
+                        obs.media = media;
+                        obs
                     }
                     Err(e) => Observation::error(&intent.id, e.to_string()),
                 };
@@ -1868,7 +1932,7 @@ impl Tool for ImageView {
         let artifacts = self.artifacts.clone();
         let image = tokio::task::spawn_blocking(move || {
             let raw = media::read_source(&image_path)?;
-            media::normalize(raw)
+            media::for_history(raw)
         })
         .await
         .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
@@ -3897,7 +3961,7 @@ impl Tool for ReadArtifact {
                 .get_async(hash.clone(), 0, Some(media::MAX_SOURCE_BYTES + 1))
                 .await
                 .map_err(ToolError::Failed)?;
-            let image = tokio::task::spawn_blocking(move || media::normalize(raw))
+            let image = tokio::task::spawn_blocking(move || media::for_history(raw))
                 .await
                 .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
                 .map_err(|error| ToolError::Args(error.to_string()))?;

@@ -5019,6 +5019,7 @@ name = "tools"
 version = "0.1.12"
 dependencies = [
  "async-trait",
+ "base64",
  "fd-lock",
  "file-ops",
  "futures",

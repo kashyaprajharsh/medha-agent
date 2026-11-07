@@ -14,6 +14,7 @@ file-ops = { path = "../file-ops" }
 git-safety = { path = "../git-safety" }
 kernel.workspace = true
 media.workspace = true
+base64 = "0.22"
 lsp = { path = "../lsp" }
 mcp = { path = "../mcp" }
 orchestrator = { path = "../orchestrator" }

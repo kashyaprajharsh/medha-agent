@@ -167,3 +167,39 @@ async fn a_compacted_screenshot_can_be_reopened_from_its_hash_after_the_file_is_
         f.artifacts.get(hash, 0, None).unwrap()
     );
 }
+
+/// A full-HD frame enters the history small enough to be re-sent each turn; the file itself is untouched.
+#[tokio::test]
+async fn a_full_hd_frame_is_kept_small_for_the_history_and_the_file_is_untouched() {
+    let f = fixture();
+    let (width, height) = (1920u32, 1080u32);
+    let mut seed = 7u32;
+    let pixels: Vec<u8> = (0..width * height * 4)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    let original = media::from_rgba(width, height, &pixels).unwrap();
+    std::fs::write(f.dir.join("frame.png"), &original).unwrap();
+
+    let payload = f
+        .tool
+        .execute(&json!({ "path": "frame.png" }))
+        .await
+        .unwrap();
+
+    let media: Vec<kernel::MediaPart> = serde_json::from_value(payload[MEDIA].clone()).unwrap();
+    let kernel::MediaSource::Artifact(hash) = &media[0].source else {
+        panic!("images must be stored")
+    };
+    let kept = f.artifacts.get(hash, 0, None).unwrap();
+    assert!(
+        media[0].width.unwrap().max(media[0].height.unwrap()) <= 1568,
+        "kept at {}x{}",
+        media[0].width.unwrap(),
+        media[0].height.unwrap()
+    );
+    assert!(kept.len() <= 256 * 1024, "kept at {} bytes", kept.len());
+    assert_eq!(std::fs::read(f.dir.join("frame.png")).unwrap(), original);
+}

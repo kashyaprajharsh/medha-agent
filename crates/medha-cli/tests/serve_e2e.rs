@@ -2229,12 +2229,8 @@ async fn an_image_too_large_for_its_server_is_sent_smaller() {
 
     turn(&mut client, "SIZE_LIMIT_SERVER hello").await;
     turn(&mut client, "READ_PATH noise.png").await;
-    assert_eq!(
-        image_requests(&world),
-        [false, true],
-        "refused whole, then taken smaller"
-    );
-    // The next turn starts smaller: nothing is refused a second time.
+    // A tool's image is kept small for the conversation, so the server never refuses it.
+    assert_eq!(image_requests(&world), [true], "sent small, never refused");
     turn(&mut client, "ok").await;
     assert_eq!(image_requests(&world), [true]);
 

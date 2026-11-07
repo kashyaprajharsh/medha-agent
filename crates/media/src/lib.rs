@@ -55,6 +55,12 @@ const MAX_DIMENSION: u32 = 16_384;
 const LONG_EDGE: u32 = 2048;
 const MIN_LONG_EDGE: u32 = 256;
 const JPEG_QUALITY: u8 = 85;
+const JPEG_QUALITIES: [u8; 3] = [JPEG_QUALITY, 70, 50];
+
+/// Longest side and size of an image a tool keeps in the conversation, where it is re-sent on every
+/// later request; vision models sample at about this size anyway.
+pub const HISTORY_SIDE: u32 = 1568;
+pub const HISTORY_BYTES: usize = 256 * 1024;
 
 pub struct Image {
     pub bytes: Vec<u8>,
@@ -182,6 +188,18 @@ pub fn thumbnail(raw: Vec<u8>, budget: usize) -> Result<Image> {
     fit(raw, budget, 512)
 }
 
+/// An image's width and height, read from its header without decoding it.
+pub fn dimensions(raw: &[u8]) -> Result<(u32, u32)> {
+    let kind = identify(raw)?;
+    let (width, height, _) = probe(raw, kind.format, ImageLimits::default())?;
+    Ok((width, height))
+}
+
+/// An image a tool puts in the conversation, sized to be re-sent on every later request.
+pub fn for_history(raw: Vec<u8>) -> Result<Image> {
+    fit(raw, HISTORY_BYTES, HISTORY_SIDE)
+}
+
 /// Bring an image within both a byte budget and a longest side, in pixels.
 pub fn fit(raw: Vec<u8>, budget: usize, max_side: u32) -> Result<Image> {
     ensure!(raw.len() <= MAX_SOURCE_BYTES, "image source exceeds 64 MiB");
@@ -265,12 +283,20 @@ fn fit_budget(image: DynamicImage, prefer_jpeg: bool, budget: usize) -> Result<I
     };
     let mut current = image;
     loop {
-        for format in formats {
-            let bytes = encode(&current, *format)?;
+        // Lower JPEG quality is tried before fewer pixels: small text survives it far better.
+        let tries = formats.iter().flat_map(|format| {
+            let qualities: &[u8] = match format {
+                ImageFormat::Jpeg => &JPEG_QUALITIES,
+                _ => &[JPEG_QUALITY],
+            };
+            qualities.iter().map(move |quality| (*format, *quality))
+        });
+        for (format, quality) in tries {
+            let bytes = encode(&current, format, quality)?;
             if bytes.len() <= budget {
                 return Ok(Image {
                     bytes,
-                    mime: mime_of(*format),
+                    mime: mime_of(format),
                     width: current.width(),
                     height: current.height(),
                     note: None,
@@ -304,7 +330,11 @@ pub fn from_rgba(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>> {
     );
     let buffer = image::RgbaImage::from_raw(width, height, pixels.to_vec())
         .context("clipboard pixel buffer does not match its reported size")?;
-    encode(&DynamicImage::ImageRgba8(buffer), ImageFormat::Png)
+    encode(
+        &DynamicImage::ImageRgba8(buffer),
+        ImageFormat::Png,
+        JPEG_QUALITY,
+    )
 }
 
 fn mime_of(format: ImageFormat) -> &'static str {
@@ -314,12 +344,12 @@ fn mime_of(format: ImageFormat) -> &'static str {
     }
 }
 
-fn encode(image: &DynamicImage, format: ImageFormat) -> Result<Vec<u8>> {
+fn encode(image: &DynamicImage, format: ImageFormat, quality: u8) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     match format {
         ImageFormat::Jpeg => image::codecs::jpeg::JpegEncoder::new_with_quality(
             &mut Cursor::new(&mut bytes),
-            JPEG_QUALITY,
+            quality,
         )
         .encode_image(&image.to_rgb8())?,
         _ => image.write_to(&mut Cursor::new(&mut bytes), format)?,

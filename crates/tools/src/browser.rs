@@ -493,7 +493,7 @@ impl BrowserScreenshot {
                 tail(&stderr)
             ))
         })?;
-        let image = tokio::task::spawn_blocking(move || media::normalize(raw))
+        let image = tokio::task::spawn_blocking(move || media::for_history(raw))
             .await
             .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
             .map_err(|error| ToolError::Failed(format!("screenshot: {error}")))?;

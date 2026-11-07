@@ -450,7 +450,20 @@ pub struct CallOutput {
     /// when the tool has one, or a screen made the call. `Null` if too large.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Images the result carried, in order, as the server sent them; `[image N]` in the text marks each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<McpImage>,
 }
+
+/// One image an MCP tool returned: its media type and base64 data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpImage {
+    pub mime: String,
+    pub data: String,
+}
+
+/// Most images taken from one result; a server cannot fill a turn with them.
+const RESULT_IMAGES: usize = 16;
 
 /// A screen's page, with only the web origins its server declared for it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1388,6 +1401,18 @@ impl McpManager {
                     .filter(|value| value.to_string().len() <= MAX_SCREEN_RESULT)
                     .unwrap_or(Value::Null)
             }),
+            images: result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Image(image) => Some(McpImage {
+                        mime: image.mime_type.clone(),
+                        data: image.data.clone(),
+                    }),
+                    _ => None,
+                })
+                .take(RESULT_IMAGES)
+                .collect(),
             screen: resource,
             server,
             tool,
@@ -2469,10 +2494,16 @@ fn validate_arguments(schema: &Value, args: &Value) -> Result<(), String> {
 /// Flatten a tool result to text: content blocks first, falling back to the
 /// structured payload so a structured-only server is not reported as empty.
 fn flatten(result: &CallToolResult) -> String {
+    let mut images = 0;
     let text = result
         .content
         .iter()
         .filter_map(|block| match block {
+            // Numbered to match the images carried beside the text.
+            ContentBlock::Image(_) => {
+                images += 1;
+                Some(format!("[image {images}]"))
+            }
             ContentBlock::Text(text) => Some(text.text.clone()),
             ContentBlock::Resource(resource) => serde_json::to_value(&resource.resource)
                 .ok()
@@ -2483,8 +2514,6 @@ fn flatten(result: &CallToolResult) -> String {
                         .map(str::to_string)
                 }),
             ContentBlock::ResourceLink(link) => Some(format!("[resource] {}", link.uri)),
-            // Binary payloads are not model context; note their presence only.
-            ContentBlock::Image(_) => Some("[image]".to_string()),
             ContentBlock::Audio(_) => Some("[audio]".to_string()),
             _ => None,
         })

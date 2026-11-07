@@ -8,7 +8,7 @@ fn canvas(width: u32, height: u32) -> DynamicImage {
 }
 
 fn encoded(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
-    encode(image, format).unwrap()
+    encode(image, format, JPEG_QUALITY).unwrap()
 }
 
 #[test]

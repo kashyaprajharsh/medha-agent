@@ -138,6 +138,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             &dispatch_cancel,
                             dispatch_wall_deadline,
                             &dispatch_settle_deadline,
+                            cx.heard.as_ref(),
                             cx.sink,
                         )
                         .await;
@@ -185,6 +186,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         dispatch_wall_deadline,
                         Arc::clone(&dispatch_settle_deadline),
                         Some(&lane),
+                        None,
                         cx.sink,
                     )
                     .await;
@@ -227,6 +229,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     &dispatch_cancel,
                     dispatch_wall_deadline,
                     &dispatch_settle_deadline,
+                    cx.heard.as_ref(),
                     cx.sink,
                 )
                 .await;

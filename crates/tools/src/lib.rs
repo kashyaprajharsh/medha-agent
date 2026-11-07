@@ -1506,6 +1506,10 @@ impl Executor for ToolRegistry {
         }
     }
 
+    fn only_waits(&self, intent: &ToolIntent) -> bool {
+        intent.tool == "task.output" && intent.args.get("task_id").is_some()
+    }
+
     async fn apply_logged(&self, tool: &str, applied: &Value) -> Result<(), String> {
         let Some(store) = self
             .memory
@@ -7124,9 +7128,18 @@ impl Tool for TaskOutput {
         while std::time::Instant::now() < deadline && !self.tasks.has_news(id, until) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        self.tasks
+        let mut read = self
+            .tasks
             .read(id, args["full"] == true)
-            .ok_or_else(|| ToolError::Failed(format!("no such task '{id}'")))
+            .ok_or_else(|| ToolError::Failed(format!("no such task '{id}'")))?;
+        // Read mid-run as a failure, a wait gets repeated; its end is announced, so other work can go on.
+        if read["status"] == "running" {
+            read["note"] = json!(
+                "The command is still running. This is not an error. You are told when it ends, \
+                 so carry on with other work rather than waiting again."
+            );
+        }
+        Ok(read)
     }
 }
 

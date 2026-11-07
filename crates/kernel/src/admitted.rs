@@ -15,6 +15,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         wall_deadline: Option<tokio::time::Instant>,
         settle_deadline: Arc<std::sync::OnceLock<tokio::time::Instant>>,
         lane: Option<&Lane>,
+        heard: Option<crate::interrupts::Activity>,
         sink: &dyn StreamSink,
     ) -> (
         String,
@@ -87,6 +88,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 obs
             };
             tokio::pin!(fut);
+            // A call that only waits ends when a message arrives, rather than holding the turn against it.
+            let mut heard = heard.filter(|_| self.executor.only_waits(&intent));
+            let spoke = async {
+                let arrived = match heard.as_mut() {
+                    Some(heard) => heard.changed().await.is_ok(),
+                    None => false,
+                };
+                if !arrived {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(spoke);
             // A memory call writes its store before its result reaches the log; cut off between the two,
             // they disagree. It is a short local write, so it finishes first.
             if is_memory_tool(&intent.tool) {
@@ -115,6 +128,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             ),
                         }
                     }
+                    _ = &mut spoke => self.released_wait(&intent).await,
                 }
             }
         };
@@ -152,6 +166,29 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// when no other future is holding a place in the queue. Reads have no
     /// mutation guard to span, so nothing is weakened by the delay; every
     /// admitted intent still reaches its observation before the next request.
+    /// A wait ended by a new message: what the task shows now, read without waiting, and why it ended.
+    async fn released_wait(&self, intent: &ToolIntent) -> Observation {
+        let mut now = intent.clone();
+        if let Some(args) = now.args.as_object_mut() {
+            args.insert("wait_s".into(), serde_json::json!(0));
+            args.remove("until");
+        }
+        let mut obs = self.executor.execute(&now).await;
+        let note = match obs.payload["status"].as_str() {
+            Some("running") => {
+                "A new message arrived, so this wait ended early. The command is still running and \
+                 you are told when it ends. Read the message and answer it now."
+            }
+            _ => {
+                "A new message arrived, so this wait ended early. Read the message and answer it now."
+            }
+        };
+        if let Some(payload) = obs.payload.as_object_mut() {
+            payload.insert("note".into(), serde_json::json!(note));
+        }
+        obs
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn settle_reads(
         &self,
@@ -162,6 +199,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         cancel: &tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
         settle_deadline: &Arc<std::sync::OnceLock<tokio::time::Instant>>,
+        heard: Option<&crate::interrupts::Activity>,
         sink: &dyn StreamSink,
     ) -> Vec<(
         String,
@@ -174,6 +212,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 let settled = unavailable.remove(&intent.id);
                 let cancel = cancel.clone();
                 let settle_deadline = Arc::clone(settle_deadline);
+                let heard = heard.cloned();
                 async move {
                     match settled {
                         Some(obs) => (intent.id, intent.tool, obs, None),
@@ -186,6 +225,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 wall_deadline,
                                 settle_deadline,
                                 None,
+                                heard,
                                 sink,
                             )
                             .await

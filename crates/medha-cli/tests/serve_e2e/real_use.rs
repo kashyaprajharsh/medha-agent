@@ -976,6 +976,59 @@ async fn a_wait_longer_than_a_minute_on_a_background_command_returns_its_end() {
     );
 }
 
+/// A wait that ends while its command runs says so, and a new message ends a long wait at once.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_says_its_command_still_runs_and_a_new_message_ends_it() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("wait-release")).await;
+    let start = json!({"command": "sleep 120", "network": false, "background": true});
+    let short = json!({"task_id": "t1", "wait_s": 1});
+    let long = json!({"task_id": "t1", "wait_s": 120});
+    client
+        .send(
+            &chat,
+            &format!("SCRIPT\nshell_exec {start}\ntask_output {short}\ntask_output {long}"),
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    for _ in 0..2 {
+        client.until(|frame| kind(frame, "tool.observation")).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let steer = json!({"content": "what is happening?", "intent": {"kind": "steer", "turn": 1}});
+    let steered = std::time::Instant::now();
+    client.ask("message.send", Some(&chat), steer).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(
+        steered.elapsed() < Duration::from_secs(60),
+        "the wait ran out its time though a message arrived"
+    );
+
+    let timed_out = result_of(&world, &chat, 1).await.to_string();
+    assert!(
+        timed_out.contains("still running") && timed_out.contains("not an error"),
+        "a wait that ended mid-run did not say so: {timed_out}"
+    );
+    let released = result_of(&world, &chat, 2).await.to_string();
+    assert!(
+        released.contains("new message") && released.contains("still running"),
+        "the released wait did not say why: {released}"
+    );
+    let sent: Vec<Value> = std::iter::from_fn(|| world.provider.seen.try_recv().ok()).collect();
+    let system = sent[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        system.contains("never pipe a command through head or tail"),
+        "the model is not told to keep output whole"
+    );
+}
+
 /// A write refused to a relative path names the folder it was refused in, never the shell that reported it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

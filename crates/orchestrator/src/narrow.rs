@@ -128,6 +128,10 @@ impl Executor for NarrowedExecutor {
         }
     }
 
+    fn only_waits(&self, intent: &ToolIntent) -> bool {
+        self.allows_intent(intent) && self.inner.only_waits(intent)
+    }
+
     async fn apply_logged(&self, tool: &str, applied: &serde_json::Value) -> Result<(), String> {
         if !self.allows(tool) {
             return Err("Outside this agent's capabilities".into());

@@ -108,6 +108,8 @@ struct RunContext<'a> {
     request_owner: &'a crate::RequestScope,
     started: f64,
     planning: bool,
+    /// Moves when a message arrives during the run, so a call that only waits can end then.
+    heard: Option<crate::interrupts::Activity>,
 }
 
 #[allow(
@@ -164,6 +166,7 @@ pub(super) async fn run<P: Provider, L: EventLog>(
         request_owner: &request_owner,
         started,
         planning,
+        heard: interrupts.as_ref().map(|queue| queue.activity()),
     };
     'turns: loop {
         if let ControlFlow::Break(stopped) = kernel

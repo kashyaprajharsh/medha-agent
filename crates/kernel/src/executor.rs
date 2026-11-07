@@ -100,6 +100,11 @@ pub trait Executor: Send + Sync {
     ) {
     }
 
+    /// Whether this call only waits, so a new message may end it early without losing anything.
+    fn only_waits(&self, _intent: &ToolIntent) -> bool {
+        false
+    }
+
     /// Apply a memory change once its event is logged, so the log always holds what the index does.
     async fn apply_logged(&self, _tool: &str, _applied: &serde_json::Value) -> Result<(), String> {
         Ok(())

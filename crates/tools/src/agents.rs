@@ -136,6 +136,9 @@ impl kernel::Executor for Rebound {
             .finish_effect(intent, preparation, observation)
             .await;
     }
+    async fn apply_logged(&self, tool: &str, applied: &Value) -> Result<(), String> {
+        self.inner.apply_logged(tool, applied).await
+    }
     async fn mutation_preflight(&self, intent: &kernel::ToolIntent) -> Option<kernel::Observation> {
         match self.tools.get(&intent.tool) {
             Some(tool) => crate::mutation_preflight(tool.as_ref(), intent).await,

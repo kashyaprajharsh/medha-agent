@@ -128,6 +128,13 @@ impl Executor for NarrowedExecutor {
         }
     }
 
+    async fn apply_logged(&self, tool: &str, applied: &serde_json::Value) -> Result<(), String> {
+        if !self.allows(tool) {
+            return Err("Outside this agent's capabilities".into());
+        }
+        self.inner.apply_logged(tool, applied).await
+    }
+
     fn observation_delivered(&self, tool: &str, observation: &Observation) {
         if self.allows(tool) {
             self.inner.observation_delivered(tool, observation);

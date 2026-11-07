@@ -100,6 +100,11 @@ pub trait Executor: Send + Sync {
     ) {
     }
 
+    /// Apply a memory change once its event is logged, so the log always holds what the index does.
+    async fn apply_logged(&self, _tool: &str, _applied: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Observe only the final model-facing result after fitting and storage.
     fn observation_delivered(&self, _tool: &str, _observation: &Observation) {}
 

@@ -273,7 +273,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             None
         };
         if let Some(op) = applied.filter(|op| op.is_object()) {
-            self.log.append(Event::memory_write(session, op)).await?;
+            self.log
+                .append(Event::memory_write(session, op.clone()))
+                .await?;
+            // Logged first: a change the index then misses returns at the next rebuild.
+            if let Err(error) = self.executor.apply_logged(&tool, &op).await {
+                obs = Observation::error(
+                    &obs.intent_id,
+                    format!(
+                        "the memory was saved to the chat log but not to the memory index \
+                         ({error}); it appears there the next time a chat opens"
+                    ),
+                );
+            }
         }
         let stored = self.fit_for_model(&mut obs, room).await;
         let mut event = Event::observed_tool(session, &obs, trust, &tool);

@@ -859,6 +859,8 @@ pub struct ToolRegistry {
     agent_session: SessionHandle,
     /// Set by the kernel: whether an image can reach the model at all.
     images_reach_model: Arc<std::sync::atomic::AtomicBool>,
+    /// The memory index a memory change goes into once the kernel has logged it.
+    memory: Option<Arc<memory::MemoryProjection>>,
 }
 
 /// Shared handle to the surface's question-asker. `main` sets it after building
@@ -882,6 +884,7 @@ impl ToolRegistry {
             agent_parent: Arc::new(Mutex::new(None)),
             agent_session: Arc::new(Mutex::new(None)),
             images_reach_model: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            memory: None,
         }
     }
 
@@ -1010,6 +1013,7 @@ impl ToolRegistry {
         budget_tokens: u32,
         stale_after_days: u32,
     ) -> &mut Self {
+        self.memory = Some(store.clone());
         self.register(Arc::new(memory_tools::Memory::new(
             store,
             budget_tokens,
@@ -1500,6 +1504,22 @@ impl Executor for ToolRegistry {
             }
             None => mutation_preflight(tool.as_ref(), intent).await,
         }
+    }
+
+    async fn apply_logged(&self, tool: &str, applied: &Value) -> Result<(), String> {
+        let Some(store) = self
+            .memory
+            .as_ref()
+            .filter(|_| self.tools.contains_key(tool))
+        else {
+            return Err(format!("no memory index for {tool}"));
+        };
+        let op: memory::MemoryOp =
+            serde_json::from_value(applied.clone()).map_err(|error| error.to_string())?;
+        store
+            .apply_async(&op)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn observation_delivered(&self, tool: &str, observation: &Observation) {

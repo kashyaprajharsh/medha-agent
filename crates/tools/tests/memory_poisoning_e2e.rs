@@ -283,3 +283,58 @@ async fn clean_user_window_writes_user_stated_memory() {
     assert!(!tool_payload.content.contains("applied"));
     assert!(!tool_payload.content.contains("The user prefers pytest"));
 }
+
+/// A log that takes everything except memory writes, as a full disk or a lost process would.
+struct RefusingMemoryLog(InMemoryLog);
+
+#[async_trait]
+impl EventLog for RefusingMemoryLog {
+    async fn append(&self, e: kernel::Event) -> Result<kernel::Event, kernel::KernelError> {
+        if e.kind == EventKind::MemoryWrite {
+            return Err(kernel::KernelError::Log("disk full".into()));
+        }
+        self.0.append(e).await
+    }
+
+    async fn events(&self, session: ulid::Ulid) -> Vec<kernel::Event> {
+        self.0.events(session).await
+    }
+}
+
+/// A memory the log could not keep is never in the index, where the next rebuild would erase it.
+#[tokio::test]
+async fn a_memory_the_log_refuses_is_not_kept_in_the_index() {
+    let dir = test_support::scratch("medha-memory-log-first");
+    let store = Arc::new(MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register_memory(store.clone());
+    let k = Kernel::new(
+        Arc::new(ScriptedProvider::new(vec![
+            vec![intent("c1", "memory", memory_write_args())],
+            vec![Block::Text("done".into())],
+        ])),
+        Arc::new(RefusingMemoryLog(InMemoryLog::new())),
+        Arc::new(registry),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let _ = k
+        .run_session(
+            &Session::new(),
+            vec![Message::user("remember the gateway note")],
+            Budget::default(),
+            &NoopSink,
+            None,
+        )
+        .await;
+    assert!(
+        store
+            .get(Scope::Project, "gateway-turbo")
+            .unwrap()
+            .is_none(),
+        "the index kept a memory its log does not have"
+    );
+}

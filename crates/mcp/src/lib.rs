@@ -36,7 +36,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     process::Command,
-    sync::{Mutex, RwLock as AsyncRwLock, Semaphore, mpsc, watch},
+    sync::{Mutex, RwLock as AsyncRwLock, Semaphore, watch},
     task::JoinSet,
     time::{Instant, MissedTickBehavior, timeout},
 };
@@ -595,7 +595,33 @@ impl Slot {
 /// `tools/list_changed`; sampling and elicitation stay refused.
 struct Handler {
     server: String,
-    changed: mpsc::UnboundedSender<String>,
+    changed: Arc<Changes>,
+}
+
+/// Servers whose catalogues changed, each held once however often it was announced.
+#[derive(Default)]
+struct Changes {
+    servers: std::sync::Mutex<std::collections::HashSet<String>>,
+    announced: tokio::sync::Notify,
+}
+
+impl Changes {
+    fn announce(&self, server: &str) {
+        if self.servers.lock().unwrap().insert(server.to_owned()) {
+            self.announced.notify_one();
+        }
+    }
+
+    /// Every server announced since the last call, waiting until there is one.
+    async fn take(&self) -> Vec<String> {
+        loop {
+            let servers = std::mem::take(&mut *self.servers.lock().unwrap());
+            if !servers.is_empty() {
+                return servers.into_iter().collect();
+            }
+            self.announced.notified().await;
+        }
+    }
 }
 
 impl ClientHandler for Handler {
@@ -617,7 +643,7 @@ impl ClientHandler for Handler {
         &self,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let _ = self.changed.send(self.server.clone());
+        self.changed.announce(&self.server);
         std::future::ready(())
     }
 }
@@ -640,8 +666,7 @@ struct ManagerInner {
     /// admission lease. It is never held for transport shutdown or connection.
     mutations: Mutex<()>,
     tools: RwLock<HashMap<String, Catalog>>,
-    changed_tx: mpsc::UnboundedSender<String>,
-    changed_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    changes: Arc<Changes>,
     /// Bumped whenever any server's state or catalogue changes.
     revision: watch::Sender<u64>,
     /// The shared host, when this manager runs inside a chat that has one.
@@ -673,7 +698,6 @@ impl McpManager {
             .iter()
             .map(|server| (server.id.clone(), Slot::new(server.clone())))
             .collect();
-        let (changed_tx, changed_rx) = mpsc::unbounded_channel();
         // Servers that will connect on their own start with their last-known
         // tools; a gated or switched-off server shows nothing until it runs.
         let seeded = config
@@ -695,8 +719,7 @@ impl McpManager {
                 servers: Mutex::new(servers),
                 mutations: Mutex::new(()),
                 tools: RwLock::new(seeded),
-                changed_tx,
-                changed_rx: Mutex::new(Some(changed_rx)),
+                changes: Default::default(),
                 revision: watch::Sender::new(0),
                 hub: std::sync::RwLock::new(None),
                 supervising: AtomicBool::new(false),
@@ -1535,11 +1558,11 @@ impl McpManager {
         }
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(supervise(weak));
-        if let Ok(mut guard) = self.inner.changed_rx.try_lock()
-            && let Some(rx) = guard.take()
-        {
-            tokio::spawn(watch_tool_changes(Arc::downgrade(&self.inner), rx));
-        }
+        tokio::spawn(watch_tool_changes(
+            Arc::downgrade(&self.inner),
+            Arc::clone(&self.inner.changes),
+            self.inner.cancel.clone(),
+        ));
     }
 
     /// One supervisor pass: retire dead transports, probe unproven connections,
@@ -2023,7 +2046,7 @@ impl McpManager {
     {
         let handler = Handler {
             server: server.id.clone(),
-            changed: self.inner.changed_tx.clone(),
+            changed: Arc::clone(&self.inner.changes),
         };
         let deadline = self.inner.config.startup_timeout;
         let connect = async {
@@ -2213,14 +2236,26 @@ async fn supervise(weak: Weak<ManagerInner>) {
     }
 }
 
-/// Refresh a server's catalogue whenever it announces `tools/list_changed`.
-async fn watch_tool_changes(weak: Weak<ManagerInner>, mut rx: mpsc::UnboundedReceiver<String>) {
-    while let Some(server) = rx.recv().await {
+/// Refresh a server's catalogue after it announces `tools/list_changed`; a burst costs one refresh,
+/// and a notice during it one more.
+async fn watch_tool_changes(
+    weak: Weak<ManagerInner>,
+    changes: Arc<Changes>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let servers = tokio::select! {
+            servers = changes.take() => servers,
+            _ = cancel.cancelled() => return,
+        };
         let Some(inner) = weak.upgrade() else { return };
-        if inner.cancel.is_cancelled() {
-            return;
+        let manager = McpManager { inner };
+        for server in servers {
+            if cancel.is_cancelled() {
+                return;
+            }
+            manager.refresh_tools(&server, None).await;
         }
-        McpManager { inner }.refresh_tools(&server, None).await;
     }
 }
 

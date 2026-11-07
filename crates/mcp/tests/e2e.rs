@@ -42,6 +42,8 @@ def catalog():
     if mode == "churn":
         tools.append(spec("grow"))
         if grew: tools.append(spec("sprouted"))
+    if mode == "flood":
+        tools.append(spec("flood"))
     return tools
 
 for line in sys.stdin:
@@ -60,6 +62,9 @@ for line in sys.stdin:
         if mode == "stale" and lists > 1:
             if marker: open(marker, "w").close()
             time.sleep(2)
+        if mode == "flood":
+            time.sleep(0.05)
+            with open(marker, "w") as counted: counted.write(str(lists))
         send({"jsonrpc":"2.0","id":mid,"result":{"tools":catalog()}})
         if mode == "flap":
             os._exit(1)
@@ -72,6 +77,9 @@ for line in sys.stdin:
             send({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
         if name == "trigger":
             send({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+        if name == "flood":
+            for _ in range(500):
+                send({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
         if name == "spawn":
             child = subprocess.Popen(["sleep", "300"])
             text = str(child.pid)
@@ -418,6 +426,37 @@ async fn tools_list_changed_refreshes_the_catalogue() {
             .any(|s| s.name.ends_with("sprouted"))
     })
     .await;
+    manager.shutdown().await;
+}
+
+/// A burst of catalogue-change notices costs a refresh or two, never one each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_change_notices_is_refreshed_once_not_once_each() {
+    let Some(fake) = Fake::new() else { return };
+    let counted = fake.path().join("lists");
+    let manager = McpManager::new(
+        fake.path().to_path_buf(),
+        config(server(
+            "fake",
+            fake.command("flood", Some(&counted.to_string_lossy())),
+        )),
+    );
+    manager.connect_startup().await;
+    let lists = || {
+        std::fs::read_to_string(&counted)
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let before = lists();
+    manager.call("mcp__fake__flood", &json!({})).await.unwrap();
+    wait_for("a refresh after the burst", async || lists() > before).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let refreshes = lists().saturating_sub(before);
+    assert!(
+        refreshes <= 3,
+        "500 notices caused {refreshes} refreshes in 2 s, one each"
+    );
     manager.shutdown().await;
 }
 

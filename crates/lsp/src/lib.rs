@@ -2911,24 +2911,34 @@ impl LspClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         lock_unpoisoned(&self.pending).insert(id, sender);
+        let mut pending = PendingRequest {
+            client: self,
+            id,
+            settled: false,
+        };
         if let Err(error) = self
             .send(json!({
                 "jsonrpc": "2.0", "id": id, "method": method, "params": params
             }))
             .await
         {
-            lock_unpoisoned(&self.pending).remove(&id);
+            pending.settled = true;
             return Err(error);
         }
         let response = match timeout(duration, receiver).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(Error::Disconnected),
+            Ok(Err(_)) => {
+                pending.settled = true;
+                return Err(Error::Disconnected);
+            }
             Err(_) => {
+                pending.settled = true;
                 lock_unpoisoned(&self.pending).remove(&id);
                 let _ = self.notify("$/cancelRequest", json!({ "id": id })).await;
                 return Err(Error::Timeout(method));
             }
         };
+        pending.settled = true;
         if let Some(error) = response.get("error") {
             return Err(Error::Protocol(error.to_string()));
         }
@@ -2943,34 +2953,14 @@ impl LspClient {
     async fn send(&self, message: Value) -> Result<(), Error> {
         let payload =
             serde_json::to_vec(&message).map_err(|error| Error::Protocol(error.to_string()))?;
-        // Deadline around the lock as well as the write: a server that stops
-        // reading its stdin blocks the writer, and every later caller then
-        // queues on this mutex — including the document mutex holders, which is
-        // how one wedged server stalls editing altogether.
-        let written = tokio::time::timeout(self.write_timeout, async {
-            let mut writer = self.writer.lock().await;
-            write_frame(&mut *writer, &payload).await
-        })
-        .await;
-        match written {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                // Any I/O error may follow a partial header/body write. Reusing
-                // the stream can therefore desynchronise every later frame.
-                self.alive.store(false, Ordering::Release);
-                self.cancel.cancel();
-                Err(Error::Io(error))
-            }
-            Err(_) => {
-                // A timeout drops the write mid-frame, so the server may have
-                // half a header on stdin. Retire rather than reuse it.
-                self.alive.store(false, Ordering::Release);
-                self.cancel.cancel();
-                Err(Error::Protocol(
-                    "timed out writing to the language server; the connection was dropped".into(),
-                ))
-            }
-        }
+        send_frame(
+            &self.writer,
+            &self.alive,
+            &self.cancel,
+            self.write_timeout,
+            payload,
+        )
+        .await
     }
 
     async fn kill_and_wait(&self) {
@@ -3288,6 +3278,86 @@ where
         if complete {
             return Ok(Some(line));
         }
+    }
+}
+
+/// A request still owed an answer. Dropped early, by a caller that stops waiting, it leaves
+/// nothing pending and tells the server to stop working on it.
+struct PendingRequest<'a> {
+    client: &'a LspClient,
+    id: i64,
+    settled: bool,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.client.pending).remove(&self.id);
+        if self.settled || !self.client.is_alive() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let message =
+            json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": self.id } });
+        let payload = serde_json::to_vec(&message).unwrap_or_default();
+        let client = self.client;
+        let (writer, alive, cancel) = (
+            Arc::clone(&client.writer),
+            Arc::clone(&client.alive),
+            client.cancel.clone(),
+        );
+        let deadline = client.write_timeout;
+        runtime.spawn(async move {
+            let _ = send_frame(&writer, &alive, &cancel, deadline, payload).await;
+        });
+    }
+}
+
+/// Retires the stream unless the frame it guards was written whole.
+struct WholeFrame<'a> {
+    alive: &'a AtomicBool,
+    cancel: &'a CancellationToken,
+    written: bool,
+}
+
+impl Drop for WholeFrame<'_> {
+    fn drop(&mut self) {
+        if !self.written {
+            self.alive.store(false, Ordering::Release);
+            self.cancel.cancel();
+        }
+    }
+}
+
+/// Write one frame. One cut off by an error, the deadline or a caller that stops waiting
+/// retires the stream: half a frame would desynchronise every later one.
+async fn send_frame(
+    writer: &Mutex<BufWriter<BoxWriter>>,
+    alive: &AtomicBool,
+    cancel: &CancellationToken,
+    deadline: Duration,
+    payload: Vec<u8>,
+) -> Result<(), Error> {
+    // The deadline covers the lock too: a server that stops reading would queue every caller here.
+    let written = tokio::time::timeout(deadline, async {
+        let mut writer = writer.lock().await;
+        let mut frame = WholeFrame {
+            alive,
+            cancel,
+            written: false,
+        };
+        let result = write_frame(&mut *writer, &payload).await;
+        frame.written = result.is_ok();
+        result
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Error::Io(error)),
+        Err(_) => Err(Error::Protocol(
+            "timed out writing to the language server; the connection was dropped".into(),
+        )),
     }
 }
 
@@ -4208,6 +4278,95 @@ mod tests {
             "a possibly partial write must retire the stream"
         );
         drop(server_write);
+    }
+
+    /// A request its caller stops waiting for leaves nothing pending and tells the server to stop.
+    #[tokio::test]
+    async fn a_request_its_caller_abandons_is_cleaned_up_and_cancelled() {
+        let directory = tempdir().unwrap();
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let (client_read, client_write) = split(client_stream);
+        let (server_read, _server_write) = split(server_stream);
+        let (heard, mut methods) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            let mut server_read = BufReader::new(server_read);
+            while let Ok(Some(message)) = read_frame(&mut server_read, 64 * 1024 * 1024).await {
+                let method = message["method"].as_str().unwrap_or_default().to_owned();
+                let _ = heard.send(method);
+            }
+        });
+        let mut settings = test_settings(Duration::from_millis(20), 20, 1000);
+        settings.request_timeout = Duration::from_secs(30);
+        let client = LspClient::from_io(
+            "abandoned".into(),
+            directory.path().to_path_buf(),
+            fake_languages(),
+            ClientTransport {
+                reader: Box::new(client_read),
+                writer: Box::new(client_write),
+                child: None,
+            },
+            settings,
+            Value::Null,
+        );
+        let request = client.request("test/slow", json!({}), Duration::from_secs(30));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), request)
+                .await
+                .is_err()
+        );
+        assert!(
+            lock_unpoisoned(&client.pending).is_empty(),
+            "the abandoned request is still pending"
+        );
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(method) = methods.recv().await {
+                if method == "$/cancelRequest" {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(cancelled, Ok(true), "the server was never told to stop");
+        assert!(
+            client.is_alive(),
+            "a whole frame was written; the stream is fine"
+        );
+        drop(client);
+        server.abort();
+    }
+
+    /// A write its caller abandons halfway retires the stream rather than leave half a frame on it.
+    #[tokio::test]
+    async fn a_write_its_caller_abandons_halfway_retires_the_transport() {
+        let directory = tempdir().unwrap();
+        let (client_read, _server_write) = duplex(1024);
+        let (client_write, _server_read) = duplex(64);
+        let client = LspClient::from_io(
+            "half-written".into(),
+            directory.path().to_path_buf(),
+            fake_languages(),
+            ClientTransport {
+                reader: Box::new(client_read),
+                writer: Box::new(client_write),
+                child: None,
+            },
+            test_settings(Duration::from_millis(20), 20, 1000),
+            Value::Null,
+        );
+        let large = json!({ "text": "x".repeat(32 * 1024) });
+        let request = client.request("test/large", large, Duration::from_secs(30));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), request)
+                .await
+                .is_err()
+        );
+        assert!(
+            !client.is_alive(),
+            "half a frame is on the stream, yet it is still used"
+        );
+        assert!(lock_unpoisoned(&client.pending).is_empty());
     }
 
     #[tokio::test]

@@ -910,6 +910,7 @@ async fn a_refusal_after_cd_names_no_folder_and_asks_for_workdir() {
 }
 
 /// The scratch folder the model was last shown, read from what it was sent.
+#[cfg(unix)]
 fn scratch_shown(world: &World) -> String {
     let sent: Vec<Value> = std::iter::from_fn(|| world.provider.seen.try_recv().ok()).collect();
     let system = sent.last().expect("the model was sent nothing")["messages"][0]["content"]

@@ -269,6 +269,7 @@ pub async fn start(
         live_context.clone(),
         memory_store.clone(),
         artifacts.clone(),
+        known_tools.clone(),
     );
 
     let policy: Arc<dyn kernel::Policy> = live_settings.clone();

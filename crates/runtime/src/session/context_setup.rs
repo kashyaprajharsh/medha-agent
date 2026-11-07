@@ -7,6 +7,7 @@ pub(super) fn build(
     live_context: Arc<crate::project_session::LiveContext>,
     memory_store: Arc<memory::MemoryProjection>,
     artifacts: Arc<dyn kernel::ArtifactStore>,
+    known_tools: std::collections::HashSet<String>,
 ) -> Arc<context::PipelineEngine> {
     let Setup { lock, options, .. } = *setup;
     let k3_budget_tokens = lock.memory.k3_budget_tokens;
@@ -64,6 +65,7 @@ pub(super) fn build(
                     k3_budget_tokens,
                     now,
                     stale_after_days,
+                    &known_tools,
                 ) {
                     Ok(snapshot) => (
                         recall_context.replace_memory(&snapshot.text),

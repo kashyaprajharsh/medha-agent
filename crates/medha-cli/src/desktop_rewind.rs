@@ -130,11 +130,18 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|value| value.as_secs_f64())
                 .unwrap_or_default();
+            let tools = kernel
+                .executor
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect();
             let block = memory::recall::compile_k3_configured(
                 memory,
                 resources.memory_budget,
                 now,
                 resources.memory_stale_days,
+                &tools,
             )
             .map_err(|e| e.to_string())?;
             updated_memory = Some(block);

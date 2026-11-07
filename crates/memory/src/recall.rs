@@ -66,12 +66,34 @@ pub(crate) fn entry_index_tokens(
     ))
 }
 
+/// The index's closing line for every tool that reads further, used where a chat's tools are not known.
+const EVERY_POINTER: &str =
+    "\n…full entries: memory (op \"search\") · past sessions: sessions.search";
+
+/// Where the model reads further than the index, naming only tools in `tools`.
+fn pointers(tools: &std::collections::HashSet<String>) -> String {
+    let named = [
+        ("memory", "full entries: memory (op \"search\")"),
+        ("sessions.search", "past sessions: sessions.search"),
+    ];
+    let found: Vec<&str> = named
+        .iter()
+        .filter(|(tool, _)| tools.contains(*tool))
+        .map(|(_, said)| *said)
+        .collect();
+    match found.is_empty() {
+        true => String::new(),
+        false => format!("\n…{}", found.join(" · ")),
+    }
+}
+
 fn render(
     selected: &[(MemoryEntry, String)],
     budget_tokens: u32,
     now: f64,
     stale_after_days: u32,
     counter: &dyn TokenCounter,
+    footer: &str,
 ) -> String {
     let project = selected
         .iter()
@@ -89,7 +111,7 @@ fn render(
             next.push('\n');
             next.push_str(&line(entry, now, description, stale_after_days));
         }
-        next.push_str("\n…full entries: memory.search · past sessions: sessions.search");
+        next.push_str(footer);
         let counted = counter.count(&next);
         block = next;
         if counted == usage {
@@ -121,17 +143,18 @@ pub(crate) fn full_index_tokens(
         now,
         stale_after_days,
         counter,
+        EVERY_POINTER,
     ))
 }
+
+/// An entry picked for the index, with the description it is shown with.
+type Chosen = (MemoryEntry, String);
 
 fn fit_pinned_description(
     selected: &[(MemoryEntry, String)],
     entry: &MemoryEntry,
     description: &str,
-    budget_tokens: u32,
-    now: f64,
-    stale_after_days: u32,
-    counter: &dyn TokenCounter,
+    fits: &dyn Fn(&[Chosen]) -> bool,
 ) -> Option<String> {
     let chars: Vec<char> = description.chars().collect();
     let mut lo = 0;
@@ -145,14 +168,7 @@ fn fit_pinned_description(
         }
         let mut trial = selected.to_vec();
         trial.push((entry.clone(), clipped.clone()));
-        if counter.count(&render(
-            &trial,
-            budget_tokens,
-            now,
-            stale_after_days,
-            counter,
-        )) <= budget_tokens
-        {
+        if fits(&trial) {
             best = Some(clipped);
             lo = mid + 1;
         } else if mid == 0 {
@@ -176,6 +192,7 @@ fn compile_snapshot_with_counter(
     now: f64,
     stale_after_days: u32,
     counter: &dyn TokenCounter,
+    footer: &str,
 ) -> Result<RecallSnapshot, MemoryError> {
     if budget_tokens == 0 {
         return Ok(RecallSnapshot {
@@ -193,7 +210,7 @@ fn compile_snapshot_with_counter(
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    let empty = render(&[], budget_tokens, now, stale_after_days, counter);
+    let empty = render(&[], budget_tokens, now, stale_after_days, counter, footer);
     if counter.count(&empty) > budget_tokens {
         return Ok(RecallSnapshot {
             text: String::new(),
@@ -201,30 +218,19 @@ fn compile_snapshot_with_counter(
         });
     }
 
+    let fits = |trial: &[(MemoryEntry, String)]| {
+        let text = render(trial, budget_tokens, now, stale_after_days, counter, footer);
+        counter.count(&text) <= budget_tokens
+    };
     let mut selected: Vec<(MemoryEntry, String)> = Vec::new();
     for entry in entries {
         let description = one_line(&entry.description);
         let mut trial = selected.clone();
         trial.push((entry.clone(), description.clone()));
-        if counter.count(&render(
-            &trial,
-            budget_tokens,
-            now,
-            stale_after_days,
-            counter,
-        )) <= budget_tokens
-        {
+        if fits(&trial) {
             selected = trial;
         } else if entry.pinned
-            && let Some(clipped) = fit_pinned_description(
-                &selected,
-                &entry,
-                &description,
-                budget_tokens,
-                now,
-                stale_after_days,
-                counter,
-            )
+            && let Some(clipped) = fit_pinned_description(&selected, &entry, &description, &fits)
         {
             selected.push((entry, clipped));
         }
@@ -235,7 +241,14 @@ fn compile_snapshot_with_counter(
             trust.min(entry.trust)
         });
     Ok(RecallSnapshot {
-        text: render(&selected, budget_tokens, now, stale_after_days, counter),
+        text: render(
+            &selected,
+            budget_tokens,
+            now,
+            stale_after_days,
+            counter,
+            footer,
+        ),
         trust,
     })
 }
@@ -247,15 +260,24 @@ fn compile_with_counter(
     stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> Result<String, MemoryError> {
-    compile_snapshot_with_counter(store, budget_tokens, now, stale_after_days, counter)
-        .map(|snapshot| snapshot.text)
+    compile_snapshot_with_counter(
+        store,
+        budget_tokens,
+        now,
+        stale_after_days,
+        counter,
+        EVERY_POINTER,
+    )
+    .map(|snapshot| snapshot.text)
 }
 
+/// The recall index for a chat whose tools are `tools`; it points only at those.
 pub fn compile_k3_snapshot(
     store: &MemoryProjection,
     budget_tokens: u32,
     now: f64,
     stale_after_days: u32,
+    tools: &std::collections::HashSet<String>,
 ) -> Result<RecallSnapshot, MemoryError> {
     compile_snapshot_with_counter(
         store,
@@ -263,7 +285,19 @@ pub fn compile_k3_snapshot(
         now,
         stale_after_days,
         &BpeCounter::o200k(),
+        &pointers(tools),
     )
+}
+
+pub fn compile_k3_configured(
+    store: &MemoryProjection,
+    budget_tokens: u32,
+    now: f64,
+    stale_after_days: u32,
+    tools: &std::collections::HashSet<String>,
+) -> Result<String, MemoryError> {
+    compile_k3_snapshot(store, budget_tokens, now, stale_after_days, tools)
+        .map(|snapshot| snapshot.text)
 }
 
 /// Compile the deterministic recall snapshot. `now` is injected so replay and
@@ -273,20 +307,11 @@ pub fn compile_k3(
     budget_tokens: u32,
     now: f64,
 ) -> Result<String, MemoryError> {
-    compile_k3_configured(store, budget_tokens, now, DEFAULT_STALE_AFTER_DAYS)
-}
-
-pub fn compile_k3_configured(
-    store: &MemoryProjection,
-    budget_tokens: u32,
-    now: f64,
-    stale_after_days: u32,
-) -> Result<String, MemoryError> {
     compile_with_counter(
         store,
         budget_tokens,
         now,
-        stale_after_days,
+        DEFAULT_STALE_AFTER_DAYS,
         &BpeCounter::o200k(),
     )
 }
@@ -462,7 +487,7 @@ mod tests {
                 ),
             })
             .unwrap();
-        let block = compile_k3_configured(&store, 1_200, now, 90).unwrap();
+        let block = compile_k3_configured(&store, 1_200, now, 90, &Default::default()).unwrap();
         assert!(block.contains("old-but-allowed"));
         assert!(!block.contains("⚠ verify before asserting"));
     }

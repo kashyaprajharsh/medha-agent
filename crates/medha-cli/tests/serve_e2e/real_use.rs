@@ -43,7 +43,6 @@ fn two_branch_repo(folder: &Path) {
 }
 
 /// Sends a plain first message, the point every rewind below returns to.
-#[cfg(unix)]
 async fn first_message(client: &mut Client, chat: &str) {
     client.send(chat, "Hi").await;
     client.until(|frame| kind(frame, "turn.done")).await;
@@ -760,6 +759,46 @@ async fn a_memory_about_the_user_is_saved_and_a_wrong_kind_names_the_right_ones(
     assert!(
         sent.contains("platform engineer"),
         "the next chat recalls who the user is"
+    );
+}
+
+/// The memory index points the model only at tools this chat was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_memory_index_names_only_tools_the_chat_has() {
+    let world = World::new();
+    let folder = world.folder("recall-tools");
+    std::fs::write(
+        folder.join("medha.lock"),
+        "[tools]\ndeny = [\"sessions.search\"]\n",
+    )
+    .unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let saver = client.open(&folder).await;
+    let fact = json!({"op": "write", "name": "deploy-target", "claim": "Deploys go to the staging cluster.",
+        "description": "Deploys go to staging", "kind": "project"});
+    scripted(&mut client, &world, &saver, &[format!("memory {fact}")]).await;
+    assert_eq!(result_of(&world, &saver, 0).await["status"], "ok");
+
+    let chat = client.open(&folder).await;
+    first_message(&mut client, &chat).await;
+    let sent = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap();
+    let system = sent["messages"][0]["content"].as_str().unwrap_or_default();
+    let footer = system
+        .lines()
+        .find(|line| line.starts_with("…full entries"))
+        .unwrap_or_else(|| panic!("no memory index footer: {system}"));
+    let tools = super::offered(&sent);
+    assert!(tools.contains(&"memory".to_string()), "{tools:?}");
+    assert!(
+        footer.contains("memory") && !footer.contains("memory.search"),
+        "the footer names a tool the chat lacks: {footer}"
+    );
+    assert!(
+        !footer.contains("sessions.search"),
+        "the footer names a switched-off tool: {footer}"
     );
 }
 

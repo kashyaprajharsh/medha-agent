@@ -122,6 +122,7 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
             lock.memory.k3_budget_tokens,
             now,
             lock.memory.stale_after_days,
+            known_tools,
         )?;
         system = live_context.replace_memory(&k3.text);
         if !k3.text.is_empty() {

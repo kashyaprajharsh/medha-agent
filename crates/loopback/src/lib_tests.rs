@@ -47,3 +47,70 @@ async fn a_busy_preferred_port_falls_back_to_a_free_one() {
     let other = bind(Some(taken.port())).await.unwrap();
     assert_ne!(other.port(), taken.port());
 }
+
+/// Whether the listener ends this connection within two seconds, read to its end.
+async fn closed_soon(stream: &mut tokio::net::TcpStream) -> bool {
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut rest),
+    )
+    .await
+    .is_ok()
+}
+
+/// A request line that never ends is cut off at its size limit, not buffered until the timeout.
+#[tokio::test]
+async fn an_endless_request_line_is_cut_off_at_its_limit() {
+    let listener = bind(None).await.unwrap();
+    let port = listener.port();
+    let _caught = tokio::spawn(listener.redirect("s"));
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _ = stream.write_all(&vec![b'A'; 64 * 1024]).await;
+    assert!(
+        closed_soon(&mut stream).await,
+        "the listener kept buffering"
+    );
+}
+
+/// Once the grant arrives, connections still open are closed, not left to run out their timeout.
+#[tokio::test]
+async fn finishing_sign_in_closes_the_connections_still_open() {
+    let listener = bind(None).await.unwrap();
+    let port = listener.port();
+    let caught = tokio::spawn(listener.redirect("s"));
+    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert!(ask(port, "/cb?code=c&state=s").await.contains("Signed in"));
+    caught.await.unwrap().unwrap();
+    assert!(
+        closed_soon(&mut silent).await,
+        "a connection outlived sign-in"
+    );
+}
+
+/// Connections past the limit are closed at once instead of each starting a task.
+#[tokio::test]
+async fn connections_past_the_limit_are_closed_at_once() {
+    let listener = bind(None).await.unwrap();
+    let port = listener.port();
+    let _caught = tokio::spawn(listener.redirect("s"));
+    let mut held = Vec::new();
+    for _ in 0..CONNECTIONS {
+        held.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
+    }
+    let mut extra = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert!(
+        closed_soon(&mut extra).await,
+        "no limit on open connections"
+    );
+}

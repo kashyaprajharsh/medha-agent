@@ -2,7 +2,7 @@
 //! redirect, and the system browser. Only a person's action should reach either.
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
 };
 
@@ -12,6 +12,13 @@ const DONE: &str = "<!doctype html><meta charset=utf-8><title>Medha</title>\
 const FAILED: &str =
     "<!doctype html><meta charset=utf-8><p>Sign-in did not finish. Return to Medha for details.";
 const WAITING: &str = "<!doctype html><meta charset=utf-8><p>Waiting for the sign-in redirect…";
+
+/// Connections answered at once during one sign-in; more are closed unread.
+const CONNECTIONS: usize = 64;
+/// Longest request line read; a browser's redirect is far shorter.
+const REQUEST_LINE: u64 = 8 * 1024;
+/// How long one connection may take to ask, and to be answered.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A listener on 127.0.0.1, bound before the browser opens: its port is part of the redirect.
 pub struct Listener {
@@ -53,17 +60,20 @@ impl Listener {
     /// else (a favicon, a stray page, another sign-in) is told to wait, and a silent connection is dropped.
     pub async fn redirect(self, state: &str) -> std::io::Result<Redirect> {
         let (found, mut arrived) = tokio::sync::mpsc::channel(1);
+        // Owned by this sign-in: when it returns, every connection still open is closed.
+        let mut answering = tokio::task::JoinSet::new();
         loop {
             let (stream, peer) = tokio::select! {
                 accepted = self.inner.accept() => accepted?,
                 Some(redirect) = arrived.recv() => return Ok(redirect),
+                Some(_) = answering.join_next(), if !answering.is_empty() => continue,
             };
-            // Bound to loopback already; anything else is refused rather than parsed.
-            if !peer.ip().is_loopback() {
+            // Bound to loopback already; anything else, or one too many, is closed unread.
+            if !peer.ip().is_loopback() || answering.len() >= CONNECTIONS {
                 continue;
             }
             let (found, state) = (found.clone(), state.to_owned());
-            tokio::spawn(async move {
+            answering.spawn(async move {
                 if let Some(redirect) = answer(stream, &state).await {
                     let _ = found.send(redirect).await;
                 }
@@ -75,14 +85,13 @@ impl Listener {
 /// One connection: its redirect when it ends this sign-in, after the browser is answered.
 async fn answer(stream: tokio::net::TcpStream, state: &str) -> Option<Redirect> {
     let mut reader = BufReader::new(stream);
-    let mut request = String::new();
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        reader.read_line(&mut request),
-    );
-    if !matches!(read.await, Ok(Ok(_))) {
+    let mut line = Vec::new();
+    let mut limited = (&mut reader).take(REQUEST_LINE);
+    let read = tokio::time::timeout(WAIT, limited.read_until(b'\n', &mut line));
+    if !matches!(read.await, Ok(Ok(_))) || !line.ends_with(b"\n") {
         return None;
     }
+    let request = String::from_utf8_lossy(&line);
     let target = request.split_whitespace().nth(1).unwrap_or_default();
     let redirect = Redirect(query_pairs(target));
     let ours = redirect.get("state") == Some(state);
@@ -99,8 +108,11 @@ async fn answer(stream: tokio::net::TcpStream, state: &str) -> Option<Redirect> 
         body.len()
     );
     let mut stream = reader.into_inner();
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.shutdown().await;
+    let reply = async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await
+    };
+    let _ = tokio::time::timeout(WAIT, reply).await;
     (failed || granted).then_some(redirect)
 }
 

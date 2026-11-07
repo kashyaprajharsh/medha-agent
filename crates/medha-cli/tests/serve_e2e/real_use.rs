@@ -839,6 +839,37 @@ async fn a_memory_saved_while_a_chat_opens_reaches_that_chat() {
     );
 }
 
+/// A misspelled limit stops the chat with the key named; another unknown key opens it with a notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_misspelled_setting_is_named_and_a_misspelled_limit_stops_the_chat() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+
+    let limited = world.folder("typo-limit");
+    std::fs::write(limited.join("medha.lock"), "[budget]\nmax_toknes = 1\n").unwrap();
+    let refused = client.create(&limited, None).await;
+    assert!(
+        refused["result"]["session"].is_null()
+            && refused["error"].to_string().contains("max_toknes"),
+        "a misspelled limit opened a chat with no limit: {refused}"
+    );
+
+    let other = world.folder("typo-other");
+    std::fs::write(other.join("medha.lock"), "[memory]\nenabeld = false\n").unwrap();
+    let made = client.create(&other, None).await;
+    assert!(
+        made["result"]["session"].is_string(),
+        "an unknown key outside a limit blocked the chat: {made}"
+    );
+    assert!(
+        made["result"]["about"]["notices"]
+            .to_string()
+            .contains("memory.enabeld"),
+        "the unknown key was not named: {made}"
+    );
+}
+
 /// The memory index points the model only at tools this chat was given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_memory_index_names_only_tools_the_chat_has() {

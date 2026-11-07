@@ -97,6 +97,9 @@ pub struct MedhaLock {
     pub gate: GateConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// Keys in the file that Medha does not know, such as `memory.enabeld`, to be named to the user.
+    #[serde(skip)]
+    pub unknown: Vec<String>,
 }
 
 /// Which tools a session exposes.
@@ -562,8 +565,9 @@ pub struct RoutingConfig {
     pub verifier: Option<String>,
 }
 
+/// A misspelled limit is refused, not dropped: dropping it would leave no limit at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u64>,
@@ -752,7 +756,12 @@ impl ReasoningLockConfig {
 impl MedhaLock {
     /// Parse a lock file's TOML text.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let lock: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut unknown = Vec::new();
+        let mut lock: Self = serde_ignored::deserialize(toml::Deserializer::new(text), |key| {
+            unknown.push(key.to_string());
+        })
+        .map_err(|e| e.to_string())?;
+        lock.unknown = unknown;
         lock.sandbox.validate()?;
         lock.tools.validate()?;
         lock.reasoning.to_config()?;

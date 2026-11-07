@@ -6,6 +6,14 @@ pub(super) fn warn_unknown(
     registered_tools: &std::collections::HashSet<String>,
     notices: &dyn Notices,
 ) {
+    if !lock.unknown.is_empty() {
+        notices.say(&format!(
+            "warning: medha.lock has {} setting(s) Medha does not know: {}. They change nothing; \
+             check the spelling",
+            lock.unknown.len(),
+            lock.unknown.join(", ")
+        ));
+    }
     let stale = unknown_approvals(&lock.policy.approve, registered_tools);
     if !stale.is_empty() {
         notices.say(&format!(

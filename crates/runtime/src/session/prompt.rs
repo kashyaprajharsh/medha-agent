@@ -107,12 +107,15 @@ pub(super) async fn build(setup: &Setup<'_>, input: Input<'_>) -> Result<String>
         }
     }
     if lock.memory.enabled {
+        // Held from reading the log to the rebuild, so a memory another chat is saving is never erased by it.
+        let lease = kernel::EventLog::acquire_mutation_lease(log, "memory:*").await?;
         // Project memory is every chat's, a branch's included; a fork's copies of its parent's events count once.
         memory_store.rebuild_project(
             log.all_events()?
                 .into_iter()
                 .filter(|event| event.provenance.source != "fork"),
         )?;
+        drop(lease);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())

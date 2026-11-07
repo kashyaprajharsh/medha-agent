@@ -762,6 +762,83 @@ async fn a_memory_about_the_user_is_saved_and_a_wrong_kind_names_the_right_ones(
     );
 }
 
+/// A memory another chat is saving while this one opens is in this chat's recall, never erased by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_memory_saved_while_a_chat_opens_reaches_that_chat() {
+    let world = World::new();
+    let folder = world.folder("memory-race");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let saver = client.open(&folder).await;
+    first_message(&mut client, &saver).await;
+    let state = std::fs::read_dir(world.home().join("projects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("events.db").is_file())
+        .unwrap();
+    let log = store::SqliteLog::open_with_mutation_lock(
+        state.join("events.db"),
+        world.home().join("mutations.db"),
+    )
+    .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let entry = memory::MemoryEntry {
+        name: "release-day".into(),
+        claim: "Releases ship on Thursdays.".into(),
+        description: "Releases ship on Thursdays".into(),
+        kind: memory::MemoryKind::Project,
+        scope: memory::Scope::Project,
+        trust: kernel::TrustLabel::User,
+        confidence: memory::ConfidenceRung::UserStated,
+        provenance: Vec::new(),
+        sessions: Vec::new(),
+        version: 1,
+        pinned: false,
+        links: Vec::new(),
+        created: now,
+        updated: now,
+    };
+    let op = serde_json::to_value(memory::MemoryOp::Write { entry }).unwrap();
+    let mut session = kernel::Session::new();
+    session.id = saver.parse().unwrap();
+
+    let mut window = backend.connect().await;
+    let chat = {
+        // Held as a chat holds it from its memory write until the write is logged.
+        let lease = log
+            .acquire_mutation_lease("memory:project:release-day")
+            .await
+            .unwrap();
+        let opening = window.open(&folder);
+        tokio::pin!(opening);
+        let early = tokio::select! {
+            chat = &mut opening => Some(chat),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => None,
+        };
+        log.append(kernel::Event::memory_write(&session, op))
+            .await
+            .unwrap();
+        drop(lease);
+        match early {
+            Some(chat) => chat,
+            None => opening.await,
+        }
+    };
+    first_message(&mut window, &chat).await;
+    let sent = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(
+        sent.contains("Releases ship on Thursdays"),
+        "the chat opened without the memory saved meanwhile"
+    );
+}
+
 /// The memory index points the model only at tools this chat was given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_memory_index_names_only_tools_the_chat_has() {

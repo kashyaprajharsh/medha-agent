@@ -775,3 +775,26 @@ async fn a_tools_switch_goes_where_its_scope_says_and_one_it_cannot_honour_says_
             if id == "github" && tool == "merge_pull_request"
     ));
 }
+
+/// A command typed in full runs itself, though a longer command that starts with it is listed first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_typed_in_full_runs_itself_not_a_longer_one_listed_first() {
+    let mut f = fixture().await;
+    for c in "/mode".chars() {
+        input::handle_key(&mut f.model, key(KeyCode::Char(c)));
+    }
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    let pending = &f.model.remote.as_ref().unwrap().pending;
+    let models_asked = pending
+        .iter()
+        .any(|asked| matches!(asked.effect, Effect::Read(Read::Models, _)));
+    assert!(!models_asked, "/mode ran /model instead");
+    let opened = f.model.picker.as_ref().map(|picker| picker.kind.labels());
+    assert!(
+        matches!(
+            f.model.picker.as_ref().map(|picker| &picker.kind),
+            Some(PickerKind::AutonomyMode)
+        ),
+        "/mode opened something else: {opened:?}"
+    );
+}

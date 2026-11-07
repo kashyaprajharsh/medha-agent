@@ -490,8 +490,10 @@ export function Composer(props: Props) {
               !event.nativeEvent.isComposing
             ) {
               event.preventDefault();
+              // A command typed in full is the one meant; the highlight only completes a partial name.
+              const exact = commands.find((entry) => entry.id === slash);
               if (commands.length)
-                command(commands[commandIndex]?.id ?? commands[0].id);
+                command(exact?.id ?? commands[commandIndex]?.id ?? commands[0].id);
               else if (canSend) props.onSend();
             }
           }}

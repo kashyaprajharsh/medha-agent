@@ -62,8 +62,12 @@ pub(super) fn autocomplete(model: &mut Model, key: KeyEvent) -> bool {
     // Autocomplete handling
     if model.input.starts_with('/') {
         let matches = command_matches(model);
+        // A command typed in full is the one meant; the highlight only completes a partial name.
+        let typed = model.input.trim();
+        let exact = matches.iter().position(|(name, _)| name == typed);
+        let chosen = exact.unwrap_or(model.ac_sel.min(matches.len().saturating_sub(1)));
         let chosen_plugin_command = matches
-            .get(model.ac_sel.min(matches.len().saturating_sub(1)))
+            .get(chosen)
             .filter(|(name, _)| {
                 model
                     .remote
@@ -109,7 +113,10 @@ pub(super) fn autocomplete(model: &mut Model, key: KeyEvent) -> bool {
                         .modifiers
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    let cmd = matches[model.ac_sel].0.trim_start_matches('/').to_string();
+                    let cmd = matches[exact.unwrap_or(model.ac_sel)]
+                        .0
+                        .trim_start_matches('/')
+                        .to_string();
                     model.input.clear();
                     model.cursor = 0;
                     model.ac_sel = 0;

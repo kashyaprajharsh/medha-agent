@@ -2951,3 +2951,37 @@ test("a tool switch saves where its scope says, and one it cannot honour there s
     ["settings.tools.switch", { tool: "lsp.start", on: true, scope: "project" }],
   ]);
 });
+
+test("a command typed in full runs itself, not a longer one listed first", async () => {
+  const opened = [];
+  await act(() =>
+    root.render(
+      h(Composer, {
+        value: "/mode",
+        onChange() {},
+        onSend() {},
+        onStop() {},
+        running: false,
+        disabled: false,
+        placeholder: "Task",
+        settings,
+        settingsLocked: false,
+        control: null,
+        onControl: (id) => opened.push(id),
+        onLoadSettings: async () => {},
+        onConfigure: async () => {},
+        showReasoning: true,
+        onShowReasoning() {},
+        attachments: [],
+        onAttachments() {},
+        onSurface() {},
+        onNew() {},
+        onRewind() {},
+        onSettings() {},
+        onExtensions() {},
+      }),
+    ),
+  );
+  await key(document.querySelector("textarea"), "Enter");
+  assert.deepEqual(opened, ["mode"], "typing /mode opened another control");
+});

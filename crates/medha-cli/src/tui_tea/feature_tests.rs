@@ -798,3 +798,58 @@ async fn a_command_typed_in_full_runs_itself_not_a_longer_one_listed_first() {
         "/mode opened something else: {opened:?}"
     );
 }
+
+/// `/resume` lists the desktop's personal chats too, and picking one opens it in its own folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_lists_personal_chats_and_opens_one_where_it_lives() {
+    let mut f = fixture().await;
+    for c in "/resume".chars() {
+        input::handle_key(&mut f.model, key(KeyCode::Char(c)));
+    }
+    input::handle_key(&mut f.model, key(KeyCode::Esc));
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    let pending = &f.model.remote.as_ref().unwrap().pending;
+    assert!(
+        pending
+            .iter()
+            .any(|asked| matches!(asked.effect, Effect::Chats)),
+        "/resume did not ask for the personal chats"
+    );
+
+    let chat = |id: &str, title: &str, updated: f64| protocol::SessionSummary {
+        id: id.into(),
+        started: updated,
+        updated,
+        title: Some(title.into()),
+        model: None,
+        events: 3,
+        agents: 0,
+    };
+    let here = ulid::Ulid::new().to_string();
+    let personal = ulid::Ulid::new().to_string();
+    let folder = std::path::PathBuf::from("/data/personal/chat-a");
+    backend_features::chats_listed(
+        &mut f.model,
+        vec![chat(&here, "this folder", 20.0)],
+        vec![(folder.clone(), chat(&personal, "on the desktop", 10.0))],
+    );
+    let rows = f.model.picker.as_ref().unwrap().kind.labels();
+    let row = rows
+        .iter()
+        .position(|row| row.contains("on the desktop"))
+        .unwrap();
+    assert!(
+        rows[row].contains("Chats"),
+        "a personal chat is not marked: {rows:?}"
+    );
+    f.model.picker.as_mut().unwrap().selected = row;
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    let pending = &f.model.remote.as_ref().unwrap().pending;
+    assert!(
+        pending.iter().any(|asked| matches!(
+            &asked.effect,
+            Effect::Resume(id, Some(at)) if *id == personal && *at == folder
+        )),
+        "the personal chat was not opened in its own folder"
+    );
+}

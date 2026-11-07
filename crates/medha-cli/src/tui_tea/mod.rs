@@ -1842,6 +1842,8 @@ struct Model {
     /// TUI has not completed a turn yet (resumed history does not retain it).
     last_turn_reasoning_received: Option<bool>,
     picker: Option<Picker>,
+    /// Personal chats `/resume` listed, with the folder each opens in.
+    chat_folders: HashMap<ulid::Ulid, std::path::PathBuf>,
     ac_sel: usize,
     welcome: bool,
     show_thinking: bool,
@@ -2137,6 +2139,7 @@ impl Model {
             streamed_this_turn: 0,
             last_turn_reasoning_received: None,
             picker: None,
+            chat_folders: HashMap::new(),
             ac_sel: 0,
             welcome: true,
             show_thinking: ui.show_thinking,

@@ -157,7 +157,10 @@ pub(super) enum Effect {
     UseSkill(protocol::UseSkill),
     Rewind(protocol::Rewind),
     Points,
-    Resume(String),
+    /// A chat to reopen, in its own folder when that is not this one (a desktop personal chat).
+    Resume(String, Option<PathBuf>),
+    /// This folder's chats and the desktop's personal chats, for `/resume`.
+    Chats,
     Reconnect,
     Clear,
     Snapshot,
@@ -265,7 +268,7 @@ impl Effect {
             Self::RefreshProviders => 0,
             Self::UseSkill(p) => size(p),
             Self::Rewind(p) => size(p),
-            Self::Resume(id) => id.len(),
+            Self::Resume(id, _) => id.len(),
             // Image decoding has its own source/dimension/output bounds and only
             // one staged load. Reserve the complete possible wire payload.
             Self::Images { .. } => wire::MAX_FRAME,
@@ -284,7 +287,7 @@ pub(super) fn request(model: &mut Model, effect: Effect) -> bool {
     if peer.ended
         && !matches!(
             effect,
-            Effect::Resume(_) | Effect::Clear | Effect::Reconnect
+            Effect::Resume(..) | Effect::Clear | Effect::Reconnect
         )
     {
         model.command_refused = true;
@@ -408,12 +411,18 @@ enum Answer {
     Points(protocol::RewindPoints),
     Snapshot(Box<protocol::PresentationSnapshot>),
     Opened(Box<Opened>),
+    /// This folder's chats, then the desktop's personal chats with the folder each lives in.
+    Chats(
+        Vec<protocol::SessionSummary>,
+        Vec<(PathBuf, protocol::SessionSummary)>,
+    ),
     Images(Vec<staged_images::Image>),
     /// Ctrl+V found text rather than an image: it is pasted as the terminal would have.
     ClipboardText(String),
     Reloaded(protocol::ExtensionsReloaded),
 }
 struct Opened {
+    folder: PathBuf,
     connection: Arc<Connection>,
     view: View,
     snapshot: protocol::PresentationSnapshot,
@@ -540,6 +549,7 @@ async fn opened(
         return Err("The backend returned an invalid terminal bootstrap".into());
     };
     Ok(Opened {
+        folder,
         connection,
         view,
         snapshot,
@@ -569,7 +579,7 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
     } = context;
     let connection = if matches!(
         effect,
-        Effect::Resume(_) | Effect::Reconnect | Effect::Clear
+        Effect::Resume(..) | Effect::Reconnect | Effect::Clear
     ) {
         tokio::task::spawn_blocking(move || backend.connection())
             .await
@@ -789,9 +799,35 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             .call_chat(&chat, &protocol::GetPresentation {})
             .await
             .map(|snapshot| Answer::Snapshot(Box::new(snapshot))),
-        Effect::Resume(id) => opened(connection, folder, startup, Some(id.clone()), None)
-            .await
-            .map(|o| Answer::Opened(Box::new(o))),
+        Effect::Resume(id, chat_folder) => {
+            let folder = chat_folder.clone().unwrap_or(folder);
+            opened(connection, folder, startup, Some(id.clone()), None)
+                .await
+                .map(|o| Answer::Opened(Box::new(o)))
+        }
+        Effect::Chats => {
+            let here = match connection
+                .call_chat(&chat, &protocol::ChatResource(Read::Sessions))
+                .await?
+            {
+                Resource::Sessions(here) => here,
+                _ => Vec::new(),
+            };
+            // A personal chat folder that cannot be listed is left out, never the whole list.
+            let mut personal = Vec::new();
+            for chat_folder in crate::personal_chats::folders() {
+                if chat_folder == folder {
+                    continue;
+                }
+                let listed = connection
+                    .call_async(protocol::Scope::Folder(&chat_folder), &Read::Sessions)
+                    .await;
+                if let Ok(Resource::Sessions(found)) = listed {
+                    personal.extend(found.into_iter().map(|chat| (chat_folder.clone(), chat)));
+                }
+            }
+            Ok(Answer::Chats(here, personal))
+        }
         Effect::Reconnect => opened(connection, folder, startup, Some(conversation), settings)
             .await
             .map(|o| Answer::Opened(Box::new(o))),
@@ -1908,7 +1944,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                 Effect::Question(answer) => {
                     peer.questions_answering.remove(&answer.question_id);
                 }
-                Effect::Resume(_) | Effect::Clear | Effect::Rewind(_) | Effect::Reconnect => {
+                Effect::Resume(..) | Effect::Clear | Effect::Rewind(_) | Effect::Reconnect => {
                     model.session_op = None
                 }
                 Effect::Snapshot => {
@@ -2193,13 +2229,17 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                     );
                 }
             }
+            Answer::Chats(here, personal) => backend_features::chats_listed(model, here, personal),
             Answer::Opened(opened) => {
                 let Opened {
+                    folder,
                     connection,
                     view,
                     snapshot,
                     bootstrap,
                 } = *opened;
+                // A personal chat opened from here is worked on in its own folder from now on.
+                peer.folder = folder;
                 peer.connection = connection;
                 *stream = view;
                 peer.chat = stream.chat();

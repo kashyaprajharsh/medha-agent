@@ -354,7 +354,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
     use input::SlashAction as A;
     match input::classify_slash(command) {
         A::Resume => {
-            request(model, Effect::Read(Read::Sessions, After::Notice));
+            request(model, Effect::Chats);
         }
         A::Rewind => {
             if boundary_allowed(model) {
@@ -519,12 +519,52 @@ pub(super) fn resume(model: &mut Model, id: String) {
         .as_ref()
         .and_then(|peer| peer.conversation.parse().ok())
         .zip(id.parse().ok());
-    if request(model, Effect::Resume(id))
+    let folder = id
+        .parse()
+        .ok()
+        .and_then(|id| model.chat_folders.get(&id).cloned());
+    if request(model, Effect::Resume(id, folder))
         && let Some((source, target)) = ids
     {
         model.session_op = Some(SessionOp::Resume { source, target });
     }
 }
+/// `/resume`: this folder's chats, then the desktop's personal chats, newest first, each opening where it lives.
+pub(super) fn chats_listed(
+    model: &mut Model,
+    here: Vec<protocol::SessionSummary>,
+    mut personal: Vec<(std::path::PathBuf, protocol::SessionSummary)>,
+) {
+    personal.sort_by(|a, b| b.1.updated.total_cmp(&a.1.updated));
+    let meta = |chat: protocol::SessionSummary, marker: &str| {
+        let id = chat.id.parse().ok()?;
+        let title = chat.title.unwrap_or_default();
+        let title = match chat.agents {
+            0 => title,
+            1 => format!("{title} · 1 sub-agent"),
+            n => format!("{title} · {n} sub-agents"),
+        };
+        Some(kernel::SessionMeta {
+            id,
+            title: format!("{marker}{title}"),
+            started_ts: chat.started,
+            last_ts: chat.updated,
+            events: chat.events,
+            parent: None,
+        })
+    };
+    model.chat_folders.clear();
+    let mut sessions: Vec<kernel::SessionMeta> =
+        here.into_iter().filter_map(|chat| meta(chat, "")).collect();
+    for (folder, chat) in personal {
+        if let Some(listed) = meta(chat, "Chats · ") {
+            model.chat_folders.insert(listed.id, folder);
+            sessions.push(listed);
+        }
+    }
+    model.picker = Some(Picker::new(PickerKind::Session(sessions)));
+}
+
 pub(super) fn rewind(model: &mut Model, event: String, scope: RewindScope) {
     if !boundary_allowed(model) {
         return;

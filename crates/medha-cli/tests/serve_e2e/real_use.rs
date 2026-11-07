@@ -712,6 +712,44 @@ async fn a_rewound_branch_keeps_the_projects_shared_memory() {
     );
 }
 
+/// A fact about who the user is saves and reaches the next chat; a wrong kind's refusal names the right ones.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_memory_about_the_user_is_saved_and_a_wrong_kind_names_the_right_ones() {
+    let world = World::new();
+    let folder = world.folder("about-user");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let saver = client.open(&folder).await;
+    let fact = json!({"op": "write", "name": "user-role", "claim": "The user is a platform engineer.",
+        "description": "The user is a platform engineer", "kind": "user", "scope": "user"});
+    let wrong = json!({"op": "write", "name": "user-team", "claim": "The user works on payments.",
+        "description": "The user's team", "kind": "person"});
+    scripted(
+        &mut client,
+        &world,
+        &saver,
+        &[format!("memory {fact}"), format!("memory {wrong}")],
+    )
+    .await;
+    let written = result_of(&world, &saver, 0).await;
+    assert_eq!(written["status"], "ok", "a fact about the user is saved: {written}");
+    let refused = result_of(&world, &saver, 1).await.to_string();
+    assert!(
+        ["preference", "project", "feedback", "reference", "decision", "user"]
+            .iter()
+            .all(|kind| refused.contains(kind)),
+        "the refusal names the kinds to choose from: {refused}"
+    );
+    let chat = client.open(&folder).await;
+    first_message(&mut client, &chat).await;
+    let sent = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .last()
+        .unwrap()["messages"]
+        .to_string();
+    assert!(sent.contains("platform engineer"), "the next chat recalls who the user is");
+}
+
 /// A reply streamed in thousands of tiny pieces, as a fast model sends it, never ends the chat it belongs to.
 #[tokio::test]
 async fn a_reply_streamed_in_thousands_of_pieces_keeps_the_chat_alive() {

@@ -388,8 +388,8 @@ impl Tool for MemoryWrite {
                 "name": { "type": "string", "description": "kebab-case slug, unique per scope" },
                 "claim": { "type": "string", "description": "The fact itself, self-contained (absolute dates, no 'today')." },
                 "description": { "type": "string", "description": "One-line hook shown in the recall index." },
-                "kind": { "type": "string", "enum": ["preference", "project", "feedback", "reference", "decision"] },
-                "scope": { "type": "string", "enum": ["project", "user"], "description": "Default project. `user` follows the person across ALL projects — only for durable personal preferences." },
+                "kind": { "type": "string", "enum": MemoryKind::ALL.map(|kind| kind.as_str()), "description": "user: who the person is (name, role, background). preference: how they like things done. feedback: a correction or confirmed approach. project: ongoing work and its constraints. decision: a choice made and why. reference: where something lives." },
+                "scope": { "type": "string", "enum": ["project", "user"], "description": "Default project. `user` follows the person across ALL projects: only for who they are and their durable preferences." },
                 "links": { "type": "array", "items": { "type": "string" }, "description": "Names of related memories." }
             },
             "required": ["name", "claim", "description", "kind"]
@@ -401,8 +401,14 @@ impl Tool for MemoryWrite {
         valid_name(name)?;
         let claim = arg_str(args, "claim")?;
         let description = arg_str(args, "description")?;
-        let kind = MemoryKind::parse(arg_str(args, "kind")?)
-            .ok_or_else(|| ToolError::Args("unknown kind".into()))?;
+        let given = arg_str(args, "kind")?;
+        let kind = MemoryKind::parse(given).ok_or_else(|| {
+            let kinds: Vec<_> = MemoryKind::ALL.iter().map(|kind| kind.as_str()).collect();
+            ToolError::Args(format!(
+                "unknown kind \"{given}\"; use one of: {}",
+                kinds.join(", ")
+            ))
+        })?;
         let scope = parse_scope(args)?;
         guard_scan(name, claim, description)?;
 

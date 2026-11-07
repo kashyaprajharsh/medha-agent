@@ -4,7 +4,7 @@ use kernel::TrustLabel;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
     Preference,
@@ -12,9 +12,20 @@ pub enum MemoryKind {
     Feedback,
     Reference,
     Decision,
+    /// Who the person is: name, role, background, accounts.
+    User,
 }
 
 impl MemoryKind {
+    pub const ALL: [MemoryKind; 6] = [
+        MemoryKind::User,
+        MemoryKind::Preference,
+        MemoryKind::Feedback,
+        MemoryKind::Project,
+        MemoryKind::Decision,
+        MemoryKind::Reference,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             MemoryKind::Preference => "preference",
@@ -22,18 +33,20 @@ impl MemoryKind {
             MemoryKind::Feedback => "feedback",
             MemoryKind::Reference => "reference",
             MemoryKind::Decision => "decision",
+            MemoryKind::User => "user",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "preference" => MemoryKind::Preference,
-            "project" => MemoryKind::Project,
-            "feedback" => MemoryKind::Feedback,
-            "reference" => MemoryKind::Reference,
-            "decision" => MemoryKind::Decision,
-            _ => return None,
-        })
+        Self::ALL.into_iter().find(|kind| kind.as_str() == s)
+    }
+}
+
+/// A kind a newer build wrote reads as `project`, as stored rows already do, so it never breaks a rebuild.
+impl<'de> Deserialize<'de> for MemoryKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = String::deserialize(deserializer)?;
+        Ok(Self::parse(&kind).unwrap_or(MemoryKind::Project))
     }
 }
 

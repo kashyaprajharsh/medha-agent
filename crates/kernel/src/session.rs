@@ -71,14 +71,17 @@ struct RequestState {
     unfit_named: bool,
     tool_call_corrections: u32,
     compaction_passes: u32,
+    /// Only the newest tool images are sent, since a refusal for size.
+    newest: bool,
 }
 
 impl RequestState {
-    fn new(sending: Sending) -> Self {
+    fn new(sending: Sending, newest: bool) -> Self {
         Self {
             overflow_retried: false,
             go_on: None,
             sending,
+            newest,
             sent: Sent::default(),
             image_refusal: None,
             small_refused: false,
@@ -170,7 +173,10 @@ pub(super) async fn run<P: Provider, L: EventLog>(
             return Ok(stopped);
         }
         let compile_control = crate::CompileControl::new(cancel.clone(), state.gov.deadline());
-        let mut request = RequestState::new(state.image_floor);
+        let mut request = RequestState::new(
+            state.image_floor,
+            kernel.newest_images.load(Ordering::Relaxed),
+        );
         let (turn, request_tools) = loop {
             let (prepared, input, output) = match kernel
                 .prepare_turn(

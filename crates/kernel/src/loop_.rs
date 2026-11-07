@@ -541,6 +541,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     shrinker: Option<Arc<dyn crate::ImageShrinker>>,
     /// This server took images only once they were smaller; later turns start there.
     shrinks_images: AtomicBool,
+    /// This chat was refused for size; only its newest tool images are sent.
+    pub(crate) newest_images: AtomicBool,
     /// The longest image side, in pixels, this server is known to take.
     image_side: std::sync::atomic::AtomicU32,
     /// Stored results that came from outside; reading one back is outside text too.
@@ -821,6 +823,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             vision: None,
             shrinker: None,
             shrinks_images: Default::default(),
+            newest_images: Default::default(),
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
             opening: Default::default(),
@@ -866,6 +869,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             vision: self.vision.clone(),
             shrinker: self.shrinker.clone(),
             shrinks_images: Default::default(),
+            newest_images: Default::default(),
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
             opening: Default::default(),

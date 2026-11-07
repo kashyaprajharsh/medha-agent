@@ -69,7 +69,15 @@ async fn resolved(
     };
     let shrinker: Arc<dyn ImageShrinker> = Arc::new(ToLimits);
     let store = Arc::new(Zeros);
-    let sent = resolve_media(&mut context, store, sending, Some(&shrinker), max_side).await;
+    let sent = resolve_media(
+        &mut context,
+        store,
+        sending,
+        false,
+        Some(&shrinker),
+        max_side,
+    )
+    .await;
     let carried = context
         .ordered_messages()
         .iter()

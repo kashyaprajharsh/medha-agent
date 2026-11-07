@@ -733,12 +733,22 @@ async fn a_memory_about_the_user_is_saved_and_a_wrong_kind_names_the_right_ones(
     )
     .await;
     let written = result_of(&world, &saver, 0).await;
-    assert_eq!(written["status"], "ok", "a fact about the user is saved: {written}");
+    assert_eq!(
+        written["status"], "ok",
+        "a fact about the user is saved: {written}"
+    );
     let refused = result_of(&world, &saver, 1).await.to_string();
     assert!(
-        ["preference", "project", "feedback", "reference", "decision", "user"]
-            .iter()
-            .all(|kind| refused.contains(kind)),
+        [
+            "preference",
+            "project",
+            "feedback",
+            "reference",
+            "decision",
+            "user"
+        ]
+        .iter()
+        .all(|kind| refused.contains(kind)),
         "the refusal names the kinds to choose from: {refused}"
     );
     let chat = client.open(&folder).await;
@@ -747,7 +757,10 @@ async fn a_memory_about_the_user_is_saved_and_a_wrong_kind_names_the_right_ones(
         .last()
         .unwrap()["messages"]
         .to_string();
-    assert!(sent.contains("platform engineer"), "the next chat recalls who the user is");
+    assert!(
+        sent.contains("platform engineer"),
+        "the next chat recalls who the user is"
+    );
 }
 
 /// A reply streamed in thousands of tiny pieces, as a fast model sends it, never ends the chat it belongs to.
@@ -988,7 +1001,13 @@ async fn a_reopened_branch_shares_its_chats_scratch_folder() {
         "the reopened branch was shown another scratch folder"
     );
     let read = json!({"command": "cat note.txt", "network": false, "workdir": scratch});
-    scripted(&mut client, &world, &branch, &[format!("shell_exec {read}")]).await;
+    scripted(
+        &mut client,
+        &world,
+        &branch,
+        &[format!("shell_exec {read}")],
+    )
+    .await;
     let last = logged(&world, &branch)
         .await
         .iter()

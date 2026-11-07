@@ -90,7 +90,11 @@ async fn rewind_branches_the_session_and_rolls_files_back_to_the_cut() {
         3,
         "branch = its lineage record + prefix before the cut (turn-1 user msg + its write)"
     );
-    assert_eq!(log.root_chat(branch).unwrap(), s.id, "the branch names its chat");
+    assert_eq!(
+        log.root_chat(branch).unwrap(),
+        s.id,
+        "the branch names its chat"
+    );
     assert!(
         branch_events.iter().all(|e| e.session_id == branch),
         "events re-homed onto the branch"

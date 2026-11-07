@@ -1554,3 +1554,205 @@ async fn image_rejection_retries_once_as_text(believed: ImageSupport) {
     })
     }));
 }
+
+/// A server that refuses a request over a size in bytes, as some do with a 413.
+struct SizeCapProvider {
+    caps: ProviderCaps,
+    /// Accepted requests answered with a screenshot tool call before the text answer.
+    calls: std::sync::atomic::AtomicUsize,
+    /// Images each request carried, and whether it was refused.
+    sent: Mutex<Vec<(usize, bool)>>,
+}
+
+const SIZE_CAP: usize = 10_485_760;
+
+#[async_trait]
+impl Provider for SizeCapProvider {
+    fn capabilities(&self) -> &ProviderCaps {
+        &self.caps
+    }
+
+    async fn stream(
+        &self,
+        _ctx: &CompiledContext,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        Err(ProviderError::Decode(
+            "kernel bypassed the prepared-request path".into(),
+        ))
+    }
+
+    async fn stream_prepared(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        let messages = request.context.ordered_messages();
+        let images: Vec<usize> = messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                ContentPart::Media(MediaPart {
+                    source: MediaSource::Base64(data),
+                    ..
+                }) => Some(data.len()),
+                _ => None,
+            })
+            .collect();
+        let size: usize = images.iter().sum();
+        let refused = size > SIZE_CAP;
+        self.sent.lock().unwrap().push((images.len(), refused));
+        if refused {
+            return Err(ProviderError::Status(
+                413,
+                format!(
+                    r#"{{"error":{{"code":"invalid_request_error","message":"Request size {size} bytes exceeds the limit of {SIZE_CAP}."}}}}"#
+                ),
+            ));
+        }
+        let left = self.calls.load(Ordering::SeqCst);
+        if left > 0 {
+            self.calls.store(left - 1, Ordering::SeqCst);
+            let call = ToolIntent {
+                id: format!("shot-{left}"),
+                tool: "test.shot".into(),
+                args: json!({}),
+            };
+            return Ok(stream::iter([Ok(Block::ToolIntent(call))]).boxed());
+        }
+        Ok(stream::iter([Ok(Block::Text("looked".into()))]).boxed())
+    }
+}
+
+/// Each call returns one 1 MB screenshot, as a video frame read back does.
+struct ShotExecutor(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl kernel::Executor for ShotExecutor {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "test.shot".into(),
+            description: "take a screenshot".into(),
+            schema: json!({ "type": "object", "properties": {} }),
+            blast_radius: BlastRadius::Read,
+            category: ToolCategory::Read,
+            icon: "t".into(),
+        }]
+    }
+
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        let at = self.0.fetch_add(1, Ordering::SeqCst);
+        let mut obs = Observation::ok(intent.id.clone(), json!({ "shot": at }));
+        obs.media = vec![MediaPart {
+            mime_type: "image/png".into(),
+            source: MediaSource::Artifact(format!("bytes:{}", 1_000_000 + at)),
+            label: Some(format!("frame-{at}.png")),
+            width: Some(1920),
+            height: Some(1080),
+            byte_size: None,
+            provider_state: Vec::new(),
+        }];
+        obs
+    }
+}
+
+/// Refused once for size, a chat keeps sending only its newest screenshots:
+/// its next turn, and the same chat opened again, are not refused.
+#[tokio::test]
+async fn a_request_refused_for_size_is_not_sent_that_large_again_in_its_chat() {
+    let provider = Arc::new(SizeCapProvider {
+        caps: ProviderCaps {
+            images: ImageSupport::Supported,
+            caching: false,
+            max_ctx: Some(1_000_000),
+            tool_calls: ToolCallStrategy::Native,
+        },
+        calls: 10.into(),
+        sent: Mutex::new(Vec::new()),
+    });
+    let log = Arc::new(InMemoryLog::new());
+    let open = || {
+        Kernel::new(
+            provider.clone(),
+            log.clone(),
+            Arc::new(ShotExecutor(0.into())),
+            Arc::new(Passthrough),
+            Arc::new(ImageArtifacts),
+            Arc::new(AllowAll),
+            Arc::new(AutoDeny),
+            Arc::new(NoVerify),
+        )
+        .with_image_shrinker(Arc::new(ToBudget))
+    };
+    let session = Session::new();
+    let kernel = open();
+    macro_rules! run {
+        ($kernel:expr, $messages:expr) => {
+            $kernel.run_session(
+                &session,
+                $messages,
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+        };
+    }
+
+    let (mut history, stop) = run!(kernel, vec![Message::user("check every frame")])
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    let refused = |sent: &[(usize, bool)]| sent.iter().filter(|(_, refused)| *refused).count();
+    assert_eq!(refused(&provider.sent.lock().unwrap()), 1, "refused once");
+
+    let seen = provider.sent.lock().unwrap().len();
+    history.push(Message::user("make it interesting"));
+    let (mut history, stop) = run!(kernel, history).await.unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    drop(kernel);
+    assert_eq!(
+        provider.sent.lock().unwrap()[seen..],
+        [(3, false)],
+        "the next turn"
+    );
+
+    let seen = provider.sent.lock().unwrap().len();
+    history.push(Message::user("and once more"));
+    let (_, stop) = run!(open(), history).await.unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    assert_eq!(
+        provider.sent.lock().unwrap()[seen..],
+        [(3, false)],
+        "the chat opened again"
+    );
+}
+
+/// A request refused for its size with no images aboard is compacted once and sent again.
+#[tokio::test]
+async fn a_text_request_refused_for_size_is_compacted_and_sent_again() {
+    let provider = Arc::new(RecordingProvider::new(vec![
+        Err(ProviderError::Status(
+            413,
+            r#"{"error":{"code":"invalid_request_error","message":"Request size 11140281 bytes exceeds the limit of 10485760."}}"#.into(),
+        )),
+        Ok(vec![Block::Text("finished".into())]),
+    ]));
+    let context = Arc::new(ForcedCompactor::new());
+    let kernel = kernel_with_context(provider.clone(), context.clone());
+    let session = Session::new();
+    let (_, stop) = kernel
+        .run_session(
+            &session,
+            vec![Message::system("system"), Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    let events = kernel.log.events(session.id).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == kernel::EventKind::Compaction)
+    );
+}

@@ -180,6 +180,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
         let mut logged_events = self.log.checked_events(session.id).await?;
+        if logged_events
+            .iter()
+            .any(|event| event.kind == EventKind::ImagesNewest)
+        {
+            self.newest_images.store(true, Ordering::Relaxed);
+        }
         self.begin_context_message(session, &mut logged_events, sink)
             .await?;
         {

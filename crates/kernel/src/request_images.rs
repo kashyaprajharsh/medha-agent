@@ -8,7 +8,7 @@ const LIMIT: usize = 20;
 const BUDGET: usize = 24_000_000;
 /// Old images go a batch at a time, so the cached start of a chat moves rarely.
 const BATCH: usize = 8;
-const NEWEST_KEPT: usize = 3;
+pub const NEWEST_KEPT: usize = 3;
 /// What a refused image is brought under, measured as sent: encoded, not on disk.
 pub const SHRINK_TO: usize = 4 * 1024 * 1024;
 /// The longest side a server takes when its refusal names none.
@@ -79,6 +79,8 @@ pub struct Sent {
     pub widest: Option<u32>,
     pub retired: usize,
     pub unreadable: usize,
+    /// Tool results whose images were sent.
+    pub tool_results: usize,
 }
 
 impl Sent {
@@ -100,10 +102,12 @@ struct Slot {
 
 /// Put image bytes into a disposable copy of the request; stored messages keep
 /// their hashes. An image that is retired or unreadable becomes a note.
+/// With `newest`, only the newest [`NEWEST_KEPT`] tool results keep their images.
 pub async fn resolve_media(
     context: &mut CompiledContext,
     store: Arc<dyn ArtifactStore>,
     sending: Sending,
+    newest: bool,
     shrinker: Option<&Arc<dyn ImageShrinker>>,
     max_side: u32,
 ) -> Sent {
@@ -142,7 +146,7 @@ pub async fn resolve_media(
             "[image not sent: the server refused this request's images, so only the newest is sent]",
         ),
         _ => (
-            retired(&slots),
+            retired(&slots, newest),
             "[older image no longer sent, to keep the request within limits]",
         ),
     };
@@ -163,12 +167,16 @@ pub async fn resolve_media(
         ..Sent::default()
     };
     let mut encoded: HashMap<String, Option<(String, String, Option<u32>)>> = HashMap::new();
+    let mut counted = None;
     for (slot, retire) in slots.iter().zip(retired) {
         let part = &mut messages[slot.message].parts[slot.part];
         if retire {
             sent.retired += 1;
             *part = note(why);
             continue;
+        }
+        if slot.tool_made && counted.replace(slot.message) != Some(slot.message) {
+            sent.tool_results += 1;
         }
         let ContentPart::Media(media) = &mut *part else {
             continue;
@@ -233,7 +241,7 @@ async fn fitted(
 
 /// Which images are left out. Only a tool's are, a whole result at a time,
 /// oldest first; what a person attached always stays.
-fn retired(slots: &[Slot]) -> Vec<bool> {
+fn retired(slots: &[Slot], newest: bool) -> Vec<bool> {
     // One entry per tool result, oldest first: its message, images and bytes.
     let mut results: Vec<(usize, usize, usize)> = Vec::new();
     let mut reserved = (0, 0);
@@ -247,7 +255,10 @@ fn retired(slots: &[Slot]) -> Vec<bool> {
         }
     }
     let newest_first: Vec<(usize, usize)> = results.iter().rev().map(|r| (r.1, r.2)).collect();
-    let retire = retire_count(&newest_first, reserved);
+    let mut retire = retire_count(&newest_first, reserved);
+    if newest {
+        retire = retire.max(results.len().saturating_sub(NEWEST_KEPT));
+    }
     slots
         .iter()
         .map(|slot| {

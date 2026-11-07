@@ -201,9 +201,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 "the provider rejected the output-token allowance; check the profile's max_output_tokens. Original rejection: {e}"
                             )));
                         }
+                        crate::provider::ProviderFailure::PayloadTooLarge if !emitted => {
+                            return Err(KernelError::TooLarge(e.to_string()));
+                        }
                         // With images aboard, they are the first thing to send less of.
-                        crate::provider::ProviderFailure::PayloadTooLarge
-                        | crate::provider::ProviderFailure::ImageUnfit
+                        crate::provider::ProviderFailure::ImageUnfit
                             if !emitted && context_has_media(&request.context) =>
                         {
                             return Err(KernelError::ImageUnfit(e.to_string()));

@@ -104,6 +104,8 @@ pub enum EventKind {
     ToolSnapshot,
     /// A compaction summary failed and the turn continued; never a checkpoint.
     SummaryFailed,
+    /// The server refused a request for its size; from here only the newest tool images are sent.
+    ImagesNewest,
     Session,
     /// Reasoning retained for audit but excluded from model history.
     ModelReasoning,
@@ -147,6 +149,7 @@ impl EventKind {
             EventKind::ContextUsage => "context.usage",
             EventKind::ToolSnapshot => "context.tools",
             EventKind::SummaryFailed => "context.summary_failed",
+            EventKind::ImagesNewest => "context.images_newest",
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
             EventKind::Interrupt => "interrupt",
@@ -180,6 +183,7 @@ impl EventKind {
             "context.usage" => EventKind::ContextUsage,
             "context.tools" => EventKind::ToolSnapshot,
             "context.summary_failed" => EventKind::SummaryFailed,
+            "context.images_newest" => EventKind::ImagesNewest,
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
             "interrupt" => EventKind::Interrupt,
@@ -640,6 +644,15 @@ impl Event {
             s,
             EventKind::SummaryFailed,
             json!({ "reason": reason }),
+            TrustLabel::System,
+        )
+    }
+
+    pub(crate) fn images_newest(s: &Session, refusal: &str) -> Self {
+        Self::new(
+            s,
+            EventKind::ImagesNewest,
+            json!({ "refusal": refusal }),
             TrustLabel::System,
         )
     }
@@ -2978,7 +2991,11 @@ mod tests {
         assert_ne!(new_id, s.id, "fork is a new session");
 
         let branch = block_on(log.events(new_id));
-        assert_eq!(branch.len(), 2, "lineage record + prefix before the cut event only");
+        assert_eq!(
+            branch.len(),
+            2,
+            "lineage record + prefix before the cut event only"
+        );
         assert_eq!(root_chat(&branch), Some(s.id), "the branch names its chat");
         assert_eq!(
             branch[1].payload.get("text").and_then(Value::as_str),

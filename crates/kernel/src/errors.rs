@@ -36,6 +36,10 @@ pub enum KernelError {
     #[error("{0}")]
     ImageUnfit(String),
 
+    /// The server refused the request for its size in bytes. Holds the server's words.
+    #[error("{0}")]
+    TooLarge(String),
+
     /// A text reply was cut off at the output limit. Holds what was written,
     /// which the caller keeps and may ask the model to continue.
     #[error("model response was truncated at its output limit")]

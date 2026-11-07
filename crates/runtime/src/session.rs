@@ -147,10 +147,7 @@ pub async fn start(
     let surface = surface(&cwd, &prompt);
     let has_task = !options.first_run_setup && !prompt.trim().is_empty();
     // A rewound branch works in its first chat's scratch folder, where its history's paths point.
-    let root = log
-        .root_chat_async(session.id)
-        .await
-        .unwrap_or(session.id);
+    let root = log.root_chat_async(session.id).await.unwrap_or(session.id);
     let sandbox_setup::Built {
         workspace,
         live_settings,

@@ -16,6 +16,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 candidate,
                 Arc::clone(&self.artifacts),
                 request.sending,
+                request.newest,
                 self.shrinker.as_ref(),
                 self.image_side.load(Ordering::Relaxed),
             )

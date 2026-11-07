@@ -58,6 +58,51 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 );
                 Ok(ControlFlow::Continue(Recovery::Retry))
             }
+            // Too large in bytes: old tool images go first, for the rest of this chat.
+            KernelError::TooLarge(refusal)
+                if !request.newest
+                    && request.sending != Sending::AsText
+                    && request.sent.tool_results > crate::request_images::NEWEST_KEPT =>
+            {
+                request.newest = true;
+                if !self.newest_images.swap(true, Ordering::Relaxed) {
+                    let event = Event::images_newest(cx.session, &refusal);
+                    if let Err(error) = self.log.append(event).await {
+                        tracing::warn!(%error, "could not persist the image limit");
+                    }
+                    cx.sink.notice(&format!(
+                        "The server refused a request as too large. Only the newest {} images \
+                         from tools are sent from now on in this chat.",
+                        crate::request_images::NEWEST_KEPT
+                    ));
+                }
+                request.image_refusal.get_or_insert(refusal);
+                Ok(ControlFlow::Continue(Recovery::Retry))
+            }
+            // Still too large with images aboard: send them smaller, then fewer.
+            KernelError::TooLarge(refusal)
+                if request.sending != Sending::AsText && request.sent.images > 0 =>
+            {
+                // Refused for bytes, not for being an image: it never shows images unread.
+                request.unfit_named = true;
+                request.sending = request.sending.after_refusal(
+                    request.sent,
+                    self.shrinker.is_some(),
+                    self.image_side.load(Ordering::Relaxed),
+                );
+                request.image_refusal.get_or_insert(refusal);
+                Ok(ControlFlow::Continue(Recovery::Retry))
+            }
+            // The text is what is too large: compacted once, then the refusal stands.
+            KernelError::TooLarge(_) if !request.overflow_retried => {
+                request.overflow_retried = true;
+                self.context.force_next_compaction();
+                Ok(ControlFlow::Continue(Recovery::Retry))
+            }
+            KernelError::TooLarge(refusal) => Err(KernelError::Provider(format!(
+                "the provider refused the request as too large, even after compacting the chat \
+                 and leaving out its images ({refusal})"
+            ))),
             // Not known to be the images' doing: send less of them each
             // try. Only a request that then passes shows what was wrong.
             e @ (KernelError::ImageSuspected(_) | KernelError::ImageUnfit(_))

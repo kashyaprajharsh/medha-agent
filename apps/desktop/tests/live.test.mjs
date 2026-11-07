@@ -600,3 +600,29 @@ test("a ChatGPT plan limit is told apart from other failures, wherever the turn'
   // A rate limit from an ordinary key is not the plan's, so it keeps the usual message.
   assert.equal(planRefusal("provider returned status 429: rate limit"), undefined);
 });
+
+const running = () => {
+  const state = reduceLive(
+    { ...startingLive(), status: "running" },
+    { method: "agents", params: { agents: [{ session: "child-1", name: "worker" }] } },
+  );
+  assert.equal(state.agents.length, 1, "the agent was not listed to begin with");
+  return state;
+};
+
+test("a chat that ends leaves no agents still listed as running", () => {
+  const state = reduceLive(running(), { method: "exit", params: {} });
+  assert.equal(state.status, "exited");
+  assert.deepEqual(state.agents, []);
+});
+
+test("a request refused because the chat ended shows the chat as ended, not running", async () => {
+  const live = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`);
+  const rust = await readFile(new URL("../src-tauri/src/live.rs", import.meta.url), "utf8");
+  assert.ok(rust.includes(`const STOPPED: &str = "${live.STOPPED}";`), "the stopped message differs from live.rs");
+  const state = live.requestRefused(running(), live.STOPPED);
+  assert.equal(state?.status, "exited", "a stopped chat still looks like it is running");
+  assert.deepEqual(state.agents, []);
+  assert.equal(state.activity, undefined);
+  assert.equal(live.requestRefused(running(), "network down"), undefined);
+});

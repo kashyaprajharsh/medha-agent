@@ -250,6 +250,28 @@ export function queuedMessages(state: LiveState) {
 
 /** Folds one bridge frame into the live view, in the order things happened.
  * `settled` bumps when a turn ends: the cue to reload the durable transcript. */
+/** What the native side says of a chat whose stream is over; the same words as `STOPPED` in live.rs. */
+export const STOPPED = "This session has stopped. Start a new session to continue.";
+
+/** A chat that has ended: nothing is running, waiting or listed as working any more. */
+function ended(state: LiveState, error: string | undefined): LiveState {
+  return {
+    ...state,
+    status: "exited",
+    activity: undefined,
+    approvals: [],
+    questions: [],
+    agents: [],
+    items: [...closeAll(state.items), ...queuedMessages(state)],
+    error,
+  };
+}
+
+/** A request refused because the chat already ended shows it ended; any other failure is not this. */
+export function requestRefused(state: LiveState, error: string): LiveState | undefined {
+  return error.includes(STOPPED) ? ended(state, error) : undefined;
+}
+
 export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
   // Recovery replies must be folded at the stream barrier, before later
   // events, rather than when the request promise resumes.
@@ -331,19 +353,12 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       };
     }
     case "exit":
-      return {
-        ...state,
-        status: "exited",
-        activity: undefined,
-        approvals: [],
-        questions: [],
-        items: [...closeAll(state.items), ...queuedMessages(state)],
-        error:
-          state.status === "starting" || state.status === "running"
-            ? (lastLine(str(params.stderr)) ??
-              "Medha stopped before the turn finished.")
-            : state.error,
-      };
+      return ended(
+        state,
+        state.status === "starting" || state.status === "running"
+          ? (lastLine(str(params.stderr)) ?? "Medha stopped before the turn finished.")
+          : state.error,
+      );
     case "agents":
       return { ...state, agents: toAgents(params.agents) };
     case "settings":

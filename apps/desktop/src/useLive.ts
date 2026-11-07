@@ -12,6 +12,7 @@ import type { OutputAbout } from "./outputBlocks";
 import {
   reduceLive,
   recordSent,
+  requestRefused,
   startingLive,
   type Approval,
   type ApprovalChoice,
@@ -185,7 +186,7 @@ export function useLive() {
           : state);
         await api.liveCall(key, "message.send", params);
       } catch (cause) {
-        patch(key, (state) => ({
+        patch(key, (state) => requestRefused(state, String(cause)) ?? {
           ...state,
           status: opened.current.has(key)
             ? before?.status === "running"
@@ -193,7 +194,7 @@ export function useLive() {
               : "idle"
             : "exited",
           error: String(cause),
-        }));
+        });
         throw cause;
       }
     },
@@ -214,7 +215,7 @@ export function useLive() {
       await api
         .liveCall(key, "cancel")
         .catch((cause) =>
-          patch(key, (state) => ({ ...state, error: String(cause) })),
+          patch(key, (state) => requestRefused(state, String(cause)) ?? { ...state, error: String(cause) }),
         );
     },
     [patch],

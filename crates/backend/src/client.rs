@@ -36,7 +36,14 @@ impl Client {
         let within = self.waiting.fetch_add(bytes, Ordering::Relaxed) + bytes <= QUEUED_BYTES;
         let sent = within && self.out.try_send(line).is_ok();
         if !sent {
-            self.waiting.fetch_sub(bytes, Ordering::Relaxed);
+            let behind = self.waiting.fetch_sub(bytes, Ordering::Relaxed) - bytes;
+            if !self.dropped.is_cancelled() {
+                tracing::warn!(
+                    client = self.id,
+                    behind_bytes = behind,
+                    "client dropped for falling behind"
+                );
+            }
             self.dropped.cancel();
         }
         sent

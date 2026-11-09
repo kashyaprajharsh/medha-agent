@@ -44,6 +44,8 @@ pub(crate) struct Session {
     tied: AtomicBool,
     stream: Mutex<Stream>,
     control: Option<crate::Control>,
+    /// When the chat started, for the log line that records its end.
+    started: std::time::Instant,
 }
 
 /// Writes to the chat one request at a time, what is urgent before what is
@@ -125,6 +127,7 @@ impl Session {
             tied: AtomicBool::new(false),
             stream: Mutex::default(),
             control,
+            started: std::time::Instant::now(),
         })
     }
 
@@ -339,6 +342,14 @@ impl Session {
             Ok(()) => Value::Null,
             Err(error) => json!(error),
         };
+        // Recorded where whoever reads the log looks, not only told to the clients still attached.
+        let lived_s = self.started.elapsed().as_secs();
+        match error.as_str() {
+            Some(error) => {
+                tracing::warn!(session = %self.id, lived_s, %error, "chat ended with an error")
+            }
+            None => tracing::info!(session = %self.id, lived_s, "chat ended"),
+        }
         self.publish(json!({ "method": "session.ended", "params": { "error": error } }));
     }
 

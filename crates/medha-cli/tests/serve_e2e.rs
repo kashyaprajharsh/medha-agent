@@ -2766,10 +2766,10 @@ async fn a_huge_background_output_stays_within_its_file_cap() {
         .unwrap()["messages"]
         .to_string();
     assert!(raw.contains("last-2"), "the end still arrives");
-    assert!(
-        !task_records(&world, &chat).join("t1.out").exists(),
-        "the file goes when the command ends"
-    );
+    // Kept after the end for the model to read, and still within its cap.
+    let kept = task_records(&world, &chat).join("t1.out");
+    assert!(kept.exists(), "the file went when the command ended");
+    assert!(std::fs::metadata(&kept).unwrap().len() <= 70_000_000);
 }
 
 /// Runs one reporting background command to its end and returns the request its end started.

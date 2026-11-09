@@ -178,7 +178,9 @@ pub async fn start(
     )
     .await?;
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
-    registry.keep_task_records_in(state.join("tasks"));
+    // Inside the stored-results folder the model may already read, so a command's whole output is readable
+    // without opening anything more; that folder's sweep passes over subfolders.
+    registry.keep_task_records_in(state.join("artifacts").join("tasks"));
     let lsp_manager = services::language_servers(&setup, &sbx_cfg, &mut registry);
     let services::Mcp {
         mcp_manager,

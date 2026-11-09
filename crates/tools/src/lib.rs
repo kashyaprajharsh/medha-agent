@@ -5753,6 +5753,8 @@ enum ShellWait {
 /// the separate completed-result cache below retains at most another 8 MiB.
 const MAX_ACTIVE_SHELL_TASKS: usize = 32;
 const MAX_RECENT_SHELL_TASKS: usize = 64;
+/// Most bytes ended commands' output files may hold together, kept for the model to read.
+const KEPT_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RECENT_SHELL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RECENT_SHELL_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MAX_TASK_COMMAND_BYTES: usize = 4096;
@@ -6061,10 +6063,50 @@ impl TaskTable {
     }
 
     fn forget_running(&self, id: &str) {
+        self.remove_records(id, &["json", "out", "err"]);
+    }
+
+    /// A command that ended stops being followed; its output files stay while it is still listed as recent,
+    /// the oldest ended ones going first once they pass [`KEPT_OUTPUT_BYTES`] together.
+    fn stop_following(&self, id: &str) {
+        self.remove_records(id, &["json"]);
         let Some(dir) = self.records.get() else {
             return;
         };
-        for extension in ["json", "out", "err"] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        // Only ended commands' output: a running one still has its record beside it.
+        let mut ended: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "out" || extension == "err")
+                    && !path.with_extension("json").exists()
+            })
+            .filter_map(|path| {
+                let meta = path.metadata().ok()?;
+                Some((meta.modified().ok()?, meta.len(), path))
+            })
+            .collect();
+        ended.sort();
+        let mut total: u64 = ended.iter().map(|(_, size, _)| size).sum();
+        for (_, size, path) in ended {
+            if total <= KEPT_OUTPUT_BYTES {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= size;
+            }
+        }
+    }
+
+    fn remove_records(&self, id: &str, extensions: &[&str]) {
+        let Some(dir) = self.records.get() else {
+            return;
+        };
+        for extension in extensions {
             let _ = std::fs::remove_file(dir.join(format!("{id}.{extension}")));
         }
     }
@@ -6083,6 +6125,10 @@ impl TaskTable {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|extension| extension != "json") {
+                // Output kept for a command that ended under an earlier backend: no table lists it now.
+                if !path.with_extension("json").exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
                 continue;
             }
             let Some(record) = std::fs::read(&path)
@@ -6159,14 +6205,20 @@ impl TaskTable {
             let from = if full { (0, 0) } else { task.read };
             let (stdout, stderr, read) = task.proc.output_since(from);
             task.read = read;
-            return Some(json!({
+            // The buffer marks the part it no longer holds; the file still has it.
+            let dropped = [&stdout, &stderr]
+                .iter()
+                .any(|text| text.contains("bytes of output dropped"));
+            let mut snapshot = json!({
                 "task_id": id,
                 "command": task.command,
                 "status": if task.proc.is_running() { "running" } else { "exited" },
                 "exit_code": task.proc.exit_code(),
                 "stdout": stdout,
                 "stderr": stderr,
-            }));
+            });
+            self.name_full_output(id, &mut snapshot, dropped);
+            return Some(snapshot);
         }
         let task = state.recent.get_mut(id)?;
         let before = task.retained_bytes();
@@ -6182,7 +6234,21 @@ impl TaskTable {
         state.recent_bytes = state.recent_bytes.saturating_sub(released);
         state.recent_lru.retain(|candidate| candidate != id);
         state.recent_lru.push_back(id.to_owned());
+        let dropped = snapshot["stdout_truncated"] == true || snapshot["stderr_truncated"] == true;
+        self.name_full_output(id, &mut snapshot, dropped);
         Some(snapshot)
+    }
+
+    /// Where a task's whole output is kept, named when part of it was left out, so `read` can page through it.
+    fn name_full_output(&self, id: &str, snapshot: &mut Value, dropped: bool) {
+        let Some(files) = self.output_files(id).filter(|_| dropped) else {
+            return;
+        };
+        snapshot["full_output"] = json!({
+            "stdout": files.stdout,
+            "stderr": files.stderr,
+            "note": "Part of this output was left out above. These files hold it, at most its latest 64 MB each: read them, page by page.",
+        });
     }
 
     /// Whether a task has ended or printed `until` (or, with no `until`, anything) since the last read.
@@ -6272,6 +6338,7 @@ impl TaskTable {
         for id in &expired {
             if let Some(task) = state.recent.remove(id) {
                 state.recent_bytes = state.recent_bytes.saturating_sub(task.retained_bytes());
+                self.forget_running(id);
             }
         }
         state
@@ -6288,8 +6355,28 @@ impl TaskTable {
             };
             if let Some(task) = state.recent.remove(&id) {
                 state.recent_bytes = state.recent_bytes.saturating_sub(task.retained_bytes());
+                self.forget_running(&id);
             }
         }
+    }
+
+    /// A command's end, moved from running to recent under one lock, so a read never finds it in neither.
+    /// Gives back its command, exit code, stdout and stderr for the note that announces it.
+    fn finish(&self, id: &str) -> Option<(String, Option<i32>, String, String)> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.active.remove(id)?;
+        let task = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
+        let ended = (
+            task.command.clone(),
+            task.exit_code,
+            task.stdout.clone(),
+            task.stderr.clone(),
+        );
+        self.remember_locked(&mut state, id.to_owned(), task);
+        Some(ended)
     }
 
     fn remember(&self, id: String, task: CompletedTask) {
@@ -6297,7 +6384,11 @@ impl TaskTable {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        self.remember_locked(&mut state, id, task);
+    }
+
+    fn remember_locked(&self, state: &mut TaskTableState, id: String, task: CompletedTask) {
+        self.prune_recent_locked(state, std::time::Instant::now());
         if self.limits.max_recent == 0 || task.retained_bytes() > self.limits.max_recent_bytes {
             return;
         }
@@ -6313,7 +6404,7 @@ impl TaskTable {
                 .unwrap_or_default(),
         );
         state.recent_lru.push_back(id);
-        self.evict_recent_locked(&mut state);
+        self.evict_recent_locked(state);
     }
 
     /// Types into a running task's terminal.
@@ -6509,6 +6600,7 @@ impl TaskTable {
         };
         state.recent_bytes = state.recent_bytes.saturating_sub(task.retained_bytes());
         state.recent_lru.retain(|candidate| candidate != id);
+        self.forget_running(id);
         true
     }
 
@@ -6672,33 +6764,14 @@ async fn report_task_end(
     let Some(tasks) = tasks.upgrade() else {
         return;
     };
-    tasks.forget_running(&id);
-    let Some(entry) = tasks.take(&id) else {
+    tasks.stop_following(&id);
+    let Some((command, exit_code, stdout, stderr)) = tasks.finish(&id) else {
         return;
     };
-    let task = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
-    let files = match backup {
-        Some(backup) => {
-            tokio::task::spawn_blocking(move || checkpoints::changed_since(&sbx, &backup))
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()))
-        }
-        None => Ok(Vec::new()),
-    };
-    let mut result = json!({"task_id": id, "command": task.command, "exit_code": task.exit_code});
-    match files {
-        Ok(files) => result["_checkpoint_files"] = json!(files),
-        Err(error) => {
-            result["_checkpoint_note"] = json!(format!(
-                "The backup is kept, but undo cannot confirm what this command changed: {error}"
-            ))
-        }
-    }
-    let exit = task
-        .exit_code
-        .map_or("no exit code, it was stopped".to_owned(), |code| {
-            format!("exit code {code}")
-        });
+    let mut result = json!({"task_id": id, "command": command, "exit_code": exit_code});
+    let exit = exit_code.map_or("no exit code, it was stopped".to_owned(), |code| {
+        format!("exit code {code}")
+    });
     let headline = match origin {
         TaskOrigin::Started => format!("[background command {id} finished, {exit}]"),
         TaskOrigin::FoundRunning => format!(
@@ -6708,12 +6781,27 @@ async fn report_task_end(
             "[background command {id} is not running any more: it stopped when Medha last stopped or while Medha was down, so its work may be unfinished. Exit code unknown]"
         ),
     };
-    let mut note = format!("{headline}\n$ {}\n", task.command);
-    note.push_str(&task_note_output(&task.stderr, &task.stdout));
+    let mut note = format!("{headline}\n$ {command}\n");
+    note.push_str(&task_note_output(&stderr, &stdout));
     note.push_str(&format!(
         "Read everything it printed with task.output, task_id \"{id}\", full: true."
     ));
-    tasks.remember(id, task);
+    let files = match backup {
+        Some(backup) => {
+            tokio::task::spawn_blocking(move || checkpoints::changed_since(&sbx, &backup))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+        }
+        None => Ok(Vec::new()),
+    };
+    match files {
+        Ok(files) => result["_checkpoint_files"] = json!(files),
+        Err(error) => {
+            result["_checkpoint_note"] = json!(format!(
+                "The backup is kept, but undo cannot confirm what this command changed: {error}"
+            ))
+        }
+    }
     let _ = tasks.endings.send(kernel::TaskEnd {
         intent_id,
         result: Some(result),

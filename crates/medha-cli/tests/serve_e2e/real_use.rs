@@ -976,6 +976,43 @@ async fn a_wait_longer_than_a_minute_on_a_background_command_returns_its_end() {
     );
 }
 
+/// A background command's output too long to hold is named in full, and the model can read the part left out.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_whole_of_a_long_background_output_is_named_and_readable() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("long-output")).await;
+    let start = json!({"command": "seq 1 3000000", "network": false, "background": true});
+    // A line never printed: the wait lasts until the command has printed everything and ended.
+    let wait = json!({"task_id": "t1", "wait_s": 60, "until": "never-printed"});
+    client
+        .send(
+            &chat,
+            &format!("SCRIPT\nshell_exec {start}\ntask_output {wait}"),
+        )
+        .await;
+    let (_, approval) = client.until(|frame| frame["method"] == "approval").await;
+    let gate = json!({"gate_id": approval["params"]["gate_id"], "approve": true});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+
+    let waited = result_of(&world, &chat, 1).await;
+    let file = waited["payload"]["full_output"]["stdout"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the full output was not named: {waited}"))
+        .to_owned();
+    let middle = json!({"path": file, "offset": 1_500_000});
+    client.send(&chat, &format!("SCRIPT\nread {middle}")).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let read = result_of(&world, &chat, 2).await.to_string();
+    assert!(
+        read.contains("1500000"),
+        "the part left out could not be read: {read}"
+    );
+}
+
 /// A wait that ends while its command runs says so, and a new message ends a long wait at once.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

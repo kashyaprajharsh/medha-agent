@@ -983,7 +983,14 @@ async fn the_whole_of_a_long_background_output_is_named_and_readable() {
     let world = World::new();
     let backend = world.backend();
     let mut client = backend.connect().await;
-    let chat = client.open(&world.folder("long-output")).await;
+    let folder = world.folder("long-output");
+    // Its end must not start a turn of its own: a message sent meanwhile would steer that turn, not run.
+    std::fs::write(
+        folder.join("medha.lock"),
+        "[budget]\nbackground_wakes = 0\n",
+    )
+    .unwrap();
+    let chat = client.open(&folder).await;
     let start = json!({"command": "seq 1 3000000", "network": false, "background": true});
     // A line never printed: the wait lasts until the command has printed everything and ended.
     let wait = json!({"task_id": "t1", "wait_s": 60, "until": "never-printed"});

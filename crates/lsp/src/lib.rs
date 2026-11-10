@@ -4076,6 +4076,7 @@ fn kill_process_group(group: u64) {
         return;
     }
     // Each server leads its own group/tree; tear down the helpers it spawned too.
+    // SAFETY: kill only takes integers; the group is the server's own, which it leads.
     #[cfg(unix)]
     unsafe {
         libc::kill(-(group as i32), libc::SIGKILL);
@@ -4598,7 +4599,9 @@ mod tests {
                     command: vec![
                         "/bin/sh".into(),
                         "-c".into(),
-                        "sleep 30 & echo $! > helper.pid; wait".into(),
+                        // The server quits as it starts, so starting fails at once; the
+                        // helper keeps no stdio, so the quit is seen.
+                        "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > helper.pid; exit 1".into(),
                     ],
                     languages: vec![Language {
                         extension: "testlang".into(),
@@ -4626,6 +4629,7 @@ mod tests {
             .unwrap();
         let mut gone = false;
         for _ in 0..20 {
+            // SAFETY: signal 0 only asks whether the process exists; kill takes integers.
             if unsafe { libc::kill(helper_pid, 0) } == -1 {
                 gone = true;
                 break;

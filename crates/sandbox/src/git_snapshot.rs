@@ -473,9 +473,11 @@ fn directory_id(path: &Path) -> std::io::Result<(u64, u64)> {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let mut info = std::mem::MaybeUninit::uninit();
+        // SAFETY: the file is open and `info` is writable storage for the struct.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: the call above succeeded, so it filled `info` completely.
         let info = unsafe { info.assume_init() };
         Ok((
             u64::from(info.dwVolumeSerialNumber),

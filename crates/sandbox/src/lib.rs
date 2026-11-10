@@ -224,12 +224,14 @@ fn component_cstring(component: &OsStr) -> Result<std::ffi::CString, SandboxErro
 #[cfg(unix)]
 fn file_from_fd(fd: i32) -> std::fs::File {
     use std::os::fd::FromRawFd;
+    // SAFETY: every caller passes a descriptor it just opened and checked non-negative, owned by nothing else.
     unsafe { std::fs::File::from_raw_fd(fd) }
 }
 
 #[cfg(unix)]
 fn open_root_dir() -> Result<std::fs::File, SandboxError> {
     let root = std::ffi::CString::new("/").expect("static path");
+    // SAFETY: `root` is a live NUL-terminated path; open only reads it.
     let fd = unsafe {
         libc::open(
             root.as_ptr(),
@@ -250,6 +252,7 @@ fn open_dir_at(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File, st
     use std::os::fd::AsRawFd;
     let name = component_cstring(name)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `parent` is open for the call and `name` is a live NUL-terminated single component.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -269,6 +272,7 @@ fn mkdir_at(parent: &std::fs::File, name: &OsStr) -> Result<(), std::io::Error> 
     use std::os::fd::AsRawFd;
     let name = component_cstring(name)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `parent` is open for the call and `name` is a live NUL-terminated single component.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
     if result == 0 {
         Ok(())
@@ -390,6 +394,7 @@ fn open_regular_file_at(
 ) -> Result<Option<std::fs::File>, SandboxError> {
     use std::os::fd::AsRawFd;
     let leaf = component_cstring(leaf)?;
+    // SAFETY: `parent` is open for the call and `leaf` is a live NUL-terminated single component.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -459,7 +464,9 @@ fn inspect_open_file_bounded(
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
+        // SAFETY: BY_HANDLE_FILE_INFORMATION is plain C data; all-zero is a valid value to be filled.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the file is open (borrowed) and `info` is live and writable.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
             return Err(SandboxError::Io(format!(
                 "cannot inspect file identity: {}",
@@ -516,6 +523,8 @@ fn create_file_at(
 ) -> Result<std::fs::File, SandboxError> {
     use std::os::fd::AsRawFd;
     let leaf = component_cstring(leaf)?;
+    // SAFETY: `parent` is open for the call and `leaf` is a live NUL-terminated single component;
+    // O_CREAT's mode is passed as the variadic third argument openat expects.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -537,6 +546,7 @@ fn create_file_at(
 fn unlink_file_at(parent: &std::fs::File, leaf: &OsStr) -> Result<(), SandboxError> {
     use std::os::fd::AsRawFd;
     let leaf = component_cstring(leaf)?;
+    // SAFETY: `parent` is open for the call and `leaf` is a live NUL-terminated single component.
     let result = unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0) };
     if result == 0 {
         Ok(())
@@ -555,6 +565,7 @@ fn rename_file_at(parent: &std::fs::File, from: &OsStr, to: &OsStr) -> Result<()
     use std::os::fd::AsRawFd;
     let from = component_cstring(from)?;
     let to = component_cstring(to)?;
+    // SAFETY: `parent` is open for the call and both names are live NUL-terminated single components.
     let result = unsafe {
         libc::renameat(
             parent.as_raw_fd(),
@@ -585,6 +596,7 @@ fn publish_new_file_at(
     let from = component_cstring(from)?;
     let to_c = component_cstring(to)?;
 
+    // SAFETY: `parent` is open for the call and both names are live NUL-terminated single components.
     #[cfg(target_os = "macos")]
     let result = unsafe {
         libc::renameatx_np(
@@ -595,6 +607,7 @@ fn publish_new_file_at(
             libc::RENAME_EXCL,
         )
     };
+    // SAFETY: `parent` is open for the call and both names are live NUL-terminated single components.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let result = unsafe {
         libc::renameat2(
@@ -664,6 +677,8 @@ fn publish_windows_file(
     // publication primitive for a target approved as missing.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let error = loop {
+        // SAFETY: both paths are NUL-terminated UTF-16 that live through the call; the optional
+        // backup name and reserved arguments are null, which both APIs allow.
         let result = unsafe {
             if target_exists {
                 ReplaceFileW(
@@ -715,6 +730,7 @@ fn publish_windows_file(
 #[cfg(unix)]
 fn set_file_mode(file: &std::fs::File, mode: u32) -> Result<(), SandboxError> {
     use std::os::fd::AsRawFd;
+    // SAFETY: `file` is borrowed for the call, so its fd is open; fchmod takes integers.
     let result = unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) };
     if result == 0 {
         Ok(())
@@ -748,6 +764,7 @@ fn copy_file_owner_and_mode(
     if source_metadata.uid() != destination_metadata.uid()
         || source_metadata.gid() != destination_metadata.gid()
     {
+        // SAFETY: `destination` is borrowed for the call, so its fd is open; fchown takes integers.
         let result = unsafe {
             libc::fchown(
                 destination.as_raw_fd(),
@@ -775,6 +792,7 @@ fn copy_acl_and_xattrs(
 ) -> Result<(), SandboxError> {
     use std::os::fd::AsRawFd;
     let flags = libc::COPYFILE_ACL | libc::COPYFILE_XATTR;
+    // SAFETY: both files are borrowed for the call, so their fds are open; the state argument is null, which fcopyfile allows.
     let result = unsafe {
         libc::fcopyfile(
             source.as_raw_fd(),
@@ -808,6 +826,7 @@ fn read_linux_xattrs(
     const MAX_VALUE: usize = 16 * 1024 * 1024;
     const MAX_TOTAL: usize = 64 * 1024 * 1024;
     let fd = file.as_raw_fd();
+    // SAFETY: a null buffer of size 0 asks only for the length; nothing is written.
     let list_len = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
     if list_len < 0 {
         let error = std::io::Error::last_os_error();
@@ -827,6 +846,7 @@ fn read_linux_xattrs(
     }
     let mut names = vec![0u8; list_len];
     if list_len != 0 {
+        // SAFETY: the pointer and length describe `names`; a list grown meanwhile fails with ERANGE, not an overrun.
         let got = unsafe { libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len()) };
         if got < 0 {
             return Err(SandboxError::Io(format!(
@@ -850,6 +870,7 @@ fn read_linux_xattrs(
         }
         let name = std::ffi::CString::from_vec_with_nul(raw_name.to_vec())
             .map_err(|error| SandboxError::Io(error.to_string()))?;
+        // SAFETY: `name` is NUL-terminated; a null buffer of size 0 asks only for the length.
         let value_len = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
         if value_len < 0 {
             return Err(SandboxError::Io(format!(
@@ -876,6 +897,7 @@ fn read_linux_xattrs(
         }
         let mut value = vec![0u8; value_len];
         if value_len != 0 {
+            // SAFETY: the pointer and length describe `value`; a value grown meanwhile fails with ERANGE.
             let got = unsafe {
                 libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len())
             };
@@ -908,6 +930,7 @@ fn copy_acl_and_xattrs(
     {
         let name = std::ffi::CString::new(name.as_slice())
             .map_err(|error| SandboxError::Io(error.to_string()))?;
+        // SAFETY: `destination` is open (borrowed) and `name` is NUL-terminated.
         let result = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
         if result != 0 {
             return Err(SandboxError::Io(format!(
@@ -928,6 +951,8 @@ fn copy_acl_and_xattrs(
         } else {
             value.as_ptr().cast()
         };
+        // SAFETY: `destination` is open, `name` is NUL-terminated, and `value_ptr` is null only
+        // for an empty value, otherwise `value`'s live bytes of the length passed.
         let result = unsafe {
             libc::fsetxattr(
                 destination.as_raw_fd(),
@@ -968,7 +993,9 @@ fn copy_file_flags(
     destination: &std::fs::File,
 ) -> Result<(), SandboxError> {
     use std::os::fd::AsRawFd;
+    // SAFETY: stat is plain C data; all-zero is a valid value for fstat to fill.
     let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `source` is borrowed, so its fd is open; `status` is a live, writable stat.
     if unsafe { libc::fstat(source.as_raw_fd(), &mut status) } != 0 {
         return Err(SandboxError::Io(format!(
             "cannot inspect file flags: {}",
@@ -984,6 +1011,7 @@ fn copy_file_flags(
                 .into(),
         ));
     }
+    // SAFETY: `destination` is borrowed, so its fd is open; fchflags takes integers.
     if unsafe { libc::fchflags(destination.as_raw_fd(), flags) } == 0 {
         Ok(())
     } else {
@@ -1005,6 +1033,7 @@ fn copy_file_flags(
     const FS_APPEND_FL: libc::c_long = 0x0000_0020;
     const FS_FL_USER_MODIFIABLE: libc::c_long = 0x0003_80ff;
     let mut flags: libc::c_long = 0;
+    // SAFETY: `source` is open (borrowed) and `flags` is a live, writable long, as FS_IOC_GETFLAGS expects.
     if unsafe { libc::ioctl(source.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error().is_some_and(|code| {
@@ -1024,6 +1053,7 @@ fn copy_file_flags(
         ));
     }
     let mut flags_to_set = flags;
+    // SAFETY: `destination` is open (borrowed) and `flags_to_set` is a live long, as FS_IOC_SETFLAGS expects.
     if unsafe {
         libc::ioctl(
             destination.as_raw_fd(),
@@ -1117,6 +1147,7 @@ fn write_snapshot_capability(
             #[cfg(not(target_os = "linux"))]
             {
                 use std::os::fd::AsRawFd;
+                // SAFETY: `file` is borrowed, so its fd is open; fsync takes an integer.
                 if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
                     return Err(SandboxError::Io(
                         std::io::Error::last_os_error().to_string(),
@@ -2211,6 +2242,7 @@ impl WorkspaceSandbox {
             #[cfg(target_os = "linux")]
             {
                 use std::os::fd::AsRawFd;
+                // SAFETY: `directory` is open (borrowed); syncfs takes an integer.
                 if unsafe { libc::syncfs(directory.as_raw_fd()) } != 0 {
                     return Err(SandboxError::Io(
                         std::io::Error::last_os_error().to_string(),
@@ -2722,6 +2754,8 @@ impl WorkspaceSandbox {
                         ) -> u32;
                     }
                     let mut name = vec![0u16; 32768];
+                    // SAFETY: the file is open and the pointer and length describe `name`; the
+                    // result is used only when it fits inside it.
                     let len = unsafe {
                         GetFinalPathNameByHandleW(
                             file.as_raw_handle(),
@@ -4695,6 +4729,7 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         fn set_xattr(file: &std::fs::File, name: &std::ffi::CStr, value: &[u8]) -> bool {
+            // SAFETY: the fd is open (borrowed), `name` is NUL-terminated, and the pointer and length describe `value`.
             unsafe {
                 libc::fsetxattr(
                     file.as_raw_fd(),
@@ -4707,6 +4742,7 @@ mod tests {
             }
         }
         fn get_xattr(file: &std::fs::File, name: &std::ffi::CStr) -> Vec<u8> {
+            // SAFETY: a null buffer of size 0 asks only for the length; nothing is written.
             let length = unsafe {
                 libc::fgetxattr(
                     file.as_raw_fd(),
@@ -4723,6 +4759,7 @@ mod tests {
                 std::io::Error::last_os_error()
             );
             let mut value = vec![0u8; length as usize];
+            // SAFETY: the pointer and length describe `value`, which is alive and writable for the call.
             let read = unsafe {
                 libc::fgetxattr(
                     file.as_raw_fd(),
@@ -4793,18 +4830,22 @@ mod tests {
                 fn acl_free(value: *mut libc::c_void) -> libc::c_int;
             }
             const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+            // SAFETY: the fd is open (borrowed); a null result is checked just below.
             let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
             if acl.is_null() {
                 return None;
             }
             let mut length = 0;
+            // SAFETY: `acl` is a non-null ACL from acl_get_fd_np and `length` is a live integer to fill.
             let text = unsafe { acl_to_text(acl, &mut length) };
             let value = (!text.is_null()).then(|| {
+                // SAFETY: acl_to_text returned non-null text of `length` bytes, freed only after this copy.
                 String::from_utf8_lossy(unsafe {
                     std::slice::from_raw_parts(text.cast::<u8>(), length.max(0) as usize)
                 })
                 .into_owned()
             });
+            // SAFETY: both came from the ACL library above, are no longer read, and are freed once each.
             unsafe {
                 if !text.is_null() {
                     acl_free(text.cast());
@@ -4857,7 +4898,9 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         fn flags(file: &std::fs::File) -> libc::c_uint {
+            // SAFETY: stat is plain C data; all-zero is a valid value for fstat to fill.
             let mut status: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: the fd is open (borrowed) and `status` is a live, writable stat.
             assert_eq!(unsafe { libc::fstat(file.as_raw_fd(), &mut status) }, 0);
             status.st_flags
         }
@@ -4872,6 +4915,7 @@ mod tests {
             .open(&target)
             .unwrap();
         let expected = libc::UF_HIDDEN | libc::UF_NODUMP;
+        // SAFETY: the fd is open for the call; fchflags takes integers.
         if unsafe { libc::fchflags(file.as_raw_fd(), expected) } != 0 {
             let error = std::io::Error::last_os_error();
             if error
@@ -4893,6 +4937,7 @@ mod tests {
         );
 
         let file = std::fs::File::open(&target).unwrap();
+        // SAFETY: the fd is open for the call; fchflags takes integers.
         assert_eq!(unsafe { libc::fchflags(file.as_raw_fd(), 0) }, 0);
         drop(file);
         sbx.restore("file.txt", Some(&snapshot)).await.unwrap();
@@ -4901,6 +4946,7 @@ mod tests {
             expected
         );
         let file = std::fs::File::open(&target).unwrap();
+        // SAFETY: the fd is open for the call; fchflags takes integers.
         unsafe {
             libc::fchflags(file.as_raw_fd(), 0);
         }

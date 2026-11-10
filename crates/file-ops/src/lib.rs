@@ -26,6 +26,7 @@ pub fn replace(source: &Path, target: &Path) -> std::io::Result<()> {
 
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are NUL-terminated UTF-16 that live through the call.
     let result = unsafe {
         MoveFileExW(
             source.as_ptr(),

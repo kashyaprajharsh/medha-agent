@@ -580,6 +580,7 @@ impl Drop for GroupReaper {
 /// `killpg`, so `taskkill /T` is invoked by absolute path to resist shadowing.
 #[allow(unused_variables)]
 fn kill_process_tree(pid: u32) {
+    // SAFETY: kill takes integers; the group is the one this command was started to lead.
     #[cfg(unix)]
     unsafe {
         // Negative pid = the process GROUP led by `pid`.
@@ -633,6 +634,7 @@ fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool, pi
 /// Runs between fork and exec, where only async-signal-safe calls such as `setsid` belong.
 #[cfg(unix)]
 fn new_session() -> std::io::Result<()> {
+    // SAFETY: setsid takes no arguments and is async-signal-safe, so it may run after fork.
     match unsafe { libc::setsid() } {
         -1 => Err(std::io::Error::last_os_error()),
         _ => Ok(()),
@@ -1771,7 +1773,9 @@ fn wait_for_leader_exit_without_reap(pid: u32) -> std::io::Result<()> {
     // the zombie leader continues to reserve the process-group id. Descendants
     // therefore cannot race a recycled id before teardown.
     loop {
+        // SAFETY: siginfo_t is plain C data; all-zero is a valid value for waitid to fill.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, writable siginfo_t; WNOWAIT leaves the child unreaped.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
@@ -1812,6 +1816,7 @@ macro_rules! impl_pump_pipe {
                 {
                     use std::os::fd::AsRawFd;
                     let fd = self.as_raw_fd();
+                    // SAFETY: the pipe is borrowed for the call, so `fd` is open; fcntl takes integers.
                     unsafe {
                         let flags = libc::fcntl(fd, libc::F_GETFL);
                         if flags >= 0 {
@@ -1830,11 +1835,13 @@ impl_pump_pipe!(std::fs::File);
 
 #[cfg(target_os = "macos")]
 fn process_snapshot() -> Vec<(i32, i32, i32)> {
+    // SAFETY: a null buffer of size 0 asks only for the count; nothing is written.
     let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if count <= 0 {
         return Vec::new();
     }
     let mut pids = vec![0i32; count as usize + 64];
+    // SAFETY: the pointer and byte size describe `pids` exactly, which is alive for the call.
     let listed = unsafe {
         libc::proc_listallpids(
             pids.as_mut_ptr().cast(),
@@ -1848,8 +1855,10 @@ fn process_snapshot() -> Vec<(i32, i32, i32)> {
     pids.into_iter()
         .filter(|pid| *pid > 0)
         .filter_map(|pid| {
+            // SAFETY: proc_bsdinfo is plain C data; all-zero is a valid value to be filled.
             let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
             let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            // SAFETY: the pointer and size describe `info` exactly, which is alive for the call.
             let read = unsafe {
                 libc::proc_pidinfo(
                     pid,
@@ -1923,6 +1932,7 @@ fn process_tree_members(root: u32) -> Vec<(i32, i32)> {
 /// cannot finish its work during a slow scan; then leader, descendants, group.
 #[cfg(unix)]
 fn kill_group_parent_first(group: u32) {
+    // SAFETY: kill takes integers; the group is the command's, which it leads.
     unsafe {
         libc::kill(-(group as i32), libc::SIGSTOP);
     }
@@ -1946,10 +1956,12 @@ fn kill_group_parent_first(group: u32) {
         depth
     };
     members.sort_by_key(|(pid, _)| depth(*pid));
+    // SAFETY: kill takes integers; the leader is unreaped, so its pid cannot be reused yet.
     unsafe {
         libc::kill(group as i32, libc::SIGKILL);
     }
     for (pid, _) in members {
+        // SAFETY: kill takes integers; these are the stopped group's own members from the scan.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
@@ -3713,13 +3725,17 @@ impl ExecBackend for LandlockBackend {
 
         // Install the namespace, Landlock and seccomp in the child without allocating.
         let mut slot = Some(ruleset);
+        // SAFETY: between fork and exec the closure makes only syscalls (mounts, Landlock,
+        // seccomp) on data prepared before fork, and builds errors from errno alone, so it
+        // takes no lock another thread could have held at fork.
         unsafe {
             cmd.pre_exec(move || {
                 mounts.install()?;
                 if let Some(r) = slot.take() {
+                    // The failed call's errno, not the error's text: formatting would allocate after fork.
                     let status = r
                         .restrict_self()
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        .map_err(|_| std::io::Error::last_os_error())?;
                     // Never run a command the kernel did not actually confine.
                     if status.ruleset == landlock::RulesetStatus::NotEnforced {
                         return Err(std::io::Error::from_raw_os_error(libc::ENOSYS));
@@ -4625,10 +4641,14 @@ mod tests {
             return;
         }
         // A pseudo-terminal made the child's controlling terminal, as a terminal running the TUI is.
+        // SAFETY: posix_openpt takes only flags; a failure is checked just below.
         let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         assert!(master >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `master` is the open pty from above.
         assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        // SAFETY: as above.
         assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        // SAFETY: ptsname of an unlocked master is a NUL-terminated name, copied before anything else calls it.
         let terminal = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }.to_owned();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         child
@@ -4639,6 +4659,8 @@ mod tests {
             ])
             .env(CHILD, "1")
             .stdin(std::process::Stdio::null());
+        // SAFETY: after fork the closure calls only setsid, open and ioctl (async-signal-safe),
+        // with a path made before fork, and builds errors from errno alone.
         unsafe {
             use std::os::unix::process::CommandExt;
             child.pre_exec(move || {
@@ -4653,6 +4675,7 @@ mod tests {
             });
         }
         let output = child.output().unwrap();
+        // SAFETY: `master` is ours and closed once, here.
         unsafe { libc::close(master) };
         assert!(
             output.status.success(),
@@ -5810,6 +5833,7 @@ mod tests {
         // SAFETY: as in `build_network_denial_markers` — a static string.
         #[cfg(unix)]
         {
+            // SAFETY: gai_strerror returns a static NUL-terminated string for any code.
             let native = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(libc::EAI_NONAME)) }
                 .to_string_lossy()
                 .into_owned();

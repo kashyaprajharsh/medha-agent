@@ -472,6 +472,7 @@ impl Drop for LeaseFile {
 #[cfg(unix)]
 fn try_lock_file(file: &File) -> std::io::Result<LockAttempt> {
     use std::os::fd::AsRawFd;
+    // SAFETY: `file` is borrowed for the call, so its fd is open; flock takes integers.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
         return Ok(LockAttempt::Acquired);
@@ -490,6 +491,7 @@ fn try_lock_file(file: &File) -> std::io::Result<LockAttempt> {
 #[cfg(unix)]
 fn unlock_file(file: &File) {
     use std::os::fd::AsRawFd;
+    // SAFETY: `file` is borrowed for the call, so its fd is open; flock takes integers.
     let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
 }
 
@@ -502,7 +504,9 @@ fn try_lock_file(file: &File) -> std::io::Result<LockAttempt> {
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
+    // SAFETY: OVERLAPPED is plain C data; all-zero means offset 0 with no event, as wanted.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // SAFETY: the file is open (borrowed) and `overlapped` lives through this synchronous call.
     let result = unsafe {
         LockFileEx(
             file.as_raw_handle() as _,
@@ -530,7 +534,9 @@ fn unlock_file(file: &File) {
     use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
+    // SAFETY: OVERLAPPED is plain C data; all-zero means offset 0 with no event, as wanted.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // SAFETY: the file is open (borrowed) and `overlapped` lives through this synchronous call.
     let _ = unsafe {
         UnlockFileEx(
             file.as_raw_handle() as _,

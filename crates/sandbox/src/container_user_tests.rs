@@ -61,13 +61,15 @@ async fn real_container_preserves_bind_ownership_and_confines_git_controls() {
         String::from_utf8_lossy(&result.stderr)
     );
     let metadata = std::fs::metadata(root.join("owned")).unwrap();
-    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
-    assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+    // SAFETY: geteuid and getegid take no arguments, cannot fail and touch no memory of ours.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    assert_eq!(metadata.uid(), uid);
+    assert_eq!(metadata.gid(), gid);
     assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), original);
     assert!(!root.join(".git/hooks/planted").exists());
     println!(
         "real container: host_uid={}, file_uid={}, file_gid={}, Git controls readonly, index writable, private HOME/TMP writable",
-        unsafe { libc::geteuid() },
+        uid,
         metadata.uid(),
         metadata.gid()
     );

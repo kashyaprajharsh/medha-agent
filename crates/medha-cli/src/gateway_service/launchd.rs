@@ -56,6 +56,7 @@ fn definition() -> Result<PathBuf> {
 }
 
 fn domain() -> String {
+    // SAFETY: getuid takes no arguments, cannot fail and touches no memory of ours.
     format!("gui/{}", unsafe { libc::getuid() })
 }
 

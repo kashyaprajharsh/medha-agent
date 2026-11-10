@@ -107,6 +107,7 @@ impl Drop for Terminal {
                             .filter(|group| *group > 1 && Some(*group as u32) != child.process_id())
                         {
                             // A foreground job may have its own process group.
+                            // SAFETY: kill takes integers; the group is the terminal's own foreground job, checked above.
                             unsafe {
                                 libc::kill(-group, libc::SIGHUP);
                             }

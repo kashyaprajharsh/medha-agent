@@ -29,6 +29,7 @@ pub(super) fn unregister() -> Result<()> {
     stop()?;
     let key = wide(VALUE);
     with_run_key(KEY_SET_VALUE, |run| {
+        // SAFETY: `run` is the open key with_run_key passes; `key` is NUL-terminated UTF-16 from `wide`.
         let status = unsafe { RegDeleteValueW(run, key.as_ptr()) };
         if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
             bail!("removing the start-up entry failed ({status})");
@@ -67,6 +68,7 @@ pub(super) fn stop() -> Result<()> {
     let Some(pid) = gateway::running_pid() else {
         return Ok(());
     };
+    // SAFETY: OpenProcess takes integers; a null result is checked just below.
     let process = unsafe {
         OpenProcess(
             PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -82,7 +84,9 @@ pub(super) fn stop() -> Result<()> {
             .is_some_and(|name| name.eq_ignore_ascii_case("medha.exe"))
     });
     // Exit code 1 is the stop `medhaw` does not restart.
+    // SAFETY: `process` is the open, non-null handle from OpenProcess, with terminate access.
     let ended = ours && unsafe { TerminateProcess(process, 1) } != 0;
+    // SAFETY: the handle is ours and closed once, here.
     unsafe { CloseHandle(process) };
     if ours && !ended {
         bail!(
@@ -145,6 +149,7 @@ fn split(line: &str) -> Option<(String, Vec<String>)> {
 fn image(process: windows_sys::Win32::Foundation::HANDLE) -> Option<PathBuf> {
     let mut buffer = vec![0u16; 32_768];
     let mut length = buffer.len() as u32;
+    // SAFETY: `length` holds the buffer's real size in units, so the call writes inside `buffer`.
     let ok = unsafe {
         QueryFullProcessImageNameW(
             process,
@@ -160,6 +165,7 @@ fn set(line: &str) -> Result<()> {
     let (key, data) = (wide(VALUE), wide(line));
     with_run_key(KEY_SET_VALUE, |run| {
         let bytes = u32::try_from(data.len() * 2).context("the command is too long")?;
+        // SAFETY: `run` is the open key; `key` and `data` are NUL-terminated UTF-16 and `bytes` is data's byte length.
         let status =
             unsafe { RegSetValueExW(run, key.as_ptr(), 0, REG_SZ, data.as_ptr().cast(), bytes) };
         if status != ERROR_SUCCESS {
@@ -174,6 +180,8 @@ fn get() -> Option<String> {
     with_run_key(KEY_QUERY_VALUE, |run| {
         let mut buffer = vec![0u16; 4096];
         let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: `bytes` is the buffer's real size, so the call writes inside `buffer`; a value
+        // too large fails with ERROR_MORE_DATA instead of overrunning.
         let status = unsafe {
             RegGetValueW(
                 run,
@@ -197,11 +205,13 @@ fn get() -> Option<String> {
 fn with_run_key<T>(access: u32, use_key: impl FnOnce(HKEY) -> Result<T>) -> Result<T> {
     let path = wide(RUN);
     let mut run: HKEY = std::ptr::null_mut();
+    // SAFETY: `path` is NUL-terminated UTF-16 and `run` is a live HKEY for the opened key.
     let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut run) };
     if status != ERROR_SUCCESS {
         bail!("opening the start-up list failed ({status})");
     }
     let result = use_key(run);
+    // SAFETY: `run` was opened above and is closed once, here.
     unsafe { RegCloseKey(run) };
     result
 }

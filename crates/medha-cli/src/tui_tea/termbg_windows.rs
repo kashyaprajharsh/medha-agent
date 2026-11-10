@@ -24,14 +24,17 @@ pub(super) fn read_reply(deadline: Instant) -> Option<Vec<u8>> {
 /// Only conhost shows its colour table; a table behind ConPTY says nothing about the theme.
 pub(super) fn console_palette_luma() -> Option<f32> {
     let mut class = [0u16; 32];
+    // SAFETY: the buffer pointer and length describe `class`; a null window only makes the call fail.
     let length =
         unsafe { GetClassNameW(GetConsoleWindow(), class.as_mut_ptr(), class.len() as i32) };
     if length <= 0 || String::from_utf16_lossy(&class[..length as usize]) != "ConsoleWindowClass" {
         return None;
     }
     let output = console(STD_OUTPUT_HANDLE)?;
+    // SAFETY: CONSOLE_SCREEN_BUFFER_INFOEX is plain C data; all-zero is a valid value.
     let mut info = unsafe { std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFOEX>() };
     info.cbSize = std::mem::size_of::<CONSOLE_SCREEN_BUFFER_INFOEX>() as u32;
+    // SAFETY: `output` is a console handle checked by `console`, and `info` is live with its size set.
     if unsafe { GetConsoleScreenBufferInfoEx(output, &mut info) } == 0 {
         return None;
     }
@@ -42,10 +45,12 @@ pub(super) fn console_palette_luma() -> Option<f32> {
 }
 
 fn console(kind: u32) -> Option<HANDLE> {
+    // SAFETY: GetStdHandle takes a constant and returns a handle we do not own or close.
     let handle = unsafe { GetStdHandle(kind) };
     let mut mode = 0;
     (!handle.is_null()
         && handle != INVALID_HANDLE_VALUE
+        // SAFETY: the handle was checked valid just above and `mode` is a live, writable u32.
         && unsafe { GetConsoleMode(handle, &mut mode) } != 0)
         .then_some(handle)
 }
@@ -74,6 +79,7 @@ impl Taken {
                 return;
             }
             let millis = left.as_millis().clamp(1, u32::MAX as u128) as u32;
+            // SAFETY: the handle is the console input handle `console` checked; the wait takes integers.
             if unsafe { WaitForSingleObject(self.handle, millis) } != WAIT_OBJECT_0
                 || self.read_waiting() == 0
             {
@@ -84,6 +90,7 @@ impl Taken {
 
     fn read_waiting(&mut self) -> usize {
         let mut waiting = 0;
+        // SAFETY: the handle is the checked console input handle and `waiting` is a live u32.
         if unsafe { GetNumberOfConsoleInputEvents(self.handle, &mut waiting) } == 0 || waiting == 0
         {
             return 0;
@@ -93,8 +100,10 @@ impl Taken {
         if wanted == 0 {
             return 0;
         }
+        // SAFETY: INPUT_RECORD is plain C data; all-zero is a valid value.
         let mut batch = [unsafe { std::mem::zeroed::<INPUT_RECORD>() }; READ_BATCH];
         let mut read = 0;
+        // SAFETY: `wanted` is at most READ_BATCH, so the call writes inside `batch`; `read` is a live u32.
         if unsafe { ReadConsoleInputW(self.handle, batch.as_mut_ptr(), wanted as u32, &mut read) }
             == 0
         {
@@ -112,7 +121,9 @@ impl Taken {
         if event.EventType != KEY_EVENT as u16 {
             return;
         }
+        // SAFETY: EventType is KEY_EVENT (checked above), so KeyEvent is the union's active field.
         let key = unsafe { event.Event.KeyEvent };
+        // SAFETY: records read with ReadConsoleInputW carry the UTF-16 field of the union.
         let unit = unsafe { key.uChar.UnicodeChar };
         if key.bKeyDown != 0
             && let Ok(byte) = u8::try_from(unit)
@@ -149,6 +160,7 @@ impl Taken {
         while written_so_far < kept.len() {
             let rest = &kept[written_so_far..];
             let mut written = 0;
+            // SAFETY: the pointer and count describe `rest`, a live slice of records; `written` is a live u32.
             if unsafe {
                 WriteConsoleInputW(self.handle, rest.as_ptr(), rest.len() as u32, &mut written)
             } == 0

@@ -275,6 +275,7 @@ fn trusted_origin(scope: &[u8], origin: &[u8], workspace: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no arguments, cannot fail and touches no memory of ours.
         meta.uid() == unsafe { libc::geteuid() }
             && meta.mode() & 0o002 == 0
             && (meta.mode() & 0o020 == 0 || private_group(meta.gid()))
@@ -292,12 +293,16 @@ fn trusted_origin(scope: &[u8], origin: &[u8], workspace: &Path) -> bool {
 #[cfg(unix)]
 fn private_group(gid: libc::gid_t) -> bool {
     use std::ffi::CStr;
+    // SAFETY: getegid takes no arguments, cannot fail and touches no memory of ours.
     if gid != unsafe { libc::getegid() } {
         return false;
     }
     let mut user_buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: passwd is plain C data (integers and pointers); all-zero is a valid value, filled in below.
     let mut user: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found = std::ptr::null_mut();
+    // SAFETY: every pointer is to a live local, the buffer length is its real length, and
+    // the strings written into `user` point into `user_buffer`, which outlives their use.
     let looked_up = unsafe {
         libc::getpwuid_r(
             libc::geteuid(),
@@ -311,8 +316,10 @@ fn private_group(gid: libc::gid_t) -> bool {
         return false;
     }
     let mut group_buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: group is plain C data (integers and pointers); all-zero is a valid value, filled in below.
     let mut group: libc::group = unsafe { std::mem::zeroed() };
     let mut found = std::ptr::null_mut();
+    // SAFETY: as for getpwuid_r above: live locals, true buffer length, results pointing into `group_buffer`.
     let looked_up = unsafe {
         libc::getgrgid_r(
             gid,
@@ -325,7 +332,10 @@ fn private_group(gid: libc::gid_t) -> bool {
     if looked_up != 0 || found.is_null() {
         return false;
     }
+    // SAFETY: both lookups succeeded, so each name is a NUL-terminated string inside its
+    // buffer, and both buffers are still alive here.
     let named = unsafe { CStr::from_ptr(group.gr_name) == CStr::from_ptr(user.pw_name) };
+    // SAFETY: gr_mem was checked non-null, and on success it points to a NULL-ended array in `group_buffer`.
     let alone = group.gr_mem.is_null() || unsafe { (*group.gr_mem).is_null() };
     named && alone
 }

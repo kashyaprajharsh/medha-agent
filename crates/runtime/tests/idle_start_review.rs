@@ -7,7 +7,7 @@ use kernel::{EventKind, EventLog, Message};
 async fn a_chat_opened_without_a_message_reviews_its_instructions_but_logs_nothing_until_used() {
     let files = tempfile::tempdir().unwrap();
     let root = files.path().canonicalize().unwrap();
-    // This integration binary has one test; environment choices belong to its fixture.
+    // SAFETY: this integration binary has one test, so no other thread reads the environment.
     unsafe {
         std::env::set_var("MEDHA_HOME", root.join("home"));
     }

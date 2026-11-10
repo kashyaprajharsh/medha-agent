@@ -441,6 +441,7 @@ mod tests {
         assert!(sbx.read_bytes_resolved(&approved, 1024).await.is_err());
         let fifo =
             std::ffi::CString::new(root.join("pipe.js").to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: fifo is a live NUL-terminated path; mkfifo only reads it.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(1),

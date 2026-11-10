@@ -2881,7 +2881,7 @@ fn stream_text_counts(path: &std::path::Path) -> Result<TextCounts, String> {
                 error.valid_up_to()
             }
         };
-        // Safe: valid_up_to bounds the checked prefix.
+        // SAFETY: from_utf8 just confirmed `carry[..valid_up_to]` is valid UTF-8.
         let text = unsafe { std::str::from_utf8_unchecked(&carry[..valid_up_to]) };
         for ch in text.chars() {
             counts.chars += 1;

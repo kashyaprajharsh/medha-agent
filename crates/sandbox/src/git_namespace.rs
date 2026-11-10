@@ -14,6 +14,8 @@ impl Mounts {
             CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| ExecError::Unavailable("Git mount path contains NUL".into()))
         };
+        // SAFETY: geteuid and getegid take no arguments, cannot fail and touch no memory of ours.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Ok(Self {
             entries: protected
                 .iter()
@@ -24,19 +26,15 @@ impl Mounts {
                 .flat_map(|item| &item.readonly)
                 .map(|path| convert(path))
                 .collect::<Result<_, _>>()?,
-            uid: CString::new(format!("{} {} 1\n", unsafe { libc::geteuid() }, unsafe {
-                libc::geteuid()
-            }))
-            .unwrap(),
-            gid: CString::new(format!("{} {} 1\n", unsafe { libc::getegid() }, unsafe {
-                libc::getegid()
-            }))
-            .unwrap(),
+            uid: CString::new(format!("{uid} {uid} 1\n")).unwrap(),
+            gid: CString::new(format!("{gid} {gid} 1\n")).unwrap(),
         })
     }
 
     pub fn install(&self) -> io::Result<()> {
-        // All paths and mapping bytes were prepared before fork.
+        // SAFETY: this runs between fork and exec, so it makes only syscalls, on paths and
+        // mapping bytes prepared before fork, and builds errors from errno alone; every pointer
+        // is to a live NUL-terminated path or a live repr(C) struct of the size passed.
         unsafe {
             checked(libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS))?;
             write_map(c"/proc/self/setgroups", b"deny")?;
@@ -140,6 +138,7 @@ pub(crate) fn available() -> bool {
         command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // SAFETY: `install` makes only syscalls on data prepared before fork (see there).
         unsafe {
             command.pre_exec(move || probe.install());
         }
@@ -161,7 +160,10 @@ fn checked(result: i32) -> io::Result<()> {
     }
 }
 
+/// # Safety
+/// Runs between fork and exec: only syscalls, no allocation.
 unsafe fn write_map(path: &std::ffi::CStr, bytes: &[u8]) -> io::Result<()> {
+    // SAFETY: `path` is NUL-terminated and `bytes` is live; the fd is ours and closed once.
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
         if fd < 0 {

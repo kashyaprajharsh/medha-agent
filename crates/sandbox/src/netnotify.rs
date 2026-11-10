@@ -112,6 +112,8 @@ pub(crate) fn arm(cmd: &mut std::process::Command) -> Option<Pending> {
         // only the address of this buffer is used.
         let program = build_filter();
         let child_fd = child.as_raw_fd();
+        // SAFETY: after fork the closure only calls `install_in_child`, which makes syscalls on
+        // the filter built above and never allocates; its errors are ignored, never formatted.
         unsafe {
             cmd.pre_exec(move || {
                 install_in_child(&program, child_fd);
@@ -185,6 +187,7 @@ fn socketpair() -> Option<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
     // Not CLOEXEC: the child half must survive to the pre-exec step. It is
     // closed there, before exec, so it never reaches the command itself.
+    // SAFETY: `fds` is a live array of the two ints socketpair writes.
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
     if rc != 0 {
         return None;
@@ -193,6 +196,8 @@ fn socketpair() -> Option<(OwnedFd, OwnedFd)> {
         tv_sec: HANDOFF_TIMEOUT,
         tv_usec: 0,
     };
+    // SAFETY: the option points at `timeout` with its true size; both fds were just created
+    // by socketpair and are owned by nothing else, so each OwnedFd takes sole ownership.
     unsafe {
         libc::setsockopt(
             fds[0],
@@ -208,6 +213,7 @@ fn socketpair() -> Option<(OwnedFd, OwnedFd)> {
 /// Runs after `fork`, before `exec`: async-signal-safe only. No allocation, no
 /// locks — just the syscalls, and silence on any failure.
 fn install_in_child(program: &[libc::sock_filter], handoff: RawFd) {
+    // SAFETY: only syscalls on the live `program` slice and fds this child inherited; nothing allocates.
     unsafe {
         // Landlock already sets this, but the filter install requires it and
         // this must not depend on the order pre-exec steps were registered in.
@@ -234,7 +240,11 @@ fn install_in_child(program: &[libc::sock_filter], handoff: RawFd) {
     }
 }
 
+/// # Safety
+/// Called between fork and exec: stack buffers and one sendmsg, no allocation.
 unsafe fn send_fd(sock: RawFd, fd: RawFd) {
+    // SAFETY: the message points at stack buffers that outlive sendmsg; the control buffer has
+    // room for one fd's header (CMSG_SPACE), and a null first header is checked.
     unsafe {
         let mut byte = [0u8; 1];
         let mut iov = libc::iovec {
@@ -260,6 +270,9 @@ unsafe fn send_fd(sock: RawFd, fd: RawFd) {
 }
 
 fn receive_listener(sock: RawFd) -> Option<OwnedFd> {
+    // SAFETY: recvmsg writes only into the stack buffers the message describes, with their true
+    // lengths; the header is checked to be SCM_RIGHTS before its fd is read, and a received fd
+    // is new to this process, so the OwnedFd is its sole owner.
     unsafe {
         let mut byte = [0u8; 1];
         let mut iov = libc::iovec {
@@ -295,6 +308,7 @@ fn supervise(listener: OwnedFd, flag: &AtomicBool, finished: &AtomicBool) {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: `poll_fd` is one live pollfd, matching the count of 1.
         let ready = unsafe { libc::poll(&mut poll_fd, 1, POLL_SLICE_MS) };
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -309,6 +323,7 @@ fn supervise(listener: OwnedFd, flag: &AtomicBool, finished: &AtomicBool) {
             return;
         }
         let mut notif = SeccompNotif::default();
+        // SAFETY: `notif` is a live, writable repr(C) seccomp_notif, as NOTIF_RECV expects.
         if unsafe { libc::ioctl(fd, NOTIF_RECV, &raw mut notif) } != 0 {
             // ENOENT: the target died between the trap and this read. Anything
             // else means the listener is unusable.
@@ -363,6 +378,7 @@ fn respond(fd: RawFd, notif: &SeccompNotif, remote: bool) {
             flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
         }
     };
+    // SAFETY: `resp` is a live repr(C) seccomp_notif_resp, as NOTIF_SEND expects; it is only read.
     unsafe {
         libc::ioctl(fd, NOTIF_SEND, &raw const resp);
     }

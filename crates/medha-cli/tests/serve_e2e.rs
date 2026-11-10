@@ -684,7 +684,7 @@ impl Drop for TerminalClient {
         if self.child.try_wait().ok().flatten().is_none() {
             // Only the exact process started by this fixture.
             if let Some(pid) = self.child.process_id() {
-                // The unreaped fixture child owns this PID, so reuse is impossible.
+                // SAFETY: kill takes integers, and the unreaped fixture child owns this PID, so it cannot be reused.
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGKILL);
                 }
@@ -1264,6 +1264,7 @@ async fn mcp_shutdown_waits_for_blocked_owned_work_and_keeps_the_singleton() {
         .truncate(false)
         .open(world.home().join("credentials.lock"))
         .unwrap();
+    // SAFETY: `lock` stays open for the call, so its fd is valid; flock takes integers.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
     std::fs::write(
         world.home().join("config.toml"),
@@ -1278,6 +1279,7 @@ async fn mcp_shutdown_waits_for_blocked_owned_work_and_keeps_the_singleton() {
             .get("result")
             .is_some()
     );
+    // SAFETY: kill takes integers, and the backend child is still unreaped, so its PID is its own.
     unsafe {
         libc::kill(backend.child.id() as libc::pid_t, libc::SIGTERM);
     }

@@ -1279,13 +1279,15 @@ fn inherit_nothing(command: &mut Command) -> std::io::Result<()> {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // SAFETY: `limit` is a live, writable rlimit for getrlimit to fill.
     let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
     let highest = if known {
         limit.rlim_cur.min(65_536)
     } else {
         1024
     } as libc::c_int;
-    // Only `close` runs between fork and exec, which is safe there.
+    // SAFETY: between fork and exec only `close` runs, which is async-signal-safe and
+    // allocates nothing; the closure captures only an integer.
     unsafe {
         command.pre_exec(move || {
             for fd in 3..highest {
@@ -1306,9 +1308,11 @@ fn inherit_nothing(_command: &mut Command) -> std::io::Result<()> {
     // Stdio::null configures the new standard handles, but CreateProcess also
     // inherits existing inheritable handles. Never retain the caller's pipes.
     for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle takes a constant and returns a handle we do not own or close.
         let handle = unsafe { GetStdHandle(stream) };
         if !handle.is_null()
             && handle != INVALID_HANDLE_VALUE
+            // SAFETY: the handle was checked valid just above; the call only changes its inherit flag.
             && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
         {
             return Err(std::io::Error::last_os_error());

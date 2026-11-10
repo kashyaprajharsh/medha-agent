@@ -20,6 +20,7 @@ fn names(directory: &File, limit: usize) -> std::io::Result<Vec<OsString>> {
     struct Directory(*mut libc::DIR);
     impl Drop for Directory {
         fn drop(&mut self) {
+            // SAFETY: the pointer is a non-null DIR from fdopendir, owned only here and closed once.
             unsafe {
                 libc::closedir(self.0);
             }
@@ -27,8 +28,10 @@ fn names(directory: &File, limit: usize) -> std::io::Result<Vec<OsString>> {
     }
     // A fresh description has its own directory cursor; dup shares the cursor.
     let fd = crate::open_dir_at(directory, OsStr::new("."))?.into_raw_fd();
+    // SAFETY: `fd` is a freshly opened directory fd we own; on success the DIR takes it over.
     let raw = unsafe { libc::fdopendir(fd) };
     if raw.is_null() {
+        // SAFETY: fdopendir failed, so `fd` is still ours alone to close, once.
         unsafe {
             libc::close(fd);
         }
@@ -38,6 +41,7 @@ fn names(directory: &File, limit: usize) -> std::io::Result<Vec<OsString>> {
     let mut result = Vec::new();
     loop {
         errno::set_errno(errno::Errno(0));
+        // SAFETY: `directory` holds a live DIR used by this thread only.
         let entry = unsafe { libc::readdir(directory.0) };
         if entry.is_null() {
             let error = errno::errno().0;
@@ -46,6 +50,8 @@ fn names(directory: &File, limit: usize) -> std::io::Result<Vec<OsString>> {
             }
             break;
         }
+        // SAFETY: readdir returned a non-null entry valid until the next readdir; d_name is
+        // NUL-terminated, and the bytes are copied before the loop reads again.
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name == b"." || name == b".." {
             continue;
@@ -110,6 +116,7 @@ fn unlink(parent: &File, leaf: &OsStr) -> std::io::Result<()> {
         0
     };
     let name = crate::component_cstring(leaf).map_err(io)?;
+    // SAFETY: `parent` is open for the call and `name` is a live NUL-terminated single component.
     if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } == 0 {
         return Ok(());
     }

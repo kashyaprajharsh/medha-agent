@@ -100,7 +100,7 @@ fn token_requests(fake: &FakeOpenAi) -> usize {
 async fn a_chatgpt_account_signs_in_renews_once_and_signs_out_without_leaving_secrets_behind() {
     let files = tempfile::tempdir().unwrap();
     let home = files.path().join("home");
-    // This integration binary has one test; environment choices belong to its fixture.
+    // SAFETY: this integration binary has one test, so no other thread reads the environment.
     unsafe {
         std::env::set_var("MEDHA_HOME", &home);
         std::env::set_var("MEDHA_CRED_STORE", "file");

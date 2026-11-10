@@ -123,6 +123,7 @@ pub fn open_path(path: &Path) -> Result<(), String> {
         .chain(Some(0))
         .collect();
     let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: verb and target are NUL-terminated UTF-16 that live through the call; the rest are null, which the API allows.
     let result = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),

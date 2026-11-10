@@ -371,6 +371,7 @@ impl Drop for TuiClient {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
             if let Some(pid) = self.child.process_id() {
+                // SAFETY: kill takes integers, and the unreaped child still owns this pid.
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGKILL);
                 }

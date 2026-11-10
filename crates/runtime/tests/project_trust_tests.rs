@@ -64,7 +64,7 @@ async fn request(chat: &runtime::session::Started, history: &mut Vec<Message>, s
 async fn live_chats_use_their_own_project_and_adopt_trust_changes_without_prompts() {
     let files = tempfile::tempdir().unwrap();
     let root = files.path().canonicalize().unwrap();
-    // This integration binary has one test; environment choices belong to its fixture.
+    // SAFETY: this integration binary has one test, so no other thread reads the environment.
     unsafe {
         std::env::set_var("MEDHA_HOME", root.join("home"));
     }
@@ -460,6 +460,7 @@ while True:
     #[cfg(unix)]
     {
         assert_eq!(
+            // SAFETY: signal 0 only asks whether the process exists; kill takes integers.
             unsafe { libc::kill(pid, 0) },
             -1,
             "server stopped before revoke returned"
@@ -508,6 +509,7 @@ while True:
     #[cfg(unix)]
     {
         assert_eq!(
+            // SAFETY: signal 0 only asks whether the process exists; kill takes integers.
             unsafe { libc::kill(starting_pid, 0) },
             -1,
             "initializing process stopped before revoke returned"

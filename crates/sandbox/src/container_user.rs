@@ -71,7 +71,9 @@ pub(crate) async fn resolve(runtime: &str, user: Option<&str>) -> Result<Vec<Str
         podman,
         rootless,
         remapped,
+        // SAFETY: geteuid takes no arguments, cannot fail and touches no memory of ours.
         unsafe { libc::geteuid() },
+        // SAFETY: getegid takes no arguments, cannot fail and touches no memory of ours.
         unsafe { libc::getegid() },
     )
 }

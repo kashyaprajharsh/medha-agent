@@ -44,6 +44,7 @@ pub(crate) fn append(path: &Path, record: &str) -> io::Result<()> {
             == 0;
         let mut information = std::mem::MaybeUninit::uninit();
         use std::os::windows::io::AsRawHandle;
+        // SAFETY: the file is open (borrowed) and `information` is writable storage for the struct.
         if unsafe {
             windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
                 file.as_raw_handle(),
@@ -53,6 +54,7 @@ pub(crate) fn append(path: &Path, record: &str) -> io::Result<()> {
         {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: the call above succeeded, so it filled `information` completely.
         safe &= unsafe { information.assume_init() }.nNumberOfLinks == 1;
     }
     if !safe {

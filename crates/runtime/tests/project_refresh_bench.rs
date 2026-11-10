@@ -18,7 +18,8 @@ fn measure_real_project_refresh() {
         .canonicalize()
         .unwrap();
     let state = tempfile::tempdir().unwrap();
-    // This ignored benchmark runs alone and leaves the user's saved trust untouched.
+    // SAFETY: this ignored benchmark runs alone, so no other thread reads the environment;
+    // it also leaves the user's saved trust untouched.
     unsafe {
         std::env::set_var("MEDHA_HOME", state.path());
     }

@@ -148,6 +148,7 @@ fn a_config_others_can_write_is_never_trusted_and_group_write_needs_a_private_gr
     assert!(!trusted(0o666), "a config any user can write was trusted");
     let gid = std::fs::metadata(&config).unwrap().gid();
     assert_eq!(trusted(0o664), private_group(gid));
+    // SAFETY: getegid takes no arguments, cannot fail and touches no memory of ours.
     if unsafe { libc::getegid() } != 0 {
         assert!(!private_group(0), "the root group is shared, never private");
     }

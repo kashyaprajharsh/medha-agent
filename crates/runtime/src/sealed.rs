@@ -70,6 +70,8 @@ fn dpapi(input: &[u8], protect: bool) -> Result<Vec<u8>> {
         cbData: 0,
         pbData: null_mut(),
     };
+    // SAFETY: `data` describes `input`, alive for the call and only read; the optional
+    // arguments are null, which the API allows; `out` is live for the result.
     let done = unsafe {
         if protect {
             CryptProtectData(
@@ -100,7 +102,9 @@ fn dpapi(input: &[u8], protect: bool) -> Result<Vec<u8>> {
             "Windows could not open a sealed key; it opens only for the user who saved it"
         });
     }
+    // SAFETY: on success the API returned `cbData` bytes at `pbData`, copied before they are freed.
     let bytes = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+    // SAFETY: the API allocated `pbData` with LocalAlloc for us to free, once, here.
     unsafe { LocalFree(out.pbData.cast()) };
     Ok(bytes)
 }

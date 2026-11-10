@@ -793,6 +793,7 @@ mod tests {
         std::fs::create_dir_all(&fixture).unwrap();
         let fifo = fixture.join("pipe");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a live NUL-terminated path; mkfifo only reads it.
         let result = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
         assert_eq!(
             result,

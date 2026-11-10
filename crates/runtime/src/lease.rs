@@ -64,6 +64,7 @@ impl SessionLease {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid takes no arguments, cannot fail and touches no memory of ours.
             if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
                 anyhow::bail!(
                     "conversation lease must be this user's own single-link regular file"
@@ -191,11 +192,14 @@ mod tests {
         let id = ulid::Ulid::new();
         let lease = SessionLease::acquire(state.path(), id).unwrap();
         let mut pipe = [0; 2];
+        // SAFETY: `pipe` is a live array of the two ints pipe(2) writes.
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        // Only async-signal-safe C calls run in the child; it deliberately
-        // keeps the inherited file description until the parent releases it.
+        // SAFETY: the child runs only async-signal-safe calls (close, read, _exit) and then
+        // exits, so forking a multi-threaded test process is sound; it deliberately keeps the
+        // inherited file description until the parent releases it.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
+            // SAFETY: the fds are the child's copies; `byte` is a live one-byte buffer.
             unsafe {
                 libc::close(pipe[1]);
                 let mut byte = 0u8;
@@ -204,11 +208,13 @@ mod tests {
             }
         }
         assert!(pid > 0);
+        // SAFETY: the parent's read end is ours and closed once, here.
         unsafe {
             libc::close(pipe[0]);
         }
         drop(lease);
         let acquired = SessionLease::acquire(state.path(), id);
+        // SAFETY: the write end is closed once, here; waitpid gets our own child and a null status pointer it accepts.
         unsafe {
             libc::close(pipe[1]);
             while libc::waitpid(pid, std::ptr::null_mut(), 0) < 0

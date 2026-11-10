@@ -14,6 +14,7 @@ impl Drop for ServerCleanup {
             .ok()
             .and_then(|text| text.parse::<i32>().ok())
         {
+            // SAFETY: kill takes integers; the pid is the fixture server this test started.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
@@ -29,6 +30,7 @@ async fn another_process_stops_its_server_at_next_use_without_interrupting_its_c
     let state = directory.join("state");
     std::fs::create_dir_all(workspace.join(".git")).unwrap();
     std::fs::create_dir_all(workspace.join("src")).unwrap();
+    // SAFETY: the only other test here is ignored and runs in its own process, so no other thread reads the environment.
     unsafe {
         std::env::set_var("MEDHA_HOME", &state);
     }
@@ -89,6 +91,7 @@ while True:
     revoke_live(&workspace.join("src")).await.unwrap();
     eprintln!("local revocation: {} us", started.elapsed().as_micros());
     assert_eq!(
+        // SAFETY: signal 0 only asks whether the process exists; kill takes integers.
         unsafe { libc::kill(pid, 0) },
         0,
         "an idle foreign process does not participate in revocation"
@@ -110,6 +113,7 @@ while True:
         .unwrap();
     assert!(status.success());
     assert_eq!(
+        // SAFETY: signal 0 only asks whether the process exists; kill takes integers.
         unsafe { libc::kill(pid, 0) },
         -1,
         "the foreign server stopped before its next query returned"

@@ -379,6 +379,7 @@ fn closing_a_tab_releases_its_shell_and_rejects_further_input() {
         }
     }
     assert_eq!(
+        // SAFETY: signal 0 only asks whether the process exists; kill takes integers.
         unsafe { libc::kill(pid as i32, 0) },
         -1,
         "the shell survived cleanup"

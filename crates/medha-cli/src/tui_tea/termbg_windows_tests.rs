@@ -28,10 +28,11 @@ fn seen(event: &INPUT_RECORD) -> (u16, bool, u16) {
     if event.EventType != KEY_EVENT as u16 {
         return (event.EventType, false, 0);
     }
+    // SAFETY: EventType is KEY_EVENT (checked above), so KeyEvent is the union's active field.
     let key = unsafe { event.Event.KeyEvent };
-    (event.EventType, key.bKeyDown != 0, unsafe {
-        key.uChar.UnicodeChar
-    })
+    // SAFETY: these test records are built with the UTF-16 field of the union.
+    let unit = unsafe { key.uChar.UnicodeChar };
+    (event.EventType, key.bKeyDown != 0, unit)
 }
 
 fn taken(events: &[INPUT_RECORD]) -> Taken {

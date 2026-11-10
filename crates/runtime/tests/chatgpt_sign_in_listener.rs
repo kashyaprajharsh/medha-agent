@@ -34,7 +34,7 @@ async fn visit(port: u16, target: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stray_local_requests_never_end_a_sign_in() {
     let files = tempfile::tempdir().unwrap();
-    // This integration binary has one test; environment choices belong to its fixture.
+    // SAFETY: this integration binary has one test, so no other thread reads the environment.
     unsafe {
         std::env::set_var("MEDHA_HOME", files.path().join("home"));
         std::env::set_var("MEDHA_CRED_STORE", "file");

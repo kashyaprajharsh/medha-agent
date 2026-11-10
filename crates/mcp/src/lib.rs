@@ -2560,6 +2560,7 @@ fn kill_process_group(pid: Option<u32>) {
     let Some(pid) = pid.filter(|pid| *pid > 0) else {
         return;
     };
+    // SAFETY: kill only takes integers; the group is the one this server was started to lead.
     #[cfg(unix)]
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);

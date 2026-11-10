@@ -30,6 +30,7 @@ fn an_attacker_cannot_redirect_or_block_audit_appends() {
     assert!(append(&log, "planted\n").is_err());
     std::fs::remove_file(&log).unwrap();
     let fifo = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo is a live NUL-terminated path; mkfifo only reads it.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     assert!(append(&log, "planted\n").is_err());
     assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");

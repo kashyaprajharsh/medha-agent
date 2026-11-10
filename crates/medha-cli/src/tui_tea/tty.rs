@@ -40,11 +40,12 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
     {
         use std::os::fd::FromRawFd;
         // Rendering through this private fd survives the fd 1/2 redirection.
+        // SAFETY: dup only takes an integer; a failure is checked just below.
         let tty_fd = unsafe { libc::dup(1) };
         if tty_fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        // Safety: `tty_fd` is a fresh, exclusively-owned fd from dup(2).
+        // SAFETY: `tty_fd` is a fresh, exclusively-owned fd from dup(2).
         let mut tty = unsafe { std::fs::File::from_raw_fd(tty_fd) };
 
         let redirect = StrayRedirect::install(stray_log)?;
@@ -94,14 +95,17 @@ mod console_input {
     static WAS_ON: AtomicBool = AtomicBool::new(false);
 
     fn mode() -> Option<(windows_sys::Win32::Foundation::HANDLE, u32)> {
+        // SAFETY: GetStdHandle takes a constant and returns a handle we do not own or close.
         let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         let mut mode = 0;
+        // SAFETY: `mode` is a live, writable u32; an invalid handle only makes the call fail.
         (unsafe { GetConsoleMode(handle, &mut mode) } != 0).then_some((handle, mode))
     }
 
     pub(super) fn read_key_records() {
         if let Some((handle, mode)) = mode()
             && mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+            // SAFETY: the handle came from GetStdHandle and the mode is plain flags.
             && unsafe { SetConsoleMode(handle, mode & !ENABLE_VIRTUAL_TERMINAL_INPUT) } != 0
         {
             WAS_ON.store(true, Ordering::SeqCst);
@@ -113,6 +117,7 @@ mod console_input {
         if WAS_ON.swap(false, Ordering::SeqCst)
             && let Some((handle, mode)) = mode()
         {
+            // SAFETY: the handle came from GetStdHandle and the mode is plain flags.
             unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) };
         }
     }
@@ -157,13 +162,16 @@ impl StrayRedirect {
             .open(stray_log)?;
 
         // Save the current fd 1/2 so they can be restored on exit.
+        // SAFETY: dup only takes an integer; failures are checked just below.
         let saved_out = unsafe { libc::dup(1) };
+        // SAFETY: as above.
         let saved_err = unsafe { libc::dup(2) };
         if saved_out < 0 || saved_err < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         // Point fd 1/2 at the log. dup2 makes them share the log's open file
         // description, so `log` can drop without closing them.
+        // SAFETY: `log` is open for the whole call, so its fd is valid; dup2 only takes integers.
         unsafe {
             libc::dup2(log.as_raw_fd(), 1);
             libc::dup2(log.as_raw_fd(), 2);
@@ -182,6 +190,7 @@ impl StrayRedirect {
         if self.restored {
             return;
         }
+        // SAFETY: the saved fds are ours from install and are closed only here, once (`restored`).
         unsafe {
             libc::dup2(self.saved_out, 1);
             libc::dup2(self.saved_err, 2);
@@ -205,6 +214,7 @@ impl StrayRedirect {
 fn install_panic_hook(saved_out: std::os::fd::RawFd, saved_err: std::os::fd::RawFd) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // SAFETY: dup2 only takes integers; if the saved fds were already closed it fails with EBADF, harmlessly.
         unsafe {
             libc::dup2(saved_out, 1);
             libc::dup2(saved_err, 2);
@@ -252,6 +262,7 @@ mod tests {
 
         let mut redirect = StrayRedirect::install(&log).unwrap();
         let msg = b"Unicode mismatch stray line\n";
+        // SAFETY: the pointer and length describe `msg`, which is alive for the call.
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()) };
         redirect.restore();
 

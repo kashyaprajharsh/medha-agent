@@ -84,6 +84,7 @@ fn windows_process_creation_time(process: windows_sys::Win32::Foundation::HANDLE
     let mut exit = creation;
     let mut kernel = creation;
     let mut user = creation;
+    // SAFETY: the four FILETIMEs are live and writable; a bad handle only makes the call fail.
     let ok = unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
     (ok != 0).then_some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
 }
@@ -94,6 +95,7 @@ fn owner_record_for_current_process() -> OwnerRecord {
 
     OwnerRecord {
         pid: std::process::id(),
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no closing and is always valid.
         creation_time: windows_process_creation_time(unsafe { GetCurrentProcess() }),
     }
 }
@@ -128,6 +130,7 @@ fn windows_owner_alive(record: OwnerRecord) -> bool {
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
 
+    // SAFETY: OpenProcess takes integers; a null result is checked just below.
     let process = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
@@ -136,6 +139,7 @@ fn windows_owner_alive(record: OwnerRecord) -> bool {
         )
     };
     if process.is_null() {
+        // SAFETY: GetLastError takes no arguments and reads this thread's last error.
         return match unsafe { GetLastError() } {
             ERROR_INVALID_PARAMETER => false,
             // Protected processes can refuse a query even while alive. An
@@ -149,7 +153,9 @@ fn windows_owner_alive(record: OwnerRecord) -> bool {
     let creation_matches = record.creation_time.is_none_or(|expected| {
         windows_process_creation_time(process).is_none_or(|actual| actual == expected)
     });
+    // SAFETY: `process` is the open handle with SYNCHRONIZE access; a zero wait only polls.
     let wait = unsafe { WaitForSingleObject(process, 0) };
+    // SAFETY: the handle is ours and closed once, here.
     unsafe {
         CloseHandle(process);
     }
@@ -177,7 +183,7 @@ fn owner_alive(worktree: &Path) -> bool {
     };
     #[cfg(unix)]
     {
-        // Signal 0 tests for existence without delivering anything.
+        // SAFETY: signal 0 tests for existence without delivering anything; kill takes integers.
         unsafe { libc::kill(record.pid as i32, 0) == 0 }
     }
     #[cfg(windows)]
@@ -300,6 +306,7 @@ impl Drop for GitGroupReaper {
 }
 
 fn kill_git_process_tree(pid: u32) {
+    // SAFETY: kill only takes integers; the group is the git process this worktree started.
     #[cfg(unix)]
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
@@ -1697,6 +1704,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("agent-worktree");
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no closing and is always valid.
         let current_creation =
             windows_process_creation_time(unsafe { GetCurrentProcess() }).unwrap();
         std::fs::write(
@@ -1739,9 +1747,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn a live Windows owner");
+        // SAFETY: OpenProcess takes integers; a null result is asserted against just below.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
         assert!(!process.is_null(), "open the child process");
         let child_creation = windows_process_creation_time(process).unwrap();
+        // SAFETY: the handle is ours and closed once, here.
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(process);
         }

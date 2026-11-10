@@ -20,7 +20,7 @@ impl StreamSink for Notices {
 async fn notices_require_disabled_content_and_belong_to_the_chat() {
     let files = tempfile::tempdir().unwrap();
     let root = files.path().canonicalize().unwrap();
-    // This integration binary owns its environment and has one active test.
+    // SAFETY: this integration binary has one active test, so no other thread reads the environment.
     unsafe {
         std::env::set_var("MEDHA_HOME", root.join("home"));
     }

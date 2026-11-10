@@ -598,6 +598,8 @@ impl kernel::context::RequestContext for LiveContext {
                 cache_write_per_mtok: lock.pricing.cache_write_per_mtok,
                 indicative: false,
             }),
+            // The person's own rate saved with the model stands as it is.
+            _ if default.is_some_and(|pricing| !pricing.indicative) => default,
             _ => {
                 let mut pricing = self
                     .fallback

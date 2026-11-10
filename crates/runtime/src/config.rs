@@ -1108,6 +1108,10 @@ fn resolve_inner(
         .unwrap_or_default();
 
     let transport = configured.filter(|profile| profile.base_url == base_url);
+    // A saved rate is for that model at that address; an override to another keeps none of it.
+    let price = transport
+        .filter(|profile| profile.model == model)
+        .and_then(|profile| profile.price);
     let provider = providers::ProviderProfile {
         provider_id: configured
             .and_then(|p| p.provider_id.clone())
@@ -1132,6 +1136,7 @@ fn resolve_inner(
         reasoning_echo: configured.and_then(|p| p.reasoning_echo),
         ca_cert_file: transport.and_then(|p| p.ca_cert_file.clone()),
         proxy: transport.and_then(|p| p.proxy.clone()),
+        price,
     };
     provider.validate().map_err(anyhow::Error::msg)?;
     if provider.auth.requires_credential() && api_key.is_empty() {
@@ -2477,6 +2482,7 @@ mod tests {
             reasoning_echo: None,
             ca_cert_file: None,
             proxy: None,
+            price: None,
         }
     }
 

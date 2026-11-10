@@ -71,6 +71,8 @@ button.cx-model:hover { background: var(--hover); }
 .cx-advanced > summary::-webkit-details-marker { display: none; }
 .cx-advanced[open] > summary span:last-child { transform: rotate(90deg); }
 .cx-advanced[open] > summary { margin-bottom: var(--s-3); border-bottom: 1px solid var(--hair); }
+/* The two rates of one price read as a pair. */
+.price-pair { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
 .cx-formfoot { display: flex; flex-direction: column; align-items: stretch; gap: var(--s-3); margin-top: auto; }
 .cx-formfoot > .cg-actions { justify-content: flex-end; }
 .cx-formfoot button, .pv-foot button, .cg-foot button { white-space: nowrap; flex: none; }

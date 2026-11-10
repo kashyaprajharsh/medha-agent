@@ -47,10 +47,12 @@ pub(super) fn resolve(
     lock: &lockfile::MedhaLock,
     model_name: &str,
     catalogue_pricing: Option<(f64, f64, Option<f64>, Option<f64>)>,
+    profile_price: Option<kernel::Pricing>,
     base_budget: &kernel::Budget,
     notices: &dyn Notices,
 ) -> Option<kernel::Pricing> {
-    // models.dev prices are advisory for self-hosted routes.
+    // A trusted project's rate, then the person's own rate saved with the model, then the
+    // catalogue's list price, which is only advisory for self-hosted routes.
     let pricing = match (lock.pricing.input_per_mtok, lock.pricing.output_per_mtok) {
         (Some(i), Some(o)) => Some(kernel::Pricing {
             input_per_mtok: i,
@@ -61,18 +63,20 @@ pub(super) fn resolve(
             cache_write_per_mtok: lock.pricing.cache_write_per_mtok,
             indicative: false,
         }),
-        _ => catalogue_pricing.map(|(input, output, cached, written)| kernel::Pricing {
-            input_per_mtok: input,
-            output_per_mtok: output,
-            cached_input_per_mtok: cached,
-            cache_write_per_mtok: written,
-            indicative: true,
+        _ => profile_price.filter(|price| !price.indicative).or_else(|| {
+            catalogue_pricing.map(|(input, output, cached, written)| kernel::Pricing {
+                input_per_mtok: input,
+                output_per_mtok: output,
+                cached_input_per_mtok: cached,
+                cache_write_per_mtok: written,
+                indicative: true,
+            })
         }),
     };
     match &pricing {
         Some(p) if p.indicative => notices.say(&format!(
             "cost meter: {model_name} list price from models.dev (${:.2}/M in, ${:.2}/M out) — \
-             indicative only; set [pricing] in medha.lock for your real rate",
+             indicative only; set your own rate with the model for the real cost",
             p.input_per_mtok, p.output_per_mtok
         )),
         Some(_) => {}
@@ -80,8 +84,8 @@ pub(super) fn resolve(
             if base_budget.max_cost_usd.is_some() {
                 notices.say(&format!(
                     "warning: max_cost_usd is set but no pricing is known for '{model_name}' — \
-                     model requests will be refused. Set [pricing] input_per_mtok / \
-                     output_per_mtok in medha.lock."
+                     model requests will be refused. Set your rate with the model, or \
+                     [pricing] input_per_mtok / output_per_mtok in medha.lock."
                 ));
             }
         }

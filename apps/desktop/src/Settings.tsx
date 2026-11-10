@@ -597,6 +597,11 @@ export function ModelForm({
   const [output, setOutput] = useState(
     String(model?.profile.max_output_tokens || ""),
   );
+  // The person's own rate per million tokens; blank means the list price, where one is known.
+  const savedPrice = model?.profile.price as { input_per_mtok: number; output_per_mtok: number } | undefined;
+  const [priceIn, setPriceIn] = useState(savedPrice ? String(savedPrice.input_per_mtok) : "");
+  const [priceOut, setPriceOut] = useState(savedPrice ? String(savedPrice.output_per_mtok) : "");
+  const halfPriced = Boolean(priceIn.trim()) !== Boolean(priceOut.trim());
   const [certificate, setCertificate] = useState(String(model?.profile.ca_cert_file || ""));
   const [proxy, setProxy] = useState(String(model?.profile.proxy || ""));
   const [reasoning, setReasoning] = useState(
@@ -741,6 +746,10 @@ export function ModelForm({
       max_output_tokens: output ? Number(output) : null,
       ca_cert_file: certificate.trim() || null,
       proxy: proxy.trim() || null,
+      price:
+        priceIn.trim() && priceOut.trim()
+          ? { ...savedPrice, input_per_mtok: Number(priceIn), output_per_mtok: Number(priceOut) }
+          : null,
       reasoning,
       reasoning_efforts: efforts.length ? efforts : null,
       image_input: images,
@@ -1102,6 +1111,35 @@ export function ModelForm({
                 onChange={(event) => setOutput(event.target.value)}
               />
             </label>
+            <div className="price-pair">
+              <label>
+                Your price, input ($ per million tokens)
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={priceIn}
+                  placeholder="List price"
+                  onChange={(event) => setPriceIn(event.target.value)}
+                />
+              </label>
+              <label>
+                Output ($ per million tokens)
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={priceOut}
+                  placeholder="List price"
+                  onChange={(event) => setPriceOut(event.target.value)}
+                />
+              </label>
+            </div>
+            <p className="quiet">
+              {halfPriced
+                ? "Set both to use your own rate; until then the list price counts."
+                : "Used for this model in every project; a trusted project's own rate comes first."}
+            </p>
             <label>
               Certificate file
               <input

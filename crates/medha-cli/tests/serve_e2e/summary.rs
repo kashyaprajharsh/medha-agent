@@ -16,6 +16,43 @@ async fn usage_logged(world: &World, chat: &str) -> Vec<kernel::Event> {
         .collect()
 }
 
+/// A price saved with the model counts as the person's own rate in any folder, with no project to trust.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_price_saved_with_the_model_is_the_persons_own_rate_anywhere() {
+    let world = World::new();
+    let folder = world.folder("priced-model");
+    let backend = world.backend_in(&[("MEDHA_API_KEY", "")]);
+    let mut client = backend.connect().await;
+    let profile = json!({"protocol": "open-ai-chat", "base_url": world.provider.url,
+        "model": "test-model", "auth": "bearer", "max_ctx": 32768,
+        "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}});
+    let save = json!({"method": "settings.model.save",
+        "params": {"name": "priced", "profile": profile, "default": true, "key": SECRET}});
+    client
+        .about(&folder, save)
+        .await
+        .expect("a model is saved with its price");
+    let chat = client.open(&folder).await;
+    client.send(&chat, "USAGE please").await;
+    let (_, done) = client.until(|frame| kind(frame, "turn.done")).await;
+    let summary = &done["params"]["summary"];
+    assert_eq!(summary["priced"], "own", "{done}");
+    let logged: f64 = usage_logged(&world, &chat)
+        .await
+        .iter()
+        .filter_map(|event| event.payload["cost_usd"].as_f64())
+        .sum();
+    // 1200 prompt tokens at $3 and 34 completion tokens at $15, per million.
+    assert!(
+        (logged - (1200.0 * 3.0 + 34.0 * 15.0) / 1e6).abs() < 1e-12,
+        "{logged}"
+    );
+    assert!(
+        (summary["cost_usd"].as_f64().unwrap() - logged).abs() < 1e-12,
+        "{done}"
+    );
+}
+
 /// A finished task says how long it took, its model calls and tokens, and what they cost at the operator's rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finished_task_says_what_it_used_and_what_it_cost() {

@@ -68,6 +68,31 @@ pub enum ChatTokenLimit {
     MaxCompletionTokens,
 }
 
+/// The person's own rate for this model, per million tokens: what the cost meter uses instead of a list price.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfilePrice {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
+}
+
+// Every rate is checked finite when a profile is read, so equality is reflexive.
+impl Eq for ProfilePrice {}
+
+impl ProfilePrice {
+    fn valid(&self) -> bool {
+        [self.input_per_mtok, self.output_per_mtok]
+            .into_iter()
+            .chain(self.cached_input_per_mtok)
+            .chain(self.cache_write_per_mtok)
+            .all(|rate| rate.is_finite() && rate >= 0.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderProfile {
     /// Public catalogue identity, independent of the pinned deployment URL
@@ -134,6 +159,9 @@ pub struct ProviderProfile {
     /// Explicit model-traffic proxy; setting it authorizes this profile's authenticated traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// The person's own rate for this model, used wherever it runs; a list price only when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<ProfilePrice>,
 }
 
 /// Bounds on a configured stream wait: long enough for a model to think,
@@ -172,6 +200,7 @@ impl ProviderProfile {
             reasoning_echo: None,
             ca_cert_file: None,
             proxy: None,
+            price: None,
         }
     }
 
@@ -357,9 +386,16 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             ca_cert_file: Option<String>,
             #[serde(default)]
             proxy: Option<String>,
+            #[serde(default)]
+            price: Option<ProfilePrice>,
         }
 
         let raw = RawProfile::deserialize(deserializer)?;
+        if raw.price.is_some_and(|price| !price.valid()) {
+            return Err(serde::de::Error::custom(
+                "a model's price must be a finite, non-negative rate per million tokens",
+            ));
+        }
         Ok(Self {
             provider_id: raw.provider_id,
             protocol: raw.protocol,
@@ -386,6 +422,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             reasoning_echo: raw.reasoning_echo,
             ca_cert_file: raw.ca_cert_file.filter(|file| !file.trim().is_empty()),
             proxy: raw.proxy.filter(|value| !value.trim().is_empty()),
+            price: raw.price,
         })
     }
 }

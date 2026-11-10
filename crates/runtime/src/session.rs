@@ -124,7 +124,14 @@ pub async fn start(
     let state = workspace_home.state.clone();
     let medha_home = workspace_home.home.clone();
     let base_budget = options.budget.apply(lock.budget.to_budget()).for_startup();
-    let pricing = pricing::resolve(lock, &model_name, catalogue_pricing, &base_budget, notices);
+    let pricing = pricing::resolve(
+        lock,
+        &model_name,
+        catalogue_pricing,
+        kernel::Provider::list_price(provider.as_ref()),
+        &base_budget,
+        notices,
+    );
     let crate::workspace::Store { log, artifacts } = workspace_home.open_store()?;
 
     let (mut session, resumed, lease) =

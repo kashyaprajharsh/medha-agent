@@ -2315,6 +2315,31 @@ test("provider search saves its identity without reusing another endpoint's key 
   assert.ok(!calls.some((call) => call.method === "settings.model.test" || call.method === "settings.model.discover"));
 });
 
+test("a price set with a model is saved as that model's own rate, and half a price is not saved", async () => {
+  const saves = [];
+  // Saving closes the form, so each price is entered in a form of its own.
+  const saveWith = async (input, output) => {
+    await providerForm(async (method = "settings.list", params) => {
+      if (method === "settings.model.save") { saves.push(params); return { saved: true }; }
+      assert.equal(method, "settings.list");
+      return providerSettings([providerFixture], []);
+    });
+    await inputValue(searchBox(), "Fixture");
+    await click(providerRow("Fixture Provider"));
+    await inputValue(fieldInput("Key"), "dummy-only-key");
+    await inputValue(fieldInput("Model ID"), "fixture-model");
+    await inputValue(fieldInput("Your price, input ($ per million tokens)"), input);
+    await inputValue(fieldInput("Output ($ per million tokens)"), output);
+    const half = /Set both to use your own rate/.test(document.body.textContent);
+    await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    return half;
+  };
+  assert.ok(await saveWith("3", ""), "half a price was not pointed out");
+  assert.equal(saves.at(-1).profile.price, null, "half a price was saved as a rate");
+  assert.ok(!(await saveWith("3", "15")));
+  assert.deepEqual(saves.at(-1).profile.price, { input_per_mtok: 3, output_per_mtok: 15 });
+});
+
 test("provider refresh is a secondary labelled control beside the search and reports failure", async () => {
   let finishRefresh, rejectRefresh, lists = 0;
   await providerForm(async (method = "settings.list") => {

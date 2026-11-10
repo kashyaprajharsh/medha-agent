@@ -362,6 +362,16 @@ impl Provider for ProviderClient {
 
     fn list_price(&self) -> Option<kernel::Pricing> {
         let profile = self.connection.lock().unwrap().profile.clone();
+        // The person's own rate for this model comes first, and is not a list price.
+        if let Some(price) = profile.price {
+            return Some(kernel::Pricing {
+                input_per_mtok: price.input_per_mtok,
+                output_per_mtok: price.output_per_mtok,
+                cached_input_per_mtok: price.cached_input_per_mtok,
+                cache_write_per_mtok: price.cache_write_per_mtok,
+                indicative: false,
+            });
+        }
         let (input, output, cached, written) = crate::models_dev::list_price(&profile)?;
         Some(kernel::Pricing {
             input_per_mtok: input,

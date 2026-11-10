@@ -164,6 +164,8 @@ pub(super) enum Effect {
     /// A chat to delete, or to bring back, in its own folder when that is not this one.
     DeleteChat(String, Option<PathBuf>),
     RestoreChat(String, Option<PathBuf>),
+    /// A chat to pin or unpin, in its own folder when that is not this one.
+    PinChat(String, Option<PathBuf>, bool),
     Reconnect,
     Clear,
     Snapshot,
@@ -422,6 +424,7 @@ enum Answer {
     Images(Vec<staged_images::Image>),
     ChatDeleted(String),
     ChatRestored(String),
+    ChatPinned(String, bool),
     /// Ctrl+V found text rather than an image: it is pasted as the terminal would have.
     ClipboardText(String),
     Reloaded(protocol::ExtensionsReloaded),
@@ -570,6 +573,49 @@ struct Context {
     settings: Option<protocol::RestoreSettings>,
     backend: Arc<Backend>,
     conversation: String,
+}
+
+/// A chat `/resume` listed, deleted, brought back or pinned in the folder it lives in.
+async fn change_listed_chat(
+    connection: &Connection,
+    here: PathBuf,
+    effect: &Effect,
+) -> Result<Answer, String> {
+    let at = |folder: &Option<PathBuf>| folder.clone().unwrap_or_else(|| here.clone());
+    match effect {
+        Effect::DeleteChat(id, folder) => {
+            let request = protocol::DeleteChat {
+                session: id.clone(),
+            };
+            let folder = at(folder);
+            connection
+                .call_async(protocol::Scope::Folder(&folder), &request)
+                .await
+                .map(|_| Answer::ChatDeleted(id.clone()))
+        }
+        Effect::RestoreChat(id, folder) => {
+            let request = protocol::RestoreChat {
+                session: id.clone(),
+            };
+            let folder = at(folder);
+            connection
+                .call_async(protocol::Scope::Folder(&folder), &request)
+                .await
+                .map(|_| Answer::ChatRestored(id.clone()))
+        }
+        Effect::PinChat(id, folder, pinned) => {
+            let request = protocol::PinChat {
+                session: id.clone(),
+                pinned: *pinned,
+            };
+            let folder = at(folder);
+            connection
+                .call_async(protocol::Scope::Folder(&folder), &request)
+                .await
+                .map(|done| Answer::ChatPinned(id.clone(), done.pinned))
+        }
+        _ => Err("not a change to a listed chat".into()),
+    }
 }
 
 async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
@@ -833,25 +879,8 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             }
             Ok(Answer::Chats(here, personal))
         }
-        Effect::DeleteChat(id, chat_folder) => {
-            let folder = chat_folder.clone().unwrap_or(folder);
-            let request = protocol::DeleteChat {
-                session: id.clone(),
-            };
-            connection
-                .call_async(protocol::Scope::Folder(&folder), &request)
-                .await
-                .map(|_| Answer::ChatDeleted(id.clone()))
-        }
-        Effect::RestoreChat(id, chat_folder) => {
-            let folder = chat_folder.clone().unwrap_or(folder);
-            let request = protocol::RestoreChat {
-                session: id.clone(),
-            };
-            connection
-                .call_async(protocol::Scope::Folder(&folder), &request)
-                .await
-                .map(|_| Answer::ChatRestored(id.clone()))
+        Effect::DeleteChat(..) | Effect::RestoreChat(..) | Effect::PinChat(..) => {
+            change_listed_chat(&connection, folder, effect).await
         }
         Effect::Reconnect => opened(connection, folder, startup, Some(conversation), settings)
             .await
@@ -2257,6 +2286,7 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
             Answer::Chats(here, personal) => backend_features::chats_listed(model, here, personal),
             Answer::ChatDeleted(id) => backend_features::chat_deleted(model, &id),
             Answer::ChatRestored(id) => backend_features::chat_restored(model, &id),
+            Answer::ChatPinned(id, pinned) => backend_features::chat_pinned(model, &id, pinned),
             Answer::Opened(opened) => {
                 let Opened {
                     folder,

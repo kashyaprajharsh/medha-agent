@@ -3032,6 +3032,44 @@ test("a chat deleted from the sidebar keeps a way back in its row, and undo brin
   assert.ok(document.querySelector('[aria-label="Delete Old plan"]'), "undo did not bring the chat back");
 });
 
+test("pins come from Medha, the pin button tells it, and pins this app kept alone move to Medha once", async () => {
+  const cache = new Map(modules);
+  const stub = (name, source) => cache.set(name, "data:text/javascript," + encodeURIComponent(source));
+  for (const [name, exports] of Object.entries({
+    FileViewer: ["FileViewer"], FirstRun: ["FirstRun"], Extensions: ["Extensions"], Messaging: ["Messaging"],
+    Rewind: ["Rewind"], LiveTail: ["LiveTail"], Palette: ["Palette"],
+    WorkSurface: ["WorkSurface"], Transcript: ["Transcript"], UpdateReady: ["UpdateReady"],
+    Welcome: ["Starters", "Welcome"], WorkspaceMenu: ["WorkspaceMenu"],
+  })) stub(name, exports.map((name) => `export function ${name}(){return null}`).join(";"));
+  stub("OutputScope", "export function OutputScope({children}){return children}");
+  const { App } = await import(await moduleUrl("App", cache));
+  globalThis.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.window);
+  const now = Date.now() / 1000;
+  const pins = new Set(["kept"]);
+  const asked = [];
+  const row = (id, title) => ({ id, title, started_ts: now, last_ts: now, pinned: pins.has(id) });
+  const api = {
+    workspace: async () => "/project",
+    sessions: async () => [row("kept", "Pinned here"), row("old", "Pinned in this app only"), row("plain", "Plain chat")],
+    branch: async () => null, defaults: async () => settings, events: async () => ({ events: [], next_cursor: null }),
+    extensions: async () => ({ skills: [] }), liveFocus: async () => {},
+    settings: async () => ({ models: [], protocols: [], search: { provider: "duckduckgo" } }),
+    onLive: async () => () => {}, onChatsChanged: async () => () => {},
+    pinChat: async (id, pinned) => { asked.push([id, pinned]); if (pinned) pins.add(id); else pins.delete(id); },
+  };
+  localStorage.setItem("medha-pins:/project", JSON.stringify(["old"]));
+  Object.assign(globalThis.__medhaControlsTest, { api, workspace: { id: "project", name: "Project" }, theme: "dark", setTheme() {} });
+  await act(async () => root.render(h(App)));
+  await act(() => new Promise((done) => setTimeout(done, 50)));
+  assert.deepEqual(asked, [["old", true]], "a pin this app kept alone did not move to Medha");
+  assert.equal(localStorage.getItem("medha-pins:/project"), null);
+  const pressed = (title) => document.querySelector(`[aria-label="Unpin ${title}"]`);
+  assert.ok(pressed("Pinned here"), "a pin Medha keeps is not shown");
+  await click(document.querySelector('[aria-label="Pin Plain chat"]'));
+  assert.deepEqual(asked.at(-1), ["plain", true]);
+  assert.ok(pressed("Plain chat"), "the pinned chat is not shown pinned");
+});
+
 test("a project leaves Medha only when asked, and its history goes only when chosen", async () => {
   const removed = [];
   const project = { id: "project-1", name: "invoices", path: "/w/invoices", personal: false };

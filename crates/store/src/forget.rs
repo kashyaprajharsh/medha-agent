@@ -165,11 +165,13 @@ impl SqliteLog {
                 [session],
             )
             .map_err(failed)?;
-            tx.execute(
-                "DELETE FROM store_meta WHERE key = ?1",
-                [format!("{DELETING}{session}")],
-            )
-            .map_err(failed)?;
+            for mark in [DELETING, super::pins::PINNED] {
+                tx.execute(
+                    "DELETE FROM store_meta WHERE key = ?1",
+                    [format!("{mark}{session}")],
+                )
+                .map_err(failed)?;
+            }
         }
         set_chain_anchor(&tx, kept, &prev)?;
         tx.commit().map_err(failed)?;

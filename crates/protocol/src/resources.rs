@@ -354,6 +354,9 @@ pub struct SessionSummary {
     /// Sub-agents this chat started; their own sessions are not listed separately.
     #[serde(default)]
     pub agents: u32,
+    /// Pinned from any app: Medha keeps the pin, not the app.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

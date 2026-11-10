@@ -8,6 +8,8 @@ export type Session = {
   started_ts: number;
   last_ts: number;
   events: number;
+  /** Pinned from any app: Medha keeps the pin. */
+  pinned?: boolean;
 };
 
 export type HistoryEvent = {
@@ -337,6 +339,8 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
       invoke<void>("chat_delete", { workspaceId, sessionId }),
     restoreChat: (sessionId: string) =>
       invoke<void>("chat_restore", { workspaceId, sessionId }),
+    pinChat: (sessionId: string, pinned: boolean) =>
+      invoke<void>("chat_pin", { workspaceId, sessionId, pinned }),
     usage: (days: number) =>
       invoke<Record<string, unknown>>("usage_summary", { workspaceId, days }),
     defaults: () =>

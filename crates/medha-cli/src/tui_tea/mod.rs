@@ -955,7 +955,7 @@ impl PickerKind {
             }
             PickerKind::Reasoning(_) => " reasoning · ↑↓ select · Enter change · Esc done ".into(),
             PickerKind::Session(_) => {
-                " resume a session — ↑↓ select, Enter open, Esc cancel ".into()
+                " resume a session — ↑↓ select, Enter open, p pin, d delete, Esc cancel ".into()
             }
             PickerKind::Rewind(_) => {
                 " rewind to a turn — ↑↓ select, Enter choose, Esc cancel ".into()
@@ -1846,6 +1846,8 @@ struct Model {
     chat_folders: HashMap<ulid::Ulid, std::path::PathBuf>,
     /// Chats deleted from `/resume` that can still be brought back, with the title each had.
     deleted_chats: HashMap<ulid::Ulid, String>,
+    /// Chats `/resume` listed as pinned; Medha keeps the pin, so every app shows it.
+    pinned_chats: std::collections::HashSet<ulid::Ulid>,
     ac_sel: usize,
     welcome: bool,
     show_thinking: bool,
@@ -2143,6 +2145,7 @@ impl Model {
             picker: None,
             chat_folders: HashMap::new(),
             deleted_chats: HashMap::new(),
+            pinned_chats: std::collections::HashSet::new(),
             ac_sel: 0,
             welcome: true,
             show_thinking: ui.show_thinking,

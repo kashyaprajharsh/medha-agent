@@ -297,7 +297,14 @@ async fn handle<C: Chats>(
                         Err(error) => Err(refused(error)),
                     }
                 }
-                true => backend.chats.about_folder(&frame).await.map_err(refused),
+                true => {
+                    let answer = backend.chats.about_folder(&frame).await;
+                    // A pin is every app's, so every app is told.
+                    if method == "chats.pin" && answer.is_ok() {
+                        backend.announce(&frame["folder"]);
+                    }
+                    answer.map_err(refused)
+                }
                 false => backend.create(&frame["params"]).await,
             };
             let made = outcome

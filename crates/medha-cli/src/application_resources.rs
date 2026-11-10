@@ -391,6 +391,7 @@ pub(crate) async fn read<L: EventLog>(
         // Sub-agents are counted on the chat that started them, not resumed on their own.
         Read::Sessions => {
             let sessions = log.sessions().await;
+            let pinned = log.pinned_sessions().await;
             let mut agents = std::collections::HashMap::<ulid::Ulid, u32>::new();
             for parent in sessions.iter().filter_map(|session| session.parent) {
                 *agents.entry(parent).or_default() += 1;
@@ -407,6 +408,7 @@ pub(crate) async fn read<L: EventLog>(
                         model: None,
                         events: session.events,
                         agents: agents.get(&session.id).copied().unwrap_or_default(),
+                        pinned: pinned.contains(&session.id),
                     })
                     .collect(),
             )

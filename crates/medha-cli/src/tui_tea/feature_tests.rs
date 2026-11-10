@@ -811,6 +811,7 @@ async fn resume_deletes_a_chat_where_it_lives_and_u_brings_it_back() {
         model: None,
         events: 3,
         agents: 0,
+        pinned: false,
     };
     let here = f.model.remote.as_ref().unwrap().conversation.clone();
     let personal = ulid::Ulid::new().to_string();
@@ -869,6 +870,45 @@ async fn resume_deletes_a_chat_where_it_lives_and_u_brings_it_back() {
     assert!(!f.model.picker.as_ref().unwrap().kind.labels()[back].contains("deleted"));
 }
 
+/// `/resume` lists pinned chats first, and `p` pins or unpins a chat where it lives, for every app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_lists_pinned_chats_first_and_p_pins_where_the_chat_lives() {
+    let mut f = fixture().await;
+    let chat = |id: &str, title: &str, updated: f64, pinned: bool| protocol::SessionSummary {
+        id: id.into(),
+        started: updated,
+        updated,
+        title: Some(title.into()),
+        model: None,
+        events: 3,
+        agents: 0,
+        pinned,
+    };
+    let (old, new) = (ulid::Ulid::new().to_string(), ulid::Ulid::new().to_string());
+    let folder = std::path::PathBuf::from("/data/personal/chat-b");
+    backend_features::chats_listed(
+        &mut f.model,
+        vec![chat(&new, "newer chat", 20.0, false)],
+        vec![(folder.clone(), chat(&old, "older pinned chat", 10.0, true))],
+    );
+    let rows = f.model.picker.as_ref().unwrap().kind.labels();
+    assert!(
+        rows[0].contains("older pinned chat") && rows[0].contains("pinned"),
+        "{rows:?}"
+    );
+
+    f.model.picker.as_mut().unwrap().selected = 0;
+    input::handle_key(&mut f.model, key(KeyCode::Char('p')));
+    let pending = &f.model.remote.as_ref().unwrap().pending;
+    assert!(pending.iter().any(|asked| matches!(
+        &asked.effect,
+        Effect::PinChat(id, Some(at), false) if *id == old && *at == folder
+    )));
+    backend_features::chat_pinned(&mut f.model, &old, false);
+    let rows = f.model.picker.as_ref().unwrap().kind.labels();
+    assert!(!rows[0].contains("pinned ·"), "{rows:?}");
+}
+
 /// `/resume` lists the desktop's personal chats too, and picking one opens it in its own folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_lists_personal_chats_and_opens_one_where_it_lives() {
@@ -894,6 +934,7 @@ async fn resume_lists_personal_chats_and_opens_one_where_it_lives() {
         model: None,
         events: 3,
         agents: 0,
+        pinned: false,
     };
     let here = ulid::Ulid::new().to_string();
     let personal = ulid::Ulid::new().to_string();

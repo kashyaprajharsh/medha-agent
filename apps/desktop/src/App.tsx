@@ -103,7 +103,6 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pinned, setPinned] = useState<Set<string>>(new Set());
   const [run, setRun] = useState<SubagentRun | null>(null);
   const text = useRef<Record<string, string>>({});
   const [draftRevision, setDraftRevision] = useState(0);
@@ -218,14 +217,31 @@ export function App() {
     store("medha-show-thinking", String(showReasoning));
   }, [showReasoning]);
 
+  const pinned = useMemo(
+    () => new Set(sessions.filter((session) => session.pinned).map((session) => session.id)),
+    [sessions],
+  );
+  // Pins this app once kept alone move to Medha, where every app sees them, then are forgotten here.
+  const pinsMoved = useRef("");
   useEffect(() => {
-    if (workspace)
-      setPinned(
-        new Set(
-          JSON.parse(stored(`medha-pins:${workspace}`) || "[]") as string[],
-        ),
-      );
-  }, [workspace]);
+    if (!workspace || loading || pinsMoved.current === workspace) return;
+    pinsMoved.current = workspace;
+    const key = `medha-pins:${workspace}`;
+    const kept = JSON.parse(stored(key) || "null") as string[] | null;
+    if (!kept) return;
+    const listed = new Map(sessions.map((session) => [session.id, session]));
+    const moving = kept.filter((id) => listed.has(id) && !listed.get(id)!.pinned);
+    void Promise.all(moving.map((id) => api.pinChat(id, true)))
+      .then(() => {
+        try {
+          localStorage.removeItem(key);
+        } catch {
+          /* private storage */
+        }
+        if (moving.length) void refresh(true);
+      })
+      .catch((cause) => setError(String(cause)));
+  }, [workspace, loading, sessions]);
 
   const { roots, subagentCounts } = useMemo(() => {
     const ids = new Set(sessions.map((session) => session.id));
@@ -596,16 +612,7 @@ export function App() {
     }
     // Hidden by the backend now; the row stays only through `deleting`, whatever the other apps hear.
     void refresh(true);
-    setTimeout(() => {
-      drop();
-      setPinned((previous) => {
-        if (!previous.has(session.id)) return previous;
-        const next = new Set(previous);
-        next.delete(session.id);
-        store(`medha-pins:${workspace}`, JSON.stringify([...next]));
-        return next;
-      });
-    }, UNDO_MS);
+    setTimeout(drop, UNDO_MS);
   }
   async function undoDelete(id: string) {
     try {
@@ -621,13 +628,18 @@ export function App() {
     void refresh(true);
   }
 
-  function togglePin(id: string) {
-    setPinned((previous) => {
-      const next = new Set(previous);
-      if (!next.delete(id)) next.add(id);
-      store(`medha-pins:${workspace}`, JSON.stringify([...next]));
-      return next;
-    });
+  // Shown at once, kept by Medha; a pin Medha refused goes back to how it was.
+  async function togglePin(id: string) {
+    const next = !pinned.has(id);
+    const flip = (on: boolean) =>
+      setSessions((old) => old.map((session) => (session.id === id ? { ...session, pinned: on } : session)));
+    flip(next);
+    try {
+      await api.pinChat(id, next);
+    } catch (cause) {
+      flip(!next);
+      setError(String(cause));
+    }
   }
 
   const blocks = useMemo(() => toBlocks(events), [events]);
@@ -949,7 +961,7 @@ export function App() {
         running={runningSessions}
         needs={needsSessions}
         pinned={pinned}
-        onTogglePin={togglePin}
+        onTogglePin={(id) => void togglePin(id)}
         onRefresh={() => void refresh()}
         loading={loading}
         workspace={workspace}

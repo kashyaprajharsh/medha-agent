@@ -199,6 +199,13 @@ impl Workspaces {
             .live
             .delete_chat(session)
     }
+    /// Pins or unpins one chat in Medha, where every app that lists it sees the pin.
+    pub fn pin_chat(&self, id: &str, session: &str, pinned: bool) -> Result<(), String> {
+        let params = json!({ "session": session, "pinned": pinned });
+        self.resolve(id, None, Some(session))?
+            .request_params("chats.pin", params)
+            .map(|_| ())
+    }
     pub fn restore_chat(&self, id: &str, session: &str) -> Result<(), String> {
         self.resolve(id, None, Some(session))?
             .live

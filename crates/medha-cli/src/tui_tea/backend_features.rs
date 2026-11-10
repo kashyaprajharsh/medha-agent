@@ -617,17 +617,69 @@ pub(super) fn chats_listed(
         })
     };
     model.chat_folders.clear();
+    model.pinned_chats.clear();
     // A chat being deleted is no longer listed, so nothing listed now can be brought back.
     model.deleted_chats.clear();
-    let mut sessions: Vec<kernel::SessionMeta> =
-        here.into_iter().filter_map(|chat| meta(chat, "")).collect();
-    for (folder, chat) in personal {
-        if let Some(listed) = meta(chat, "Chats · ") {
+    let mut pinned = std::collections::HashSet::new();
+    let mut sessions: Vec<kernel::SessionMeta> = Vec::new();
+    let all = here.into_iter().map(|chat| (None, chat, ""));
+    let personal = personal
+        .into_iter()
+        .map(|(folder, chat)| (Some(folder), chat, "Chats · "));
+    for (folder, chat, marker) in all.chain(personal) {
+        let pin = chat.pinned;
+        let Some(listed) = meta(chat, marker) else {
+            continue;
+        };
+        if let Some(folder) = folder {
             model.chat_folders.insert(listed.id, folder);
-            sessions.push(listed);
+        }
+        if pin {
+            pinned.insert(listed.id);
+        }
+        sessions.push(listed);
+    }
+    // Pinned first, each part in the order it was listed.
+    sessions.sort_by_key(|listed| !pinned.contains(&listed.id));
+    for listed in &mut sessions {
+        if pinned.contains(&listed.id) {
+            listed.title = format!("{PINNED_MARK}{}", listed.title);
         }
     }
+    model.pinned_chats = pinned;
     model.picker = Some(Picker::new(PickerKind::Session(sessions)));
+}
+
+const PINNED_MARK: &str = "pinned · ";
+
+/// `p` in `/resume`: pins or unpins the chosen chat where it lives, for every app that lists it.
+pub(super) fn pin_chat(model: &mut Model, id: ulid::Ulid) {
+    let folder = model.chat_folders.get(&id).cloned();
+    let pinned = !model.pinned_chats.contains(&id);
+    request(model, Effect::PinChat(id.to_string(), folder, pinned));
+}
+
+pub(super) fn chat_pinned(model: &mut Model, id: &str, pinned: bool) {
+    let Ok(id) = id.parse::<ulid::Ulid>() else {
+        return;
+    };
+    if pinned {
+        model.pinned_chats.insert(id);
+    } else {
+        model.pinned_chats.remove(&id);
+    }
+    if let Some(row) = resume_row(model, id) {
+        let title = row
+            .title
+            .strip_prefix(PINNED_MARK)
+            .unwrap_or(&row.title)
+            .to_owned();
+        row.title = if pinned {
+            format!("{PINNED_MARK}{title}")
+        } else {
+            title
+        };
+    }
 }
 
 pub(super) fn rewind(model: &mut Model, event: String, scope: RewindScope) {
@@ -1300,10 +1352,7 @@ pub(super) fn resource_reply(model: &mut Model, resource: Resource, after: After
             }
         },
         Resource::Pulse(notice) => model.upsert_notice("pulse", notice.messages.join("\n")),
-        Resource::Sessions(sessions) => { let sessions = sessions.into_iter().filter_map(|session| session.id.parse().ok().map(|id| {
-            let title = session.title.unwrap_or_default();
-            let title = match session.agents { 0 => title, 1 => format!("{title} · 1 sub-agent"), n => format!("{title} · {n} sub-agents") };
-            kernel::SessionMeta { id, title, started_ts: session.started, last_ts: session.updated, events: session.events, parent: None } })).collect(); model.picker = Some(Picker::new(PickerKind::Session(sessions))); },
+        Resource::Sessions(sessions) => chats_listed(model, sessions, Vec::new()),
         Resource::Skills(catalogue) => {
             let text = catalogue.skills.iter().map(|skill| format!("{}  {} — {}{}", if skill.enabled && skill.available { "✔" } else { "○" }, skill.name, skill.description,
                 if !skill.enabled { " (disabled)" } else if !skill.available { " (missing tools)" } else { "" })).chain(catalogue.errors.iter().map(|error| format!("! {error}"))).collect::<Vec<_>>().join("\n");

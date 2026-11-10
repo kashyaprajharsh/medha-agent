@@ -61,6 +61,7 @@ struct SessionView {
     started_ts: f64,
     last_ts: f64,
     events: u64,
+    pinned: bool,
 }
 
 #[derive(Serialize, Default)]
@@ -351,6 +352,18 @@ async fn handle(
             Ok(sessions) => Response::ok(req.id, sessions),
             Err(error) => Response::error(req.id, error.to_string()),
         },
+        "chats.pin" => {
+            let chat = req.params["session"]
+                .as_str()
+                .and_then(|id| Ulid::from_string(id).ok());
+            match (chat, req.params["pinned"].as_bool()) {
+                (Some(chat), Some(pinned)) => match log.set_pinned(chat, pinned) {
+                    Ok(()) => Response::ok(req.id, json!({"pinned": pinned})),
+                    Err(error) => Response::error(req.id, error.to_string()),
+                },
+                _ => Response::error(req.id, "name the chat and whether it is pinned"),
+            }
+        }
         "folder.history" => match list_session_views(log) {
             Ok(sessions) => Response::ok(
                 req.id,
@@ -526,6 +539,7 @@ fn list_session_views(log: &store::SqliteLog) -> Result<Vec<SessionView>> {
                 .or_insert_with(|| (session, name.to_owned()));
         }
     }
+    let pinned = log.pinned_chats()?;
     Ok(sessions
         .into_iter()
         .map(|session| {
@@ -540,6 +554,7 @@ fn list_session_views(log: &store::SqliteLog) -> Result<Vec<SessionView>> {
                 started_ts: session.started_ts,
                 last_ts: session.last_ts,
                 events: session.events,
+                pinned: pinned.contains(&session.id),
             }
         })
         .collect())

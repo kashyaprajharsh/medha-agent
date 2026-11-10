@@ -247,6 +247,20 @@ async fn chat_delete(
         .map_err(|error| error.to_string())?
 }
 #[tauri::command]
+async fn chat_pin(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    session_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let workspaces = state.workspaces.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        workspaces.pin_chat(&workspace_id, &session_id, pinned)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+#[tauri::command]
 async fn chat_restore(
     state: State<'_, DesktopState>,
     workspace_id: String,
@@ -850,6 +864,7 @@ fn main() {
             workspace_remove,
             chat_delete,
             chat_restore,
+            chat_pin,
             workspace_branch,
             list_sessions,
             usage_summary,

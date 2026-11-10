@@ -57,7 +57,12 @@ async fn a_deleted_chat_leaves_a_log_every_open_reader_still_trusts() {
         log.forget_chat(gone.id, &[gone.id]).is_err(),
         "a sub-agent the caller did not lock was deleted"
     );
+    log.set_pinned(gone.id, true).unwrap();
     let forgotten = log.forget_chat(gone.id, &family).unwrap();
+    assert!(
+        reader.pinned_chats().unwrap().is_empty(),
+        "a deleted chat stayed pinned"
+    );
     assert_eq!(forgotten.artifacts, vec![only_gone]);
 
     for log in [&log, &reader] {

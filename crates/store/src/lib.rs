@@ -21,6 +21,7 @@ mod forget;
 #[cfg(test)]
 #[path = "forget_tests.rs"]
 mod forget_tests;
+mod pins;
 pub use forget::Forgotten;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1498,6 +1499,12 @@ impl EventLog for SqliteLog {
     /// list rather than failing the caller.
     async fn sessions(&self) -> Vec<SessionMeta> {
         self.list_sessions_async().await.unwrap_or_default()
+    }
+
+    async fn pinned_sessions(&self) -> std::collections::HashSet<Ulid> {
+        self.run_store_task(|log| log.pinned_chats())
+            .await
+            .unwrap_or_default()
     }
 
     async fn tool_calls_since(&self, since: f64) -> Vec<(String, f64)> {

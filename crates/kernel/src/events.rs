@@ -870,6 +870,11 @@ pub trait EventLog: Send + Sync {
         Vec::new()
     }
 
+    /// The sessions pinned from any app. Default: none.
+    async fn pinned_sessions(&self) -> std::collections::HashSet<Ulid> {
+        std::collections::HashSet::new()
+    }
+
     /// Fork a session, re-appending everything before `at_event` under a fresh id
     /// as an independently hash-valid chain, so the original is never mutated.
     /// This is what makes rewind non-destructive. `at_event` is a cut *before* it.

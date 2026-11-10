@@ -19,6 +19,23 @@ impl Command for DeleteChat {
     type Output = ChatHeld;
 }
 
+/// Pins or unpins a chat for every app that lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinChat {
+    pub session: String,
+    pub pinned: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatPinned {
+    pub pinned: bool,
+}
+impl Command for PinChat {
+    const METHOD: &'static str = "chats.pin";
+    const SCOPE: ScopeKind = ScopeKind::Folder;
+    type Output = ChatPinned;
+}
+
 /// Brings back a chat deleted moments ago, from whichever app deleted it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

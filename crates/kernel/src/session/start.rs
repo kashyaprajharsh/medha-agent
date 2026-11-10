@@ -179,7 +179,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
-        let mut logged_events = self.log.checked_events(session.id).await?;
+        // Only what was logged since the read above: this turn's input, hooks, and anything written meanwhile.
+        let read_up_to = prior_events.last().map(|event| event.id);
+        let mut logged_events = prior_events;
+        logged_events.extend(
+            self.log
+                .checked_events_after(session.id, read_up_to)
+                .await?,
+        );
         if logged_events
             .iter()
             .any(|event| event.kind == EventKind::ImagesNewest)

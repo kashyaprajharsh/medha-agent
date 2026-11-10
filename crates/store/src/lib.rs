@@ -25,6 +25,9 @@ mod forget_tests;
 #[path = "memory_events_tests.rs"]
 mod memory_events_tests;
 mod pins;
+#[cfg(test)]
+#[path = "tail_tests.rs"]
+mod tail_tests;
 pub use forget::Forgotten;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1385,6 +1388,48 @@ impl EventLog for SqliteLog {
         self.run_store_task(move |log| log.session_events(session))
             .await
             .map_err(|e| KernelError::Log(e.to_string()))
+    }
+
+    async fn checked_events_after(
+        &self,
+        session: Ulid,
+        after: Option<Ulid>,
+    ) -> Result<Vec<Event>, KernelError> {
+        let Some(after) = after else {
+            return self.checked_events(session).await;
+        };
+        self.run_store_task(move |log| {
+            log.with_verified_snapshot(false, |conn| {
+                use rusqlite::OptionalExtension;
+                let (session, after) = (session.to_string(), after.to_string());
+                let from: i64 = conn
+                    .query_row(
+                        "SELECT rowid FROM events WHERE session_id = ?1 AND id = ?2",
+                        [&session, &after],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| StoreError::Db(e.to_string()))?
+                    .ok_or_else(|| {
+                        StoreError::Db(format!("event {after} is not in session {session}"))
+                    })?;
+                let mut query = conn
+                    .prepare(
+                        "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                         prev_hash, hash, hash_version, ts FROM events
+                         WHERE session_id = ?1 AND rowid > ?2 ORDER BY rowid ASC",
+                    )
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                let rows = query
+                    .query_map(rusqlite::params![session, from], chain_row)
+                    .map_err(|e| StoreError::Db(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                decode_events(conn, rows)
+            })
+        })
+        .await
+        .map_err(|e| KernelError::Log(e.to_string()))
     }
 
     async fn checked_event(&self, session: Ulid, id: Ulid) -> Result<Option<Event>, KernelError> {

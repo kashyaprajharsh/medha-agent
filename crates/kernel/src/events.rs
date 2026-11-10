@@ -772,6 +772,25 @@ pub trait EventLog: Send + Sync {
         Ok(self.events(session).await)
     }
 
+    /// The session's trusted events logged after `after`, all of them for `None`; an `after` not in the session is an error.
+    async fn checked_events_after(
+        &self,
+        session: Ulid,
+        after: Option<Ulid>,
+    ) -> Result<Vec<Event>, KernelError> {
+        let mut events = self.checked_events(session).await?;
+        if let Some(after) = after {
+            let at = events
+                .iter()
+                .position(|event| event.id == after)
+                .ok_or_else(|| {
+                    KernelError::Log(format!("event {after} is not in session {session}"))
+                })?;
+            events.drain(..=at);
+        }
+        Ok(events)
+    }
+
     /// Verified events that can contribute to a generated-output catalogue.
     /// Durable stores select these before decoding, leaving unrelated tool
     /// results and operational events on disk.

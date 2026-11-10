@@ -549,6 +549,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     outside_stored: std::sync::Mutex<std::collections::HashMap<String, TrustLabel>>,
     /// Startup context recorded with the first message, so an unused chat leaves no log.
     opening: std::sync::Mutex<Vec<OpeningContext>>,
+    /// Side calls made at startup, recorded with the first message for the same reason.
+    opening_usage: std::sync::Mutex<Vec<serde_json::Value>>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     request_context: Option<Arc<dyn crate::context::RequestContext>>,
     max_parallel_tools: usize,
@@ -827,6 +829,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
             opening: Default::default(),
+            opening_usage: Default::default(),
             progressive_context: None,
             request_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
@@ -873,6 +876,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             image_side: crate::request_images::SIDE.into(),
             outside_stored: Default::default(),
             opening: Default::default(),
+            opening_usage: Default::default(),
             progressive_context: self.progressive_context.clone(),
             request_context: self.request_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
@@ -1054,8 +1058,32 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .push(context);
     }
 
+    /// Record side calls made before the chat was used, with its first message.
+    pub fn record_usage_with_first_message(&self, held: &std::sync::Mutex<Vec<serde_json::Value>>) {
+        let usage = std::mem::take(
+            &mut *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        self.opening_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(usage);
+    }
+
     /// Written ahead of everything the run reads, exactly as if logged at startup.
     async fn record_opening(&self, session: &Session) -> Result<(), KernelError> {
+        let usage = std::mem::take(
+            &mut *self
+                .opening_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for payload in usage {
+            if let Err(error) = self.log.append(Event::aux_usage(session.id, payload)).await {
+                tracing::warn!(%error, "could not record a startup side call's usage");
+            }
+        }
         let opening = std::mem::take(
             &mut *self
                 .opening
@@ -1440,6 +1468,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 budget.clone(),
                 self.provider.context_identity(),
                 self.price(),
+                Some(crate::auxiliary::Recorder::Log {
+                    log: self.log.clone(),
+                    session: session.id,
+                }),
                 self.run_session_inner(session, messages, budget, sink, interrupts),
             ),
         )

@@ -16,6 +16,51 @@ async fn usage_logged(world: &World, chat: &str) -> Vec<kernel::Event> {
         .collect()
 }
 
+/// A compaction's own model call is counted: the turn that compacted tells it as a side call, in its tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compactions_model_call_is_counted_in_the_turn_that_made_it() {
+    let world = World::new();
+    let folder = world.folder("compacting");
+    let backend = world.backend_in(&[("MEDHA_MAX_CTX", "24000")]);
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    let long = "USAGE ".to_owned() + &"words to fill the window ".repeat(400);
+    let mut compacted = None;
+    for _ in 0..12 {
+        client.send(&chat, &long).await;
+        let (_, done) = client.until(|frame| kind(frame, "turn.done")).await;
+        if client.heard.contains("\"kind\":\"compaction\"") {
+            compacted = Some(done);
+            break;
+        }
+    }
+    let done = compacted.expect("the chat never compacted, so nothing was tested");
+    let summary = &done["params"]["summary"];
+    assert!(
+        summary["side_calls"]
+            .as_u64()
+            .is_some_and(|calls| calls >= 1),
+        "{done}"
+    );
+    let state = std::fs::read_dir(world.home().join("projects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("events.db").is_file())
+        .unwrap();
+    let log = store::SqliteLog::open(state.join("events.db")).unwrap();
+    let side: Vec<kernel::Event> = log
+        .events(chat.parse().unwrap())
+        .await
+        .into_iter()
+        .filter(|event| event.kind == kernel::EventKind::AuxUsage)
+        .collect();
+    assert!(
+        side.iter()
+            .any(|event| event.payload["task"] == "compaction"),
+        "no compaction usage was recorded: {side:?}"
+    );
+}
+
 /// A price saved with the model counts as the person's own rate in any folder, with no project to trust.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_price_saved_with_the_model_is_the_persons_own_rate_anywhere() {

@@ -876,10 +876,10 @@ test("a finished turn shows what it used and cost, the line the terminal shows, 
     state = reduceLive(state, event(kind, params));
     await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
   };
-  const summary = { seconds: 252, calls: 9, input_tokens: 182400, cached_tokens: 151000, output_tokens: 6100, cost_usd: 0.4123, priced: "list" };
+  const summary = { seconds: 252, calls: 9, side_calls: 2, input_tokens: 182400, cached_tokens: 151000, output_tokens: 6100, cost_usd: 0.4123, priced: "list" };
   await then("turn.started", { turn: 1 });
   await then("turn.done", { stopped: null, summary });
-  assert.equal(line(), "4m 12s · 9 calls · 182k in (151k cached) · 6.1k out · $0.41 list price");
+  assert.equal(line(), "4m 12s · 9 calls · 2 side calls · 182k in (151k cached) · 6.1k out · $0.41 list price");
   await then("turn.started", { turn: 2 });
   assert.equal(line(), undefined, "the next turn still shows the last one's summary");
   await then("turn.done", { stopped: null, summary: { ...summary, calls: 0 } });

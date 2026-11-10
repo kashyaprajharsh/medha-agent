@@ -1,16 +1,30 @@
 //! One reservation/settlement route for non-chat model requests.
 
 use crate::{
-    Block, Budget, CompiledContext, Governor, PreparedModelRequest, Pricing, Provider,
+    Block, Budget, CompiledContext, EventLog, Governor, PreparedModelRequest, Pricing, Provider,
     ProviderError, Usage,
 };
 use futures::{StreamExt, stream::BoxStream};
 use std::future::Future;
+use std::sync::Arc;
+
+/// Where a side call's usage goes: the chat it was made for.
+#[derive(Clone)]
+pub enum Recorder {
+    /// Written to the chat's log as each call ends.
+    Log {
+        log: Arc<dyn EventLog>,
+        session: ulid::Ulid,
+    },
+    /// Kept for the chat's first message, so an unused chat leaves no log.
+    Held(Arc<std::sync::Mutex<Vec<serde_json::Value>>>),
+}
 
 struct Active {
     budget: Budget,
     route: String,
     pricing: Option<Pricing>,
+    recorder: Option<Recorder>,
 }
 tokio::task_local! { static ACTIVE: Active; }
 
@@ -18,6 +32,7 @@ pub async fn scope<T>(
     budget: Budget,
     route: String,
     pricing: Option<Pricing>,
+    recorder: Option<Recorder>,
     future: impl Future<Output = T>,
 ) -> T {
     ACTIVE
@@ -26,6 +41,7 @@ pub async fn scope<T>(
                 budget: budget.pooling(),
                 route,
                 pricing,
+                recorder,
             },
             future,
         )
@@ -36,6 +52,39 @@ struct Charge {
     reservation: Option<crate::budgets::ModelReservation>,
     usage: Option<Usage>,
     pricing: Option<Pricing>,
+    /// The chat, the side call's task and the model, for its usage record.
+    record: Option<(Recorder, &'static str, String)>,
+}
+
+impl Charge {
+    /// Writes what the side call used, as the main loop writes its own calls.
+    async fn record(&mut self) {
+        let (Some(usage), Some((recorder, task, identity))) = (self.usage, self.record.take())
+        else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "task": task,
+            "identity": identity,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "cached_prompt_tokens": usage.cached_prompt_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "cost_usd": self.pricing.map(|pricing| pricing.cost(&usage)),
+            "cost_indicative": self.pricing.map(|pricing| pricing.indicative),
+        });
+        match recorder {
+            Recorder::Log { log, session } => {
+                if let Err(error) = log.append(crate::Event::aux_usage(session, payload)).await {
+                    tracing::warn!(%error, task, "could not record a side call's usage");
+                }
+            }
+            Recorder::Held(held) => held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(payload),
+        }
+    }
 }
 
 impl Charge {
@@ -64,6 +113,7 @@ pub async fn context(
     provider: &dyn Provider,
     context: &CompiledContext,
     cap: u64,
+    task: &'static str,
 ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
     if ACTIVE.try_with(|_| ()).is_err() {
         return Err(ProviderError::Response(
@@ -109,7 +159,7 @@ pub async fn context(
             Some(request.body.to_string().len() as u64)
         }
     });
-    prepared(provider, &request, input, output).await
+    prepared(provider, &request, input, output, task).await
 }
 
 pub async fn prepared(
@@ -117,8 +167,9 @@ pub async fn prepared(
     request: &PreparedModelRequest,
     input: Option<u64>,
     output: Option<u64>,
+    task: &'static str,
 ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-    let (budget, pricing) = ACTIVE
+    let (budget, pricing, recorder) = ACTIVE
         .try_with(|active| {
             (
                 active.budget.clone(),
@@ -127,6 +178,7 @@ pub async fn prepared(
                 } else {
                     provider.list_price()
                 },
+                active.recorder.clone(),
             )
         })
         .map_err(|_| {
@@ -148,6 +200,7 @@ pub async fn prepared(
         reservation: Some(reservation),
         usage: None,
         pricing,
+        record: recorder.map(|recorder| (recorder, task, provider.context_identity())),
     };
     let stream = match provider.stream_prepared(request).await {
         Ok(stream) => stream,
@@ -172,10 +225,13 @@ pub async fn prepared(
                     Some((Err(settled.err().unwrap_or(error)), (stream, charge, true)))
                 }
                 Some(block) => Some((block, (stream, charge, false))),
-                None => charge
-                    .finish(None)
-                    .err()
-                    .map(|error| (Err(error), (stream, charge, true))),
+                None => {
+                    charge.record().await;
+                    charge
+                        .finish(None)
+                        .err()
+                        .map(|error| (Err(error), (stream, charge, true)))
+                }
             }
         },
     )

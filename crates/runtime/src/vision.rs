@@ -58,7 +58,7 @@ impl AuxiliaryVision {
             }]),
             tools: Vec::new(),
         };
-        let mut stream = kernel::auxiliary::context(&self.provider, &context, 2048)
+        let mut stream = kernel::auxiliary::context(&self.provider, &context, 2048, "vision")
             .await
             .context("auxiliary vision request failed")?;
         let mut description = String::new();

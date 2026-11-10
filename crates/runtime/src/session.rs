@@ -171,6 +171,7 @@ pub async fn start(
     } else {
         base_budget.clone().with_fresh_pool()
     };
+    let startup_usage = Arc::new(std::sync::Mutex::new(Vec::new()));
     let instructions::Discovered {
         startup_context,
         persona_file,
@@ -181,6 +182,7 @@ pub async fn start(
         startup_budget,
         kernel::Provider::context_identity(provider.as_ref()),
         pricing,
+        Some(kernel::auxiliary::Recorder::Held(startup_usage.clone())),
         instructions::discover(&setup, &provider, &workspace),
     )
     .await?;
@@ -352,6 +354,7 @@ pub async fn start(
         kernel = kernel.with_progressive_context(progressive_context);
     }
     let kernel = Arc::new(kernel);
+    kernel.record_usage_with_first_message(&startup_usage);
     // A weak back-reference avoids retaining the entire tool graph.
     if let Ok(mut slot) = agent_parent.lock() {
         *slot = Some(Arc::downgrade(&kernel.executor));

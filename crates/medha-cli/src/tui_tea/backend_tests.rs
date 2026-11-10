@@ -1200,6 +1200,7 @@ async fn a_finished_turn_says_what_it_used_and_cost() {
     let summary = |calls| protocol::TurnSummary {
         seconds: 252.0,
         calls,
+        side_calls: 2,
         input_tokens: 182_400,
         cached_tokens: 151_000,
         output_tokens: 6_100,
@@ -1214,7 +1215,9 @@ async fn a_finished_turn_says_what_it_used_and_cost() {
     turn_event(&mut f.model, done(9));
     assert_eq!(
         notices(&f.model).last().map(String::as_str),
-        Some("4m 12s · 9 calls · 182k in (151k cached) · 6.1k out · $0.41 list price")
+        Some(
+            "4m 12s · 9 calls · 2 side calls · 182k in (151k cached) · 6.1k out · $0.41 list price"
+        )
     );
     let before = notices(&f.model).len();
     turn_event(&mut f.model, protocol::TurnEvent::Started { turn: 2 });

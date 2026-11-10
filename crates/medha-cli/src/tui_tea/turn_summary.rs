@@ -37,6 +37,11 @@ pub(super) fn line(summary: &TurnSummary) -> String {
             calls => format!("{calls} calls"),
         },
     ];
+    match summary.side_calls {
+        0 => {}
+        1 => parts.push("1 side call".to_owned()),
+        side => parts.push(format!("{side} side calls")),
+    }
     let input = tokens(summary.input_tokens);
     parts.push(match summary.cached_tokens {
         0 => format!("{input} in"),

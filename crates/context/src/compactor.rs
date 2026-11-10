@@ -599,6 +599,7 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
                 &request,
                 Some(tokens),
                 Some(output_cap),
+                "compaction",
             ),
         )
         .await

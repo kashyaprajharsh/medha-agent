@@ -71,14 +71,20 @@ async fn auxiliary_work_uses_the_same_pool_and_keeps_actual_usage_on_stream_fail
     }
     .pooling();
     let request = request(&model);
-    scope(budget.clone(), model.context_identity(), None, async {
-        let result = prepared(&model, &request, Some(20), Some(20))
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
-        assert!(result.last().unwrap().is_err());
-    })
+    scope(
+        budget.clone(),
+        model.context_identity(),
+        None,
+        None,
+        async {
+            let result = prepared(&model, &request, Some(20), Some(20), "test")
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert!(result.last().unwrap().is_err());
+        },
+    )
     .await;
     let governor = Governor::new(budget);
     assert_eq!(governor.task_tokens(), 15);
@@ -94,19 +100,25 @@ async fn unfunded_work_does_not_send_and_proven_rejection_returns_its_reservatio
     }
     .pooling();
     let request = request(&model);
-    scope(budget.clone(), model.context_identity(), None, async {
-        assert!(
-            prepared(&model, &request, Some(100), Some(1))
-                .await
-                .is_err()
-        );
-        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
-        assert!(
-            prepared(&model, &request, Some(20), Some(20))
-                .await
-                .is_err()
-        );
-    })
+    scope(
+        budget.clone(),
+        model.context_identity(),
+        None,
+        None,
+        async {
+            assert!(
+                prepared(&model, &request, Some(100), Some(1), "test")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                prepared(&model, &request, Some(20), Some(20), "test")
+                    .await
+                    .is_err()
+            );
+        },
+    )
     .await;
     assert_eq!(Governor::new(budget).task_tokens(), 0);
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);

@@ -66,7 +66,7 @@ impl context::ctxfiles::ContextJudge for LlmJudge {
 }
 
 async fn collect_text(provider: &dyn Provider, ctx: &CompiledContext) -> Result<String, String> {
-    let mut stream = kernel::auxiliary::context(provider, ctx, 1024)
+    let mut stream = kernel::auxiliary::context(provider, ctx, 1024, "skill_judge")
         .await
         .map_err(|e| e.to_string())?;
     let mut out = String::new();

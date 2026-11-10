@@ -2,6 +2,8 @@
 export type TurnSummary = {
   seconds: number;
   calls: number;
+  /** Model calls for the turn's upkeep, such as compaction; already in the totals. */
+  side_calls?: number;
   input_tokens: number;
   cached_tokens: number;
   output_tokens: number;
@@ -38,9 +40,11 @@ export function summaryLine(summary: TurnSummary) {
         : summary.priced === "partly"
           ? `${dollars(summary.cost_usd)} for the priced calls`
           : dollars(summary.cost_usd);
+  const side = summary.side_calls ?? 0;
   return [
     duration(summary.seconds),
     summary.calls === 1 ? "1 call" : `${summary.calls} calls`,
+    ...(side ? [side === 1 ? "1 side call" : `${side} side calls`] : []),
     summary.cached_tokens ? `${input} in (${tokens(summary.cached_tokens)} cached)` : `${input} in`,
     `${tokens(summary.output_tokens)} out`,
     cost,

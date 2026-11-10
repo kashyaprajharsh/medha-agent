@@ -101,6 +101,8 @@ pub enum EventKind {
     Compaction,
     /// Provider usage for an exact request prefix, used only for context calibration.
     ContextUsage,
+    /// Usage of a side call (compaction, skill judge, image description), kept apart so calibration never reads it.
+    AuxUsage,
     ToolSnapshot,
     /// A compaction summary failed and the turn continued; never a checkpoint.
     SummaryFailed,
@@ -147,6 +149,7 @@ impl EventKind {
             EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
             EventKind::ContextUsage => "context.usage",
+            EventKind::AuxUsage => "model.aux_usage",
             EventKind::ToolSnapshot => "context.tools",
             EventKind::SummaryFailed => "context.summary_failed",
             EventKind::ImagesNewest => "context.images_newest",
@@ -181,6 +184,7 @@ impl EventKind {
             "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
             "context.usage" => EventKind::ContextUsage,
+            "model.aux_usage" => EventKind::AuxUsage,
             "context.tools" => EventKind::ToolSnapshot,
             "context.summary_failed" => EventKind::SummaryFailed,
             "context.images_newest" => EventKind::ImagesNewest,
@@ -657,6 +661,24 @@ impl Event {
         )
     }
 
+    /// What one side call used, for the chat it was made for.
+    pub(crate) fn aux_usage(session: Ulid, payload: Value) -> Self {
+        Self {
+            id: Ulid::new(),
+            session_id: session,
+            parent_id: None,
+            kind: EventKind::AuxUsage,
+            payload,
+            trust: TrustLabel::System,
+            provenance: Provenance {
+                source: "kernel".into(),
+            },
+            prev_hash: [0u8; 32],
+            hash_version: EVENT_HASH_VERSION,
+            ts: now_ts(),
+        }
+    }
+
     pub(crate) fn context_usage(s: &Session, anchor: &crate::usage_reporting::UsageAnchor) -> Self {
         Self::new(
             s,
@@ -762,7 +784,7 @@ pub fn tool_calls(events: &[Event]) -> Vec<(String, f64)> {
 
 /// The log interface. Append computes the hash chain; replay/projection read it.
 #[async_trait]
-pub trait EventLog: Send + Sync {
+pub trait EventLog: Send + Sync + 'static {
     async fn append(&self, e: Event) -> Result<Event, KernelError>;
     async fn events(&self, session: Ulid) -> Vec<Event>;
 

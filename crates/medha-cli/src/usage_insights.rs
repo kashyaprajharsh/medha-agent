@@ -1,7 +1,8 @@
 //! Tokens and cost from the event log, shared by the TUI's `/usage` and the
-//! desktop Usage page. Each model call's `context.usage` record carries its
-//! tokens and, when the model's price was known, its cost; calls recorded
-//! before that carry prompt tokens only and are counted, never guessed.
+//! desktop Usage page. Each model call's `context.usage` record (or, for a side
+//! call such as compaction, `model.aux_usage`) carries its tokens and, when the
+//! price was known, its cost; older records carry prompt tokens only and are
+//! counted, never guessed.
 
 use kernel::{Event, EventKind, EventLog};
 use serde_json::{Value, json};
@@ -26,7 +27,7 @@ pub(crate) fn calls(events: &[Event]) -> (Vec<Call>, Vec<Ulid>) {
     let mut children = Vec::new();
     for event in events {
         match event.kind {
-            EventKind::ContextUsage => {
+            EventKind::ContextUsage | EventKind::AuxUsage => {
                 let number = |key: &str| event.payload.get(key).and_then(Value::as_u64);
                 calls.push(Call {
                     session: event.session_id,
@@ -66,6 +67,7 @@ pub(crate) async fn turn_summary<L: EventLog + ?Sized>(
     let mut summary = protocol::TurnSummary {
         seconds,
         calls: 0,
+        side_calls: 0,
         input_tokens: 0,
         cached_tokens: 0,
         output_tokens: 0,
@@ -83,8 +85,12 @@ pub(crate) async fn turn_summary<L: EventLog + ?Sized>(
         {
             let number = |key: &str| event.payload.get(key).and_then(Value::as_u64).unwrap_or(0);
             match event.kind {
-                EventKind::ContextUsage => {
-                    summary.calls += 1;
+                EventKind::ContextUsage | EventKind::AuxUsage => {
+                    if event.kind == EventKind::AuxUsage {
+                        summary.side_calls += 1;
+                    } else {
+                        summary.calls += 1;
+                    }
                     summary.input_tokens += number("prompt_tokens");
                     summary.cached_tokens += number("cached_prompt_tokens");
                     summary.output_tokens += number("completion_tokens");
@@ -110,7 +116,7 @@ pub(crate) async fn turn_summary<L: EventLog + ?Sized>(
     }
     summary.priced = match priced {
         0 => protocol::CostSource::None,
-        n if n < summary.calls => protocol::CostSource::Partly,
+        n if n < summary.calls + summary.side_calls => protocol::CostSource::Partly,
         _ if listed => protocol::CostSource::List,
         _ => protocol::CostSource::Own,
     };

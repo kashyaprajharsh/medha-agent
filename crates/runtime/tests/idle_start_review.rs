@@ -68,4 +68,10 @@ async fn a_chat_opened_without_a_message_reviews_its_instructions_but_logs_nothi
         })
         .expect("the instruction file was recorded");
     assert!(instructions < first_message);
+    // The review's own model call is counted too, written with the first message.
+    let review = events
+        .iter()
+        .position(|event| event.kind == EventKind::AuxUsage)
+        .expect("the startup review's usage was recorded");
+    assert!(review < first_message);
 }

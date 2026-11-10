@@ -21,6 +21,9 @@ pub enum CostSource {
 pub struct TurnSummary {
     pub seconds: f64,
     pub calls: u32,
+    /// Model calls made for the turn's own upkeep, such as compaction; their tokens and cost are in the totals.
+    #[serde(default)]
+    pub side_calls: u32,
     /// Prompt tokens, cached ones included.
     pub input_tokens: u64,
     pub cached_tokens: u64,

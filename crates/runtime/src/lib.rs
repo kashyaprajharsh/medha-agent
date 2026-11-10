@@ -6,6 +6,7 @@ pub mod attachments;
 pub mod budget;
 pub mod chatgpt_accounts;
 pub mod config;
+pub mod history;
 pub mod key_pool;
 pub mod lease;
 pub mod mcp_shared;

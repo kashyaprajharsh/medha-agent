@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkspace } from "./Workspace";
 import { Icon } from "./Icon";
+import { RemoveWorkspace } from "./RemoveWorkspace";
 export function WorkspaceMenu({
   folder,
   workspace,
+  working,
 }: {
   folder: string;
   workspace: string;
+  working: boolean;
 }) {
   const context = useWorkspace();
   const [open, setOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const root = useRef<HTMLSpanElement>(null);
@@ -106,12 +110,28 @@ export function WorkspaceMenu({
             <Icon name="copy" />
             Copy path
           </button>
+          {!context.workspace.personal && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setOpen(false);
+                setRemoving(true);
+              }}
+            >
+              <Icon name="x" />
+              Remove from Medha…
+            </button>
+          )}
           {notice && (
             <span role="status" className="quiet">
               {notice}
             </span>
           )}
         </span>
+      )}
+      {removing && (
+        <RemoveWorkspace working={working} onClose={() => setRemoving(false)} />
       )}
     </span>
   );

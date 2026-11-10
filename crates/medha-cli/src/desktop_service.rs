@@ -351,6 +351,13 @@ async fn handle(
             Ok(sessions) => Response::ok(req.id, sessions),
             Err(error) => Response::error(req.id, error.to_string()),
         },
+        "folder.history" => match list_session_views(log) {
+            Ok(sessions) => Response::ok(
+                req.id,
+                json!({"chats": sessions.len(), "bytes": runtime::history::size(workspace)}),
+            ),
+            Err(error) => Response::error(req.id, error.to_string()),
+        },
         "library.sessions" => {
             let prune_before = req.params["prune_before"].as_f64();
             let mut rows = Vec::new();

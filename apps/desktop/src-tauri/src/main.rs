@@ -226,6 +226,27 @@ async fn list_sessions(
         .map_err(|error| error.to_string())?
 }
 #[tauri::command]
+async fn workspace_history(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+) -> Result<Value, String> {
+    let workspaces = state.workspaces.clone();
+    tauri::async_runtime::spawn_blocking(move || workspaces.history(&workspace_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+#[tauri::command]
+async fn workspace_remove(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    delete_history: bool,
+) -> Result<(), String> {
+    let workspaces = state.workspaces.clone();
+    tauri::async_runtime::spawn_blocking(move || workspaces.remove(&workspace_id, delete_history))
+        .await
+        .map_err(|error| error.to_string())?
+}
+#[tauri::command]
 async fn usage_summary(
     state: State<'_, DesktopState>,
     workspace_id: String,
@@ -801,6 +822,8 @@ fn main() {
             extension_source_choose,
             workspace_info,
             workspace_reveal,
+            workspace_history,
+            workspace_remove,
             workspace_branch,
             list_sessions,
             usage_summary,

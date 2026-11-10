@@ -42,7 +42,7 @@ const modules = new Map([
   ],
   [
     "api",
-    "data:text/javascript," + encodeURIComponent("export const desktop = {chooseExtensionSource: (kind) => globalThis.__medhaControlsTest.chooseExtensionSource(kind), chooseAttachments: (kind) => globalThis.__medhaControlsTest.chooseAttachments(kind), admitImage: (bytes) => globalThis.__medhaControlsTest.admitImage(bytes)}"),
+    "data:text/javascript," + encodeURIComponent("export const desktop = {chooseExtensionSource: (kind) => globalThis.__medhaControlsTest.chooseExtensionSource(kind), chooseAttachments: (kind) => globalThis.__medhaControlsTest.chooseAttachments(kind), admitImage: (bytes) => globalThis.__medhaControlsTest.admitImage(bytes), workspaceHistory: (id) => globalThis.__medhaControlsTest.workspaceHistory(id)}"),
   ],
   [
     // The diagram engine needs a real browser; a whole diagram here is one that ends in a node.
@@ -2985,4 +2985,33 @@ test("a command typed in full runs itself, not a longer one listed first", async
   );
   await key(document.querySelector("textarea"), "Enter");
   assert.deepEqual(opened, ["mode"], "typing /mode opened another control");
+});
+
+test("a project leaves Medha only when asked, and its history goes only when chosen", async () => {
+  const removed = [];
+  const project = { id: "project-1", name: "invoices", path: "/w/invoices", personal: false };
+  Object.assign(globalThis.__medhaControlsTest, {
+    workspace: { id: "personal", name: "Chats", path: "/w/personal", personal: true },
+    workspaces: [],
+    remove: async (id, deleteHistory) => removed.push([id, deleteHistory]),
+    workspaceHistory: async () => ({ chats: 14, bytes: 120 * 1024 * 1024 }),
+  });
+  const { WorkspaceMenu } = await import(await moduleUrl("WorkspaceMenu"));
+  const render = (working) => act(async () => root.render(h(WorkspaceMenu, {
+    folder: "invoices", workspace: "/w/invoices", working,
+  })));
+  await render(false);
+  await click(document.querySelector(".workspace-trigger"));
+  assert.equal(namedButton("Remove from Medha…"), undefined, "Chats offered to leave Medha");
+
+  globalThis.__medhaControlsTest.workspace = project;
+  await render(true);
+  await click(namedButton("Remove from Medha…"));
+  assert.match(document.body.textContent, /14 chats, their backups and this folder's memory, 120 MB/);
+  assert.ok(namedButton("Remove").disabled, "a working chat's folder could be removed");
+  await render(false);
+  await click(document.querySelectorAll('input[name="remove-history"]')[1]);
+  assert.match(document.body.textContent, /can't be brought back/);
+  await click(namedButton("Remove and delete history"));
+  assert.deepEqual(removed, [["project-1", true]]);
 });

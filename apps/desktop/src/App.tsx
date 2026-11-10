@@ -942,7 +942,15 @@ export function App() {
                     : current?.title || folder}
             </h1>
             <span className="crumb">
-              <WorkspaceMenu folder={folder} workspace={workspace} />
+              <WorkspaceMenu
+                folder={folder}
+                workspace={workspace}
+                working={Object.values(live).some(
+                  (chat) =>
+                    chat.status === "running" ||
+                    (chat.status === "starting" && chat.sent.length > 0),
+                )}
+              />
               {branch && (
                 <>
                   <Icon name="branch" />

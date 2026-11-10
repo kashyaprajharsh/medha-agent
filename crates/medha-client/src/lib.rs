@@ -515,6 +515,35 @@ impl Connection {
         self.ask(request, waited)
     }
 
+    /// Deletes everything Medha keeps for `folder`, waiting only for this window's own chats there that are closing.
+    pub fn delete_history(&self, folder: &Path) -> Result<(), String> {
+        let deadline = Instant::now() + LEAVING;
+        loop {
+            let error = match self.about(folder, json!({"method": "folder.history.delete"})) {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            if Instant::now() >= deadline || !self.closing_in(folder)? {
+                return Err(error);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Whether a chat of this window's, heard or just let go, is still live in `folder`.
+    fn closing_in(&self, folder: &Path) -> Result<bool, String> {
+        let folder = folder.canonicalize().map_err(|error| error.to_string())?;
+        let listed = self.call(protocol::Scope::Service, &protocol::ListSessions {})?;
+        let routes = self.routes();
+        Ok(listed.sessions.iter().any(|live| {
+            (routes.over.contains_key(&live.session) || routes.chats.contains_key(&live.session))
+                && live
+                    .about
+                    .as_ref()
+                    .is_some_and(|about| about.folder == folder)
+        }))
+    }
+
     pub fn is_live(&self, session: &str) -> bool {
         self.call(protocol::Scope::Service, &protocol::ListSessions {})
             .is_ok_and(|listed| {

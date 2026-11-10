@@ -329,6 +329,28 @@ impl Chats for ServeChats {
         answer
     }
 
+    async fn delete_history(&self, request: &Value) -> Result<Value, String> {
+        let _admitted = self.requests.admit().await?;
+        let (folders, asked) = (Arc::clone(&self.folders), request.clone());
+        apart(move || {
+            let folder = folder(&asked["folder"])?;
+            // Held throughout, so nothing here opens the folder while its history goes.
+            let mut folders = folders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((held, _)) = folders.open.get(&folder) {
+                if Arc::strong_count(held) > 1 {
+                    return Err(runtime::history::OPEN.into());
+                }
+                // Its store is closed before its files go.
+                folders.open.remove(&folder);
+            }
+            runtime::history::delete(&folder).map_err(|error| format!("{error:#}"))?;
+            Ok(json!({"deleted": true}))
+        })
+        .await
+    }
+
     async fn open(&self, params: &Value) -> Result<Opened, String> {
         // Held until the chat is ready, so only a few chats start at once.
         let _admitted = self.starts.admit().await?;

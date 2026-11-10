@@ -251,6 +251,13 @@ async fn handle<C: Chats>(
         tokio::spawn(async move {
             let _work = work;
             let outcome = match about_folder {
+                true if method == "folder.history.delete" => {
+                    let deleted = backend.chats.delete_history(&frame).await;
+                    if deleted.is_ok() {
+                        backend.announce(&frame["folder"]);
+                    }
+                    deleted.map_err(refused)
+                }
                 true => backend.chats.about_folder(&frame).await.map_err(refused),
                 false => backend.create(&frame["params"]).await,
             };

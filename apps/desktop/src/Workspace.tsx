@@ -26,6 +26,7 @@ const Context = createContext<{
   scope: MutableRefObject<Scope>;
   select: (id: string) => void;
   choose: () => Promise<void>;
+  remove: (id: string, deleteHistory: boolean) => Promise<void>;
   theme: string;
   setTheme: (theme: string) => void;
   mode: string;
@@ -120,6 +121,12 @@ export function WorkspaceHost() {
     );
     select(workspace.id);
   }
+  async function remove(id: string, deleteHistory: boolean) {
+    await desktop.removeWorkspace(id, deleteHistory);
+    setWorkspaces((old) => old.filter((item) => item.id !== id));
+    setVisited((old) => old.filter((item) => item !== id));
+    if (selected === id) select("personal");
+  }
   if (error)
     return (
       <div className="empty">
@@ -141,6 +148,7 @@ export function WorkspaceHost() {
       active={selected === id}
       select={select}
       choose={choose}
+      remove={remove}
       theme={theme}
       setTheme={setMode}
       mode={mode}

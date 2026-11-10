@@ -300,6 +300,9 @@
   color: var(--dim);
   line-height: 1.65;
 }
+.confirm-dialog p.dialog-warn {
+  color: var(--err);
+}
 .confirm-dialog .row-actions {
   margin-top: var(--s-6);
   justify-content: flex-end;

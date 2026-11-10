@@ -737,6 +737,28 @@ fn a_chat_with_history_wakes_into_the_same_conversation_without_greeting_again()
 }
 
 #[test]
+fn deleting_a_folders_history_waits_for_this_windows_own_chat_there_to_close() {
+    let (model, _) = stand_in_model();
+    let Some(chat) = Chat::open("delete-history", &model) else {
+        return;
+    };
+    chat.turn("something to delete");
+    chat.sessions.delete_history().unwrap();
+    let left = chat
+        .sessions
+        .inner
+        .backend
+        .connection()
+        .unwrap()
+        .about(
+            &chat.sessions.inner.workspace,
+            json!({"method": "sessions.list"}),
+        )
+        .unwrap();
+    assert_eq!(left, json!([]), "the folder's chats outlived its history");
+}
+
+#[test]
 fn requests_racing_a_sleep_question_are_never_lost() {
     let Some(chat) = Chat::open("sleep-race", "http://127.0.0.1:9/v1") else {
         return;

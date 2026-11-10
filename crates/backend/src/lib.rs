@@ -58,6 +58,11 @@ pub trait Chats: Send + Sync + 'static {
         Err("unknown method".into())
     }
 
+    /// Deletes everything Medha keeps for the folder the frame names, refused while a chat in it is open.
+    async fn delete_history(&self, _request: &Value) -> Result<Value, String> {
+        Err("unknown method".into())
+    }
+
     /// A nonblocking resource snapshot. Busy resources may report `null`
     /// instead of waiting for the work that the health check is diagnosing.
     fn resources(&self) -> Value {

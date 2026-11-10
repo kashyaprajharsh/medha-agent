@@ -318,6 +318,15 @@ impl LiveSessions {
         Ok(())
     }
 
+    /// Closes this window's chats here, then deletes everything Medha keeps for the folder.
+    pub fn delete_history(&self) -> Result<(), String> {
+        self.close_all();
+        self.inner
+            .backend
+            .connection()?
+            .delete_history(&self.inner.workspace)
+    }
+
     pub fn close_all(&self) {
         let removed = {
             let mut open = self

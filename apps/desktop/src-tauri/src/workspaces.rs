@@ -187,18 +187,51 @@ impl Workspaces {
             personal: false,
         };
         entries.push(item.clone());
-        let saved = self.data.join("workspaces.json");
-        let temporary = self.data.join("workspaces.json.tmp");
-        let result = std::fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(&*entries).map_err(|e| e.to_string())?,
-        )
-        .and_then(|()| std::fs::rename(&temporary, &saved));
-        if let Err(error) = result {
+        if let Err(error) = self.save(&entries) {
             entries.pop();
-            return Err(error.to_string());
+            return Err(error);
         }
         Ok(item)
+    }
+    /// How many chats a project has and the bytes its history takes, for the removal question.
+    pub fn history(&self, id: &str) -> Result<Value, String> {
+        let workspace = self.workspace(id)?;
+        self.runtime(workspace.path)?
+            .request_params("folder.history", json!({}))
+    }
+    /// Takes a project off the list; its folder is never touched, its history only when asked.
+    pub fn remove(&self, id: &str, delete_history: bool) -> Result<(), String> {
+        let workspace = self.workspace(id)?;
+        if workspace.personal {
+            return Err("Chats cannot be removed".into());
+        }
+        let runtime = self.runtime(workspace.path.clone())?;
+        if delete_history {
+            runtime.live.delete_history()?;
+        } else {
+            runtime.live.close_all();
+        }
+        runtime.terminals.close_all();
+        self.runtimes
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(&workspace.path);
+        let mut entries = self.entries.lock().map_err(|e| e.to_string())?;
+        let kept: Vec<Workspace> = entries.iter().filter(|w| w.id != id).cloned().collect();
+        self.save(&kept)?;
+        *entries = kept;
+        Ok(())
+    }
+    /// Written whole, then moved into place, so a crash never leaves half a list.
+    fn save(&self, entries: &[Workspace]) -> Result<(), String> {
+        let saved = self.data.join("workspaces.json");
+        let temporary = self.data.join("workspaces.json.tmp");
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(entries).map_err(|e| e.to_string())?,
+        )
+        .and_then(|()| std::fs::rename(&temporary, &saved))
+        .map_err(|e| e.to_string())
     }
     pub fn workspace(&self, id: &str) -> Result<Workspace, String> {
         self.entries

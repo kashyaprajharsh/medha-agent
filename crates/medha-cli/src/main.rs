@@ -497,11 +497,7 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
     let _memory_lease = log.acquire_mutation_lease("memory:*").await?;
     let projection =
         memory::MemoryProjection::open(state.join("memory.db"), medha_home.join("memory.db"))?;
-    projection.rebuild_project(
-        log.all_events()?
-            .into_iter()
-            .filter(|event| event.provenance.source != "fork"),
-    )?;
+    projection.rebuild_project(log.memory_events()?.into_iter())?;
 
     match cli.command {
         MemoryCommand::List { scope } => {

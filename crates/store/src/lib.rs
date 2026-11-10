@@ -21,6 +21,9 @@ mod forget;
 #[cfg(test)]
 #[path = "forget_tests.rs"]
 mod forget_tests;
+#[cfg(test)]
+#[path = "memory_events_tests.rs"]
+mod memory_events_tests;
 mod pins;
 pub use forget::Forgotten;
 
@@ -936,6 +939,26 @@ impl SqliteLog {
     /// Read and verify a single SQLite snapshot before trusting serialized events.
     pub fn all_events(&self) -> Result<Vec<Event>, StoreError> {
         self.with_verified_snapshot(false, |conn| decode_events(conn, load_chain_rows(conn)?))
+    }
+
+    /// The memory saves project memory is rebuilt from, without reading every other event.
+    /// A branch's copies of its parent's saves are left out: they count once, in the parent.
+    pub fn memory_events(&self) -> Result<Vec<Event>, StoreError> {
+        self.with_verified_snapshot(false, |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                            prev_hash, hash, hash_version, ts
+                     FROM events WHERE kind = ?1 AND provenance <> 'fork' ORDER BY rowid ASC",
+                )
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            let rows = stmt
+                .query_map([EventKind::MemoryWrite.as_str()], chain_row)
+                .map_err(|error| StoreError::Db(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            decode_events(conn, rows)
+        })
     }
 
     fn session_events(&self, session: Ulid) -> Result<Vec<Event>, StoreError> {

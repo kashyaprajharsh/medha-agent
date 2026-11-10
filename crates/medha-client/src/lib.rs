@@ -162,6 +162,8 @@ pub struct Connection {
     unsent: Arc<AtomicUsize>,
     routes: Mutex<Routes>,
     stop: tokio::sync::watch::Sender<bool>,
+    /// Counts the backend's word that some folder's chats changed, from this or another app.
+    chats_changed: tokio::sync::watch::Sender<u64>,
 }
 
 /// Dropping an async request releases its slot without leaving a native thread
@@ -221,6 +223,16 @@ fn outcome(mut frame: Value) -> Result<Value, String> {
 }
 
 impl Connection {
+    /// Ticks whenever some folder's chats changed, from this app or another; a list shown should be fetched again.
+    pub fn chats_changed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.chats_changed.subscribe()
+    }
+
+    /// Turns true once this connection is lost; a later one is reached through the backend again.
+    pub fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
     fn routes(&self) -> MutexGuard<'_, Routes> {
         self.routes.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -723,6 +735,11 @@ impl Connection {
             }
             return;
         }
+        if frame["method"] == "chats.changed" {
+            self.chats_changed
+                .send_modify(|count| *count = count.wrapping_add(1));
+            return;
+        }
         let Some(id) = frame["id"].as_u64() else {
             return;
         };
@@ -979,6 +996,7 @@ async fn join_for(
         unsent: Arc::clone(&unsent),
         routes: Mutex::default(),
         stop,
+        chats_changed: tokio::sync::watch::Sender::new(0),
     });
     tokio::spawn(async move {
         loop {

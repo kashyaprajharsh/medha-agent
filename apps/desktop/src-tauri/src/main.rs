@@ -779,6 +779,7 @@ fn main() {
                 terminals: Arc::default(),
                 views: Arc::default(),
             });
+            backend::follow_chat_lists(app.handle().clone());
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol(view::SCHEME, outputs::serve)

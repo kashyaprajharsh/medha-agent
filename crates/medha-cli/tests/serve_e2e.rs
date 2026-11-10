@@ -791,14 +791,19 @@ impl Client {
     }
 
     async fn frame(&mut self) -> Value {
-        let frame = tokio::time::timeout(WAIT, wire::read_frame(&mut self.reader))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("the backend went quiet: {error}; heard: {}", self.heard)
-            })
-            .expect("the backend closed the connection");
-        self.heard.push_str(&frame.to_string());
-        frame
+        loop {
+            let frame = tokio::time::timeout(WAIT, wire::read_frame(&mut self.reader))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the backend went quiet: {error}; heard: {}", self.heard)
+                })
+                .expect("the backend closed the connection");
+            self.heard.push_str(&frame.to_string());
+            // Every app is told when a folder's chats change; these tests watch one chat.
+            if frame["method"] != "chats.changed" {
+                return frame;
+            }
+        }
     }
 
     async fn ask(&mut self, method: &str, session: Option<&str>, params: Value) -> Value {

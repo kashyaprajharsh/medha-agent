@@ -2081,6 +2081,7 @@ test("saving a new default refreshes an open chat's model picker without restart
     branch: async () => null, defaults: async () => currentSettings(defaultName),
     events: async () => ({ events: [], next_cursor: null }), extensions: async () => ({ skills: [] }),
     liveFocus: async () => {}, onLive: async (callback) => { receive = callback; return () => {}; },
+    onChatsChanged: async () => () => {},
     liveOpen: async (key, resume) => {
       opened.push(key);
       active.set(key, resume ? "old" : defaultName);

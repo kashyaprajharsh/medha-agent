@@ -435,6 +435,9 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
         for (const [key, native] of routes) if (native === event.payload.key) keys.add(key);
         for (const key of keys) handler(key, event.payload.frame);
       }),
+    // The backend's word that some folder's chats changed, here or in the terminal.
+    onChatsChanged: (handler: () => void): Promise<UnlistenFn> =>
+      listen("medha-chats-changed", () => handler()),
   };
 
   return api;

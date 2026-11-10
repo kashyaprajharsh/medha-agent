@@ -265,12 +265,18 @@ impl Tester {
 
     /// The next event as `(seq, frame the chat wrote)`.
     async fn event(&mut self) -> (u64, Value) {
-        let frame = match self.events.pop_front() {
-            Some(frame) => frame,
-            None => self
-                .frame()
-                .await
-                .expect("the backend closed the connection"),
+        // An app also hears folders' lists change; those are not a chat's events.
+        let frame = loop {
+            let frame = match self.events.pop_front() {
+                Some(frame) => frame,
+                None => self
+                    .frame()
+                    .await
+                    .expect("the backend closed the connection"),
+            };
+            if frame["method"] != "chats.changed" {
+                break frame;
+            }
         };
         assert_eq!(frame["method"], "session.event", "{frame}");
         let params = &frame["params"];
@@ -1026,4 +1032,29 @@ async fn a_client_gone_before_its_tied_chat_started_leaves_no_chat_behind() {
     })
     .await;
     until("the orphan ends", || backend.live() == 0).await;
+}
+
+/// A chat started from one app is announced to every other app on the backend, so their lists stay current.
+#[tokio::test]
+async fn a_chat_started_in_one_app_is_announced_to_the_others() {
+    let backend = backend();
+    let mut desktop = connect(&backend);
+    let mut terminal = connect(&backend);
+    terminal.ask("hello", None, json!({})).await;
+    desktop
+        .ask("session.create", None, json!({"folder": "/work"}))
+        .await;
+    let heard = loop {
+        let frame = match terminal.events.pop_front() {
+            Some(frame) => frame,
+            None => terminal
+                .frame()
+                .await
+                .expect("the backend closed the connection"),
+        };
+        if frame["method"] == "chats.changed" {
+            break frame;
+        }
+    };
+    assert_eq!(heard["params"]["folder"], "/work");
 }

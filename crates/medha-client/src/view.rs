@@ -355,6 +355,7 @@ mod tests {
             unsent: Arc::default(),
             routes: Mutex::default(),
             stop: watch::channel(false).0,
+            chats_changed: watch::channel(0).0,
         });
         let (mut view, hear) = View::mailbox(connection.clone(), limits).unwrap();
         let chat = connection.listen("chat".into(), hear.clone()).unwrap();

@@ -21,6 +21,7 @@ fn reply_saturation_fixture_counts_a_pending_bootstrap_request() {
         unsent: Arc::default(),
         routes: Mutex::default(),
         stop: tokio::sync::watch::channel(false).0,
+        chats_changed: tokio::sync::watch::channel(0).0,
     });
     let chat = connection
         .listen("fixture".into(), Arc::new(|_| {}))
@@ -128,6 +129,7 @@ async fn an_old_chat_handle_cannot_send_an_async_request_to_its_replacement() {
         unsent: Arc::default(),
         routes: Mutex::default(),
         stop: tokio::sync::watch::channel(false).0,
+        chats_changed: tokio::sync::watch::channel(0).0,
     };
     let first = connection.listen("same".into(), Arc::new(|_| {})).unwrap();
     connection.routes().forget("same", first.opened);
@@ -149,6 +151,7 @@ async fn cancelling_after_create_while_attach_waits_detaches_and_abandons_in_ord
         unsent: Arc::default(),
         routes: Mutex::default(),
         stop: tokio::sync::watch::channel(false).0,
+        chats_changed: tokio::sync::watch::channel(0).0,
     };
     let params = protocol::CreateSession {
         folder: PathBuf::from("."),
@@ -230,6 +233,7 @@ fn leaving_an_old_incarnation_preserves_the_current_viewer_and_requests() {
         unsent: Arc::default(),
         routes: Mutex::default(),
         stop: tokio::sync::watch::channel(false).0,
+        chats_changed: tokio::sync::watch::channel(0).0,
     };
     let current = Chat {
         session: "same".into(),
@@ -472,6 +476,7 @@ async fn a_closed_writer_releases_the_bytes_and_reply_slot_before_returning() {
         unsent: Arc::default(),
         routes: Mutex::default(),
         stop: tokio::sync::watch::channel(false).0,
+        chats_changed: tokio::sync::watch::channel(0).0,
     };
     for method in ["session.create", "session.close"] {
         let outcome = connection.request(json!({"method": method})).await;

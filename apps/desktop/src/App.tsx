@@ -270,6 +270,18 @@ export function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  // A chat started or deleted in another window or the terminal shows here without a manual refresh.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let gone = false;
+    void api
+      .onChatsChanged(() => void refresh(true))
+      .then((unlisten) => (gone ? unlisten() : (off = unlisten)));
+    return () => {
+      gone = true;
+      off?.();
+    };
+  }, [api, refresh]);
 
   const keyFor = useCallback(
     (id: string) => keyBySession[id] ?? id,

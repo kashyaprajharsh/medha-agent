@@ -79,6 +79,8 @@ pub struct Backend<C> {
 
 struct Activity {
     clients: HashMap<u64, Arc<AtomicUsize>>,
+    /// Every connected app, told when a folder's list of chats changes.
+    listeners: HashMap<u64, client::Client>,
     work: usize,
     stopping: bool,
     last_busy: Instant,
@@ -106,6 +108,7 @@ impl<C: Chats> Backend<C> {
             clients: AtomicU64::new(1),
             activity: Mutex::new(Activity {
                 clients: HashMap::new(),
+                listeners: HashMap::new(),
                 work: 0,
                 stopping: false,
                 last_busy: Instant::now(),
@@ -225,6 +228,23 @@ impl<C: Chats> Backend<C> {
         activity.work += 1;
         activity.last_busy = Instant::now();
         Ok(Working(Arc::clone(self)))
+    }
+
+    /// Tells every connected app that a folder's chats changed, so the desktop's list and the terminal's agree.
+    pub(crate) fn announce(&self, folder: &Value) {
+        if folder.is_null() {
+            return;
+        }
+        let frame =
+            json!({"jsonrpc": "2.0", "method": "chats.changed", "params": {"folder": folder}});
+        let line: Arc<str> = format!("{frame}\n").into();
+        let activity = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for listener in activity.listeners.values() {
+            listener.send(Arc::clone(&line));
+        }
     }
 
     /// Tells every chat to finish, as a backend that is stopping does. Each is

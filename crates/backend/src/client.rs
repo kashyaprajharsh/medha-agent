@@ -107,12 +107,14 @@ where
         attached: HashSet::new(),
         tied: Tied::default(),
     };
-    backend
-        .activity
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clients
-        .insert(me.id, Arc::clone(&me.waiting));
+    {
+        let mut activity = backend
+            .activity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        activity.clients.insert(me.id, Arc::clone(&me.waiting));
+        activity.listeners.insert(me.id, me.clone());
+    }
     loop {
         let frame = tokio::select! {
             () = backend.stopping() => break,
@@ -144,6 +146,7 @@ impl<C: Chats> Drop for Leaving<C> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             activity.clients.remove(&self.me.id);
+            activity.listeners.remove(&self.me.id);
             activity.last_busy = std::time::Instant::now();
         }
         for id in self.attached.drain() {
@@ -261,6 +264,7 @@ async fn handle<C: Chats>(
                 if me.dropped.is_cancelled() {
                     tied.close();
                 }
+                backend.announce(&frame["params"]["folder"]);
             }
             me.reply(id, outcome);
         });

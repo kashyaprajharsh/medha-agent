@@ -17,6 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ulid::Ulid;
 
+mod forget;
+#[cfg(test)]
+#[path = "forget_tests.rs"]
+mod forget_tests;
+pub use forget::Forgotten;
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Connection-local proof that the complete chain was authenticated. External
@@ -797,7 +803,11 @@ impl SqliteLog {
         // Fail closed: nothing stays cached unless this read succeeds.
         let state = match cached.take() {
             Some(known) if !force && known.version == version => known,
-            Some(known) if !force => known.extended(&tx, version)?,
+            // A chat deleted elsewhere links the chain anew; it is then proven whole, as on open.
+            Some(known) if !force => match known.extended(&tx, version) {
+                Ok(state) => state,
+                Err(_) => Verified::full(&tx, version)?,
+            },
             _ => {
                 #[cfg(test)]
                 self.verification_count
@@ -821,6 +831,7 @@ impl SqliteLog {
     /// user message (pre-logging, or a sub-agent) shows a placeholder. A chat
     /// now logs nothing before its first message; one from older builds that
     /// holds only startup context is not listed, and its events stay in the log.
+    /// Nor is a deleted chat, whose memory saves alone stay, nor one being deleted.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>, StoreError> {
         let conn = self
             .conn
@@ -839,13 +850,16 @@ impl SqliteLog {
                     (SELECT parent FROM spawns
                      WHERE child = e1.session_id AND parent <> e1.session_id LIMIT 1)
                  FROM events e1
+                 WHERE NOT EXISTS (SELECT 1 FROM store_meta
+                     WHERE key = ?1 || e1.session_id AND CAST(value AS REAL) > ?2)
                  GROUP BY e1.session_id
-                 HAVING SUM(e1.kind NOT IN ('context.file_loaded', 'context.file_blocked', 'session')) > 0
+                 HAVING SUM(e1.kind NOT IN ('context.file_loaded', 'context.file_blocked', 'session', 'memory.write')) > 0
                  ORDER BY MAX(e1.ts) DESC",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
+        let marked_since = forget::now() - forget::DELETING_FOR;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(rusqlite::params![forget::DELETING, marked_since], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, f64>(1)?,

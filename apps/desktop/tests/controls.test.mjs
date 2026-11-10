@@ -684,6 +684,9 @@ test("session date groups start with Today open and older groups collapsed", asy
     selected: null,
     onSelect: (id) => selected.push(id),
     onTogglePin() {},
+    deleting: new Set(),
+    onDelete() {},
+    onUndo() {},
     onRefresh() {},
     onNew() {},
     onPalette() {},
@@ -754,6 +757,9 @@ test("calendar groups do not put last Sunday's session into this week's Monday",
     selected: null,
     onSelect() {},
     onTogglePin() {},
+    deleting: new Set(),
+    onDelete() {},
+    onUndo() {},
     onRefresh() {},
     onNew() {},
     onPalette() {},
@@ -2985,6 +2991,45 @@ test("a command typed in full runs itself, not a longer one listed first", async
   );
   await key(document.querySelector("textarea"), "Enter");
   assert.deepEqual(opened, ["mode"], "typing /mode opened another control");
+});
+
+test("a chat deleted from the sidebar keeps a way back in its row, and undo brings it back", async () => {
+  const cache = new Map(modules);
+  const stub = (name, source) => cache.set(name, "data:text/javascript," + encodeURIComponent(source));
+  for (const [name, exports] of Object.entries({
+    FileViewer: ["FileViewer"], FirstRun: ["FirstRun"], Extensions: ["Extensions"], Messaging: ["Messaging"],
+    Rewind: ["Rewind"], LiveTail: ["LiveTail"], Palette: ["Palette"],
+    WorkSurface: ["WorkSurface"], Transcript: ["Transcript"], UpdateReady: ["UpdateReady"],
+    Welcome: ["Starters", "Welcome"], WorkspaceMenu: ["WorkspaceMenu"],
+  })) stub(name, exports.map((name) => `export function ${name}(){return null}`).join(";"));
+  stub("OutputScope", "export function OutputScope({children}){return children}");
+  const { App } = await import(await moduleUrl("App", cache));
+  globalThis.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.window);
+  const now = Date.now() / 1000;
+  const all = [
+    { id: "gone", title: "Old plan", started_ts: now, last_ts: now },
+    { id: "kept", title: "Kept chat", started_ts: now, last_ts: now - 1 },
+  ];
+  let rows = all;
+  const asked = [];
+  const api = {
+    workspace: async () => "/project", sessions: async () => rows, branch: async () => null,
+    defaults: async () => settings, events: async () => ({ events: [], next_cursor: null }),
+    extensions: async () => ({ skills: [] }), liveFocus: async () => {},
+    settings: async () => ({ models: [], protocols: [], search: { provider: "duckduckgo" } }),
+    onLive: async () => () => {}, onChatsChanged: async () => () => {},
+    deleteChat: async (id) => { asked.push(["delete", id]); rows = all.filter((row) => row.id !== id); },
+    restoreChat: async (id) => { asked.push(["restore", id]); rows = all; },
+  };
+  Object.assign(globalThis.__medhaControlsTest, { api, workspace: { id: "project", name: "Project" }, theme: "dark", setTheme() {} });
+  await act(async () => root.render(h(App)));
+  await click(document.querySelector('[aria-label="Delete Old plan"]'));
+  assert.deepEqual(asked, [["delete", "gone"]]);
+  await act(() => new Promise((done) => setTimeout(done, 450)));
+  assert.match(document.querySelector(".ghost-line")?.textContent ?? "", /"Old plan"\s*deleted/);
+  await click(namedButton("Undo"));
+  assert.deepEqual(asked.at(-1), ["restore", "gone"]);
+  assert.ok(document.querySelector('[aria-label="Delete Old plan"]'), "undo did not bring the chat back");
 });
 
 test("a project leaves Medha only when asked, and its history goes only when chosen", async () => {

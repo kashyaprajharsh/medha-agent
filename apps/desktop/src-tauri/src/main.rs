@@ -236,6 +236,30 @@ async fn workspace_history(
         .map_err(|error| error.to_string())?
 }
 #[tauri::command]
+async fn chat_delete(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    let workspaces = state.workspaces.clone();
+    tauri::async_runtime::spawn_blocking(move || workspaces.delete_chat(&workspace_id, &session_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+#[tauri::command]
+async fn chat_restore(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    let workspaces = state.workspaces.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        workspaces.restore_chat(&workspace_id, &session_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+#[tauri::command]
 async fn workspace_remove(
     state: State<'_, DesktopState>,
     workspace_id: String,
@@ -824,6 +848,8 @@ fn main() {
             workspace_reveal,
             workspace_history,
             workspace_remove,
+            chat_delete,
+            chat_restore,
             workspace_branch,
             list_sessions,
             usage_summary,

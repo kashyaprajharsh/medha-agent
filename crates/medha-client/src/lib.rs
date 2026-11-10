@@ -517,9 +517,20 @@ impl Connection {
 
     /// Deletes everything Medha keeps for `folder`, waiting only for this window's own chats there that are closing.
     pub fn delete_history(&self, folder: &Path) -> Result<(), String> {
+        self.once_own_chats_close(folder, json!({"method": "folder.history.delete"}))
+    }
+
+    /// Deletes one chat in `folder`; it can be brought back with `chats.restore` for a few seconds.
+    pub fn delete_chat(&self, folder: &Path, chat: &str) -> Result<(), String> {
+        let request = json!({"method": "chats.delete", "params": {"session": chat}});
+        self.once_own_chats_close(folder, request)
+    }
+
+    /// Asks `request`, asked again while it is refused only because this window's own chats there are still closing.
+    fn once_own_chats_close(&self, folder: &Path, request: Value) -> Result<(), String> {
         let deadline = Instant::now() + LEAVING;
         loop {
-            let error = match self.about(folder, json!({"method": "folder.history.delete"})) {
+            let error = match self.about(folder, request.clone()) {
                 Ok(_) => return Ok(()),
                 Err(error) => error,
             };

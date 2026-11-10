@@ -1,6 +1,7 @@
 import type { Session } from "./api";
-import { type ReactNode, useId, useState } from "react";
+import { type ReactNode, useId, useLayoutEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import { SessionRow } from "./SessionRow";
 import { shortcut } from "./shortcut";
 
 export const medhaIcon = new URL("./assets/medha-logo.png", import.meta.url)
@@ -26,6 +27,9 @@ type Props = {
   needs: Set<string>;
   pinned: Set<string>;
   onTogglePin: (id: string) => void;
+  deleting: Set<string>;
+  onDelete: (session: Session) => void;
+  onUndo: (id: string) => void;
   onRefresh: () => void;
   loading: boolean;
   workspace: string;
@@ -85,6 +89,29 @@ export function Sidebar(props: Props) {
     groups.get(label)!.push(session);
   }
   for (const [label, rows] of groups) if (!rows.length) groups.delete(label);
+  const nav = useRef<HTMLElement>(null);
+  const tops = useRef(new Map<string, number>());
+  const wasDeleting = useRef(new Set<string>());
+  // When a deleted chat's row goes, the rows below glide up into its place, moved only by transform.
+  useLayoutEffect(() => {
+    const rows = [...(nav.current?.querySelectorAll<HTMLElement>(".sess-row[data-id]") ?? [])];
+    const placed = new Map(rows.map((row) => [row.dataset.id!, row.getBoundingClientRect().top]));
+    const gone = [...wasDeleting.current].some((id) => tops.current.has(id) && !placed.has(id));
+    if (gone && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      for (const row of rows) {
+        const before = tops.current.get(row.dataset.id!);
+        const shift = before === undefined ? 0 : before - placed.get(row.dataset.id!)!;
+        if (!shift) continue;
+        row.style.transform = `translateY(${shift}px)`;
+        row.getBoundingClientRect();
+        row.classList.add("gliding");
+        row.style.transform = "";
+        setTimeout(() => row.classList.remove("gliding"), 260);
+      }
+    }
+    tops.current = placed;
+    wasDeleting.current = new Set(props.deleting);
+  });
   return (
     <aside
       id="session-sidebar"
@@ -129,7 +156,7 @@ export function Sidebar(props: Props) {
           />
         </button>
       </div>
-      <nav className="sessions" aria-label="Sessions">
+      <nav className="sessions" aria-label="Sessions" ref={nav}>
         {[...groups].map(([label, rows]) => {
           const collapsible = DATE_GROUPS.includes(label);
           const open = !collapsible || expanded.has(label);
@@ -172,47 +199,38 @@ export function Sidebar(props: Props) {
                     const active = props.selected === session.id;
                     const isPinned = pinned.has(session.id);
                     return (
-                      <div className="sess-row" key={session.id}>
-                        <button
-                          type="button"
-                          className={`sess ${active ? "active" : ""}`}
-                          onClick={() => props.onSelect(session.id)}
-                          aria-current={active ? "page" : undefined}
-                        >
-                          <span className="sess-title">
-                            {session.title || "Untitled session"}
-                          </span>
-                          <span className="sess-when">
-                            {props.needs.has(session.id) ? (
-                              <span
-                                className="need-dot"
-                                aria-label="Waiting for you"
-                              />
-                            ) : props.running.has(session.id) ? (
-                              <span className="spin-dot" aria-label="Working" />
-                            ) : (
-                              when(session.last_ts, now)
-                            )}
-                          </span>
-                          {agents > 0 && (
+                      <SessionRow
+                        key={session.id}
+                        session={session}
+                        active={active}
+                        pinned={isPinned}
+                        deleting={props.deleting.has(session.id)}
+                        when={
+                          props.needs.has(session.id) ? (
+                            <span
+                              className="need-dot"
+                              aria-label="Waiting for you"
+                            />
+                          ) : props.running.has(session.id) ? (
+                            <span className="spin-dot" aria-label="Working" />
+                          ) : (
+                            when(session.last_ts, now)
+                          )
+                        }
+                        meta={
+                          agents > 0 && (
                             <span className="sess-meta">
                               <Icon name="fork" />
                               {agents}{" "}
                               {agents === 1 ? "sub-agent" : "sub-agents"}
                             </span>
-                          )}
-                        </button>
-                        <button
-                          type="button"
-                          className="pin"
-                          aria-pressed={isPinned}
-                          aria-label={`${isPinned ? "Unpin" : "Pin"} ${session.title || "session"}`}
-                          title={isPinned ? "Unpin" : "Pin"}
-                          onClick={() => props.onTogglePin(session.id)}
-                        >
-                          <Icon name="pin" />
-                        </button>
-                      </div>
+                          )
+                        }
+                        onSelect={() => props.onSelect(session.id)}
+                        onTogglePin={() => props.onTogglePin(session.id)}
+                        onDelete={() => props.onDelete(session)}
+                        onUndo={() => props.onUndo(session.id)}
+                      />
                     );
                   })}
               </div>

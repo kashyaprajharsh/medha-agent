@@ -98,10 +98,19 @@ impl<T> Kept<T> {
 /// workspace and so its one event log.
 pub(crate) struct ServeChats {
     folders: Arc<Mutex<Kept<Workspace>>>,
+    /// Chats deleted but still able to be brought back, by id.
+    held: Arc<Mutex<HashMap<String, Held>>>,
     mcp_host: mcp::hub::Endpoint,
     mcp_changed: Arc<tokio::sync::Notify>,
     requests: Lane,
     starts: Lane,
+}
+
+/// A deleted chat waiting out its undo: its own lease and its sub-agents' keep anyone from opening it.
+struct Held {
+    folder: PathBuf,
+    family: Vec<ulid::Ulid>,
+    _leases: Vec<runtime::lease::SessionLease>,
 }
 
 const BUSY: &str = "Medha is busy with other requests. Try again in a moment.";
@@ -226,6 +235,7 @@ impl ServeChats {
         });
         Self {
             folders,
+            held: Arc::default(),
             mcp_host,
             mcp_changed,
             requests: Lane::new(ANSWERING, 64),
@@ -347,6 +357,103 @@ impl Chats for ServeChats {
             }
             runtime::history::delete(&folder).map_err(|error| format!("{error:#}"))?;
             Ok(json!({"deleted": true}))
+        })
+        .await
+    }
+
+    async fn hold_chat(&self, request: &Value) -> Result<Value, String> {
+        let _admitted = self.requests.admit().await?;
+        let (folders, held, asked) = (
+            Arc::clone(&self.folders),
+            Arc::clone(&self.held),
+            request.clone(),
+        );
+        apart(move || {
+            let folder = folder(&asked["folder"])?;
+            let chat = asked["params"]["session"]
+                .as_str()
+                .and_then(|id| ulid::Ulid::from_string(id).ok())
+                .ok_or("name the chat to delete")?;
+            let workspace = opened(&folders, &folder, &Collected::default())?;
+            let failed = |error: store::StoreError| error.to_string();
+            let log = workspace
+                .open_store()
+                .map_err(|error| format!("{error:#}"))?
+                .log;
+            if !log
+                .list_sessions()
+                .map_err(failed)?
+                .iter()
+                .any(|listed| listed.id == chat)
+            {
+                return Err("This chat is not in this folder.".into());
+            }
+            let family = log.chat_with_agents(chat).map_err(failed)?;
+            let leases = runtime::history::hold(&workspace.state, &family)
+                .map_err(|error| error.to_string())?;
+            log.hide_chats(&family).map_err(failed)?;
+            let entry = Held {
+                folder,
+                family,
+                _leases: leases,
+            };
+            held.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(chat.to_string(), entry);
+            Ok(json!({"held": true}))
+        })
+        .await
+    }
+
+    async fn release_chat(&self, chat: &str) -> Result<bool, String> {
+        let taken = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(chat);
+        let Some(held) = taken else {
+            return Ok(false);
+        };
+        let folders = Arc::clone(&self.folders);
+        apart(move || {
+            let workspace = opened(&folders, &held.folder, &Collected::default())?;
+            let log = workspace
+                .open_store()
+                .map_err(|error| format!("{error:#}"))?
+                .log;
+            log.show_chats(&held.family)
+                .map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn delete_held_chat(&self, chat: &str) -> Result<bool, String> {
+        let taken = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(chat);
+        let Some(held) = taken else {
+            return Ok(false);
+        };
+        let folders = Arc::clone(&self.folders);
+        apart(move || {
+            let workspace = opened(&folders, &held.folder, &Collected::default())?;
+            let store = workspace
+                .open_store()
+                .map_err(|error| format!("{error:#}"))?;
+            let forgotten = store
+                .log
+                .forget_chat(held.family[0], &held.family)
+                .map_err(|error| error.to_string())?;
+            runtime::history::delete_outputs(
+                &workspace.state.join("artifacts"),
+                &forgotten.artifacts,
+            );
+            // Its leases go only now, so it cannot be opened half deleted.
+            drop(held);
+            Ok(true)
         })
         .await
     }

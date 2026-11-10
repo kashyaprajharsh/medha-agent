@@ -759,6 +759,36 @@ fn deleting_a_folders_history_waits_for_this_windows_own_chat_there_to_close() {
 }
 
 #[test]
+fn deleting_the_chat_this_window_shows_closes_it_and_undo_brings_it_back() {
+    let (model, _) = stand_in_model();
+    let Some(chat) = Chat::open("delete-chat", &model) else {
+        return;
+    };
+    chat.turn("something to delete");
+    let id = chat.wait("the greeting", |frame| frame["method"] == "ready")["params"]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let listed = || {
+        chat.sessions
+            .inner
+            .backend
+            .connection()
+            .unwrap()
+            .about(
+                &chat.sessions.inner.workspace,
+                json!({"method": "sessions.list"}),
+            )
+            .unwrap()
+            .to_string()
+    };
+    chat.sessions.delete_chat(&id).unwrap();
+    assert!(!listed().contains(&id), "a deleted chat is still listed");
+    chat.sessions.restore_chat(&id).unwrap();
+    assert!(listed().contains(&id), "undo did not bring the chat back");
+}
+
+#[test]
 fn requests_racing_a_sleep_question_are_never_lost() {
     let Some(chat) = Chat::open("sleep-race", "http://127.0.0.1:9/v1") else {
         return;

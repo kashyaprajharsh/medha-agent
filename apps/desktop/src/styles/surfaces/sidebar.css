@@ -298,6 +298,104 @@
   background: var(--hover);
   color: var(--text);
 }
+.del {
+  position: absolute;
+  top: 5px;
+  right: 34px;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-xs);
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity var(--t-fast), background var(--t-fast), color var(--t-fast);
+}
+.del .icon {
+  width: 13px;
+  height: 13px;
+}
+.sess-row:hover .del,
+.del:focus-visible {
+  opacity: 1;
+}
+.del:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+/* A deleted chat's name lifts away letter by letter; the rest of its row fades with it. */
+.ink-letter {
+  display: inline-block;
+  white-space: pre;
+  animation: ink-lift 210ms var(--ease-out) forwards;
+}
+@keyframes ink-lift {
+  to {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+.sess-row.leaving .sess-title {
+  text-overflow: clip;
+}
+.sess-row.leaving .sess-when,
+.sess-row.leaving .sess-meta {
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.sess-row.leaving .sess {
+  background: transparent;
+}
+.sess-row.gliding {
+  transition: transform 220ms var(--ease-out);
+}
+.ghost-line {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px 0 10px;
+  font-size: var(--text-sm);
+  color: var(--faint);
+  animation: fade-in 200ms var(--ease-out);
+}
+/* The name gives way before the word that says what happened. */
+.ghost-text {
+  display: flex;
+  min-width: 0;
+  gap: 0.35em;
+  white-space: nowrap;
+}
+.ghost-text b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 400;
+  color: var(--dim);
+}
+.ghost-text span {
+  flex: none;
+}
+.ghost-line button {
+  flex: none;
+  color: var(--gold);
+  font-size: var(--text-sm);
+  padding: 3px 8px;
+  border-radius: var(--r-xs);
+}
+.ghost-line button:hover {
+  background: var(--gold-wash);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ink-letter {
+    animation: none;
+    opacity: 0;
+  }
+  .sess-row.gliding {
+    transition: none;
+  }
+}
 .side-empty {
   margin: var(--s-4) 10px;
   color: var(--faint);

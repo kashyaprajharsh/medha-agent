@@ -529,6 +529,69 @@ pub(super) fn resume(model: &mut Model, id: String) {
         model.session_op = Some(SessionOp::Resume { source, target });
     }
 }
+/// `d` in `/resume`: deletes the chosen chat, which `u` brings back for a few seconds.
+pub(super) fn delete_chat(model: &mut Model, id: ulid::Ulid) {
+    let open_here = model
+        .remote
+        .as_ref()
+        .is_some_and(|peer| peer.conversation == id.to_string());
+    if open_here {
+        model.push_notice("This is the chat open here. Start a new one with /new, then delete it.");
+        return;
+    }
+    if model.deleted_chats.contains_key(&id) {
+        return;
+    }
+    let folder = model.chat_folders.get(&id).cloned();
+    request(model, Effect::DeleteChat(id.to_string(), folder));
+}
+
+pub(super) fn restore_chat(model: &mut Model, id: ulid::Ulid) {
+    if !model.deleted_chats.contains_key(&id) {
+        model.push_notice("u brings back a chat deleted here a moment ago.");
+        return;
+    }
+    let folder = model.chat_folders.get(&id).cloned();
+    request(model, Effect::RestoreChat(id.to_string(), folder));
+}
+
+/// The listed row of `id` in an open `/resume`, if any.
+fn resume_row(model: &mut Model, id: ulid::Ulid) -> Option<&mut kernel::SessionMeta> {
+    match model.picker.as_mut().map(|picker| &mut picker.kind) {
+        Some(PickerKind::Session(rows)) => rows.iter_mut().find(|row| row.id == id),
+        _ => None,
+    }
+}
+
+pub(super) fn chat_deleted(model: &mut Model, id: &str) {
+    let Ok(id) = id.parse::<ulid::Ulid>() else {
+        return;
+    };
+    let title = match resume_row(model, id) {
+        Some(row) => {
+            let title = row.title.clone();
+            row.title = format!("deleted · u brings it back · {title}");
+            title
+        }
+        None => String::new(),
+    };
+    model.deleted_chats.insert(id, title);
+    model.push_notice("Chat deleted. Press u on it within a few seconds to bring it back.");
+}
+
+pub(super) fn chat_restored(model: &mut Model, id: &str) {
+    let Ok(id) = id.parse::<ulid::Ulid>() else {
+        return;
+    };
+    let Some(title) = model.deleted_chats.remove(&id) else {
+        return;
+    };
+    if let Some(row) = resume_row(model, id) {
+        row.title = title;
+    }
+    model.push_notice("Chat brought back.");
+}
+
 /// `/resume`: this folder's chats, then the desktop's personal chats, newest first, each opening where it lives.
 pub(super) fn chats_listed(
     model: &mut Model,
@@ -554,6 +617,8 @@ pub(super) fn chats_listed(
         })
     };
     model.chat_folders.clear();
+    // A chat being deleted is no longer listed, so nothing listed now can be brought back.
+    model.deleted_chats.clear();
     let mut sessions: Vec<kernel::SessionMeta> =
         here.into_iter().filter_map(|chat| meta(chat, "")).collect();
     for (folder, chat) in personal {

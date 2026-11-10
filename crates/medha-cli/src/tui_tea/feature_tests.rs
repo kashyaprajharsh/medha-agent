@@ -799,6 +799,76 @@ async fn a_command_typed_in_full_runs_itself_not_a_longer_one_listed_first() {
     );
 }
 
+/// `d` in `/resume` deletes a chat where it lives and `u` brings it back; the chat open here is never deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_deletes_a_chat_where_it_lives_and_u_brings_it_back() {
+    let mut f = fixture().await;
+    let chat = |id: &str, title: &str, updated: f64| protocol::SessionSummary {
+        id: id.into(),
+        started: updated,
+        updated,
+        title: Some(title.into()),
+        model: None,
+        events: 3,
+        agents: 0,
+    };
+    let here = f.model.remote.as_ref().unwrap().conversation.clone();
+    let personal = ulid::Ulid::new().to_string();
+    let folder = std::path::PathBuf::from("/data/personal/chat-a");
+    backend_features::chats_listed(
+        &mut f.model,
+        vec![chat(&here, "open here", 20.0)],
+        vec![(folder.clone(), chat(&personal, "on the desktop", 10.0))],
+    );
+    let row = |model: &Model, title: &str| {
+        let rows = model.picker.as_ref().unwrap().kind.labels();
+        rows.iter().position(|row| row.contains(title)).unwrap()
+    };
+    let asked = |model: &Model, wanted: &dyn Fn(&Effect) -> bool| {
+        model
+            .remote
+            .as_ref()
+            .unwrap()
+            .pending
+            .iter()
+            .any(|asked| wanted(&asked.effect))
+    };
+
+    f.model.picker.as_mut().unwrap().selected = row(&f.model, "open here");
+    input::handle_key(&mut f.model, key(KeyCode::Char('d')));
+    assert!(
+        !asked(&f.model, &|effect| matches!(effect, Effect::DeleteChat(..))),
+        "the chat open here was deleted"
+    );
+
+    f.model.picker.as_mut().unwrap().selected = row(&f.model, "on the desktop");
+    input::handle_key(&mut f.model, key(KeyCode::Char('d')));
+    assert!(asked(&f.model, &|effect| matches!(
+        effect,
+        Effect::DeleteChat(id, Some(at)) if *id == personal && *at == folder
+    )));
+    backend_features::chat_deleted(&mut f.model, &personal);
+    let marked = row(&f.model, "on the desktop");
+    assert!(f.model.picker.as_ref().unwrap().kind.labels()[marked].contains("u brings it back"));
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    assert!(
+        !asked(
+            &f.model,
+            &|effect| matches!(effect, Effect::Resume(id, _) if *id == personal)
+        ),
+        "a chat being deleted was opened"
+    );
+
+    input::handle_key(&mut f.model, key(KeyCode::Char('u')));
+    assert!(asked(&f.model, &|effect| matches!(
+        effect,
+        Effect::RestoreChat(id, Some(at)) if *id == personal && *at == folder
+    )));
+    backend_features::chat_restored(&mut f.model, &personal);
+    let back = row(&f.model, "on the desktop");
+    assert!(!f.model.picker.as_ref().unwrap().kind.labels()[back].contains("deleted"));
+}
+
 /// `/resume` lists the desktop's personal chats too, and picking one opens it in its own folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_lists_personal_chats_and_opens_one_where_it_lives() {

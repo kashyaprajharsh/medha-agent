@@ -8,6 +8,10 @@ pub(super) fn activate(model: &mut Model) -> bool {
         && let Some(meta) = sessions.get(picker.selected)
     {
         let id = meta.id;
+        if model.deleted_chats.contains_key(&id) {
+            model.push_notice("This chat is being deleted. Press u to bring it back first.");
+            return true;
+        }
         if model.foreground_owned() || model.has_active_agents() {
             model.picker = None;
             model.push_notice("finish foreground and background work before resuming a session");

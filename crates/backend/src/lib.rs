@@ -63,6 +63,21 @@ pub trait Chats: Send + Sync + 'static {
         Err("unknown method".into())
     }
 
+    /// Hides the chat the frame names and keeps it from being opened, until it is deleted or brought back.
+    async fn hold_chat(&self, _request: &Value) -> Result<Value, String> {
+        Err("unknown method".into())
+    }
+
+    /// Brings back a held chat; false when it was not held.
+    async fn release_chat(&self, _chat: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Deletes a held chat; false when it was brought back first.
+    async fn delete_held_chat(&self, _chat: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// A nonblocking resource snapshot. Busy resources may report `null`
     /// instead of waiting for the work that the health check is diagnosing.
     fn resources(&self) -> Value {

@@ -193,6 +193,17 @@ impl Workspaces {
         }
         Ok(item)
     }
+    /// Deletes one chat, wherever it lives; it can be brought back for a few seconds.
+    pub fn delete_chat(&self, id: &str, session: &str) -> Result<(), String> {
+        self.resolve(id, None, Some(session))?
+            .live
+            .delete_chat(session)
+    }
+    pub fn restore_chat(&self, id: &str, session: &str) -> Result<(), String> {
+        self.resolve(id, None, Some(session))?
+            .live
+            .restore_chat(session)
+    }
     /// How many chats a project has and the bytes its history takes, for the removal question.
     pub fn history(&self, id: &str) -> Result<Value, String> {
         let workspace = self.workspace(id)?;

@@ -16,6 +16,8 @@ mod model_providers;
 pub use model_providers::*;
 mod chatgpt;
 pub use chatgpt::*;
+mod chats;
+pub use chats::*;
 mod messaging;
 pub use messaging::*;
 mod session_features;

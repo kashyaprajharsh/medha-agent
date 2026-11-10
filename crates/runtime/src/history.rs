@@ -5,6 +5,34 @@ use std::path::Path;
 
 pub const OPEN: &str =
     "A chat in this folder is open. Close it first, then delete the folder's history.";
+pub const CHAT_OPEN: &str = "This chat is open. Close it first, then delete it.";
+/// A stored output changed this lately may be one another chat is about to log, so it stays.
+const RECENT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Holds a chat and its sub-agents so none can be opened, refused while any is open anywhere.
+pub fn hold(state: &Path, chats: &[ulid::Ulid]) -> Result<Vec<crate::lease::SessionLease>> {
+    chats
+        .iter()
+        .map(|chat| {
+            crate::lease::SessionLease::acquire(state, *chat)
+                .map_err(|_| anyhow::anyhow!(CHAT_OPEN))
+        })
+        .collect()
+}
+
+/// Deletes the stored outputs only a deleted chat named, keeping any changed lately.
+pub fn delete_outputs(artifacts: &Path, names: &[String]) {
+    let lately = std::time::SystemTime::now().checked_sub(RECENT);
+    for name in names {
+        let path = artifacts.join(name);
+        let recent = std::fs::symlink_metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| lately.is_none_or(|lately| modified > lately));
+        if !recent {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 /// Bytes the folder's history takes on disk, links not followed.
 pub fn size(folder: &Path) -> u64 {

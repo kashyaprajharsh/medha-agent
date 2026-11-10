@@ -318,6 +318,38 @@ impl LiveSessions {
         Ok(())
     }
 
+    /// Closes this window's view of `chat`, then deletes it; it can be brought back for a few seconds.
+    pub fn delete_chat(&self, chat: &str) -> Result<(), String> {
+        let closed: Vec<Live> = {
+            let mut open = self.inner.open.lock().map_err(|error| error.to_string())?;
+            let showing: Vec<String> = open
+                .iter()
+                .filter(|(_, live)| {
+                    live.conversation
+                        .lock()
+                        .is_ok_and(|id| id.as_deref() == Some(chat))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            showing.iter().filter_map(|key| open.remove(key)).collect()
+        };
+        drop(closed);
+        self.inner
+            .backend
+            .connection()?
+            .delete_chat(&self.inner.workspace, chat)
+    }
+
+    /// Brings back a chat deleted moments ago, from this window or any other.
+    pub fn restore_chat(&self, chat: &str) -> Result<(), String> {
+        let request = json!({"method": "chats.restore", "params": {"session": chat}});
+        self.inner
+            .backend
+            .connection()?
+            .about(&self.inner.workspace, request)
+            .map(|_| ())
+    }
+
     /// Closes this window's chats here, then deletes everything Medha keeps for the folder.
     pub fn delete_history(&self) -> Result<(), String> {
         self.close_all();

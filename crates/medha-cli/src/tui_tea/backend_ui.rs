@@ -161,6 +161,9 @@ pub(super) enum Effect {
     Resume(String, Option<PathBuf>),
     /// This folder's chats and the desktop's personal chats, for `/resume`.
     Chats,
+    /// A chat to delete, or to bring back, in its own folder when that is not this one.
+    DeleteChat(String, Option<PathBuf>),
+    RestoreChat(String, Option<PathBuf>),
     Reconnect,
     Clear,
     Snapshot,
@@ -417,6 +420,8 @@ enum Answer {
         Vec<(PathBuf, protocol::SessionSummary)>,
     ),
     Images(Vec<staged_images::Image>),
+    ChatDeleted(String),
+    ChatRestored(String),
     /// Ctrl+V found text rather than an image: it is pasted as the terminal would have.
     ClipboardText(String),
     Reloaded(protocol::ExtensionsReloaded),
@@ -827,6 +832,26 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
                 }
             }
             Ok(Answer::Chats(here, personal))
+        }
+        Effect::DeleteChat(id, chat_folder) => {
+            let folder = chat_folder.clone().unwrap_or(folder);
+            let request = protocol::DeleteChat {
+                session: id.clone(),
+            };
+            connection
+                .call_async(protocol::Scope::Folder(&folder), &request)
+                .await
+                .map(|_| Answer::ChatDeleted(id.clone()))
+        }
+        Effect::RestoreChat(id, chat_folder) => {
+            let folder = chat_folder.clone().unwrap_or(folder);
+            let request = protocol::RestoreChat {
+                session: id.clone(),
+            };
+            connection
+                .call_async(protocol::Scope::Folder(&folder), &request)
+                .await
+                .map(|_| Answer::ChatRestored(id.clone()))
         }
         Effect::Reconnect => opened(connection, folder, startup, Some(conversation), settings)
             .await
@@ -2230,6 +2255,8 @@ fn settle(model: &mut Model, stream: &mut View, done: Completion) {
                 }
             }
             Answer::Chats(here, personal) => backend_features::chats_listed(model, here, personal),
+            Answer::ChatDeleted(id) => backend_features::chat_deleted(model, &id),
+            Answer::ChatRestored(id) => backend_features::chat_restored(model, &id),
             Answer::Opened(opened) => {
                 let Opened {
                     folder,

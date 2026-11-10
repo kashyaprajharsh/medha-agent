@@ -157,6 +157,21 @@ pub(super) fn handle(model: &mut Model, key: KeyEvent) -> bool {
                 }
                 return true;
             }
+            // `d` deletes the chosen chat and `u` brings it back, as `d` removes elsewhere.
+            KeyCode::Char(key @ ('d' | 'u')) if matches!(&picker.kind, PickerKind::Session(_)) => {
+                let chosen = match &picker.kind {
+                    PickerKind::Session(rows) => rows.get(picker.selected).map(|row| row.id),
+                    _ => None,
+                };
+                if let Some(id) = chosen {
+                    if key == 'd' {
+                        delete_chat(model, id);
+                    } else {
+                        restore_chat(model, id);
+                    }
+                }
+                return true;
+            }
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
                 let id = if let PickerKind::Mcp(rows) = &picker.kind {
                     (picker.selected > 0)

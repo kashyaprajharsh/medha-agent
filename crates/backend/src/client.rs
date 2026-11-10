@@ -15,6 +15,8 @@ use crate::{Backend, Chats, Failure, refused};
 
 /// Room for a full replay and then some; a client further behind than this is dropped.
 const QUEUE: usize = KEPT_FRAMES + 1024;
+/// How long a deleted chat can be brought back, from any app, before it is gone.
+const UNDO: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// What may wait for one client, in bytes: a full replay, the largest answer, and room beside them.
 pub(crate) const QUEUED_BYTES: usize = 4 * wire::MAX_FRAME;
@@ -212,6 +214,24 @@ impl Tied {
     }
 }
 
+/// Deletes a held chat once it can no longer be brought back, and tells every app either way.
+fn delete_later<C: Chats>(backend: &Arc<Backend<C>>, frame: &Value) {
+    let (backend, folder) = (Arc::clone(backend), frame["folder"].clone());
+    let chat = frame["params"]["session"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    tokio::spawn(async move {
+        tokio::time::sleep(UNDO).await;
+        match backend.chats.delete_held_chat(&chat).await {
+            Ok(false) => return,
+            Ok(true) => tracing::info!(chat, "chat deleted"),
+            Err(error) => tracing::warn!(chat, error, "chat could not be deleted and is back"),
+        }
+        backend.announce(&folder);
+    });
+}
+
 async fn handle<C: Chats>(
     backend: &Arc<Backend<C>>,
     me: &Client,
@@ -257,6 +277,25 @@ async fn handle<C: Chats>(
                         backend.announce(&frame["folder"]);
                     }
                     deleted.map_err(refused)
+                }
+                true if method == "chats.delete" => {
+                    let held = backend.chats.hold_chat(&frame).await;
+                    if held.is_ok() {
+                        backend.announce(&frame["folder"]);
+                        delete_later(&backend, &frame);
+                    }
+                    held.map_err(refused)
+                }
+                true if method == "chats.restore" => {
+                    let chat = frame["params"]["session"].as_str().unwrap_or_default();
+                    match backend.chats.release_chat(chat).await {
+                        Ok(true) => {
+                            backend.announce(&frame["folder"]);
+                            Ok(json!({"restored": true}))
+                        }
+                        Ok(false) => Err(refused("This chat can no longer be brought back.")),
+                        Err(error) => Err(refused(error)),
+                    }
                 }
                 true => backend.chats.about_folder(&frame).await.map_err(refused),
                 false => backend.create(&frame["params"]).await,

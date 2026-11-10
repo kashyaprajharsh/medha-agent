@@ -333,6 +333,10 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
     revealWorkspace: () => invoke<void>("workspace_reveal", scope()),
     branch: () => invoke<string | null>("workspace_branch", { workspaceId }),
     sessions: () => invoke<Session[]>("list_sessions", { workspaceId }),
+    deleteChat: (sessionId: string) =>
+      invoke<void>("chat_delete", { workspaceId, sessionId }),
+    restoreChat: (sessionId: string) =>
+      invoke<void>("chat_restore", { workspaceId, sessionId }),
     usage: (days: number) =>
       invoke<Record<string, unknown>>("usage_summary", { workspaceId, days }),
     defaults: () =>

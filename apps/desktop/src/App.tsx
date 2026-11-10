@@ -41,6 +41,8 @@ const TerminalDrawer = lazy(() =>
     default: module.TerminalDrawer,
   })),
 );
+/** As long as the backend keeps a deleted chat able to be brought back. */
+const UNDO_MS = 8000;
 
 function stored(key: string) {
   try {
@@ -89,6 +91,7 @@ export function App() {
   }
   const [workspace, setWorkspace] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [deleting, setDeleting] = useState<Map<string, Session>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
   const [draftKey, setDraftKey] = useState<string | null>(
     () => `draft-${crypto.randomUUID()}`,
@@ -574,6 +577,50 @@ export function App() {
     submit();
   }, [modelless]);
 
+  // A deleted chat keeps its row, with a way back, for as long as the backend can still bring it back.
+  async function deleteChat(session: Session) {
+    const drop = () =>
+      setDeleting((old) => {
+        const next = new Map(old);
+        next.delete(session.id);
+        return next;
+      });
+    setDeleting((old) => new Map(old).set(session.id, session));
+    if (!draftKey && selected === session.id) startNew();
+    try {
+      await api.deleteChat(session.id);
+    } catch (cause) {
+      drop();
+      setError(String(cause));
+      return;
+    }
+    // Hidden by the backend now; the row stays only through `deleting`, whatever the other apps hear.
+    void refresh(true);
+    setTimeout(() => {
+      drop();
+      setPinned((previous) => {
+        if (!previous.has(session.id)) return previous;
+        const next = new Set(previous);
+        next.delete(session.id);
+        store(`medha-pins:${workspace}`, JSON.stringify([...next]));
+        return next;
+      });
+    }, UNDO_MS);
+  }
+  async function undoDelete(id: string) {
+    try {
+      await api.restoreChat(id);
+    } catch (cause) {
+      setError(String(cause));
+    }
+    setDeleting((old) => {
+      const next = new Map(old);
+      next.delete(id);
+      return next;
+    });
+    void refresh(true);
+  }
+
   function togglePin(id: string) {
     setPinned((previous) => {
       const next = new Set(previous);
@@ -884,7 +931,15 @@ export function App() {
         />
       )}
       <Sidebar
-        sessions={roots}
+        sessions={[
+          ...roots,
+          ...[...deleting.values()].filter(
+            (gone) => !roots.some((root) => root.id === gone.id),
+          ),
+        ]}
+        deleting={new Set(deleting.keys())}
+        onDelete={(session) => void deleteChat(session)}
+        onUndo={(id) => void undoDelete(id)}
         subagentCounts={subagentCounts}
         selected={draftKey ? null : selected}
         onSelect={openSession}

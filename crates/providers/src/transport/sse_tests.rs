@@ -70,6 +70,47 @@ fn arbitrary_byte_fragmentation_preserves_typed_multiline_events() {
     }
 }
 
+/// A large record that trickles in costs no more than one that arrives whole: each byte is looked at once.
+#[test]
+fn a_record_split_into_small_chunks_is_looked_at_once() {
+    let record = format!("data: {}\n\n", "a".repeat(256 * 1024));
+    let mut decoder = SseDecoder::default();
+    let mut events = Vec::new();
+    for chunk in record.as_bytes().chunks(256) {
+        events.extend(decoder.push(chunk).unwrap());
+    }
+    assert_eq!(events.len(), 1);
+    assert!(
+        decoder.looked_at <= record.len(),
+        "looked at {} bytes for a {}-byte record",
+        decoder.looked_at,
+        record.len()
+    );
+}
+
+/// Every way of splitting a stream, empty chunks included, yields what it yields whole.
+#[test]
+fn every_split_yields_the_events_of_the_whole_stream() {
+    let stream = b"event: a\r\ndata: {\"v\":\r\ndata: 2}\r\n\r\nevent: b\rdata: x\r\r: note\n\ndata:\n\ndata: tail";
+    let run = |parts: &[&[u8]]| {
+        let mut decoder = SseDecoder::default();
+        let mut events: Vec<SseEvent> = parts
+            .iter()
+            .flat_map(|part| decoder.push(part).unwrap())
+            .collect();
+        events.extend(decoder.finish());
+        events
+    };
+    let whole = run(&[stream]);
+    assert_eq!(whole.len(), 4);
+    for i in 0..=stream.len() {
+        for j in i..=stream.len() {
+            let parts = [&stream[..i], &stream[i..j], &stream[j..]];
+            assert_eq!(run(&parts), whole, "split at {i} and {j}");
+        }
+    }
+}
+
 #[test]
 fn finish_decodes_an_unterminated_final_record_and_ignores_comments() {
     let mut decoder = SseDecoder::default();

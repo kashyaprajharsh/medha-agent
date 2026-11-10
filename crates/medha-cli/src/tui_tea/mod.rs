@@ -34,6 +34,7 @@ mod staged_images;
 #[cfg(test)]
 mod tree_tests;
 mod tty;
+mod turn_summary;
 mod view;
 pub(crate) use protocol::AgentStep;
 use view::*;

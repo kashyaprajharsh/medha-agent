@@ -1183,6 +1183,49 @@ async fn failed_activation_leaves_the_saved_profile_without_resaving_it() {
     assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
 }
 
+/// A finished turn says what it used and cost in one line; a turn that called no model says nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_turn_says_what_it_used_and_cost() {
+    let mut f = fixture().await;
+    let notices = |model: &Model| {
+        model
+            .items
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                Item::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let summary = |calls| protocol::TurnSummary {
+        seconds: 252.0,
+        calls,
+        input_tokens: 182_400,
+        cached_tokens: 151_000,
+        output_tokens: 6_100,
+        cost_usd: Some(0.4123),
+        priced: protocol::CostSource::List,
+    };
+    turn_event(&mut f.model, protocol::TurnEvent::Started { turn: 1 });
+    let done = |calls| protocol::TurnEvent::Done {
+        stopped: None,
+        summary: Some(summary(calls)),
+    };
+    turn_event(&mut f.model, done(9));
+    assert_eq!(
+        notices(&f.model).last().map(String::as_str),
+        Some("4m 12s · 9 calls · 182k in (151k cached) · 6.1k out · $0.41 list price")
+    );
+    let before = notices(&f.model).len();
+    turn_event(&mut f.model, protocol::TurnEvent::Started { turn: 2 });
+    turn_event(&mut f.model, done(0));
+    assert_eq!(
+        notices(&f.model).len(),
+        before,
+        "a turn without model calls told a summary"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consecutive_turns_keep_their_assistant_answers_separate() {
     let mut f = fixture().await;
@@ -1194,7 +1237,13 @@ async fn consecutive_turns_keep_their_assistant_answers_separate() {
             source_event: None,
         },
     );
-    turn_event(&mut f.model, protocol::TurnEvent::Done { stopped: None });
+    turn_event(
+        &mut f.model,
+        protocol::TurnEvent::Done {
+            stopped: None,
+            summary: None,
+        },
+    );
     turn_event(&mut f.model, protocol::TurnEvent::Started { turn: 2 });
     turn_event(
         &mut f.model,

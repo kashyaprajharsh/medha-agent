@@ -866,6 +866,26 @@ test("directory and unknown targets never claim an exact file grant", async () =
   }
 });
 
+test("a finished turn shows what it used and cost, the line the terminal shows, and the next turn clears it", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  const event = (kind, params = {}) => ({ method: "event", params: { kind, ...params } });
+  const line = () => document.querySelector(".turn-summary")?.textContent;
+  let state = reduceLive(startingLive(), { method: "ready", params: { session: "s" } });
+  const then = async (kind, params) => {
+    state = reduceLive(state, event(kind, params));
+    await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
+  };
+  const summary = { seconds: 252, calls: 9, input_tokens: 182400, cached_tokens: 151000, output_tokens: 6100, cost_usd: 0.4123, priced: "list" };
+  await then("turn.started", { turn: 1 });
+  await then("turn.done", { stopped: null, summary });
+  assert.equal(line(), "4m 12s · 9 calls · 182k in (151k cached) · 6.1k out · $0.41 list price");
+  await then("turn.started", { turn: 2 });
+  assert.equal(line(), undefined, "the next turn still shows the last one's summary");
+  await then("turn.done", { stopped: null, summary: { ...summary, calls: 0 } });
+  assert.equal(line(), undefined, "a turn that called no model told a summary");
+});
+
 test("a tool call still being written says what Medha is doing, where a caret alone looked stuck", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive } = await import(await moduleUrl("live"));

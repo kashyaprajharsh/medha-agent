@@ -1838,10 +1838,13 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
             restore_draft(model, contents.join("\n"));
             model.push_main_notice("Queued text returned to the input — it was not sent.");
         }
-        E::Done { stopped } => {
+        E::Done { stopped, summary } => {
             settled(model);
             if let Some(stopped) = stopped {
                 model.push_main_notice(format!("Turn stopped: {stopped}"));
+            }
+            if let Some(summary) = summary.filter(|summary| summary.calls > 0) {
+                model.push_main_notice(super::turn_summary::line(&summary));
             }
         }
         E::Cancelled => {

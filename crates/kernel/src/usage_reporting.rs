@@ -22,6 +22,9 @@ pub(crate) struct UsageAnchor {
     /// `None` when no price is known for the model, never a guessed zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
+    /// Whether that cost is a list price rather than the operator's own rate; unknown in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_indicative: Option<bool>,
 }
 
 impl UsageAnchor {
@@ -41,6 +44,7 @@ impl UsageAnchor {
             cached_prompt_tokens: usage.cached_prompt_tokens,
             cache_write_tokens: usage.cache_write_tokens,
             cost_usd: pricing.map(|pricing| pricing.cost(usage)),
+            cost_indicative: pricing.map(|pricing| pricing.indicative),
         }
     }
 

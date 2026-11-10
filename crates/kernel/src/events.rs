@@ -889,6 +889,17 @@ pub trait EventLog: Send + Sync {
         Vec::new()
     }
 
+    /// The session's trusted events logged at or after `since`, a Unix time in seconds.
+    async fn checked_events_since(
+        &self,
+        session: Ulid,
+        since: f64,
+    ) -> Result<Vec<Event>, KernelError> {
+        let mut events = self.checked_events(session).await?;
+        events.retain(|event| event.ts >= since);
+        Ok(events)
+    }
+
     /// The sessions pinned from any app. Default: none.
     async fn pinned_sessions(&self) -> std::collections::HashSet<Ulid> {
         std::collections::HashSet::new()

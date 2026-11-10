@@ -18,6 +18,8 @@ mod chatgpt;
 pub use chatgpt::*;
 mod chats;
 pub use chats::*;
+mod turn_summary;
+pub use turn_summary::*;
 mod messaging;
 pub use messaging::*;
 mod session_features;
@@ -784,7 +786,11 @@ pub enum TurnEvent {
     #[serde(rename = "model.restarted")]
     Restarted,
     #[serde(rename = "turn.done")]
-    Done { stopped: Option<String> },
+    Done {
+        stopped: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<TurnSummary>,
+    },
     #[serde(rename = "turn.cancelled")]
     Cancelled,
     #[serde(rename = "turn.abort_settled")]

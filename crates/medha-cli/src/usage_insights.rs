@@ -56,6 +56,67 @@ pub(crate) fn calls(events: &[Event]) -> (Vec<Call>, Vec<Ulid>) {
     (calls, children)
 }
 
+/// What one turn used: this chat's model calls since `since`, and those of every sub-agent it started meanwhile.
+pub(crate) async fn turn_summary<L: EventLog + ?Sized>(
+    log: &L,
+    session: Ulid,
+    since: f64,
+    seconds: f64,
+) -> protocol::TurnSummary {
+    let mut summary = protocol::TurnSummary {
+        seconds,
+        calls: 0,
+        input_tokens: 0,
+        cached_tokens: 0,
+        output_tokens: 0,
+        cost_usd: None,
+        priced: protocol::CostSource::None,
+    };
+    let (mut sessions, mut priced, mut listed) = (vec![session], 0u32, false);
+    let mut next = 0;
+    while let Some(id) = sessions.get(next).copied() {
+        next += 1;
+        for event in log
+            .checked_events_since(id, since)
+            .await
+            .unwrap_or_default()
+        {
+            let number = |key: &str| event.payload.get(key).and_then(Value::as_u64).unwrap_or(0);
+            match event.kind {
+                EventKind::ContextUsage => {
+                    summary.calls += 1;
+                    summary.input_tokens += number("prompt_tokens");
+                    summary.cached_tokens += number("cached_prompt_tokens");
+                    summary.output_tokens += number("completion_tokens");
+                    if let Some(cost) = event.payload.get("cost_usd").and_then(Value::as_f64) {
+                        priced += 1;
+                        *summary.cost_usd.get_or_insert(0.0) += cost;
+                        // A record without the mark predates it, so its cost is not known to be the operator's.
+                        listed |= event.payload["cost_indicative"].as_bool() != Some(false);
+                    }
+                }
+                EventKind::AgentSpawned => {
+                    if let Some(child) = event.payload["child"]
+                        .as_str()
+                        .and_then(|id| Ulid::from_string(id).ok())
+                        .filter(|child| !sessions.contains(child))
+                    {
+                        sessions.push(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    summary.priced = match priced {
+        0 => protocol::CostSource::None,
+        n if n < summary.calls => protocol::CostSource::Partly,
+        _ if listed => protocol::CostSource::List,
+        _ => protocol::CostSource::Own,
+    };
+    summary
+}
+
 /// Reads every session active in the last `days` days.
 pub(crate) async fn collect<L: EventLog>(
     log: &L,

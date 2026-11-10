@@ -1728,6 +1728,8 @@ where
     let mut task_notes: Vec<TaskNote> = Vec::new();
     // Turns started by endings since the person last spoke: unattended work must not spend without end.
     let mut task_wakes = 0;
+    // When the running turn began, on the clock and as the log stamps its events.
+    let mut turn_began = (Instant::now(), 0.0f64);
     loop {
         // Progress leaves the last wake free, so a chatty job cannot use up the one for its own end.
         let wake = task_notes.iter().any(|note| {
@@ -1774,6 +1776,10 @@ where
                 turn_requested = false;
                 running = true;
                 turn_number += 1;
+                let stamped = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |since| since.as_secs_f64());
+                turn_began = (Instant::now(), stamped);
                 if writer.presents() {
                     writer.turn_event(protocol::TurnEvent::Started { turn: turn_number });
                 }
@@ -2046,7 +2052,14 @@ where
                         } else if reason == StopReason::Interrupted {
                             writer.event("turn.cancelled", json!({}));
                         } else {
-                            writer.event("turn.done", json!({ "stopped": stopped_label(&reason) }));
+                            let summary = crate::usage_insights::turn_summary(
+                                kernel.log.as_ref(),
+                                session.id,
+                                turn_began.1,
+                                turn_began.0.elapsed().as_secs_f64(),
+                            )
+                            .await;
+                            writer.event("turn.done", json!({ "stopped": stopped_label(&reason), "summary": summary }));
                         }
                     }
                     Some(Ok(TurnDone::Err(e))) => {

@@ -1390,6 +1390,32 @@ impl EventLog for SqliteLog {
             .map_err(|e| KernelError::Log(e.to_string()))
     }
 
+    async fn checked_events_since(
+        &self,
+        session: Ulid,
+        since: f64,
+    ) -> Result<Vec<Event>, KernelError> {
+        self.run_store_task(move |log| {
+            log.with_verified_snapshot(false, |conn| {
+                let mut query = conn
+                    .prepare(
+                        "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                         prev_hash, hash, hash_version, ts FROM events
+                         WHERE session_id = ?1 AND ts >= ?2 ORDER BY rowid ASC",
+                    )
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                let rows = query
+                    .query_map(rusqlite::params![session.to_string(), since], chain_row)
+                    .map_err(|e| StoreError::Db(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                decode_events(conn, rows)
+            })
+        })
+        .await
+        .map_err(|e| KernelError::Log(e.to_string()))
+    }
+
     async fn checked_events_after(
         &self,
         session: Ulid,

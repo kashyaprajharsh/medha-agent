@@ -1,6 +1,7 @@
 import { Fragment, memo, useMemo } from "react";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
+import { summaryLine } from "./turnSummary";
 import {
   explainError,
   planRefusal,
@@ -211,6 +212,7 @@ export const LiveTail = memo(function LiveTail({
         </div>
       )}
       {state.notice && <p className="quiet">{state.notice}</p>}
+      {state.summary && <p className="quiet turn-summary">{summaryLine(state.summary)}</p>}
       {state.projectTrust && <ProjectTrustNotice key={`${state.sessionId}:${state.projectTrust.root}:${state.projectTrust.fingerprint}`} review={state.projectTrust} session={state.sessionId} />}
       {state.outbound && <OutboundNotice key={`${state.sessionId}:${state.outbound.id}`} review={state.outbound} />}
       {state.mutations?.map(review => <OutboundNotice kind="protected" key={`${state.sessionId}:${review.id}`} review={review} />)}

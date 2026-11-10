@@ -1,5 +1,6 @@
 import type { ArtifactRevision, LiveFrame, MessageImage, SessionSettings, ToolScreen } from "./api";
 import type { ProjectTrustReview } from "./ProjectTrustNotice";
+import type { TurnSummary } from "./turnSummary";
 
 /** What may be answered to an approval, as the backend names each answer. */
 export type ApprovalChoice =
@@ -118,6 +119,8 @@ export type LiveState = {
   /** `tool`: the model has named a tool and is still writing its call, which can take minutes for a large file. */
   activity?: { kind: "compacting" | "model" | "tool"; started: number; tool?: string; target?: string };
   notice?: string;
+  /** What the last finished turn used and cost; cleared when the next begins. */
+  summary?: TurnSummary;
   projectTrust?: ProjectTrustReview;
   outbound?: { id: string };
   mutations?: { id: string }[];
@@ -401,7 +404,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
   }
   switch (params.kind) {
     case "turn.started":
-      return { ...state, status: "running", stopReason: undefined, error: undefined };
+      return { ...state, status: "running", stopReason: undefined, error: undefined, summary: undefined };
     case "message.accepted": {
       const text = str(params.content) ?? "";
       const alreadyShown = state.status !== "idle" && state.sent.find(
@@ -688,11 +691,14 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
               : undefined,
         },
       };
-    case "turn.done":
+    case "turn.done": {
+      const summary = params.summary as TurnSummary | undefined;
       return {
         ...settle(state, stopNotice(str(params.stopped))),
         stopReason: str(params.stopped),
+        summary: summary && summary.calls > 0 ? summary : undefined,
       };
+    }
     case "turn.continued":
       return { ...state, notice: stopNotice(str(params.stopped)) };
     case "turn.cancelled":

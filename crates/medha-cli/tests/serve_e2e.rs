@@ -33,6 +33,8 @@ mod pins;
 mod real_use;
 #[path = "serve_e2e/stored.rs"]
 mod stored;
+#[path = "serve_e2e/summary.rs"]
+mod summary;
 
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut request = Vec::new();
@@ -245,6 +247,12 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     let mut stream_body = String::new();
     for event in events {
         stream_body.push_str(&format!("data: {event}\n\n"));
+    }
+    // USAGE reports what the call used, as an OpenAI-style server's final chunk does.
+    if asked.contains("USAGE") {
+        let usage = json!({"choices": [], "usage": {"prompt_tokens": 1200, "completion_tokens": 34,
+            "prompt_tokens_details": {"cached_tokens": 1000}}});
+        stream_body.push_str(&format!("data: {usage}\n\n"));
     }
     stream_body.push_str("data: [DONE]\n\n");
     respond(&mut stream, "text/event-stream", &stream_body);

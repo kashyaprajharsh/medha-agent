@@ -25,6 +25,7 @@ where
     let model_env = start.options.model_env.clone();
     let flag_model = start.options.model.clone();
     let flag_base_url = start.options.base_url.clone();
+    let answer = start.options.answer;
     let (approval_wait, question_wait) =
         start.model.profiles.lock().map_or((None, None), |config| {
             (config.agent.approval_wait(), config.agent.question_wait())
@@ -63,13 +64,16 @@ where
         made.control = control;
         let surface = runtime::Surface {
             gate: Arc::new(
-                chat::Gate::new(made.writer.clone(), made.pending.clone()).timed(approval_wait),
+                chat::Gate::new(made.writer.clone(), made.pending.clone())
+                    .timed(approval_wait)
+                    .answered_by(answer),
             ),
             asker: Arc::new(chat_questions::Asker {
                 writer: Arc::clone(&made.writer),
                 pending: Arc::clone(&made.questions),
                 next_id: std::sync::atomic::AtomicU64::new(1),
                 limit: question_wait,
+                nobody: answer == protocol::Answerer::Nobody,
             }),
             agents: Some(Arc::new(crate::chat_agents::Watch {
                 writer: Arc::clone(&made.writer),

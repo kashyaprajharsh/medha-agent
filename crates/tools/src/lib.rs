@@ -5345,7 +5345,7 @@ impl Tool for Clarify {
         let prompts: Vec<String> = questions.iter().map(|q| q.prompt.clone()).collect();
 
         let asker = self.asker.lock().ok().and_then(|g| g.clone());
-        let Some(asker) = asker else {
+        let Some(asker) = asker.filter(|asker| asker.available()) else {
             // No interactive surface (headless/CI). Never block — tell the model
             // to proceed on its own best judgment.
             return Ok(json!({

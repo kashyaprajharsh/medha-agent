@@ -42,6 +42,11 @@ pub struct Answer {
 #[async_trait]
 pub trait Asker: Send + Sync {
     async fn ask(&self, questions: Vec<Question>) -> Option<Vec<Answer>>;
+
+    /// Whether anyone can answer; when no one can, nothing is asked and the model is told so.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// No interactive user (headless / non-interactive): every question is skipped.

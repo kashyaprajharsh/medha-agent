@@ -591,6 +591,7 @@ impl Connection {
                 .map(|settings| serde_json::from_value(settings.clone()))
                 .transpose()
                 .map_err(|_| "The saved chat settings are invalid")?,
+            answer: None,
         };
         let deadline = Instant::now() + LEAVING;
         let mut gone = 0;

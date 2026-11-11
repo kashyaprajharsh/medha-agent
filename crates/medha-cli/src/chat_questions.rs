@@ -17,6 +17,8 @@ pub(crate) struct Asker {
     pub pending: Questions,
     pub next_id: AtomicU64,
     pub limit: Option<std::time::Duration>,
+    /// No one can answer this chat's questions, so none is asked.
+    pub nobody: bool,
 }
 
 struct Guard {
@@ -41,6 +43,10 @@ impl Drop for Guard {
 
 #[async_trait::async_trait]
 impl kernel::Asker for Asker {
+    fn available(&self) -> bool {
+        !self.nobody
+    }
+
     async fn ask(&self, questions: Vec<Question>) -> Option<Vec<Answer>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let view = questions

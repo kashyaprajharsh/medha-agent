@@ -477,6 +477,12 @@ impl Chats for ServeChats {
             let folder = folder(&asked["folder"])?;
             let mut options = options(&asked)?;
             options.mcp_host = Some(host);
+            // Beside either kind of options, since who can answer is about how the run started.
+            options.answer = match asked.get("answer").filter(|answer| !answer.is_null()) {
+                Some(answer) => serde_json::from_value(answer.clone())
+                    .map_err(|_| "answer must be person, notify or nobody".to_string())?,
+                None => protocol::Answerer::Person,
+            };
             let workspace = opened(&folders, &folder, noted.as_ref())?;
             let lock = runtime::workspace::load_lock(&folder, noted.as_ref()).map_err(failed)?;
             let choices = Choices::of(&lock, &options, &workspace.root).map_err(failed)?;

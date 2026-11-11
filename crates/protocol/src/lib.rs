@@ -173,8 +173,24 @@ pub struct CreateSession {
     /// do not inherit the daemon starter's environment. Secrets are ephemeral.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup: Option<StartupOptions>,
+    /// Who can answer this chat's approvals and questions; a person unless the caller says otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Answerer>,
 }
 command!(CreateSession, "session.create", Service, LiveSession);
+
+/// Who can answer what a chat asks, set by how its run started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Answerer {
+    /// Someone at a screen: the approval card, as always.
+    #[default]
+    Person,
+    /// Someone reached through a route such as a phone, within the same time limit.
+    Notify,
+    /// No one: a cron job, a webhook, a run with no screen. What needs an answer is refused at once.
+    Nobody,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

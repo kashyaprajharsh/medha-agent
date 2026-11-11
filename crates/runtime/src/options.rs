@@ -250,6 +250,8 @@ pub struct SessionOptions {
     /// Who runs the user's remote MCP servers for every chat, when someone does.
     pub mcp_host: Option<mcp::hub::Endpoint>,
     pub session_mcp: Vec<protocol::SessionMcpServer>,
+    /// Who can answer the chat's approvals and questions.
+    pub answer: protocol::Answerer,
 }
 
 #[cfg(test)]

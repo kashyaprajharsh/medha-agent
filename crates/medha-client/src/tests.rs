@@ -162,6 +162,7 @@ async fn cancelling_after_create_while_attach_waits_detaches_and_abandons_in_ord
         reasoning: None,
         settings: None,
         startup: None,
+        answer: None,
     };
     let mut opening = Box::pin(connection.create_chat(&params, Arc::new(|_| {})));
     poll_fn(|cx| {
@@ -508,6 +509,7 @@ async fn typed_async_commands_validate_scope_and_decode_the_backend_answer() {
                 reasoning: None,
                 settings: None,
                 startup: None,
+                answer: None,
             },
         )
         .await

@@ -358,6 +358,8 @@ impl ChatLink {
             reasoning: None,
             settings: None,
             startup: None,
+            // The person is reached on their phone, not at a screen.
+            answer: Some(protocol::Answerer::Notify),
         };
         let (view, _) = View::open(connection, params, ViewLimits::default(), |live| match live
             .about

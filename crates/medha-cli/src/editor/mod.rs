@@ -152,6 +152,7 @@ async fn open(
         reasoning: None,
         settings: None,
         startup: Some(startup),
+        answer: None,
     };
     let (mut view, session) = View::open(connection, params, ViewLimits::default(), |live| {
         let about = live

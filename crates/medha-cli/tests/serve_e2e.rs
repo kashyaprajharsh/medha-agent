@@ -18,6 +18,8 @@ const WAIT: Duration = Duration::from_secs(60);
 mod editor_checks;
 
 #[cfg(unix)]
+#[path = "serve_e2e/answering.rs"]
+mod answering;
 #[path = "serve_e2e/checkpoint_caps.rs"]
 mod checkpoint_caps;
 

@@ -728,7 +728,13 @@ pub struct Gate {
     next_id: AtomicU64,
     always: Mutex<HashSet<String>>,
     limit: Option<Duration>,
+    /// No one can answer, so nothing is asked and what needs an answer is refused at once.
+    nobody: bool,
 }
+
+/// What the model is told when an approval was refused because no one could be asked.
+pub(crate) const NOBODY_TO_ASK: &str = "no one can answer approvals in this run, so this was refused without \
+     asking anyone. Do not retry it or work around it; finish what you can without it and say what needed approval";
 
 impl Gate {
     pub(crate) fn new(writer: Arc<Writer>, pending: Pending) -> Self {
@@ -738,6 +744,7 @@ impl Gate {
             next_id: AtomicU64::new(1),
             always: Mutex::new(HashSet::new()),
             limit: None,
+            nobody: false,
         }
     }
 
@@ -745,6 +752,22 @@ impl Gate {
     pub(crate) fn timed(mut self, limit: Option<Duration>) -> Self {
         self.limit = limit;
         self
+    }
+
+    /// Who can answer, as the run that started the chat said.
+    pub(crate) fn answered_by(mut self, answer: protocol::Answerer) -> Self {
+        self.nobody = answer == protocol::Answerer::Nobody;
+        self
+    }
+
+    /// Refuses at once when no one can answer, telling the chat what was not asked.
+    fn nobody_to_ask(&self, action: &str) -> bool {
+        if self.nobody {
+            self.writer.turn_event(protocol::TurnEvent::Notice {
+                text: format!("Not run: {action}. No one can answer approvals in this run."),
+            });
+        }
+        self.nobody
     }
 
     async fn answer<T>(&self, answered: oneshot::Receiver<T>, deny: T) -> (T, Resolution) {
@@ -801,12 +824,23 @@ impl Drop for PendingGuard {
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for Gate {
+    fn denial_reason(&self) -> &'static str {
+        if self.nobody {
+            NOBODY_TO_ASK
+        } else {
+            "rejected by human"
+        }
+    }
+
     async fn confirm(
         &self,
         action: &str,
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::Approval {
+        if self.nobody_to_ask(action) {
+            return kernel::Approval::Deny;
+        }
         if !escalated
             && self
                 .always
@@ -873,6 +907,9 @@ impl kernel::HumanGate for Gate {
     /// Every viewer receives the same path choices. The editor adapter maps
     /// these offered scopes to ACP permission options.
     async fn confirm_path(&self, request: kernel::PathRequest<'_>) -> kernel::PathApproval {
+        if self.nobody_to_ask(request.action) {
+            return kernel::PathApproval::Deny;
+        }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock_pending(&self.pending).insert(
@@ -956,6 +993,9 @@ impl Gate {
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::NetworkDecision {
+        if self.nobody_to_ask(action) {
+            return kernel::NetworkDecision::Deny;
+        }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
         lock_pending(&self.pending).insert(
@@ -2886,6 +2926,7 @@ mod tests {
             pending: Arc::clone(&pending),
             next_id: AtomicU64::new(1),
             limit: None,
+            nobody: false,
         };
         let asked = tokio::spawn(async move { kernel::Asker::ask(&asker, vec![]).await });
         let prompt = output.recv().await.unwrap();

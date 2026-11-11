@@ -463,6 +463,7 @@ fn create(
         reasoning: None,
         settings,
         startup: Some(startup),
+        answer: None,
     }
 }
 

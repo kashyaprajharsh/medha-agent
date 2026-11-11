@@ -911,19 +911,19 @@ pub(super) struct McpRow {
 const AUTONOMY_MODES: &[(kernel::AutonomyLevel, &str)] = &[
     (
         kernel::AutonomyLevel::Plan,
-        "plan — read-only investigation; no edits, shell, or delegation",
+        "plan: read-only investigation; no edits, shell, or delegation",
     ),
     (
         kernel::AutonomyLevel::Careful,
-        "careful — ask before every edit and shell command (safest)",
+        "careful: ask before every edit and shell command (safest)",
     ),
     (
         kernel::AutonomyLevel::Normal,
-        "normal — auto-apply edits; still ask before shell commands",
+        "normal: auto-apply edits; still ask before shell commands",
     ),
     (
-        kernel::AutonomyLevel::Yolo,
-        "yolo — auto-apply edits AND shell; only dangerous ops (rm -rf, personal files, deploys) still ask",
+        kernel::AutonomyLevel::Autopilot,
+        "autopilot: auto-apply edits AND shell; only dangerous ops (rm -rf, personal files, deploys) still ask",
     ),
 ];
 

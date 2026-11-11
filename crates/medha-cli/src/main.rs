@@ -121,7 +121,7 @@ struct Cli {
     #[arg(long, conflicts_with = "mode")]
     plan: bool,
 
-    /// Execution mode: plan, careful, normal, or yolo.
+    /// Execution mode: plan, careful, normal, or autopilot.
     #[arg(long, value_parser = kernel::AutonomyLevel::parse)]
     mode: Option<kernel::AutonomyLevel>,
 
@@ -2032,7 +2032,7 @@ where
                         let choice = if name == "plan" { "plan" } else { rest.trim() };
                         if choice.is_empty() {
                             println!(
-                                "mode: {} — /mode plan|careful|normal|yolo",
+                                "mode: {}. /mode plan|careful|normal|autopilot",
                                 session.autonomy.as_str()
                             );
                         } else {
@@ -2153,7 +2153,7 @@ fn print_help() {
          /effort LEVEL (auto|none|minimal|low|medium|high|xhigh|max|ultra)\n\
                                       set reasoning depth (turns thinking on)\n  \
          /plan                        investigate without edits or commands\n  \
-         /mode plan|careful|normal|yolo  choose execution mode\n  \
+         /mode plan|careful|normal|autopilot  choose execution mode\n  \
          /clear                       reset the conversation (keep system prompt)\n  \
          /exit                        quit (also Ctrl-D)\n\
          anything else is sent to the agent."

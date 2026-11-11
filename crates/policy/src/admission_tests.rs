@@ -14,7 +14,7 @@ fn decide(jail: Jail, mode: AutonomyLevel, command: &str) -> Decision {
         .authorize(mode, &intent, Some(BlastRadius::IrreversibleLocal))
 }
 
-/// The commands refused or carded in the 2026-10-20 chats run inside the jail in normal and yolo.
+/// The commands refused or carded in the 2026-10-20 chats run inside the jail in normal and autopilot.
 #[test]
 fn the_jail_runs_what_used_to_be_refused() {
     for command in [
@@ -29,7 +29,7 @@ fn the_jail_runs_what_used_to_be_refused() {
         "chown -R me ./build",
         "dd if=input.bin of=output.bin",
     ] {
-        for mode in [AutonomyLevel::Normal, AutonomyLevel::Yolo] {
+        for mode in [AutonomyLevel::Normal, AutonomyLevel::Autopilot] {
             assert!(
                 matches!(decide(Jail::Active, mode, command), Decision::Allow),
                 "{command} in {mode:?}"
@@ -61,7 +61,7 @@ fn real_dangers_are_refused_inside_the_jail_too() {
         for jail in [Jail::Active, Jail::Off] {
             assert!(
                 matches!(
-                    decide(jail, AutonomyLevel::Yolo, command),
+                    decide(jail, AutonomyLevel::Autopilot, command),
                     Decision::Deny { .. }
                 ),
                 "{command} with {jail:?}"
@@ -86,7 +86,7 @@ fn quoted_text_and_file_names_are_not_dangers() {
         for jail in [Jail::Active, Jail::Off] {
             assert!(
                 !matches!(
-                    decide(jail, AutonomyLevel::Yolo, command),
+                    decide(jail, AutonomyLevel::Autopilot, command),
                     Decision::Deny { .. }
                 ),
                 "{command} with {jail:?}"
@@ -98,29 +98,29 @@ fn quoted_text_and_file_names_are_not_dangers() {
 /// Outside the workspace a delete still asks; a target only the jail can place asks only without one.
 #[test]
 fn deletes_outside_the_workspace_still_ask() {
-    let yolo = AutonomyLevel::Yolo;
+    let autopilot = AutonomyLevel::Autopilot;
     assert!(matches!(
-        decide(Jail::Active, yolo, "rm -rf ~/Documents/old"),
+        decide(Jail::Active, autopilot, "rm -rf ~/Documents/old"),
         Decision::Human
     ));
     assert!(matches!(
-        decide(Jail::Off, yolo, "rm -rf ~/Documents/old"),
+        decide(Jail::Off, autopilot, "rm -rf ~/Documents/old"),
         Decision::Human
     ));
     assert!(matches!(
-        decide(Jail::Active, yolo, "rm -rf ../sibling"),
+        decide(Jail::Active, autopilot, "rm -rf ../sibling"),
         Decision::Allow
     ));
     assert!(matches!(
-        decide(Jail::Off, yolo, "rm -rf ../sibling"),
+        decide(Jail::Off, autopilot, "rm -rf ../sibling"),
         Decision::Human
     ));
     assert!(matches!(
-        decide(Jail::Active, yolo, "rm -rf \"$f\""),
+        decide(Jail::Active, autopilot, "rm -rf \"$f\""),
         Decision::Allow
     ));
     assert!(matches!(
-        decide(Jail::Off, yolo, "rm -rf \"$f\""),
+        decide(Jail::Off, autopilot, "rm -rf \"$f\""),
         Decision::Human
     ));
 }

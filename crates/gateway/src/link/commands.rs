@@ -15,7 +15,11 @@ const MODES: [(&str, Mode, &str); 4] = [
         "asks before every edit and command",
     ),
     ("normal", Mode::Normal, "edits run, commands ask"),
-    ("yolo", Mode::Yolo, "everything inside the folder runs"),
+    (
+        "autopilot",
+        Mode::Autopilot,
+        "everything inside the folder runs",
+    ),
 ];
 /// Choices offered at once; a phone screen holds about this many buttons.
 const OFFERED: usize = 8;
@@ -82,11 +86,19 @@ impl ChatLink {
             let names = MODES.map(|(name, ..)| name.to_owned()).to_vec();
             return self.offer("mode", &text, names.clone(), names).await;
         }
+        // Autopilot was called yolo, and a phone may still say so.
+        let name = if name.eq_ignore_ascii_case("yolo") {
+            "autopilot"
+        } else {
+            name
+        };
         let Some((name, mode, meaning)) = MODES
             .into_iter()
             .find(|(known, ..)| known.eq_ignore_ascii_case(name))
         else {
-            return self.say("Modes are plan, careful, normal and yolo.").await;
+            return self
+                .say("Modes are plan, careful, normal and autopilot.")
+                .await;
         };
         let reply = match view.call(&protocol::Configure::Mode(mode)).await {
             Ok(_) => format!("Mode is now {name}: {meaning}."),

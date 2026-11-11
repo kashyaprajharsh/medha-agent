@@ -486,7 +486,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::ModePicker => open_mode_picker(model),
         A::SwitchMode(mode) => match kernel::AutonomyLevel::parse(&mode) {
             Ok(level) => set_autonomy(model, level),
-            Err(_) => model.push_notice("usage: /mode plan|careful|normal|yolo"),
+            Err(_) => model.push_notice("usage: /mode plan|careful|normal|autopilot"),
         },
         A::Other => local_command(model, command),
     }
@@ -1208,7 +1208,7 @@ pub(super) fn set_autonomy(model: &mut Model, level: kernel::AutonomyLevel) {
         kernel::AutonomyLevel::Plan => protocol::Mode::Plan,
         kernel::AutonomyLevel::Careful => protocol::Mode::Careful,
         kernel::AutonomyLevel::Normal => protocol::Mode::Normal,
-        kernel::AutonomyLevel::Yolo => protocol::Mode::Yolo,
+        kernel::AutonomyLevel::Autopilot => protocol::Mode::Autopilot,
     };
     request(model, Effect::Configure(protocol::Configure::Mode(mode)));
 }

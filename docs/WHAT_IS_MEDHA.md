@@ -282,7 +282,7 @@ max_cost_usd = 5.0
 max_parallel_tools = 8
 
 [policy]
-autonomy = "careful"  # careful | normal | yolo
+autonomy = "careful"  # careful | normal | autopilot
 ```
 
 ---
@@ -604,15 +604,15 @@ not silently replayed after an interruption.
 
 The dial controls exactly one thing: which tools from the `[policy] approve` list get
 escalated from `Allow` to `Human`. It can **only tighten** — a base `Human` or `Deny`
-verdict is returned untouched, so no level, `yolo` included, can loosen the floor.
+verdict is returned untouched, so no level, `autopilot` included, can loosen the floor.
 
 | Mode | What the dial escalates |
 |------|-------------------------|
 | `careful` (default) | Every tool in the approve set |
 | `normal` | The approve set **minus** `edit` — so edits run freely; inside an OS jail, `shell.exec` runs freely too |
-| `yolo` | Nothing from the approve set |
+| `autopilot` | Nothing from the approve set (`yolo`, its old name, is still read) |
 
-> **`yolo` is not "no approval prompts."** It switches off the approve-set
+> **`autopilot` is not "no approval prompts."** It switches off the approve-set
 > escalation only. Base `Human` and `Deny` verdicts still survive every level:
 >
 > - `diagnostics` and every `External` tool (`mcp__*`, `lsp.start`, `mcp.start`)
@@ -621,7 +621,7 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 >   commands are denied, and without an OS jail ambiguous commands are
 >   human-gated. Everything else starts at `Allow`. The approve-set gates that
 >   class in `careful`, and in `normal` when there is no jail;
->   `yolo` may run it without a prompt, still inside the configured sandbox and its network policy.
+>   `autopilot` may run it without a prompt, still inside the configured sandbox and its network policy.
 >   Access a command lacks (network, outside paths, running outside the
 >   sandbox) gets its own card in every mode
 > - `skill.save` — always `Human`, unconditionally
@@ -631,7 +631,7 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 >   into every future session, so they earn a gate; project scope rides its `Read`
 >   radius
 > - Any web-tainted consequential action — trust-flow escalation is applied *after*
->   the dial, so it survives `yolo`
+>   the dial, so it survives `autopilot`
 > - Anything unregistered — `Deny`, deny-first
 
 ### Shell Command Scanner
@@ -657,7 +657,7 @@ redirects, loops, `cd`, comments and interpreters are not reasons to ask.
 
 #### Tier 1 — Hard deny
 
-Refused outright. `yolo` does not reach these; the dial can only tighten. Each is
+Refused outright. `autopilot` does not reach these; the dial can only tighten. Each is
 judged by the program that runs and the files it really names, so a search
 pattern, a quoted sentence or a heredoc mentioning one is never refused.
 
@@ -875,7 +875,7 @@ AI: "I found the solution! Let me run the generated build."
      │
      ▼
 WITHOUT TRUST FLOW:
-  A statically ordinary shell command could run without a yolo prompt when
+  A statically ordinary shell command could run without an Autopilot prompt when
   the configured sandbox allows network access.
   💥 The injected build script gets a chance to act!
 
@@ -938,7 +938,7 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 | Level | Tools | Undo Possible? | Policy Default |
 |-------|-------|----------------|----------------|
 | 🟢 **Read** | `read`, `grep`, `glob`, `ls`, `code`, `lsp` queries, `web`, `memory`, `sessions.search`, `skill`, `task.output`, `clarify`, `update_plan`, `mcp.status`, and `agent` — the verbs that only look at a child (`list`, `wait`, `message`, `steer`, `transcript`, `cancel`) | N/A (nothing changes) | Allow |
-| 🟡 **ReversibleLocal** | `edit`, `git` (add/commit), `task.control`, `skill.save`, `agent.spawn` (a spawn or a follow-up), `agent.apply` | Yes (snapshot, git, or bounded agent state) | Ask (careful) / Allow (yolo) |
+| 🟡 **ReversibleLocal** | `edit`, `git` (add/commit), `task.control`, `skill.save`, `agent.spawn` (a spawn or a follow-up), `agent.apply` | Yes (snapshot, git, or bounded agent state) | Ask (careful) / Allow (autopilot) |
 | 🟠 **IrreversibleLocal** | `shell.exec`, `diagnostics` | No | `diagnostics`: Ask Human. `shell.exec`: scanner decides Deny/Human/Allow, then the autonomy dial may tighten `Allow`. |
 | 🔴 **External** | `mcp__*` (every MCP tool), `lsp.start`, `mcp.start` | No + affects outside | Ask Human |
 
@@ -1030,7 +1030,7 @@ bounded to 1 MiB, 256 filter drivers and three seconds; failure refuses the call
   `agent.spawn`, `agent.apply`
 - **Base verdict:** `Allow` — the snapshot is what makes `medha undo` possible
 - **Then the dial:** `careful` gates whatever is in `[policy] approve`; `normal` drops
-  `edit` from that set; `yolo` gates none of it. Some tools here carry
+  `edit` from that set; `autopilot` gates none of it. Some tools here carry
   their own rule regardless — `agent.apply` is always `Human`, because reviewing a
   sub-agent's diff *is* the feature.
 
@@ -1046,7 +1046,7 @@ spawn is, which is why the two share one name.
   `shell.exec` is a tool-specific scanner exception: hard-dangerous shapes are
   `Deny`, ambiguous shapes are `Human` when there is no OS jail, and the rest are
   `Allow` before the autonomy approve-set is applied. Thus a safe-scanned shell
-  command can run without a prompt in `yolo`, but never outside the configured
+  command can run without a prompt in `autopilot`, but never outside the configured
   sandbox/network boundary.
 - `diagnostics` is here because `cargo`, `npm`, Maven and Gradle execute
   repository-owned build scripts and plugins. `shell.exec` additionally goes through
@@ -3003,7 +3003,7 @@ max_patch_bytes = 16777216      # 16 MiB
 [policy]
 # Tools requiring human approval
 approve = ["edit", "skill.save"]   # the built-in default
-# Autonomy mode: careful | normal | yolo
+# Autonomy mode: careful | normal | autopilot
 autonomy = "careful"
 
 # ───────────────────────────────────────────────────────────
@@ -3191,7 +3191,7 @@ export MEDHA_MAX_COST=10.0
 export MEDHA_SANDBOX=host
 
 # Override policy
-export MEDHA_MODE=yolo
+export MEDHA_MODE=autopilot
 
 # Override verification
 export MEDHA_VERIFY="npm test"

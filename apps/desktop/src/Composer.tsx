@@ -95,8 +95,8 @@ const MODES = [
     description: "Apply edits. Ask before shell commands.",
   },
   {
-    id: "yolo",
-    title: "Yolo",
+    id: "autopilot",
+    title: "Autopilot",
     description: "Run edits and shell. Dangerous actions still ask.",
   },
 ];

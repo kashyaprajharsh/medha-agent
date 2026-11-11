@@ -1346,8 +1346,8 @@ pub enum AutonomyLevel {
     Careful,
     /// Reversible edits auto-run; shell still asks.
     Normal,
-    /// Everything in-workspace auto-runs; the floor still gates catastrophe.
-    Yolo,
+    /// Everything in-workspace auto-runs; the floor still gates catastrophe. Once called yolo, still read as that.
+    Autopilot,
 }
 
 impl AutonomyLevel {
@@ -1356,7 +1356,7 @@ impl AutonomyLevel {
             AutonomyLevel::Plan => "plan",
             AutonomyLevel::Careful => "careful",
             AutonomyLevel::Normal => "normal",
-            AutonomyLevel::Yolo => "yolo",
+            AutonomyLevel::Autopilot => "autopilot",
         }
     }
     /// Strict parsing for user configuration; typos must be visible.
@@ -1365,9 +1365,9 @@ impl AutonomyLevel {
             "plan" => Ok(Self::Plan),
             "careful" => Ok(Self::Careful),
             "normal" => Ok(Self::Normal),
-            "yolo" => Ok(Self::Yolo),
+            "autopilot" | "yolo" => Ok(Self::Autopilot),
             _ => Err(format!(
-                "unknown mode '{s}'; choose plan, careful, normal, or yolo"
+                "unknown mode '{s}'; choose plan, careful, normal, or autopilot"
             )),
         }
     }
@@ -1376,7 +1376,7 @@ impl AutonomyLevel {
         match s.trim().to_ascii_lowercase().as_str() {
             "plan" => AutonomyLevel::Plan,
             "normal" => AutonomyLevel::Normal,
-            "yolo" => AutonomyLevel::Yolo,
+            "autopilot" | "yolo" => AutonomyLevel::Autopilot,
             _ => AutonomyLevel::Careful,
         }
     }

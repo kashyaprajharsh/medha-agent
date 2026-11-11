@@ -676,7 +676,7 @@ pub struct PolicyConfig {
     #[serde(default = "default_approve")]
     pub approve: Vec<String>,
     /// Starting autonomy dial: `careful` (edits+shell ask) · `normal` (edits auto)
-    /// · `yolo` (everything in-workspace auto). The safety floor is gated at every
+    /// · `autopilot` (everything in-workspace auto; `yolo` still read). The safety floor is gated at every
     /// level. Switchable via `/mode` or `MEDHA_MODE`.
     #[serde(default = "default_autonomy")]
     pub autonomy: String,

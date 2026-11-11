@@ -93,7 +93,7 @@ export type SessionSettings = {
   }[];
   profile: string | null;
   model: string | null;
-  mode: "plan" | "careful" | "normal" | "yolo";
+  mode: "plan" | "careful" | "normal" | "autopilot";
   reasoning: "auto" | "on" | "off";
   effort: string;
   efforts: string[];

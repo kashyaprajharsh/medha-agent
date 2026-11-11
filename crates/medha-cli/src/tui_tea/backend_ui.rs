@@ -1302,7 +1302,7 @@ fn settings(model: &mut Model, settings: protocol::Settings) {
         protocol::Mode::Plan => kernel::AutonomyLevel::Plan,
         protocol::Mode::Careful => kernel::AutonomyLevel::Careful,
         protocol::Mode::Normal => kernel::AutonomyLevel::Normal,
-        protocol::Mode::Yolo => kernel::AutonomyLevel::Yolo,
+        protocol::Mode::Autopilot => kernel::AutonomyLevel::Autopilot,
     };
     model.reasoning = kernel::ReasoningConfig {
         enabled: match settings.reasoning {

@@ -26,8 +26,9 @@ impl std::fmt::Display for RiskySetting {
     }
 }
 
+/// Named by what stays strict, so a looser mode under any name, old or new, still waits for trust.
 fn relaxes_autonomy(value: &str) -> bool {
-    matches!(value.trim().to_lowercase().as_str(), "normal" | "yolo")
+    !matches!(value.trim().to_lowercase().as_str(), "plan" | "careful")
 }
 
 fn selects_external_executor(value: &str) -> bool {

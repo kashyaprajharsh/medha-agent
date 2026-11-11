@@ -232,7 +232,7 @@ Resolution order is **CLI flag > `MEDHA_*` env > `~/.medha/config.toml` > first-
 
 **A real sandbox on macOS and Linux.** macOS Seatbelt and Linux Landlock by default, with Docker/Podman containers and remote SSH available. Network can be denied outright. `shell.exec` starts from an empty environment, so a leaked key never reaches an arbitrary command. Keys, tokens and local daemon sockets such as Docker's stay closed even after an approval; a command that needs them (`ssh`, `git push`, `docker`) runs outside the sandbox, once, when you approve that run.
 
-**Windows has no OS sandbox yet.** There, commands run with your own rights behind the command reader and the approval gate, the terminal shows `[no sandbox]`, and `yolo` still asks before builds and tests.
+**Windows has no OS sandbox yet.** There, commands run with your own rights behind the command reader and the approval gate, the terminal shows `[no sandbox]`, and Autopilot still asks before builds and tests.
 
 Each session gets an empty scratch folder for throwaway files and test repositories. Commands and file tools use it without asking, and it is deleted when the session ends.
 
@@ -273,7 +273,7 @@ Drop a `medha.lock` in your repo to version the harness itself. No file means bu
 
 ```toml
 [policy]
-autonomy = "careful"          # careful · normal · yolo
+autonomy = "careful"          # careful · normal · autopilot
 approve  = ["edit", "skill.save"]
 
 [tools]

@@ -36,6 +36,17 @@ fn everything_the_environment_asks_of_a_chat_is_in_the_options_every_surface_sta
     set("MEDHA_VERIFY", "  ");
     let unchecked = SessionOptions::from_process(None, None).unwrap();
     assert_eq!(unchecked.verify_command, None);
+
+    // Autopilot by its name, and by yolo, its old one, which scripts may still set.
+    for name in ["autopilot", "yolo"] {
+        set("MEDHA_MODE", name);
+        let autopilot = SessionOptions::from_process(None, None).unwrap();
+        assert_eq!(
+            autopilot.autonomy,
+            Some(kernel::AutonomyLevel::Autopilot),
+            "{name}"
+        );
+    }
     set("MEDHA_MODE", "no-such-mode");
     set("MEDHA_REASONING_EFFORT", "no-such-effort");
     assert!(SessionOptions::from_process(None, None).is_err());

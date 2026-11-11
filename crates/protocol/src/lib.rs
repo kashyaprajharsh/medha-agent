@@ -104,7 +104,9 @@ pub enum Mode {
     Plan,
     Careful,
     Normal,
-    Yolo,
+    /// Older clients send yolo.
+    #[serde(alias = "yolo")]
+    Autopilot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -42,7 +42,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mode",
-        "execution: read-only plan · careful · normal · yolo",
+        "execution: read-only plan · careful · normal · autopilot",
     ),
     ("/detail", "expand/collapse full tool input & output"),
     ("/theme", "light · dark · auto (bare /theme toggles)"),

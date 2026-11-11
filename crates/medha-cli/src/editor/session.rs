@@ -532,7 +532,7 @@ pub(super) async fn run(
     if let Some(settings) = snapshot.settings {
         result["modes"] = json!({"currentModeId":settings.mode,"availableModes":[
             {"id":"plan","name":"Plan"},{"id":"careful","name":"Careful"},
-            {"id":"normal","name":"Normal"},{"id":"yolo","name":"Yolo"}]});
+            {"id":"normal","name":"Normal"},{"id":"autopilot","name":"Autopilot"}]});
     }
     writer.respond(reply, result);
     loop {

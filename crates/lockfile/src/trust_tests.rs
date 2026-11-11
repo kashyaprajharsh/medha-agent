@@ -66,6 +66,26 @@ fn dropping_the_approval_list_is_itself_a_relaxation() {
     }
 }
 
+/// Any mode looser than careful in an untrusted lock waits for trust, under its new name and its old one.
+#[test]
+fn every_mode_looser_than_careful_is_a_relaxation() {
+    for (mode, relaxes) in [
+        ("plan", false),
+        ("careful", false),
+        ("normal", true),
+        ("autopilot", true),
+        ("yolo", true),
+        ("Autopilot ", true),
+    ] {
+        let lock = MedhaLock::parse(&format!("[policy]\nautonomy = {mode:?}\n")).expect("parses");
+        let flagged = lock
+            .risky_settings()
+            .iter()
+            .any(|setting| setting.key == "policy.autonomy");
+        assert_eq!(flagged, relaxes, "autonomy = {mode:?}");
+    }
+}
+
 #[test]
 fn a_jail_wide_extra_writable_is_refused_outright() {
     #[cfg(windows)]

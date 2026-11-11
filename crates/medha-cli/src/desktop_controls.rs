@@ -71,7 +71,7 @@ pub(crate) fn settings<P: Provider>(
             kernel::AutonomyLevel::Plan => protocol::Mode::Plan,
             kernel::AutonomyLevel::Careful => protocol::Mode::Careful,
             kernel::AutonomyLevel::Normal => protocol::Mode::Normal,
-            kernel::AutonomyLevel::Yolo => protocol::Mode::Yolo,
+            kernel::AutonomyLevel::Autopilot => protocol::Mode::Autopilot,
         },
         reasoning: match reasoning.enabled {
             None => protocol::Reasoning::Auto,

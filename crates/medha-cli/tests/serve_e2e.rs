@@ -20,6 +20,8 @@ mod editor_checks;
 #[cfg(unix)]
 #[path = "serve_e2e/answering.rs"]
 mod answering;
+#[path = "serve_e2e/autopilot.rs"]
+mod autopilot;
 #[path = "serve_e2e/checkpoint_caps.rs"]
 mod checkpoint_caps;
 
@@ -172,7 +174,26 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
         .as_array()
         .and_then(|messages| messages.last())
         .is_some_and(|message| message["role"] == "tool");
-    let events = if asked.starts_with("Call medha_setup_echo") {
+    // Autopilot's reviewer: allows what carries REVIEW_ALLOW, answers late for REVIEW_SLOW, and is unsure otherwise.
+    let reviewing = body["messages"][0]["content"]
+        .as_str()
+        .is_some_and(|system| system.starts_with("You review one action"));
+    let events = if reviewing {
+        // Only the action under review counts; the transcript above it holds the whole script.
+        let action = asked.split("<action>").nth(1).unwrap_or_default();
+        if action.contains("REVIEW_SLOW") {
+            std::thread::sleep(Duration::from_secs(6));
+        }
+        let verdict = if action.contains("REVIEW_ALLOW") || action.contains("REVIEW_SLOW") {
+            "ALLOW the person asked for this step"
+        } else {
+            "UNSURE the request does not say"
+        };
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": verdict}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]
+    } else if asked.starts_with("Call medha_setup_echo") {
         let call = json!({"index":0,"id":"setup-test","type":"function","function":{"name":"medha_setup_echo","arguments":"{\"value\":\"medha-check\"}"}});
         vec![
             json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]}}]}),

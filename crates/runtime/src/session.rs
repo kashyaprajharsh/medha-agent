@@ -92,6 +92,17 @@ impl Choices {
     }
 }
 
+/// How many times a turn waits for an away model server, and how long Autopilot's reviewer may take.
+fn waits(profiles: &std::sync::Mutex<config::Config>) -> (u32, std::time::Duration) {
+    profiles.lock().map_or(
+        (kernel::recovery::WAITS, kernel::review::REVIEW_TIMEOUT),
+        |config| {
+            let waits = config.agent.server_waits.unwrap_or(kernel::recovery::WAITS);
+            (waits, config.agent.review_wait())
+        },
+    )
+}
+
 /// `surface` is asked once the prompt is settled, because a surface may depend on it.
 pub async fn start(
     input: Start<'_>,
@@ -299,11 +310,7 @@ pub async fn start(
         .max_parallel_tools
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
-    let server_waits = model_profiles
-        .lock()
-        .ok()
-        .and_then(|c| c.agent.server_waits);
-    let server_waits = server_waits.unwrap_or(kernel::recovery::WAITS);
+    let (server_waits, review_wait) = waits(&model_profiles);
     let hook_runner = session_plugins.hook_runner(&cwd, &sbx_cfg.home);
     for diagnostic in session_plugins
         .warnings()
@@ -332,6 +339,7 @@ pub async fn start(
             .chain(kernel::redact::Secrets::in_environment()),
     ))
     .with_max_parallel_tools(max_parallel_tools)
+    .with_review_timeout(review_wait)
     .with_server_waits(server_waits)
     .with_result_limits(lock.budget.tool_result_bytes, lock.budget.tool_round_bytes)
     .with_background_wakes(lock.budget.background_wakes)

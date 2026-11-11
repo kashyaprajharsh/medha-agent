@@ -302,6 +302,9 @@ pub struct AgentConfig {
     /// Seconds a question waits for an answer before it is dismissed. Unset is 3600; 0 waits forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_timeout: Option<u64>,
+    /// Seconds Autopilot's reviewer may take before the person is asked instead. Unset is 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_timeout: Option<u64>,
 }
 
 impl AgentConfig {
@@ -311,6 +314,14 @@ impl AgentConfig {
 
     pub fn question_wait(&self) -> Option<std::time::Duration> {
         wait(self.question_timeout.unwrap_or(3600))
+    }
+
+    /// Never unbounded: a review that does not answer hands the approval to the person.
+    pub fn review_wait(&self) -> std::time::Duration {
+        self.review_timeout
+            .map_or(kernel::review::REVIEW_TIMEOUT, |seconds| {
+                std::time::Duration::from_secs(seconds.max(1))
+            })
     }
 }
 

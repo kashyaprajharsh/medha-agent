@@ -923,7 +923,7 @@ const AUTONOMY_MODES: &[(kernel::AutonomyLevel, &str)] = &[
     ),
     (
         kernel::AutonomyLevel::Autopilot,
-        "autopilot: auto-apply edits AND shell; only dangerous ops (rm -rf, personal files, deploys) still ask",
+        "autopilot: auto-apply edits AND shell; a reviewer may allow network or outside folders one action at a time; the rest asks",
     ),
 ];
 

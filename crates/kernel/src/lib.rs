@@ -31,6 +31,7 @@ mod refusals;
 mod rejections;
 mod repetition;
 pub mod request_images;
+pub mod review;
 mod seam;
 pub mod sink;
 pub mod tool_pattern;

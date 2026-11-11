@@ -135,6 +135,8 @@ pub struct Answered {
     pub allowed: bool,
     pub by: Decider,
     pub reason: Option<String>,
+    /// Why Autopilot's reviewer left it to whoever answered, when it was asked first.
+    pub review: Option<String>,
 }
 
 tokio::task_local! {
@@ -159,7 +161,8 @@ pub fn record_answer(answered: Answered) {
     });
 }
 
-/// The chat's gate with every answer recorded, whoever gives it, for the kernel to log.
+/// The chat's gate with every answer recorded, whoever gives it, for the kernel to log. In Autopilot the
+/// reviewer is asked first; it allows one action at a time, and whatever it does not allow goes on to `inner`.
 pub struct RecordedGate {
     inner: std::sync::Arc<dyn HumanGate>,
 }
@@ -169,13 +172,40 @@ impl RecordedGate {
         Self { inner }
     }
 
-    fn record(&self, kind: &'static str, action: &str, allowed: bool) {
+    /// The reviewer's allow, recorded, or why it left the answer to `inner`.
+    async fn reviewed(
+        &self,
+        kind: &'static str,
+        action: &str,
+        detail: Option<&str>,
+    ) -> Result<(), Option<String>> {
+        let Some(reviewer) = crate::review::current() else {
+            return Err(None);
+        };
+        match reviewer.review(kind, action, detail).await {
+            crate::review::Verdict::Allow(why) => {
+                record_answer(Answered {
+                    kind,
+                    action: action.to_owned(),
+                    allowed: true,
+                    by: Decider::Reviewer,
+                    reason: Some(why),
+                    review: None,
+                });
+                Ok(())
+            }
+            crate::review::Verdict::Defer(why) => Err(Some(why)),
+        }
+    }
+
+    fn record(&self, kind: &'static str, action: &str, allowed: bool, review: Option<String>) {
         record_answer(Answered {
             kind,
             action: action.to_owned(),
             allowed,
             by: self.inner.answerer(),
             reason: (!allowed).then(|| self.inner.denial_reason().to_owned()),
+            review,
         });
     }
 }
@@ -183,8 +213,13 @@ impl RecordedGate {
 #[async_trait]
 impl HumanGate for RecordedGate {
     async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> Approval {
+        let review = match self.reviewed("tool", action, detail).await {
+            // Once only: a reviewer's allow is never remembered.
+            Ok(()) => return Approval::Once,
+            Err(review) => review,
+        };
         let approval = self.inner.confirm(action, detail, escalated).await;
-        self.record("tool", action, approval.approved());
+        self.record("tool", action, approval.approved(), review);
         approval
     }
 
@@ -197,29 +232,35 @@ impl HumanGate for RecordedGate {
     }
 
     async fn confirm_network(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        let action = detail.unwrap_or("network");
+        let review = match self.reviewed("network", action, None).await {
+            Ok(()) => return NetworkDecision::Once,
+            Err(review) => review,
+        };
         let decision = self.inner.confirm_network(detail, escalated).await;
-        self.record(
-            "network",
-            detail.unwrap_or("network"),
-            decision != NetworkDecision::Deny,
-        );
+        self.record("network", action, decision != NetworkDecision::Deny, review);
         decision
     }
 
     async fn confirm_access(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        let action = detail.unwrap_or("command access");
+        let review = match self.reviewed("access", action, None).await {
+            Ok(()) => return NetworkDecision::Once,
+            Err(review) => review,
+        };
         let decision = self.inner.confirm_access(detail, escalated).await;
-        self.record(
-            "access",
-            detail.unwrap_or("command access"),
-            decision != NetworkDecision::Deny,
-        );
+        self.record("access", action, decision != NetworkDecision::Deny, review);
         decision
     }
 
     async fn confirm_path(&self, request: PathRequest<'_>) -> PathApproval {
         let action = request.action.to_owned();
+        let review = match self.reviewed("path", &action, request.detail).await {
+            Ok(()) => return PathApproval::Once,
+            Err(review) => review,
+        };
         let approval = self.inner.confirm_path(request).await;
-        self.record("path", &action, approval != PathApproval::Deny);
+        self.record("path", &action, approval != PathApproval::Deny, review);
         approval
     }
 }

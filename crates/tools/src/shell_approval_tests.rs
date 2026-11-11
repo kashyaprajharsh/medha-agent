@@ -530,7 +530,7 @@ async fn outside_sandbox_runs_once_on_the_host_and_is_asked_again_every_time() {
     );
     assert!(f.gate.cards.lock().unwrap()[0].contains("Run outside Medha's sandbox"));
     let audit = std::fs::read_to_string(f.base.join("audit.log")).unwrap();
-    assert!(audit.contains("OutsideSandbox | decision=allowed (user approved, once)"));
+    assert!(audit.contains("OutsideSandbox | decision=allowed (approved, once)"));
     run(&f, args, false).await;
     assert_eq!(
         f.gate.cards.lock().unwrap().len(),

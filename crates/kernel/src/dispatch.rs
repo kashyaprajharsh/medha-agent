@@ -212,16 +212,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         lane: Option<&Lane>,
         sink: &dyn StreamSink,
     ) -> Observation {
-        let (observation, answers) = crate::gate::answers_scope(self.dispatch_decided(
-            session,
-            intent,
-            web_tainted,
-            cancel,
-            lane,
-            sink,
-        ))
-        .await;
+        // Read at each call, so a change of mode applies from the next approval.
+        let reviewer = (session.autonomy == crate::types::AutonomyLevel::Autopilot)
+            .then(|| Arc::new(self.reviewer(session.id)));
+        let decided = self.dispatch_decided(session, intent, web_tainted, cancel, lane, sink);
+        let (observation, answers) =
+            crate::gate::answers_scope(crate::review::review_scope(reviewer, decided)).await;
         for answered in &answers {
+            if answered.by == crate::gate::Decider::Reviewer {
+                let why = answered.reason.as_deref().unwrap_or_default();
+                sink.notice(&format!("Allowed by Autopilot: {why}"));
+            }
             if let Err(error) = self
                 .log
                 .append(Event::approval(session, intent, answered))
@@ -231,6 +232,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
         }
         observation
+    }
+
+    /// The reviewer for this chat: its own model, log and secrets.
+    fn reviewer(&self, session: ulid::Ulid) -> crate::review::Reviewer {
+        crate::review::Reviewer::new(
+            self.provider.clone(),
+            self.log.clone(),
+            session,
+            Arc::clone(&self.secrets),
+            self.review_timeout,
+        )
     }
 
     async fn dispatch_decided(
@@ -383,9 +395,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         detail.push_str("\nA pre-tool hook requires approval: ");
                         detail.push_str(reason);
                     }
-                    self.executor
-                        .grant_access(&access, &detail, access_escalated)
-                        .await
+                    let grant = self
+                        .executor
+                        .grant_access(&access, &detail, access_escalated);
+                    // Leaving the sandbox is never the reviewer's call: the person always sees it.
+                    if access.outside_sandbox {
+                        crate::review::withheld(grant).await
+                    } else {
+                        grant.await
+                    }
                 };
                 self.observe_hook(
                     session,

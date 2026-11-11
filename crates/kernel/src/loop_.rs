@@ -565,6 +565,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     background_wakes: u32,
     /// Removed from every tool result before the model reads it.
     secrets: Arc<crate::redact::Secrets>,
+    /// How long Autopilot's reviewer may take before the person is asked instead.
+    review_timeout: std::time::Duration,
     pub egress: Arc<crate::egress::Guard>,
     pricing: Option<crate::types::Pricing>,
     /// The model `pricing` was set for; any other is priced from its list price.
@@ -840,6 +842,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             result_limits: (None, None),
             background_wakes: DEFAULT_BACKGROUND_WAKES,
             secrets: Arc::default(),
+            review_timeout: crate::review::REVIEW_TIMEOUT,
             egress: Arc::default(),
             pricing: None,
             priced_model: None,
@@ -887,6 +890,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             result_limits: self.result_limits,
             background_wakes: self.background_wakes,
             secrets: Arc::clone(&self.secrets),
+            review_timeout: self.review_timeout,
             egress: Arc::clone(&self.egress),
             pricing: self.pricing,
             priced_model: self.priced_model.clone(),
@@ -1218,6 +1222,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// Secrets to remove from every tool result before the model reads it.
     pub fn with_secrets(mut self, secrets: crate::redact::Secrets) -> Self {
         self.secrets = Arc::new(secrets);
+        self
+    }
+
+    /// How long Autopilot's reviewer may take before the person is asked instead.
+    pub fn with_review_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.review_timeout = timeout;
         self
     }
 

@@ -737,7 +737,7 @@ impl PermissionManager {
         };
         match decision {
             NetworkDecision::Once => {
-                let _ = self.audit_network("allowed (user approved, once)");
+                let _ = self.audit_network("allowed (approved, once)");
                 NetworkDecision::Once
             }
             NetworkDecision::Session => {
@@ -806,7 +806,7 @@ impl PermissionManager {
         }
         let audit = match decision {
             NetworkDecision::Deny => "denied",
-            NetworkDecision::Once => "allowed (user approved, once)",
+            NetworkDecision::Once => "allowed (approved, once)",
             NetworkDecision::Session => "allowed (user approved, session)",
             NetworkDecision::Persistent => "allowed (user approved, persistence requested)",
         };
@@ -1280,7 +1280,7 @@ impl PermissionManager {
                 Err(PermissionError::Denied { path: resolved })
             }
             (kernel::PathApproval::Once, _) => {
-                self.audit_log(path, &resolved, permission, "allowed (user approved, once)")?;
+                self.audit_log(path, &resolved, permission, "allowed (approved, once)")?;
                 Ok(resolved)
             }
             // Only a folder that was offered is ever remembered: an answer naming

@@ -634,6 +634,16 @@ verdict is returned untouched, so no level, `autopilot` included, can loosen the
 >   the dial, so it survives `autopilot`
 > - Anything unregistered — `Deny`, deny-first
 
+**Autopilot's reviewer.** In `autopilot`, what still asks goes to a reviewer first: the chat's own
+model, with thinking off, a small reply and a time limit (`[agent] review_timeout`, 30 seconds). It reads
+the conversation with every part labelled: only the person's own messages can authorize, and the agent's
+words, tool results, files and web pages are untrusted evidence. It answers ALLOW, DENY or UNSURE with a
+reason. ALLOW runs that one action once and is never remembered; DENY, UNSURE, a late or unclear answer,
+or a failed call go to whoever can answer the chat, as if there were no reviewer. Running outside the
+sandbox and sending out a secret the chat holds are never the reviewer's call, and the floor above still
+holds. Every answer, the reviewer's included, is logged with who gave it, and the chat says "Allowed by
+Autopilot" with the reason.
+
 ### Shell Command Scanner
 
 `shell.exec` is the one tool that can do anything, so it does not ride its blast

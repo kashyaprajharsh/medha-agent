@@ -604,6 +604,7 @@ impl Event {
                 "outcome": if answered.allowed { "allowed" } else { "denied" },
                 "by": answered.by.as_str(),
                 "reason": answered.reason,
+                "review": answered.review,
             }),
             TrustLabel::System,
         )

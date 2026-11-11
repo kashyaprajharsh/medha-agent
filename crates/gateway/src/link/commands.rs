@@ -18,7 +18,7 @@ const MODES: [(&str, Mode, &str); 4] = [
     (
         "autopilot",
         Mode::Autopilot,
-        "everything inside the folder runs",
+        "everything inside the folder runs; a reviewer may allow network or outside folders one action at a time",
     ),
 ];
 /// Choices offered at once; a phone screen holds about this many buttons.

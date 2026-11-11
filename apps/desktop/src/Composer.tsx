@@ -97,7 +97,7 @@ const MODES = [
   {
     id: "autopilot",
     title: "Autopilot",
-    description: "Run edits and shell. Dangerous actions still ask.",
+    description: "Run edits and shell. A reviewer may allow network or outside folders, one action at a time.",
   },
 ];
 const COMMANDS: { id: string; icon: IconName; description: string }[] = [

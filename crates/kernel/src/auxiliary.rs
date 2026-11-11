@@ -115,12 +115,29 @@ pub async fn context(
     cap: u64,
     task: &'static str,
 ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+    context_with(provider, context, cap, task, None).await
+}
+
+/// `context` with thinking set for this one call, as a short verdict needs it off.
+pub async fn context_with(
+    provider: &dyn Provider,
+    context: &CompiledContext,
+    cap: u64,
+    task: &'static str,
+    reasoning: Option<&crate::ReasoningConfig>,
+) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
     if ACTIVE.try_with(|_| ()).is_err() {
         return Err(ProviderError::Response(
             "auxiliary call unavailable: no active task allowance".into(),
         ));
     }
     let request = provider.prepare_request(context)?;
+    let request = match reasoning {
+        Some(reasoning) => provider
+            .with_request_reasoning(&request, reasoning)?
+            .unwrap_or(request),
+        None => request,
+    };
     let bounded = provider.with_output_limit(&request, cap)?;
     let output = bounded
         .as_ref()

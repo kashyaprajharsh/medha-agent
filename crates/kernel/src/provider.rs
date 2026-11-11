@@ -984,7 +984,7 @@ impl ReasoningConfig {
 }
 
 #[async_trait]
-pub trait Provider: Send + Sync {
+pub trait Provider: Send + Sync + 'static {
     fn capabilities(&self) -> &ProviderCaps;
 
     /// Context window for the connection currently serving requests. Most

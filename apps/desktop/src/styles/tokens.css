@@ -12,6 +12,8 @@
   --text-lg: 19px;
   --text-xl: 24px;
   --reading-size: 16px;
+  --code-size: 13px;
+  --terminal-size: 14px;
 
   --s-1: 4px;
   --s-2: 8px;
@@ -45,9 +47,24 @@
   --r-mark: 4px;
   --r-swatch: 2px;
 }
+/* A text size scales the whole interface, so controls, code and the terminal grow with the messages. */
 :root[data-text-size="small"] {
+  --text-sm: 12.5px;
+  --text-md: 14px;
+  --text-base: 15px;
+  --text-lg: 18px;
   --reading-size: 15px;
+  --code-size: 12px;
+  --terminal-size: 13px;
 }
 :root[data-text-size="large"] {
+  --text-xs: 13.5px;
+  --text-sm: 15px;
+  --text-md: 16.5px;
+  --text-base: 17.5px;
+  --text-lg: 21px;
+  --text-xl: 26px;
   --reading-size: 18px;
+  --code-size: 15px;
+  --terminal-size: 16px;
 }

@@ -71,3 +71,34 @@ test("stylesheets outside the design tokens do not add raw sizes, colours or eas
   for (const [key, limit] of Object.entries(CEILING))
     assert.ok(found[key] <= limit, `${key}: ${found[key]} raw values, ceiling ${limit}. Use a token.`);
 });
+
+test("each text size scales the whole interface, code and terminal included, not only messages", async () => {
+  const css = (await readFile(new URL("styles/tokens.css", src), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const block = (selector) => css.slice(css.indexOf(selector)).match(/\{([^}]*)\}/)[1];
+  const sizes = (text) => Object.fromEntries([...text.matchAll(/--([\w-]+):\s*([\d.]+)px/g)].map((m) => [m[1], Number(m[2])]));
+  const base = sizes(block(":root {"));
+  const small = { ...base, ...sizes(block(':root[data-text-size="small"]')) };
+  const large = { ...base, ...sizes(block(':root[data-text-size="large"]')) };
+  for (const name of ["text-sm", "text-md", "text-base", "text-lg", "reading-size", "code-size", "terminal-size"]) {
+    assert.ok(small[name] < base[name] && base[name] < large[name], `--${name}: ${small[name]} < ${base[name]} < ${large[name]}`);
+  }
+  assert.ok(large["text-xs"] > base["text-xs"], "small labels grow at Large");
+  const markdown = await readFile(new URL("styles/surfaces/markdown.css", src), "utf8");
+  assert.doesNotMatch(markdown, /font-size:\s*13px/, "code blocks follow --code-size");
+});
+
+test("a style preview starts from the plain theme, so it never shows the active style's depth", async () => {
+  const theme = async (name) => (await readFile(new URL(`styles/themes/${name}.css`, src), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const firstSelector = (css) => css.slice(0, css.indexOf("{")).replace(/\s+/g, " ").trim();
+  // The base tokens land on every look sample too; the light reset stays at the looks' own weight so they still apply.
+  assert.equal(firstSelector(await theme("ink")), ":root, [data-look]");
+  assert.equal(firstSelector(await theme("parchment")), ':root[data-theme="light"], :where([data-theme="light"]) [data-look]');
+});
+
+test("styles change how dense the theme's surfaces are, never their colour", async () => {
+  const css = (await readFile(new URL("styles/themes/looks.css", src), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const surfaces = [...css.matchAll(/--(side|canvas|raised):\s*([^;]+);/g)];
+  assert.ok(surfaces.length > 0, "the glass surfaces are no longer found");
+  for (const [, name, value] of surfaces)
+    assert.match(value, /var\(--base-(side|canvas|raised)\)/, `--${name} in looks.css is a colour of its own: ${value.trim()}`);
+});

@@ -428,12 +428,27 @@ export function Settings({
             </div>
             <div className="appearance-looks">
               <span id="look-label">Style</span>
-              <div role="radiogroup" aria-labelledby="look-label">
+              <div
+                role="radiogroup"
+                aria-labelledby="look-label"
+                onKeyDown={(event) => {
+                  // A radio group is one tab stop; the arrows move to the next style and choose it.
+                  const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key];
+                  if (!step) return;
+                  event.preventDefault();
+                  const radios = [...event.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]')];
+                  const from = radios.indexOf(event.target as HTMLElement);
+                  const to = (from + step + LOOKS.length) % LOOKS.length;
+                  context.setLook(LOOKS[to].id);
+                  radios[to]?.focus();
+                }}
+              >
                 {LOOKS.map((look) => (
                   <button
                     key={look.id}
                     role="radio"
                     aria-checked={context.look === look.id}
+                    tabIndex={context.look === look.id ? 0 : -1}
                     className="look-option"
                     onClick={() => context.setLook(look.id)}
                   >
@@ -445,7 +460,7 @@ export function Settings({
                     <strong>{look.name}</strong>
                     <small>
                       {look.id === "glass" &&
-                      document.documentElement.dataset.platform !== "mac"
+                      !document.documentElement.hasAttribute("data-window-glass")
                         ? "Frosted menus and cards."
                         : look.note}
                     </small>
@@ -454,7 +469,7 @@ export function Settings({
               </div>
             </div>
             <div className="appearance-row">
-              <label htmlFor="text-size">Reading size</label>
+              <label htmlFor="text-size">Text size</label>
               <Select
                 id="text-size"
                 value={context.textSize}
@@ -465,10 +480,15 @@ export function Settings({
                 <option value="large">Large</option>
               </Select>
             </div>
-            <p className="prose appearance-sample">
-              Clear text, comfortable spacing. Code keeps its own monospace
-              font.
-            </p>
+            <div className="md appearance-sample">
+              <p>
+                Messages, menus and code all follow this size. Code keeps its
+                own monospace font, as in <code>npm test</code>.
+              </p>
+              <pre>
+                <code>{"git commit -m \"Fix the login test\""}</code>
+              </pre>
+            </div>
           </>
         )}
         {confirm && (

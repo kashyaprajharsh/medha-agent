@@ -16,6 +16,29 @@ const HEAD = 56;
 const MARGIN = 12;
 const SMALLEST = 180;
 
+/** Marks a scrolling menu body while more of it sits below its edge, so the cut edge fades. */
+function useMoreBelow() {
+  const [node, setNode] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!node) return;
+    const mark = () =>
+      node.toggleAttribute("data-more", node.scrollTop + node.clientHeight < node.scrollHeight - 1);
+    mark();
+    node.addEventListener("scroll", mark);
+    // The box resizing and its content changing (settings arriving, a note appearing) both move the edge.
+    const resized = new ResizeObserver(mark);
+    resized.observe(node);
+    const changed = new MutationObserver(mark);
+    changed.observe(node, { childList: true, subtree: true });
+    return () => {
+      node.removeEventListener("scroll", mark);
+      resized.disconnect();
+      changed.disconnect();
+    };
+  }, [node]);
+  return setNode;
+}
+
 type Props = {
   value: string;
   resetRevision?: number;
@@ -131,6 +154,7 @@ export function Composer(props: Props) {
   const box = useRef<HTMLFormElement>(null);
   // Where a menu has room: the composer sits at the foot of a chat and mid-page on a new session.
   const [room, setRoom] = useState<{ down: boolean; most: number }>();
+  const moreBelow = useMoreBelow();
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -665,7 +689,7 @@ export function Composer(props: Props) {
                 </>
               )}
               {props.control === "mode" && (
-                <div className="popover-body">
+                <div className="popover-body" ref={moreBelow}>
                   {MODES.map((mode) => (
                     <button
                       type="button"
@@ -685,7 +709,7 @@ export function Composer(props: Props) {
                 </div>
               )}
               {props.control === "reasoning" && (
-                <div className="popover-body">
+                <div className="popover-body" ref={moreBelow}>
                   <div className="setting-section">
                     <label>Model reasoning</label>
                     <div className="segmented">

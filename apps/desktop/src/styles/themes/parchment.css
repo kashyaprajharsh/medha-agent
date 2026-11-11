@@ -1,9 +1,14 @@
-/* Parchment: the light theme. */
-:root[data-theme="light"] {
+/* Parchment: the light theme. Style previews start from it too, at a weight the looks still override. */
+:root[data-theme="light"],
+:where([data-theme="light"]) [data-look] {
   color-scheme: light;
-  --side: #f1ebdf;
-  --canvas: #f9f6ef;
-  --raised: #fffdf8;
+  /* The theme's surfaces, defined once. A style changes how dense they are, never their colour. */
+  --base-side: #f1ebdf;
+  --base-canvas: #f9f6ef;
+  --base-raised: #fffdf8;
+  --side: var(--base-side);
+  --canvas: var(--base-canvas);
+  --raised: var(--base-raised);
   --overlay: #fffdf8;
   --hover: rgba(43, 38, 30, 0.045);
   --press: rgba(43, 38, 30, 0.07);
@@ -12,9 +17,11 @@
   --line-strong: #a09583;
   --text: #2b261e;
   --dim: #6a6153;
-  --faint: #756d60;
+  --faint: #6b6355;
   --gold: #8c5c0e;
   --gold-hi: #b8802c;
+  /* On a light page a hovered button darkens, so its cream text keeps its contrast. */
+  --gold-hover: #7a5010;
   --gold-ink: #fff8e8;
   /* OpenAI's Continue with ChatGPT button: dark on a light theme. */
   --plan-bg: #0d0d0d;
@@ -39,7 +46,9 @@
   --syntax-string: #3b6a30;
   --syntax-number: #9a5616;
   --syntax-function: #236983;
-  --syntax-comment: #77756f;
+  --syntax-comment: #69675f;
+  /* The terminal's one colour the syntax set has no match for. */
+  --term-cyan: #1d6b6b;
   --syntax-attr: #a0393c;
   /* Chart series: CVD-safe adjacent pairs; three sit under 3:1, so values also appear as text. */
   --chart-1: #2a78d6;

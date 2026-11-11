@@ -228,7 +228,12 @@ export function Sidebar(props: Props) {
                         }
                         onSelect={() => props.onSelect(session.id)}
                         onTogglePin={() => props.onTogglePin(session.id)}
-                        onDelete={() => props.onDelete(session)}
+                        // Letting go of a working chat ends its turn, so it can be deleted only once it is idle.
+                        onDelete={
+                          props.running.has(session.id) || props.needs.has(session.id)
+                            ? undefined
+                            : () => props.onDelete(session)
+                        }
                         onUndo={() => props.onUndo(session.id)}
                       />
                     );

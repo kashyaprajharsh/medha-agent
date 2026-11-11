@@ -22,6 +22,7 @@ import { Rewind, type RewindHold } from "./Rewind";
 import { Settings } from "./Settings";
 import { Composer, type Control } from "./Composer";
 import { Icon } from "./Icon";
+import { useFollowBottom } from "./followBottom";
 import { LiveTail } from "./LiveTail";
 import { Palette, type Action } from "./Palette";
 import { medhaIcon, Sidebar } from "./Sidebar";
@@ -114,12 +115,6 @@ export function App() {
     [],
   );
   const [keyBySession, setKeyBySession] = useState<Record<string, string>>({});
-  const [away, updateAway] = useState(false);
-  const awayRef = useRef(false);
-  const setAway = useCallback((value: boolean) => {
-    awayRef.current = value;
-    updateAway(value);
-  }, []);
   const [palette, setPalette] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() =>
     stored("medha-sidebar")
@@ -193,9 +188,6 @@ export function App() {
     };
   }, [api]);
   const [branch, setBranch] = useState<string | null>(null);
-  const scroller = useRef<HTMLDivElement>(null);
-  const following = useRef(false);
-  const lastTop = useRef(0);
   const settled = useRef<Record<string, number>>({});
   const {
     live,
@@ -307,6 +299,7 @@ export function App() {
     [keyBySession],
   );
   const currentKey = draftKey ?? (selected ? keyFor(selected) : null);
+  const follow = useFollowBottom(currentKey);
   context.scope.current = {
     chatKey: currentKey,
     sessionId: draftKey ? null : selected,
@@ -385,7 +378,6 @@ export function App() {
     setPreview(null);
     dropRewind();
     setControl(null);
-    setAway(false);
     setEvents([]);
   }, [selected, draftKey]);
 
@@ -456,27 +448,6 @@ export function App() {
       }));
     }
   }, [live, takeReturned, setText]);
-
-  useEffect(() => {
-    const box = scroller.current;
-    if (!box || awayRef.current) return;
-    const frame = requestAnimationFrame(() => {
-      if (awayRef.current) return;
-      const bottom = Math.max(0, box.scrollHeight - box.clientHeight);
-      if (Math.abs(box.scrollTop - bottom) < 1) return;
-      following.current = true;
-      box.scrollTop = bottom;
-      lastTop.current = box.scrollTop;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [
-    events.length,
-    state?.items,
-    state?.sent.length,
-    state?.approvals.length,
-    state?.error,
-    away,
-  ]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -570,7 +541,7 @@ export function App() {
     const body = skill ? `${typed}\n\n${skill.message}` : typed;
     if (skill) setSkillFor(({ [currentKey]: _, ...rest }) => rest);
     setText((all) => ({ ...all, [currentKey]: "" }));
-    setAway(false);
+    follow.toBottom();
     setAttachments((all) => ({ ...all, [currentKey]: [] }));
     if (currentKey === spareDraft.current) spareDraft.current = null;
     void send(currentKey, draftKey ? null : selected, body, attached, about).catch(
@@ -595,6 +566,11 @@ export function App() {
 
   // A deleted chat keeps its row, with a way back, for as long as the backend can still bring it back.
   async function deleteChat(session: Session) {
+    // Deleting first lets go of this window's view, and letting go of a working chat ends its turn.
+    if (runningSessions.has(session.id) || needsSessions.has(session.id)) {
+      setError("This chat is still working. Stop it or let it finish, then delete it.");
+      return;
+    }
     const drop = () =>
       setDeleting((old) => {
         const next = new Map(old);
@@ -919,13 +895,13 @@ export function App() {
           setText((all) => ({ ...all, [key]: [all[key], request].filter(Boolean).join("\n\n") }));
         // Without a model, or while Medha works, the request waits in the composer.
         if (modelless || working) return draft();
-        setAway(false);
+        follow.toBottom();
         void send(key, draftKey ? null : selected, request, [], fixing).catch(draft);
       }}
     >
     <div
       ref={appRoot}
-      className={`shell ${surface || preview ? "with-panel" : ""} ${surface === "preview" && !preview ? "previewing" : ""}${sidebarOpen ? "sidebar-open" : "sidebar-hidden"} ${sidebarPeek && !sidebarOpen ? "sidebar-peek" : ""}`}
+      className={`shell ${surface || preview ? "with-panel" : ""} ${surface === "preview" && !preview ? "previewing" : ""} ${sidebarOpen ? "sidebar-open" : "sidebar-hidden"} ${sidebarPeek && !sidebarOpen ? "sidebar-peek" : ""}`}
     >
       {!sidebarOpen && (
         <div
@@ -1103,23 +1079,7 @@ export function App() {
         <div
           hidden={page !== "chat"}
           className="scroll"
-          ref={scroller}
-          onWheel={(event) => {
-            if (event.deltaY < 0) {
-              following.current = false;
-              setAway(true);
-            }
-          }}
-          onScroll={(event) => {
-            const box = event.currentTarget;
-            const up = box.scrollTop < lastTop.current - 2;
-            lastTop.current = box.scrollTop;
-            const ours = following.current;
-            following.current = false;
-            if (up && !ours) setAway(true);
-            else if (box.scrollHeight - box.scrollTop - box.clientHeight < 32)
-              setAway(false);
-          }}
+          ref={follow.ref}
         >
           <div className="thread">
             {fresh && (
@@ -1187,9 +1147,16 @@ export function App() {
           </div>
         </div>
 
-        {away && working && (
-          <button type="button" className="jump" onClick={() => setAway(false)}>
-            Jump to latest
+        {follow.away && page === "chat" && (
+          <button
+            type="button"
+            className={`jump ${working ? "working" : ""}`}
+            aria-label="Scroll to the latest message"
+            title="Scroll to the latest message"
+            onClick={() => follow.toBottom(true)}
+          >
+            <Icon name="arrowDown" />
+            {working && <span>New activity</span>}
           </button>
         )}
 

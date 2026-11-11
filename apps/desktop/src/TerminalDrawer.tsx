@@ -1,6 +1,6 @@
 import { useWorkspaceApi } from "./Workspace";
 import { useEffect, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { Icon } from "./Icon";
@@ -13,6 +13,12 @@ type Tab = {
   error?: string;
 };
 let sequence = 0;
+
+/** The terminal's font size from the chosen text size, 14 when the style sheet has none. */
+function terminalSize() {
+  const size = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--terminal-size"));
+  return Number.isFinite(size) ? size : 14;
+}
 const newTab = (): Tab => ({
   key: `terminal-${Date.now()}-${++sequence}`,
   label: "Shell",
@@ -44,7 +50,7 @@ function TerminalPane({
     const ptyKey = `${tab.key}-${++sequence}`;
     const term = new Terminal({
       fontFamily: 'Menlo, Monaco, "SFMono-Regular", Consolas, monospace',
-      fontSize: 14,
+      fontSize: terminalSize(),
       lineHeight: 1.3,
       cursorBlink: true,
       scrollback: 5000,
@@ -54,20 +60,39 @@ function TerminalPane({
     terminal.current = term;
     const colors = () => {
       const css = getComputedStyle(document.documentElement);
-      term.options.theme = {
-        background: css.getPropertyValue("--canvas").trim(),
-        foreground: css.getPropertyValue("--text").trim(),
-        cursor: css.getPropertyValue("--gold").trim(),
-        selectionBackground: css.getPropertyValue("--line").trim(),
+      const token = (name: string) => css.getPropertyValue(name).trim() || undefined;
+      // The theme's solid page colour: a glass tint is a color-mix the terminal cannot read, and output reads best opaque.
+      const theme: ITheme = {
+        background: token("--base-canvas"),
+        foreground: token("--text"),
+        cursor: token("--gold"),
+        selectionBackground: token("--line"),
       };
+      // The terminal's own colours suit a dark page; a light one takes the theme's contrast-checked set.
+      if (document.documentElement.dataset.theme === "light")
+        Object.assign(theme, {
+          black: token("--text"), red: token("--err"), green: token("--ok"), yellow: token("--warn"),
+          blue: token("--syntax-function"), magenta: token("--syntax-keyword"), cyan: token("--term-cyan"), white: token("--dim"),
+          brightBlack: token("--faint"), brightRed: token("--err"), brightGreen: token("--ok"), brightYellow: token("--warn"),
+          brightBlue: token("--syntax-function"), brightMagenta: token("--syntax-keyword"), brightCyan: token("--term-cyan"),
+          brightWhite: token("--text"),
+        });
+      term.options.theme = theme;
     };
     colors();
-    const theme = new MutationObserver(colors);
+    const fit = new FitAddon();
+    // The terminal follows the theme and the text size, refitting its grid when the font changes.
+    const theme = new MutationObserver(() => {
+      colors();
+      const size = terminalSize();
+      if (term.options.fontSize === size) return;
+      term.options.fontSize = size;
+      fitVisible();
+    });
     theme.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ["data-theme"],
+      attributeFilter: ["data-theme", "data-text-size"],
     });
-    const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container.current);
     const fitVisible = () => {

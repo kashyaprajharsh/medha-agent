@@ -2,6 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { useWorkspace } from "./Workspace";
 import { Icon } from "./Icon";
 import { RemoveWorkspace } from "./RemoveWorkspace";
+
+/** A path fitted to one line: its start and its end, with the middle left out. */
+function shortPath(path: string, most = 46) {
+  if (path.length <= most) return path;
+  const head = Math.min(15, Math.floor(most / 3));
+  return `${path.slice(0, head)}…${path.slice(path.length - (most - head - 1))}`;
+}
+
 export function WorkspaceMenu({
   folder,
   workspace,
@@ -93,7 +101,9 @@ export function WorkspaceMenu({
             <Icon name="plus" />
             Open project folder…
           </button>
-          <span className="workspace-path">{workspace}</span>
+          <span className="workspace-path" title={workspace}>
+            {shortPath(workspace)}
+          </span>
           <button
             type="button"
             disabled={busy}

@@ -8,12 +8,10 @@
   --radius-scale: 1.1;
   --glass: color-mix(in srgb, var(--overlay) 62%, transparent);
   --glass-edge: color-mix(in srgb, var(--text) 7%, transparent);
-  --frost: blur(24px) saturate(1.5);
-  /* A floating pane sits over the tinted canvas, not the bare desktop; the lift
-     brings it back to the tone it has when docked. */
-  --pane-frost: blur(24px) saturate(1.5) brightness(1.7);
-  /* A card over the dimmed page carries the desktop's colour, not just its light. */
-  --float-frost: blur(30px) saturate(1.9) brightness(1.35);
+  /* One frost for everything that floats, so every pane reads as the same material. */
+  --frost: blur(28px) saturate(1.6);
+  --pane-frost: var(--frost);
+  --float-frost: var(--frost);
   --hover: color-mix(in srgb, var(--text) 8%, transparent);
   --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.1);
   --glass-light: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 40%);
@@ -30,66 +28,77 @@
 :root[data-theme="light"][data-look="glass"],
 [data-theme="light"] [data-look="glass"] {
   --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.7);
-  --glass: color-mix(in srgb, var(--overlay) 60%, transparent);
-  --pane-frost: var(--frost);
-  --float-frost: blur(30px) saturate(1.8) brightness(1.1);
+  /* Light panes stay parchment over any wallpaper; the frost only softens them. */
+  --glass: color-mix(in srgb, var(--overlay) 84%, transparent);
   --glass-light: linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0) 38%);
   --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 0 0 1px rgba(255, 255, 255, 0.55);
   --e1-shadow: var(--sheen), 0 1px 2px rgba(74, 56, 26, 0.08);
   --e2-shadow: var(--sheen), 0 2px 8px rgba(74, 56, 26, 0.07), 0 16px 40px rgba(74, 56, 26, 0.14);
 }
-/* On macOS the window is the frosted desktop, so every surface token becomes a tint over it. */
-:root[data-platform="mac"][data-look="glass"] {
-  --side: rgba(18, 19, 23, 0.58);
-  --canvas: rgba(22, 23, 27, 0.74);
-  --raised: rgba(30, 31, 36, 0.66);
+/* Where the window itself is glass (the platform frosts the desktop behind it), each surface is the
+   theme's own colour at a density. Themes set only the densities; the colours stay in the theme file.
+   The page is a small step denser than the frame, so no edge boxes the conversation in. */
+:root[data-window-glass][data-look="glass"] {
+  --glass-frame: 40%;
+  --glass-page: 48%;
+  --glass-card: 58%;
+  /* 1 turns every surface solid, for people who ask the system for no transparency. */
+  --glass-solid: 0;
+  --side: color-mix(in srgb, var(--base-side) calc(var(--glass-frame) + (100% - var(--glass-frame)) * var(--glass-solid)), transparent);
+  --canvas: color-mix(in srgb, var(--base-canvas) calc(var(--glass-page) + (100% - var(--glass-page)) * var(--glass-solid)), transparent);
+  --raised: color-mix(in srgb, var(--base-raised) calc(var(--glass-card) + (100% - var(--glass-card)) * var(--glass-solid)), transparent);
 }
-:root[data-platform="mac"][data-theme="light"][data-look="glass"] {
-  --side: rgba(241, 235, 223, 0.6);
-  --canvas: rgba(249, 246, 239, 0.76);
-  --raised: rgba(255, 253, 248, 0.7);
+/* Dark text needs a light ground, so light glass is denser than dark. */
+:root[data-window-glass][data-theme="light"][data-look="glass"] {
+  --glass-frame: 56%;
+  --glass-page: 64%;
+  --glass-card: 86%;
 }
-:root[data-platform="mac"][data-look="glass"],
-:root[data-platform="mac"][data-look="glass"] body {
+:root[data-window-glass][data-look="glass"],
+:root[data-window-glass][data-look="glass"] body {
   background: transparent;
 }
 [data-look="glass"] :is(.side, .status, .head) {
   border-color: transparent;
 }
-:root[data-platform="mac"][data-look="glass"] .side .sess.active {
+:root[data-window-glass][data-look="glass"] .side .sess.active {
   background: color-mix(in srgb, var(--text) 10%, transparent);
 }
 @media (prefers-reduced-transparency: reduce) {
-  :root[data-platform="mac"][data-look="glass"] {
-    --side: #121317;
-    --canvas: #16171b;
-    --raised: #1e1f24;
+  :root[data-window-glass][data-look="glass"] {
+    --glass-solid: 1;
   }
-  :root[data-platform="mac"][data-theme="light"][data-look="glass"] {
-    --side: #f1ebdf;
-    --canvas: #f9f6ef;
-    --raised: #fffdf8;
-  }
-  :root[data-platform="mac"][data-look="glass"] body {
+  :root[data-window-glass][data-look="glass"] body {
     background: var(--canvas);
+  }
+  /* Reduced transparency means no frost anywhere, menus and dialogs included. */
+  [data-look="glass"] * {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+  [data-look="glass"] {
+    --glass: var(--overlay);
   }
 }
 [data-look="glass"]
   :is(.palette, .control-popover, .select-menu, .slash-menu, .workspace-popover, .row-more > div, .confirm-dialog, .jump) {
-  background: var(--glass);
+  background: var(--glass-light), var(--glass);
   border-color: var(--glass-edge);
+  box-shadow: var(--glass-rim), var(--e2-shadow);
   -webkit-backdrop-filter: var(--frost);
   backdrop-filter: var(--frost);
 }
 /* A pane floating over the conversation keeps its own tint and frosts what is
    behind it: through a bare tint the chat text reads straight through. */
 [data-look="glass"] .sidebar-hidden.sidebar-peek .side {
+  background: var(--glass);
   border-color: var(--glass-edge);
   -webkit-backdrop-filter: var(--pane-frost);
   backdrop-filter: var(--pane-frost);
 }
 @media (max-width: 1100px) {
   [data-look="glass"] .panel {
+    background: var(--glass);
     border-color: var(--glass-edge);
     -webkit-backdrop-filter: var(--pane-frost);
     backdrop-filter: var(--pane-frost);
@@ -97,16 +106,20 @@
 }
 @media (max-width: 780px) {
   [data-look="glass"] .side {
+    background: var(--glass);
     border-color: var(--glass-edge);
     -webkit-backdrop-filter: var(--pane-frost);
     backdrop-filter: var(--pane-frost);
   }
 }
+/* The composer carries the same lit rim as every pane. It takes no frost of its own: a backdrop
+   filter here would cut its menus off from the page, and they would stop frosting what is behind. */
 [data-look="glass"] .composer {
-  box-shadow: inset 0 0 0 1px var(--glass-edge), var(--e2-shadow);
+  box-shadow: var(--glass-rim), var(--e2-shadow);
 }
 [data-look="glass"] .composer:focus-within {
   box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
     inset 0 0 0 1px color-mix(in srgb, var(--gold) 55%, var(--glass-edge)),
     var(--e2-shadow),
     0 0 0 3px var(--gold-wash);
@@ -202,13 +215,11 @@
   box-shadow: inset 0 0 0 1px var(--neo-rule);
 }
 
-/* Soft: one tone everywhere; raised things are extruded, inputs are pressed in. */
+/* Soft: things that float or take a press are extruded, inputs are pressed in, and what you
+   read stays flat on the theme's own surface steps, so depth marks what you act on. */
 :root[data-look="soft"],
 [data-look="soft"] {
   --radius-scale: 1.3;
-  --side: var(--canvas);
-  --raised: var(--canvas);
-  --overlay: var(--canvas);
   --hover: color-mix(in srgb, var(--text) 7%, transparent);
   --soft-light: rgba(255, 255, 255, 0.045);
   --soft-dark: rgba(0, 0, 0, 0.55);
@@ -231,7 +242,7 @@
 :root[data-theme="light"][data-look="soft"],
 [data-theme="light"] [data-look="soft"] {
   --soft-light: rgba(255, 255, 255, 0.95);
-  --soft-dark: rgba(120, 96, 60, 0.22);
+  --soft-dark: rgba(120, 96, 60, 0.13);
   --well: color-mix(in srgb, var(--canvas) 94%, #7a6040);
   --slab-lit: color-mix(in srgb, var(--canvas) 45%, #fff);
   --slab-shade: var(--canvas);
@@ -241,11 +252,20 @@
   border-color: transparent;
 }
 [data-look="soft"]
-  :is(.you, .ask, .plan, .settings-form, .market, .question-card, .look-option, .md pre, .palette, .control-popover, .select-menu, .slash-menu, .confirm-dialog) {
+  :is(.ask, .question-card, .look-option, .palette, .control-popover, .select-menu, .slash-menu, .confirm-dialog) {
   border-color: transparent;
   box-shadow: var(--e1-shadow), inset 0 0 0 1px var(--hair);
 }
-[data-look="soft"] :is(.btn-line, .send, .stop, .icon-btn.active, .sess.active, .side-btn.active, .step-icon, .segmented button[aria-pressed="true"]) {
+[data-look="soft"] :is(.you, .plan, .settings-form, .market, .md pre) {
+  border-color: transparent;
+  box-shadow: inset 0 0 0 1px var(--hair);
+}
+/* The selected row is a tone step with a hairline, not a raised key. */
+[data-look="soft"] :is(.sess.active, .side-btn.active) {
+  background: var(--press);
+  box-shadow: inset 0 0 0 1px var(--hair);
+}
+[data-look="soft"] :is(.btn-line, .send, .stop, .icon-btn.active, .step-icon, .segmented button[aria-pressed="true"]) {
   box-shadow: var(--soft-raised);
 }
 [data-look="soft"] :is(.btn-line, .btn-gold, .send, .stop, .chip, .icon-btn, .look-option, .sess, .side-btn):not(:disabled):active {

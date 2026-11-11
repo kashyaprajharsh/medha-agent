@@ -73,7 +73,7 @@
   font-weight: 600;
 }
 .btn-gold:hover {
-  background: var(--gold-hi);
+  background: var(--gold-hover);
 }
 .btn-gold:disabled,
 .btn-line:disabled,

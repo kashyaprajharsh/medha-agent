@@ -423,6 +423,11 @@
   min-height: 0;
   overflow-y: auto;
 }
+/* A body cut off by a short window fades at its edge, so the switches below read as more to scroll. */
+.composer .control-popover > .popover-body[data-more] {
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent);
+  mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent);
+}
 .composer.menus-down .control-popover,
 .composer.menus-down .slash-menu {
   top: calc(100% + var(--s-2));

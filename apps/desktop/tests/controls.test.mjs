@@ -20,6 +20,7 @@ for (const name of [
   "KeyboardEvent",
   "Event",
   "CustomEvent",
+  "MutationObserver",
   "localStorage",
 ])
   globalThis[name] = dom.window[name];
@@ -3142,4 +3143,131 @@ test("a project leaves Medha only when asked, and its history goes only when cho
   assert.match(document.body.textContent, /can't be brought back/);
   await click(namedButton("Remove and delete history"));
   assert.deepEqual(removed, [["project-1", true]]);
+});
+
+test("a long workspace path shows on one line, shortened in the middle, and copies whole", async () => {
+  const copied = [];
+  const path = "/Users/someone/Library/Application Support/app.medha.desktop/personal/chat-personal-draft-e7cd00b-20f3";
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async (text) => copied.push(text) } }, configurable: true });
+  Object.assign(globalThis.__medhaControlsTest, {
+    workspace: { id: "personal", name: "Chats", path, personal: true },
+    workspaces: [],
+  });
+  const { WorkspaceMenu } = await import(await moduleUrl("WorkspaceMenu"));
+  await act(async () => root.render(h(WorkspaceMenu, { folder: "Chats", workspace: path, working: false })));
+  await click(document.querySelector(".workspace-trigger"));
+  const shown = document.querySelector(".workspace-path");
+  assert.ok(shown.textContent.length <= 48, `the path is ${shown.textContent.length} characters: ${shown.textContent}`);
+  assert.match(shown.textContent, /^\/Users\/someone\/.*….*draft-e7cd00b-20f3$/, "both ends of the path stay readable");
+  assert.equal(shown.title, path, "the whole path is on hover");
+  await click(namedButton("Copy path"));
+  assert.deepEqual(copied, [path]);
+});
+
+test("a settings menu taller than its room marks that more is below, until scrolled to the end", async () => {
+  const proto = dom.window.HTMLElement.prototype;
+  const saved = ["scrollHeight", "clientHeight"].map((key) => [key, Object.getOwnPropertyDescriptor(proto, key)]);
+  Object.defineProperty(proto, "scrollHeight", { configurable: true, get() { return this.classList.contains("popover-body") ? 600 : 0; } });
+  Object.defineProperty(proto, "clientHeight", { configurable: true, get() { return this.classList.contains("popover-body") ? 300 : 0; } });
+  try {
+    await act(() => root.render(h(Composer, {
+      value: "", onChange() {}, onSend() {}, onStop() {}, running: false, disabled: false, placeholder: "Task",
+      settings, settingsLocked: false, control: "reasoning", onControl() {}, onLoadSettings: async () => {},
+      onConfigure: async () => {}, showReasoning: true, onShowReasoning() {}, attachments: [], onAttachments() {},
+      onSurface() {}, onNew() {}, onRewind() {}, onSettings() {}, onExtensions() {},
+    })));
+    const body = document.querySelector(".control-popover .popover-body");
+    assert.ok(body.hasAttribute("data-more"), "a cut-off menu gave no sign that it scrolls");
+    body.scrollTop = 300;
+    await act(async () => body.dispatchEvent(new dom.window.Event("scroll")));
+    assert.ok(!body.hasAttribute("data-more"), "the cue stayed after scrolling to the end");
+  } finally {
+    for (const [key, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(proto, key, descriptor);
+      else delete proto[key];
+    }
+  }
+});
+
+test("the style picker moves and chooses with the arrow keys, with one tab stop, and the size sample shows code", async () => {
+  const { Settings } = await import(await moduleUrl("Settings"));
+  const chosen = [];
+  globalThis.__medhaControlsTest.api = { settings: async () => ({ models: [], search: { provider: "duckduckgo" }, protocols: [] }) };
+  Object.assign(globalThis.__medhaControlsTest, { look: "soft", setLook: (look) => chosen.push(look) });
+  await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
+  await click([...document.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Appearance"));
+  const radios = () => [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')];
+  assert.deepEqual(radios().map((radio) => radio.tabIndex), [0, -1, -1, -1], "only the chosen style is a tab stop");
+  radios()[0].focus();
+  await act(async () => radios()[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
+  assert.deepEqual(chosen, ["flat"], "the right arrow did not choose the next style");
+  assert.equal(document.activeElement, radios()[1], "focus did not follow the arrow");
+  await act(async () => radios()[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+  assert.deepEqual(chosen, ["flat", "neo"], "the left arrow from the first style should wrap to the last");
+  assert.ok(document.querySelector(".appearance-sample code"), "the text size sample shows no code");
+  assert.ok(document.querySelector('label[for="text-size"]').textContent === "Text size");
+});
+
+test("a chat opens at its latest message or where it was left, and only the person's own scrolling leaves the end", async () => {
+  const { useFollowBottom } = await import(await moduleUrl("followBottom"));
+  let follow;
+  function Harness({ chat }) {
+    follow = useFollowBottom(chat);
+    return h("div", { ref: follow.ref, className: "scroll" }, h("div", { className: "thread" }));
+  }
+  await act(async () => root.render(h(Harness, { chat: "long" })));
+  const box = document.querySelector(".scroll");
+  // A box with real sizes whose position clamps as a browser's does when content shrinks.
+  let height = 2000, top = 0;
+  Object.defineProperty(box, "clientHeight", { configurable: true, get: () => 500 });
+  Object.defineProperty(box, "scrollHeight", { configurable: true, get: () => height });
+  Object.defineProperty(box, "scrollTop", { configurable: true, get: () => top, set: (value) => (top = Math.max(0, Math.min(value, height - 500))) });
+  const grow = (to) => act(async () => { height = to; box.firstChild.append(document.createElement("p")); });
+  const scrollTo = (to, byPerson) => act(async () => {
+    if (byPerson) box.dispatchEvent(new dom.window.Event("wheel"));
+    top = to;
+    box.dispatchEvent(new dom.window.Event("scroll"));
+  });
+
+  await grow(2000);
+  assert.equal(top, 1500, "the chat did not open at its latest message");
+  await scrollTo(200, false);
+  assert.equal(follow.away, false, "a position change the person did not make moved them away from the end");
+  await grow(2400);
+  assert.equal(top, 1900, "late content did not keep the chat at its latest message");
+
+  await scrollTo(1000, true);
+  assert.equal(follow.away, true, "scrolling up did not leave the end");
+  await act(async () => root.render(h(Harness, { chat: "other" })));
+  assert.equal(follow.away, false, "a chat never left opened away from its end");
+  await grow(1200);
+  assert.equal(top, 700);
+
+  height = 2400;
+  await act(async () => root.render(h(Harness, { chat: "long" })));
+  await grow(2400);
+  assert.equal(follow.away, true);
+  assert.equal(top, 1000, "the chat did not reopen where it was left");
+  await act(async () => follow.toBottom());
+  assert.equal(follow.away, false);
+  assert.equal(top, 1900, "jumping did not reach the latest message");
+});
+
+test("a chat that is running or waiting on you offers no delete, since Medha refuses to delete an open chat", async () => {
+  const { Sidebar } = await import(await moduleUrl("Sidebar"));
+  const now = Date.now() / 1000;
+  const session = (id) => ({ id, title: id, parent_id: null, events: 1, started_ts: now, last_ts: now });
+  const deleted = [];
+  await act(() => root.render(h(Sidebar, {
+    sessions: [session("working"), session("asking"), session("idle")],
+    running: new Set(["working"]), needs: new Set(["asking"]), pinned: new Set(), subagentCounts: new Map(),
+    selected: null, onSelect() {}, onTogglePin() {}, deleting: new Set(), onDelete: (row) => deleted.push(row.id),
+    onUndo() {}, onRefresh() {}, onNew() {}, onPalette() {}, onExtensions() {}, onSettings() {},
+    onPointerEnter() {}, onPointerLeave() {}, onToggleTheme() {}, page: "chat", workspace: "/w", workspaceName: "w",
+    loading: false, drafting: false, theme: "dark", visible: true,
+  })));
+  assert.equal(document.querySelector('[aria-label="Delete working"]'), null, "a running chat offered delete");
+  assert.equal(document.querySelector('[aria-label="Delete asking"]'), null, "a chat waiting on the person offered delete");
+  await click(document.querySelector('[aria-label="Delete idle"]'));
+  assert.deepEqual(deleted, ["idle"]);
 });

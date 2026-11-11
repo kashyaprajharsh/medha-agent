@@ -76,6 +76,8 @@ export function WorkspaceHost() {
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.platform = MAC ? "mac" : "other";
+    // The window itself is glass where the platform frosts the desktop behind it: macOS today.
+    root.toggleAttribute("data-window-glass", MAC);
     root.dataset.switching = "";
     root.dataset.theme = theme;
     root.dataset.look = look;

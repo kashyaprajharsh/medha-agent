@@ -6,7 +6,15 @@ const themes = ["ink", "parchment"];
 
 async function tokens(name) {
   const css = await readFile(new URL(`../src/styles/themes/${name}.css`, import.meta.url), "utf8");
-  return Object.fromEntries([...css.matchAll(/--([\w-]+):\s*(#[0-9a-f]{6})\b/gi)].map((m) => [m[1], m[2]]));
+  // A token may name another (`--side: var(--base-side)`); follow it to the colour, as the browser does.
+  const raw = Object.fromEntries([...css.matchAll(/--([\w-]+):\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]));
+  const resolve = (value, depth = 0) => {
+    const ref = value?.match(/^var\(--([\w-]+)\)$/);
+    return ref && depth < 8 ? resolve(raw[ref[1]], depth + 1) : value;
+  };
+  return Object.fromEntries(
+    Object.keys(raw).map((name) => [name, resolve(raw[name])]).filter(([, value]) => /^#[0-9a-f]{6}$/i.test(value ?? "")),
+  );
 }
 
 function luminance(hex) {
@@ -28,9 +36,12 @@ for (const name of themes) {
     for (const surface of ["canvas", "side", "raised", "overlay"]) {
       assert.ok(contrast(t.text, t[surface]) >= 7, `${name} text on ${surface}`);
       assert.ok(contrast(t.dim, t[surface]) >= 4.5, `${name} dim on ${surface}: ${contrast(t.dim, t[surface]).toFixed(2)}`);
-      assert.ok(contrast(t.faint, t[surface]) >= 3, `${name} faint on ${surface}: ${contrast(t.faint, t[surface]).toFixed(2)}`);
+      // Muted text is small meta and code comments sit at code size, so both need the small-text bar.
+      assert.ok(contrast(t.faint, t[surface]) >= 4.5, `${name} faint on ${surface}: ${contrast(t.faint, t[surface]).toFixed(2)}`);
+      assert.ok(contrast(t["syntax-comment"], t[surface]) >= 4.5, `${name} code comment on ${surface}: ${contrast(t["syntax-comment"], t[surface]).toFixed(2)}`);
       assert.ok(contrast(t.gold, t[surface]) >= 3, `${name} gold focus ring on ${surface}: ${contrast(t.gold, t[surface]).toFixed(2)}`);
     }
     assert.ok(contrast(t["gold-ink"], t.gold) >= 4.5, `${name} text on the gold button`);
+    assert.ok(contrast(t["gold-ink"], t["gold-hover"]) >= 4.5, `${name} text on the hovered gold button`);
   });
 }

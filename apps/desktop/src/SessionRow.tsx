@@ -28,7 +28,8 @@ export function SessionRow({
   meta: ReactNode;
   onSelect: () => void;
   onTogglePin: () => void;
-  onDelete: () => void;
+  /** Absent while the chat works or waits on the person: it can't be deleted then. */
+  onDelete?: () => void;
   onUndo: () => void;
 }) {
   const title = session.title || "Untitled session";
@@ -72,15 +73,17 @@ export function SessionRow({
       </button>
       {!deleting && (
         <>
-          <button
-            type="button"
-            className="del"
-            aria-label={`Delete ${title}`}
-            title="Delete"
-            onClick={onDelete}
-          >
-            <Icon name="x" />
-          </button>
+          {onDelete && (
+            <button
+              type="button"
+              className="del"
+              aria-label={`Delete ${title}`}
+              title="Delete"
+              onClick={onDelete}
+            >
+              <Icon name="x" />
+            </button>
+          )}
           <button
             type="button"
             className="pin"

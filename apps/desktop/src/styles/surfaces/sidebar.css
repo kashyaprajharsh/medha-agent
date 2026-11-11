@@ -79,7 +79,7 @@
 }
 .side-btn {
   width: 100%;
-  height: 36px;
+  min-height: 36px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -144,13 +144,10 @@
   color: var(--faint);
   line-height: 1.4;
 }
+/* Same row height and icon column as the rows at the top, so every icon sits on one line. */
 .side-sections {
-  padding: var(--s-2) var(--s-3);
+  padding: var(--s-2) 10px;
   border-top: 1px solid var(--hair);
-}
-.side-sections .side-btn {
-  height: auto;
-  padding: 9px var(--s-3);
 }
 .spin-dot {
   display: inline-block;
@@ -243,7 +240,11 @@
   text-overflow: ellipsis;
   font-size: var(--text-md);
 }
+/* The date column always holds the room the pin and delete buttons take on hover (they sit 6 to 60px
+   from the edge), so a long title ends before them instead of running underneath. */
 .sess-when {
+  min-width: 50px;
+  text-align: right;
   font-size: var(--text-xs);
   color: var(--faint);
   white-space: nowrap;
@@ -262,7 +263,7 @@
   width: 12px;
   height: 12px;
 }
-.sess-row:hover .sess-when,
+.sess-row:is(:hover, :focus-within) .sess-when,
 .sess-row:has(.pin[aria-pressed="true"]) .sess-when {
   visibility: hidden;
 }
@@ -283,7 +284,7 @@
   width: 14px;
   height: 14px;
 }
-.sess-row:hover .pin,
+.sess-row:is(:hover, :focus-within) .pin,
 .pin:focus-visible,
 .pin[aria-pressed="true"] {
   opacity: 1;
@@ -315,7 +316,7 @@
   width: 13px;
   height: 13px;
 }
-.sess-row:hover .del,
+.sess-row:is(:hover, :focus-within) .del,
 .del:focus-visible {
   opacity: 1;
 }

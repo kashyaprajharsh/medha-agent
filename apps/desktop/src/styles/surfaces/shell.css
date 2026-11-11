@@ -1,6 +1,7 @@
 /* The window layout: sidebar, main column, side panel, header and status bar. */
 .shell {
   --sidebar-width: 288px;
+  --status-split: var(--sidebar-width);
   --panel-width: min(560px, 44vw);
   height: 100%;
   display: grid;
@@ -12,6 +13,7 @@
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--panel-width);
 }
 .shell.sidebar-hidden {
+  --status-split: 0px;
   grid-template-columns: 0 minmax(0, 1fr) 0;
 }
 .shell.sidebar-hidden.with-panel {
@@ -103,6 +105,8 @@
   box-shadow: 0 0 0 3px var(--gold-wash);
 }
 
+/* The status line continues each column's own surface, so the page runs to the window's edge
+   instead of being boxed in by a sidebar-coloured strip. */
 .status {
   grid-column: 1 / -1;
   grid-row: 2;
@@ -110,8 +114,11 @@
   align-items: center;
   gap: 10px;
   padding: 0 var(--s-4);
-  border-top: 1px solid var(--hair);
-  background: var(--side);
+  background: linear-gradient(
+    to right,
+    var(--side) var(--status-split),
+    var(--canvas) var(--status-split)
+  );
   color: var(--faint);
   font-size: var(--text-xs);
   white-space: nowrap;

@@ -112,8 +112,22 @@
   left: 0;
 }
 
+/* The filter, the rows and any message share the toolbar's 16px inset, so nothing meets the panel edge. */
+.surface-content > .filter-input {
+  display: block;
+  width: calc(100% - 2 * var(--s-4));
+  margin: var(--s-3) var(--s-4) 0;
+}
+.surface-content > :is(.quiet, .surface-error) {
+  margin: 0;
+  padding: var(--s-3) var(--s-4);
+}
 .file-list {
-  padding: 6px 0;
+  padding: 6px 6px;
+}
+.file-list > .quiet {
+  margin: 0;
+  padding: var(--s-2) 10px;
 }
 .file-row {
   display: flex;

@@ -1,9 +1,15 @@
-/* Ink: the default dark theme. Slate with a whisper of blue; gold is rationed to accents. */
-:root {
+/* Ink: the default dark theme. Slate with a whisper of blue; gold is rationed to accents.
+   Style previews get the base tokens too, so each starts from the plain theme. */
+:root,
+[data-look] {
   color-scheme: dark;
-  --side: #121317;
-  --canvas: #16171b;
-  --raised: #1e1f24;
+  /* The theme's surfaces, defined once. A style changes how dense they are, never their colour. */
+  --base-side: #121317;
+  --base-canvas: #16171b;
+  --base-raised: #1e1f24;
+  --side: var(--base-side);
+  --canvas: var(--base-canvas);
+  --raised: var(--base-raised);
   --overlay: #25272d;
   --hover: rgba(230, 232, 240, 0.05);
   --press: rgba(230, 232, 240, 0.08);
@@ -12,9 +18,10 @@
   --line-strong: #5d606b;
   --text: #e9eaee;
   --dim: #adb0ba;
-  --faint: #878a95;
+  --faint: #8d909b;
   --gold: #dfb46c;
   --gold-hi: #efcd90;
+  --gold-hover: #efcd90;
   --gold-ink: #16171b;
   /* OpenAI's Continue with ChatGPT button: light on a dark theme. */
   --plan-bg: #f4f4f2;

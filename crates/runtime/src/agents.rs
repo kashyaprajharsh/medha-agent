@@ -1228,7 +1228,9 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
                 .chain(run.spec.objective_trust),
         );
         let status = match stop {
-            StopReason::VerificationFailed | StopReason::Blocked => AgentStatus::Failed,
+            StopReason::VerificationFailed
+            | StopReason::Blocked
+            | StopReason::RefusedRepeatedly => AgentStatus::Failed,
             StopReason::Finished => AgentStatus::Completed,
             StopReason::Budget(_) => AgentStatus::Exhausted,
             StopReason::Interrupted => AgentStatus::Cancelled,

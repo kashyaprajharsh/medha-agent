@@ -481,6 +481,9 @@ pub enum StopReason {
     /// A prompt-submit hook refused the new input before any model call. The
     /// reason reaches the surface through `StreamSink::notice` and the log.
     Blocked,
+    /// So many actions were refused, in a row or in all, that the run stopped
+    /// instead of trying more. The reason reaches the surface as a notice.
+    RefusedRepeatedly,
 }
 
 #[path = "hook_points.rs"]

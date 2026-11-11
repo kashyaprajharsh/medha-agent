@@ -191,6 +191,12 @@ test("budget and verification stops remain different from ordinary completion", 
   assert.match(budget.notice, /tokens limit/);
   assert.match(failed.notice, /Verification failed/);
   assert.equal(done.notice, undefined);
+  const refused = reduceLive(
+    startingLive(),
+    event("turn.done", { stopped: "refused_repeatedly" }),
+  );
+  assert.doesNotMatch(refused.notice, /limit/, "a run stopped for refusals read as a budget stop");
+  assert.match(refused.notice, /refused/);
 });
 
 test("an approval settled in another window leaves this one", () => {

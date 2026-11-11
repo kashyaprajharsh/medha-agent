@@ -18,11 +18,18 @@ const NOT_RUN: &str = "Not run: this exact call already failed four times since 
 const BLOCK_AT: usize = 5;
 const NOT_RUN_CODE: &str = "repeated_failure";
 
+/// Refusals in a row, and in all, after which the run stops instead of trying again.
+const STOP_IN_A_ROW: usize = 3;
+const STOP_IN_ALL: usize = 20;
+
 /// Refusals by tool and reason, and failures by exact call, counted across one run.
 #[derive(Default)]
 pub(crate) struct Refusals {
     reasons: HashMap<String, usize>,
     failures: HashMap<String, usize>,
+    /// Refused calls since the last one that was allowed to run.
+    in_a_row: usize,
+    in_all: usize,
 }
 
 /// One call by tool and arguments; JSON objects keep their keys sorted, so equal calls match.
@@ -31,6 +38,23 @@ fn signature(intent: &ToolIntent) -> String {
 }
 
 impl Refusals {
+    /// Why the run should stop now, after too many refusals in a row or in all; counted by `note`.
+    pub(crate) fn stopping(&self) -> Option<String> {
+        if self.in_a_row >= STOP_IN_A_ROW {
+            Some(format!(
+                "Medha stopped this run: {} actions in a row were refused, so trying more would not help.",
+                self.in_a_row
+            ))
+        } else if self.in_all >= STOP_IN_ALL {
+            Some(format!(
+                "Medha stopped this run: {} actions were refused in it, so trying more would not help.",
+                self.in_all
+            ))
+        } else {
+            None
+        }
+    }
+
     /// A call that already failed `BLOCK_AT - 1` times settles without running.
     pub(crate) fn blocked(&self, intent: &ToolIntent) -> Option<Observation> {
         let failures = self.failures.get(&signature(intent)).copied().unwrap_or(0);
@@ -48,6 +72,12 @@ impl Refusals {
         failed: bool,
         observation: &mut Observation,
     ) -> Option<String> {
+        if observation.status == ObsStatus::Denied {
+            self.in_a_row += 1;
+            self.in_all += 1;
+        } else {
+            self.in_a_row = 0;
+        }
         if observation.payload["error_code"] == NOT_RUN_CODE {
             return Some(format!(
                 "Medha did not run {} again: the same call failed {} times.",

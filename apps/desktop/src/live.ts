@@ -735,6 +735,8 @@ function stopNotice(reason?: string) {
   if (reason === "verification_failed")
     return "Verification failed. Review the check before continuing.";
   if (reason === "blocked_by_hook") return "A project hook blocked this turn.";
+  if (reason === "refused_repeatedly")
+    return "Medha stopped: its actions were refused again and again. Say what to do differently, or allow what it needs.";
   return `Stopped at the ${reason.replaceAll("_", " ")} limit. You can continue with another message.`;
 }
 

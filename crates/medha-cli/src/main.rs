@@ -1114,6 +1114,9 @@ async fn main() -> Result<()> {
         Ok((_t, kernel::StopReason::Blocked)) => {
             Err(anyhow::anyhow!("the prompt was blocked by a plugin hook"))
         }
+        Ok((_t, kernel::StopReason::RefusedRepeatedly)) => Err(anyhow::anyhow!(
+            "headless run stopped: its actions were refused again and again; it needs approvals no one could give"
+        )),
         Err(error) => Err(anyhow::anyhow!("headless run failed: {error}")),
     };
     if let Some(control) = &agent_control {

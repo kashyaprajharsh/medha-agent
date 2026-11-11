@@ -734,7 +734,9 @@ pub struct Gate {
 
 /// What the model is told when an approval was refused because no one could be asked.
 pub(crate) const NOBODY_TO_ASK: &str = "no one can answer approvals in this run, so this was refused without \
-     asking anyone. Do not retry it or work around it; finish what you can without it and say what needed approval";
+     asking anyone. Do not retry it or work around it; finish what you can without it and say what needed \
+     approval. It can run when someone is there to approve it, or when the person allows it beforehand \
+     in the project's medha.lock";
 
 impl Gate {
     pub(crate) fn new(writer: Arc<Writer>, pending: Pending) -> Self {
@@ -1424,7 +1426,9 @@ fn turn_outcome(reason: &StopReason) -> protocol::TurnOutcome {
     match reason {
         StopReason::Finished => protocol::TurnOutcome::Finished,
         StopReason::Interrupted => protocol::TurnOutcome::Cancelled,
-        StopReason::VerificationFailed | StopReason::Blocked => protocol::TurnOutcome::Refused,
+        StopReason::VerificationFailed | StopReason::Blocked | StopReason::RefusedRepeatedly => {
+            protocol::TurnOutcome::Refused
+        }
         StopReason::Budget(kernel::BudgetStop::Tokens) => protocol::TurnOutcome::TokenLimit,
         StopReason::Budget(_) => protocol::TurnOutcome::RequestLimit,
     }
@@ -1639,6 +1643,7 @@ fn stopped_label(reason: &StopReason) -> Option<&'static str> {
         StopReason::VerificationFailed => Some("verification_failed"),
         StopReason::Budget(stop) => Some(stop.label()),
         StopReason::Blocked => Some("blocked_by_hook"),
+        StopReason::RefusedRepeatedly => Some("refused_repeatedly"),
         StopReason::Finished | StopReason::Interrupted => None,
     }
 }

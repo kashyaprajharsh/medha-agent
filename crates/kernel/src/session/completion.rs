@@ -10,6 +10,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         finishing: bool,
         modified_files: bool,
     ) -> Flow<()> {
+        // Refused again and again: every call has settled and been logged, and asking the model once more would not help.
+        if let Some(why) = state.refusals.stopping() {
+            cx.sink.notice(&why);
+            if let Some(q) = interrupts.as_mut() {
+                Self::return_unapplied_steers(q, cx.sink);
+            }
+            return Ok(ControlFlow::Break((
+                std::mem::take(&mut history.messages),
+                StopReason::RefusedRepeatedly,
+            )));
+        }
         let dispatch_wall_deadline = state.gov.deadline();
         // Cancelled during dispatch: every admitted intent has settled
         // (real or synthesized observation, logged above) — stop here.

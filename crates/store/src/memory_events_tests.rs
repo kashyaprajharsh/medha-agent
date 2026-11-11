@@ -52,5 +52,6 @@ async fn memory_saves_are_read_alone_in_order_and_still_checked() {
         SqliteLog::open(&db).unwrap().memory_events().is_err(),
         "a changed memory save was trusted"
     );
+    drop(log);
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -39,5 +39,6 @@ async fn the_tail_after_an_event_is_the_rest_of_a_full_read() {
             .is_err(),
         "an unknown starting event read as the whole history"
     );
+    drop(log);
     std::fs::remove_dir_all(dir).unwrap();
 }

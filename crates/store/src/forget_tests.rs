@@ -84,5 +84,6 @@ async fn a_deleted_chat_leaves_a_log_every_open_reader_still_trusts() {
     log.append(Event::model_text(&kept, "later")).await.unwrap();
     reader.all_events().unwrap();
     SqliteLog::open(&db).unwrap().verify().unwrap();
+    drop((log, reader));
     std::fs::remove_dir_all(dir).unwrap();
 }

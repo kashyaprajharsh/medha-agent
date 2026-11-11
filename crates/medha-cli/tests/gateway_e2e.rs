@@ -337,6 +337,12 @@ impl Gateway {
             .unwrap()
     }
 
+    /// Stops it and waits until it has let go of its chats, as a gateway process that exits has.
+    async fn stop(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+
     async fn until(&mut self, wanted: impl Fn(&Sent) -> bool) -> Sent {
         loop {
             let sent = self.next().await;
@@ -392,7 +398,7 @@ async fn stranger_then_restart(world: &World) {
     gateway.write(OWNER, "remember the word heron").await;
     assert_eq!(gateway.next().await.text, "echo: remember the word heron");
     world.seen.recv_timeout(WAIT).unwrap();
-    drop(gateway);
+    gateway.stop().await;
 
     let mut restarted = world.gateway();
     restarted.write(OWNER, "which word?").await;
@@ -456,7 +462,7 @@ async fn projects(world: &World) {
     assert_eq!(gateway.next().await.text, "echo: hello from site");
     world.seen.recv_timeout(WAIT).unwrap();
     assert!(folders_in_use(world).await.contains(&site));
-    drop(gateway);
+    gateway.stop().await;
 
     // Taken off the list on the computer: the chat is told, and works in the default again.
     let mut restarted = world.gateway_with(vec![world.folder.clone()]);

@@ -229,18 +229,24 @@ const MAX_NAMED: usize = 8;
 const CLOCK_SLACK: f64 = 2.0;
 
 /// Paths a reply points at: image and link targets, and names in code spans.
-fn named_paths(text: &str) -> Vec<String> {
+/// Entries a reply's look for changed files may visit, so a large folder cannot slow a turn's end.
+const MAX_SCANNED: usize = 20_000;
+
+/// What a reply names: files it links or embeds, which ask for them to be shown, and files it
+/// only mentions in code, which never add an output but put the run's own first.
+fn named_paths(text: &str) -> (Vec<String>, Vec<String>) {
     use pulldown_cmark::{Event, Parser, Tag};
-    let mut found = Vec::new();
+    let (mut linked, mut mentioned) = (Vec::new(), Vec::new());
     for part in Parser::new(text) {
-        let named = match part {
-            Event::Start(Tag::Image { dest_url, .. } | Tag::Link { dest_url, .. }) => {
+        let (named, into) = match part {
+            Event::Start(Tag::Image { dest_url, .. } | Tag::Link { dest_url, .. }) => (
                 urlencoding::decode(&dest_url)
                     .ok()
-                    .map(|path| path.into_owned())
-            }
-            Event::Code(code) => Some(code.into_string()),
-            _ => None,
+                    .map(|path| path.into_owned()),
+                &mut linked,
+            ),
+            Event::Code(code) => (Some(code.into_string()), &mut mentioned),
+            _ => continue,
         };
         let Some(path) = named.map(|path| path.trim().to_owned()) else {
             continue;
@@ -249,40 +255,94 @@ fn named_paths(text: &str) -> Vec<String> {
             && !path.contains("://")
             && !path.contains(['*', '\n', '#', '?'])
             && kind(Path::new(&path)).is_some()
-            && !found.contains(&path)
+            && !into.contains(&path)
         {
-            found.push(path);
+            into.push(path);
         }
     }
-    found
+    (linked, mentioned)
 }
 
-/// Files a reply names that changed during this run, read where they lie and
-/// through the same permission check as any read. A file the reply only
-/// mentions, or one that predates the run, is not an output of it.
+/// Seconds since the epoch at which a file last changed.
+fn changed_at(meta: &std::fs::Metadata) -> Option<f64> {
+    let time = meta.modified().ok()?;
+    Some(
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64(),
+    )
+}
+
+/// Viewable files in the workspace that changed since `since`, newest first, with the same
+/// folders left out as the workspace tools leave out.
+fn changed_files(root: &Path, since: f64) -> Vec<PathBuf> {
+    let mut found: Vec<(f64, PathBuf)> = Vec::new();
+    let walk = ignore::WalkBuilder::new(root)
+        .standard_filters(true)
+        .filter_entry(|entry| !crate::skip_dir(entry))
+        .build();
+    for entry in walk.take(MAX_SCANNED).flatten() {
+        let path = entry.path();
+        if kind(path).is_none() || !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if let Some(changed) = entry.metadata().ok().as_ref().and_then(changed_at)
+            && changed >= since - CLOCK_SLACK
+        {
+            found.push((changed, path.to_path_buf()));
+        }
+    }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// The outputs of a reply. A file it links or embeds is shown even when the run left it alone,
+/// so a person asking to see a file again gets it. A file it names in code is shown only when
+/// the run created or changed it, found by its path or by its file name alone, since a reply
+/// often leaves out the folder. A file the run only read keeps its old time and is never shown,
+/// and nothing the reply does not name is added. Every file passes the same permission check as
+/// any read.
 pub async fn named(sbx: &WorkspaceSandbox, text: &str, since: f64) -> Vec<Value> {
+    let (linked, mentioned) = named_paths(text);
+    let root = sbx.root().to_path_buf();
+    let changed = if mentioned.is_empty() {
+        Vec::new()
+    } else {
+        tokio::task::spawn_blocking({
+            let root = root.clone();
+            move || changed_files(&root, since)
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let named_by_reply = |path: &PathBuf| {
+        mentioned.iter().any(|name| {
+            path.ends_with(name)
+                || Path::new(name)
+                    .file_name()
+                    .is_some_and(|file| path.file_name() == Some(file))
+        })
+    };
+    let candidates = linked
+        .iter()
+        .map(|path| root.join(path))
+        .chain(changed.into_iter().filter(named_by_reply));
     let mut outputs: Vec<Value> = Vec::new();
-    for path in named_paths(text) {
+    for candidate in candidates {
         if outputs.len() >= MAX_NAMED {
             break;
         }
-        let candidate = sbx.root().join(&path);
         let Some(resolved) = sbx.resolve_if_permitted(&candidate.to_string_lossy()).await else {
             continue;
         };
         let Ok(meta) = tokio::fs::metadata(&resolved).await else {
             continue;
         };
-        let changed = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|age| age.as_secs_f64());
-        let (true, Some(changed), Some(kind)) = (meta.is_file(), changed, kind(&resolved)) else {
+        let (true, Some(kind)) = (meta.is_file(), kind(&resolved)) else {
             continue;
         };
         let path = resolved.to_string_lossy().into_owned();
-        if changed >= since - CLOCK_SLACK && outputs.iter().all(|other| other["path"] != path) {
+        if outputs.iter().all(|other| other["path"] != path) {
             outputs.push(json!({"path": path, "kind": kind}));
         }
     }
@@ -368,6 +428,77 @@ mod tests {
         assert!(
             output.get("hash").is_none(),
             "the text is in the write's own result"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_shows_the_files_it_names_that_its_run_made_and_never_what_it_only_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("chat");
+        for folder in [
+            "chat/campaign",
+            "chat/stills",
+            "chat/node_modules/pkg",
+            "outside",
+        ] {
+            std::fs::create_dir_all(base.join(folder)).unwrap();
+        }
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let old = |name: &str| {
+            let path = base.join(name);
+            std::fs::write(&path, b"bytes").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        };
+        // Files that were there before the run: it may read them, but they are not its outputs.
+        old("chat/stills/frame.png");
+        old("chat/stills/earlier.mp4");
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        // What the run made: a video copied into a folder, a package's own image, a file outside.
+        for name in [
+            "chat/campaign/video_1080p.mp4",
+            "chat/node_modules/pkg/logo.png",
+            "outside/leak.png",
+        ] {
+            std::fs::write(base.join(name), b"bytes").unwrap();
+        }
+        let sbx = WorkspaceSandbox::new_jailed(&root).unwrap();
+        let path = |name: &str| root.join(name).to_string_lossy().into_owned();
+
+        // Named by its file name alone, as a model often writes it, and next to a file it only read.
+        let found = named(
+            &sbx,
+            "Ready: **`video_1080p.mp4`**. I looked at `stills/frame.png` too.",
+            since,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![json!({"path": path("campaign/video_1080p.mp4"), "kind": "video"})]
+        );
+        // Not named at all: nothing is added, so a build's or a test run's files never pile up as cards.
+        assert_eq!(
+            named(&sbx, "The video is ready.", since).await,
+            Vec::<Value>::new()
+        );
+        // Asked to see an earlier file again: a link shows it even though this run left it alone.
+        let found = named(
+            &sbx,
+            "Here it is: [earlier](stills/earlier.mp4). Outside: [x](../outside/leak.png)",
+            since,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![json!({"path": path("stills/earlier.mp4"), "kind": "video"})]
         );
     }
 

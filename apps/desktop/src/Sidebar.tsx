@@ -4,7 +4,7 @@ import { Icon } from "./Icon";
 import { SessionRow } from "./SessionRow";
 import { shortcut } from "./shortcut";
 
-export const medhaIcon = new URL("./assets/medha-logo.png", import.meta.url)
+export const medhaIcon = new URL("./assets/medha-mark.svg", import.meta.url)
   .href;
 
 type Props = {

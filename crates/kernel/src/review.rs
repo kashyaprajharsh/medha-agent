@@ -321,7 +321,11 @@ fn verdict(reply: &str) -> Verdict {
     let word = word
         .trim_matches(|ch: char| !ch.is_ascii_alphabetic())
         .to_ascii_uppercase();
-    let why = why.trim().trim_start_matches([':', '-', '.']).trim();
+    // Models often write "ALLOW — reason"; the dash is not part of the reason.
+    let why = why
+        .trim()
+        .trim_start_matches([':', '-', '.', '—', '–'])
+        .trim();
     let why = clipped(why.lines().next().unwrap_or_default(), 240);
     match word.as_str() {
         "ALLOW" => Verdict::Allow(if why.is_empty() {

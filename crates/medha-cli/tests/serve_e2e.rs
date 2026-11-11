@@ -185,7 +185,7 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             std::thread::sleep(Duration::from_secs(6));
         }
         let verdict = if action.contains("REVIEW_ALLOW") || action.contains("REVIEW_SLOW") {
-            "ALLOW the person asked for this step"
+            "ALLOW — the person asked for this step"
         } else {
             "UNSURE the request does not say"
         };

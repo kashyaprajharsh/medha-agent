@@ -56,6 +56,10 @@ async fn turning_autopilot_on_asks_once_about_the_network_and_yes_opens_it() {
         said.contains("reviewer may allow"),
         "the card did not say what Autopilot may allow: {said}"
     );
+    assert!(
+        said.contains("reading a web page, each command still goes to the reviewer"),
+        "the card did not say commands are still reviewed once a web page was read: {said}"
+    );
     for mode in ["careful", "autopilot"] {
         client
             .ask("session.configure", Some(&chat), json!({"mode": mode}))
@@ -187,6 +191,43 @@ async fn autopilot_allows_what_the_person_asked_with_no_card_and_says_why() {
     assert_eq!(logged.len(), 1, "{logged:?}");
     assert_eq!(logged[0]["by"], "reviewer", "{logged:?}");
     assert_eq!(logged[0]["outcome"], "allowed", "{logged:?}");
+}
+
+/// Autopilot's allow is said and logged as soon as it is given, before the command it allows runs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_allow_is_said_and_logged_before_the_command_runs() {
+    let world = World::new();
+    let (_backend, mut client, _, chat) = autopilot(&world, "allowed-first").await;
+    // A command that changes files, so it is snapshotted before it runs, as the person's `rm` was.
+    let writes = networked("echo made > made.txt; echo REVIEW_ALLOW");
+    let (cards, notices) = run(&mut client, &chat, &[writes], false).await;
+    assert_eq!(cards, 0, "{notices:?}");
+    // The command's snapshot is taken just before it runs; the allow is said and logged as it is given, before that.
+    let mut order = Vec::new();
+    for state in std::fs::read_dir(world.home().join("projects")).unwrap() {
+        let db = state.unwrap().path().join("events.db");
+        if db.is_file() {
+            let log = store::SqliteLog::open(&db).unwrap();
+            for event in log.events(chat.parse().unwrap()).await {
+                if matches!(
+                    event.kind.as_str(),
+                    "approval.decision" | "tool.effect_prepared" | "tool.observation"
+                ) {
+                    order.push(event.kind.as_str().to_owned());
+                }
+            }
+        }
+    }
+    assert_eq!(
+        order,
+        [
+            "approval.decision",
+            "tool.effect_prepared",
+            "tool.observation"
+        ],
+        "the allow was logged after the command was prepared to run"
+    );
 }
 
 /// When the reviewer is unsure, or does not answer in time, the person gets the card and the log says why.

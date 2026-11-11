@@ -140,25 +140,20 @@ pub struct Answered {
 }
 
 tokio::task_local! {
-    static ANSWERS: std::sync::Arc<std::sync::Mutex<Vec<Answered>>>;
+    static ANSWERS: tokio::sync::mpsc::UnboundedSender<Answered>;
 }
 
-/// Runs one tool call and returns, beside its result, every approval answered while it ran.
-pub async fn answers_scope<F: std::future::Future>(fut: F) -> (F::Output, Vec<Answered>) {
-    let answers = std::sync::Arc::<std::sync::Mutex<Vec<Answered>>>::default();
-    let output = ANSWERS.scope(std::sync::Arc::clone(&answers), fut).await;
-    let answered = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));
-    (output, answered)
+/// Runs one tool call with each approval answered during it sent to `answers` as it is given.
+pub async fn answers_scope<F: std::future::Future>(
+    answers: tokio::sync::mpsc::UnboundedSender<Answered>,
+    fut: F,
+) -> F::Output {
+    ANSWERS.scope(answers, fut).await
 }
 
-/// Records an answer for the tool call it was given in; outside one, there is nothing to record it to.
+/// Passes on an answer for the tool call it was given in; outside one, there is nothing to pass it to.
 pub fn record_answer(answered: Answered) {
-    let _ = ANSWERS.try_with(|answers| {
-        answers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(answered);
-    });
+    let _ = ANSWERS.try_with(|answers| answers.send(answered));
 }
 
 /// The chat's gate with every answer recorded, whoever gives it, for the kernel to log. In Autopilot the

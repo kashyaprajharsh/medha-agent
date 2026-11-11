@@ -202,7 +202,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         observation
     }
 
-    /// One tool call, with every approval answered while it ran logged beside it.
+    /// One tool call, with each approval answered during it said and logged as it is given, before what it allows runs.
     pub(super) async fn dispatch_one(
         &self,
         session: &Session,
@@ -217,22 +217,43 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let reviewer = (mode == crate::types::AutonomyLevel::Autopilot)
             .then(|| Arc::new(self.reviewer(session.id)));
         let decided = self.dispatch_decided(session, intent, web_tainted, cancel, lane, sink);
-        let (observation, answers) =
-            crate::gate::answers_scope(crate::review::review_scope(reviewer, decided)).await;
-        for answered in &answers {
-            if answered.by == crate::gate::Decider::Reviewer {
-                let why = answered.reason.as_deref().unwrap_or_default();
-                sink.notice(&format!("Allowed by Autopilot: {why}"));
+        let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
+        let decided =
+            crate::gate::answers_scope(answers, crate::review::review_scope(reviewer, decided));
+        tokio::pin!(decided);
+        // While an answer is being logged the call waits, so nothing it allows starts before its record.
+        let observation = loop {
+            tokio::select! {
+                biased;
+                Some(answer) = answered.recv() => self.record_answer(session, intent, &answer, sink).await,
+                observation = &mut decided => break observation,
             }
-            if let Err(error) = self
-                .log
-                .append(Event::approval(session, intent, answered))
-                .await
-            {
-                tracing::warn!(%error, tool = %intent.tool, "an approval answer could not be logged");
-            }
+        };
+        while let Ok(answer) = answered.try_recv() {
+            self.record_answer(session, intent, &answer, sink).await;
         }
         observation
+    }
+
+    /// Says and logs one approval's answer.
+    async fn record_answer(
+        &self,
+        session: &Session,
+        intent: &ToolIntent,
+        answered: &crate::gate::Answered,
+        sink: &dyn StreamSink,
+    ) {
+        if answered.by == crate::gate::Decider::Reviewer {
+            let why = answered.reason.as_deref().unwrap_or_default();
+            sink.notice(&format!("Allowed by Autopilot: {why}"));
+        }
+        if let Err(error) = self
+            .log
+            .append(Event::approval(session, intent, answered))
+            .await
+        {
+            tracing::warn!(%error, tool = %intent.tool, "an approval answer could not be logged");
+        }
     }
 
     /// The reviewer for this chat: its own model, log and secrets.

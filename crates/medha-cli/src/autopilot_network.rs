@@ -7,7 +7,9 @@ use crate::chat::Writer;
 pub(crate) const ASK: &str = "open the network for this chat in Autopilot";
 pub(crate) const DETAIL: &str = "In Autopilot, Medha runs edits and commands without asking, and a reviewer may allow \
      network access or folders outside the project, one action at a time.\n\n\
-     Allow: commands in this chat may use the network until the chat ends.\n\
+     Allow: commands in this chat may use the network until the chat ends. After reading a web page, \
+     each command still goes to the reviewer first, since with the network open a page could try to send \
+     your data out.\n\
      Deny: each command that needs the network goes to the reviewer, and to you when it is unsure.";
 
 /// Asks once, beside the chat so the chat stays free to take the answer; no one is asked when no one can answer.

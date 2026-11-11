@@ -539,3 +539,66 @@ entrypoint = { program = "hook.sh", args = [] }
         );
     }
 }
+
+/// A run with no screen in Autopilot does what the reviewer allows and refuses the rest at once, never waiting.
+#[cfg(unix)]
+#[test]
+fn a_run_with_no_screen_in_autopilot_allows_what_was_asked_and_refuses_the_rest_at_once() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let folder = world.folder("unattended-run");
+    let script = [
+        networked("echo made > allowed.txt; echo REVIEW_ALLOW"),
+        networked("echo made > refused.txt"),
+    ];
+    let started = std::time::Instant::now();
+    let output = medha(&world.home(), &world.provider)
+        .arg(format!("SCRIPT\n{}", script.join("\n")))
+        .current_dir(&folder)
+        .env("MEDHA_MODE", "autopilot")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    let said = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        took < Duration::from_secs(60),
+        "the run waited for someone: {took:?}\n{said}"
+    );
+    assert!(
+        folder.join("allowed.txt").exists(),
+        "what the reviewer allowed did not run\n{said}"
+    );
+    assert!(
+        !folder.join("refused.txt").exists(),
+        "what the reviewer was unsure of ran\n{said}"
+    );
+
+    let mut logged = Vec::new();
+    for state in std::fs::read_dir(world.home().join("projects")).unwrap() {
+        let db = state.unwrap().path().join("events.db");
+        if db.is_file() {
+            for event in store::SqliteLog::open(&db).unwrap().all_events().unwrap() {
+                if event.kind.as_str() == "approval.decision" {
+                    logged.push(event.payload);
+                }
+            }
+        }
+    }
+    let who: Vec<(&Value, &Value)> = logged
+        .iter()
+        .map(|answer| (&answer["by"], &answer["outcome"]))
+        .collect();
+    assert_eq!(
+        who,
+        [
+            (&json!("reviewer"), &json!("allowed")),
+            (&json!("nobody"), &json!("denied"))
+        ],
+        "{logged:?}"
+    );
+}

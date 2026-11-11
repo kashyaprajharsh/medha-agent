@@ -2489,6 +2489,20 @@ fn sweep_stale_homes(root: &Path, legacy: &Path) {
     }
 }
 
+/// The user's own folders by name, kept read-only in the private home so a write meant for them fails where it can be seen.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const USER_FOLDERS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+    "Templates",
+    "Videos",
+];
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl IsolatedHome {
     /// The one isolated HOME for this process, shared by every native backend and
@@ -2498,6 +2512,20 @@ impl IsolatedHome {
         static SHARED: std::sync::OnceLock<std::sync::Arc<IsolatedHome>> =
             std::sync::OnceLock::new();
         std::sync::Arc::clone(SHARED.get_or_init(Self::new))
+    }
+
+    /// Puts back any of the user's folder names a command removed or replaced, each empty and read-only.
+    fn guard_user_folders(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        for name in USER_FOLDERS {
+            let folder = self.path.join(name);
+            let is_dir = std::fs::symlink_metadata(&folder).is_ok_and(|meta| meta.is_dir());
+            if !is_dir {
+                let _ = std::fs::remove_file(&folder);
+                let _ = std::fs::create_dir(&folder);
+            }
+            let _ = std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555));
+        }
     }
 
     fn new() -> std::sync::Arc<Self> {
@@ -2513,6 +2541,7 @@ impl IsolatedHome {
         let path = requested.canonicalize().unwrap_or(requested);
         let home = std::sync::Arc::new(Self { path, _lock: lock });
         home.prepare();
+        home.guard_user_folders();
         home
     }
 
@@ -2652,6 +2681,41 @@ impl Drop for IsolatedHome {
         // user-controlled path participates in cleanup.
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// The user's own folder a path in the private home's copy of it stands for, such as `~/Desktop` in a command.
+pub fn users_own_folder(path: &Path) -> Option<PathBuf> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let homes = std::env::temp_dir().join(ISOLATED_HOMES);
+        let homes = homes.canonicalize().unwrap_or(homes);
+        let mut inside = path.strip_prefix(&homes).ok()?.components();
+        inside.next()?;
+        let rest = inside.as_path();
+        let name = rest.components().next()?.as_os_str().to_str()?;
+        USER_FOLDERS
+            .contains(&name)
+            .then(|| home_dir().map(|real| real.join(rest)))
+            .flatten()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Each path a command's output names inside the private home's user folders, beside the user's own folder it stood for.
+pub fn private_user_folders_in(output: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for token in output.lines().flat_map(absolute_path_tokens) {
+        if let Some(real) = users_own_folder(&token)
+            && !found.iter().any(|(named, _)| *named == token)
+        {
+            found.push((token, real));
+        }
+    }
+    found
 }
 
 /// The same home the permissions crate protects; Windows sets no `HOME`, so it comes from the user profile.
@@ -2892,7 +2956,8 @@ fn sensitive_deny(access: &str, secret: &Path, exceptions: &[PathBuf]) -> String
 /// report denials as `prog: /path: message`, so split on the separators that
 /// bound a path and keep what still looks absolute.
 fn absolute_path_tokens(text: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    text.split([' ', '\t', ':', '\'', '"', '`'])
+    // GNU tools quote a path with ‘ ’ in a UTF-8 locale.
+    text.split([' ', '\t', ':', '\'', '"', '`', '‘', '’'])
         .map(str::trim)
         .filter(|token| token.len() > 1 && token.starts_with('/'))
         .map(PathBuf::from)
@@ -3027,6 +3092,7 @@ pub(crate) fn escalation_candidates(
             || sensitive
                 .iter()
                 .any(|secret| secret.starts_with(&root) || root.starts_with(secret))
+            || users_own_folder(&root).is_some()
             || candidates.contains(&root)
         {
             continue;
@@ -3048,6 +3114,7 @@ fn workspace_contains_native_credentials(workspace: &Path) -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn apply_isolated_environment(cmd: &mut tokio::process::Command, home: &IsolatedHome) {
+    home.guard_user_folders();
     let home_path = &home.path;
     cmd.env("HOME", home_path)
         .env("TMPDIR", home_path.join("tmp"))

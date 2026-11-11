@@ -7140,6 +7140,10 @@ impl Tool for ShellExec {
                 if shell_hints::asked_on_terminal(&output) {
                     result["next_step"] = json!(shell_hints::TERMINAL_PROMPT);
                 } else if invocation.jailed()
+                    && let Some(next) = shell_hints::private_home_folder(&output)
+                {
+                    result["sandbox_blocked"] = json!(next);
+                } else if invocation.jailed()
                     && (denied_filesystem || shell_hints::local_socket_refused(&output))
                     && let Some(next) =
                         shell_hints::sandbox_blocked(&command, &output, &denied_paths)

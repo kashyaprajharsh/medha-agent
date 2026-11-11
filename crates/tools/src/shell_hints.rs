@@ -44,6 +44,21 @@ pub(crate) fn asked_on_terminal(output: &str) -> bool {
     .any(|message| output.contains(message))
 }
 
+/// When a failed command wrote to `~/Desktop` or another user folder name, what the model must know: `~` is not the user's.
+pub(crate) fn private_home_folder(output: &str) -> Option<String> {
+    let found = sandbox::exec::private_user_folders_in(output);
+    let (private, real) = found.first()?;
+    Some(format!(
+        "~ in a command is Medha's private home for commands, not the user's home, so {} is not \
+         the user's folder and nothing reached it. The user's own is {}. To put a file there, \
+         rerun with that absolute path in place of ~ and add its folder to write_paths; the user \
+         reviews that run. Never tell the user a file is in one of their folders unless a command \
+         wrote it to that absolute path.",
+        private.display(),
+        real.display()
+    ))
+}
+
 /// None unless the output shows the sandbox itself refusing.
 pub(crate) fn sandbox_blocked(
     command: &str,

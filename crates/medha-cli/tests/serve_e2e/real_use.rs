@@ -1123,6 +1123,39 @@ async fn a_refusal_naming_no_full_path_names_the_folder_the_command_ran_in() {
     );
 }
 
+/// A copy to ~/Desktop fails where ~ is the sandbox's own home, and names the user's real Desktop to use instead.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_to_the_private_homes_desktop_fails_and_names_the_users_own() {
+    let world = World::new();
+    let os_home = world.folder("os-home");
+    let backend = world.backend_in(&[("HOME", os_home.to_str().unwrap())]);
+    let mut client = backend.connect().await;
+    let folder = world.folder("project");
+    std::fs::write(folder.join("video.mp4"), "frames").unwrap();
+    let chat = client.open(&folder).await;
+    let copy = json!({"command": "mkdir -p ~/Desktop/campaign && cp video.mp4 ~/Desktop/campaign/",
+        "network": false});
+    scripted(&mut client, &world, &chat, &[format!("shell_exec {copy}")]).await;
+    let refused = result_of(&world, &chat, 0).await;
+    assert_ne!(
+        refused["payload"]["exit_code"],
+        json!(0),
+        "the copy succeeded where the user never sees it: {refused}"
+    );
+    let real = os_home.join("Desktop").display().to_string();
+    assert!(
+        refused["payload"]["sandbox_blocked"]
+            .as_str()
+            .is_some_and(|note| note.contains(&real)),
+        "the note did not name the user's own Desktop: {refused}"
+    );
+    assert!(
+        refused["payload"].get("denied_paths").is_none(),
+        "the sandbox's own folder was offered for approval: {refused}"
+    );
+}
+
 /// A command that changes folder itself names no refused folder, and is told to use workdir so the next refusal can.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

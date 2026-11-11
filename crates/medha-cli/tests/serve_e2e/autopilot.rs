@@ -463,3 +463,79 @@ async fn without_an_os_sandbox_the_reviewer_answers_commands_and_nothing_asks_ab
     assert_eq!(logged.len(), 1, "{logged:?}");
     assert_eq!(logged[0]["by"], "reviewer", "{logged:?}");
 }
+
+/// A plugin hook that wants a person asked always reaches the person, even where the reviewer would allow.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hook_asking_for_approval_always_asks_the_person_in_autopilot() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new();
+    let package = world.home().join("guard-package");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("plugin.toml"),
+        r#"schema_version = 1
+id = "dev.medha.guard"
+name = "Guard"
+version = "0.1.0"
+medha = ">=0.1.0, <0.2.0"
+
+[[components]]
+kind = "hook"
+id = "ask"
+points = ["pre_tool"]
+protocol = "exit_status"
+matcher = ["Bash"]
+failure = "fail_closed"
+timeout_ms = 5000
+entrypoint = { program = "hook.sh", args = [] }
+"#,
+    )
+    .unwrap();
+    let hook = package.join("hook.sh");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ncat >/dev/null\necho '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"the guard wants a person\"}}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let folder = world.folder("hooked");
+    for args in [
+        vec!["plugins", "install", package.to_str().unwrap()],
+        vec!["plugins", "enable", "dev.medha.guard"],
+    ] {
+        let done = std::process::Command::new(env!("CARGO_BIN_EXE_medha"))
+            .args(&args)
+            .current_dir(&folder)
+            .env("MEDHA_HOME", world.home())
+            .output()
+            .unwrap();
+        assert!(
+            done.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+    }
+
+    let (_backend, mut client, _, chat) = autopilot(&world, "hooked").await;
+    // A plain command asks on its own card; one needing the network asks on its access card.
+    let command = json!({"command": "echo REVIEW_ALLOW"});
+    let steps = [
+        format!("shell_exec {command}"),
+        networked("echo REVIEW_ALLOW"),
+    ];
+    let (cards, notices) = run(&mut client, &chat, &steps, false).await;
+    assert_eq!(
+        cards, 2,
+        "the hook's request for a person did not reach the person: {notices:?}"
+    );
+    let logged = answers(&world, &chat).await;
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    for answer in &logged {
+        assert_eq!(answer["by"], "person", "{logged:?}");
+        assert!(
+            answer["review"].is_null(),
+            "the reviewer was asked: {logged:?}"
+        );
+    }
+}

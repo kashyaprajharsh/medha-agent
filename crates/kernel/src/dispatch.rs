@@ -420,8 +420,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     let grant = self
                         .executor
                         .grant_access(&access, &detail, access_escalated);
-                    // Leaving the sandbox is never the reviewer's call: the person always sees it.
-                    if access.outside_sandbox {
+                    // Leaving the sandbox, or a hook wanting a person, is never the reviewer's call.
+                    if access.outside_sandbox || hook_approval_reason.is_some() {
                         crate::review::withheld(grant).await
                     } else {
                         grant.await
@@ -490,7 +490,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         detail.push_str(reason);
                     }
                     let action = approval_key(intent);
-                    self.gate.confirm(&action, Some(&detail), escalated).await
+                    let confirm = self.gate.confirm(&action, Some(&detail), escalated);
+                    if hook_approval_reason.is_some() {
+                        crate::review::withheld(confirm).await
+                    } else {
+                        confirm.await
+                    }
                 };
                 self.observe_hook(
                     session,

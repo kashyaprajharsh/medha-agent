@@ -4514,7 +4514,7 @@ async fn tavily_search(
         .json(&body)
         .send()
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+        .map_err(request_failed)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -4558,7 +4558,7 @@ async fn tavily_extract(
         .json(&body)
         .send()
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+        .map_err(request_failed)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let brief: String = resp
@@ -4625,7 +4625,7 @@ async fn tavily_crawl(
         .json(&body)
         .send()
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+        .map_err(request_failed)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let brief: String = resp
@@ -4693,7 +4693,7 @@ async fn brave_search(
         .query(&[("q", query), ("count", count.as_str())])
         .send()
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+        .map_err(request_failed)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -4732,7 +4732,7 @@ async fn searxng_search(
         .query(&[("q", query), ("format", "json")])
         .send()
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+        .map_err(request_failed)?;
     if !resp.status().is_success() {
         return Err(ToolError::Failed(format!("searxng {}", resp.status())));
     }
@@ -4916,6 +4916,26 @@ impl Tool for WebFetch {
     }
 }
 
+#[cfg(test)]
+#[path = "fetch_errors_tests.rs"]
+mod fetch_errors_tests;
+
+/// A failed request with what lies under it: "error sending request" alone does not say whether DNS, TLS or the
+/// connection failed.
+fn request_failed(error: reqwest::Error) -> ToolError {
+    let mut said = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(inner) = cause {
+        let text = inner.to_string();
+        if !said.contains(&text) {
+            said.push_str(": ");
+            said.push_str(&text);
+        }
+        cause = inner.source();
+    }
+    ToolError::Failed(said)
+}
+
 /// Free plain HTTP fetch → Markdown. Returns Err on network failure or a non-2xx
 /// status. A saved extraction setting is required for any third-party rescue.
 async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
@@ -4934,7 +4954,7 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
             .get(current.clone())
             .send()
             .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+            .map_err(request_failed)?;
         validate_connected_peer(r.remote_addr(), &target)?;
         if !r.status().is_redirection() {
             break r;

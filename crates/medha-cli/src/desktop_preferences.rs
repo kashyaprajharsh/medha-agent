@@ -480,6 +480,47 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             })?;
             Ok(json!({"saved": true}))
         }
+        "settings.agent" => {
+            let agent = config::load()?.unwrap_or_default().agent;
+            Ok(json!({"waits": {
+                "approval_timeout": agent.approval_timeout,
+                "question_timeout": agent.question_timeout,
+                "review_timeout": agent.review_timeout,
+                "server_waits": agent.server_waits,
+            }}))
+        }
+        "settings.agent.save" => {
+            let key = text(params, "key")?;
+            let value = match params.get("value").filter(|value| !value.is_null()) {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("{key} must be a whole number, 0 or more"))?,
+                ),
+            };
+            // The reviewer always has a limit: 0 would mean no time at all.
+            if key == "review_timeout" && value == Some(0) {
+                bail!("The reviewer needs at least 1 second");
+            }
+            config::edit(|cfg| {
+                let agent = &mut cfg.agent;
+                match key {
+                    "approval_timeout" => agent.approval_timeout = value,
+                    "question_timeout" => agent.question_timeout = value,
+                    "review_timeout" => agent.review_timeout = value,
+                    "server_waits" => {
+                        agent.server_waits = value
+                            .map(u32::try_from)
+                            .transpose()
+                            .map_err(|_| anyhow!("server_waits is too large"))?;
+                    }
+                    _ => bail!("{key} is not a wait Medha knows"),
+                }
+                Ok(())
+            })?;
+            Ok(json!({"saved": true}))
+        }
         "settings.tools.switch" => {
             let tool = text(params, "tool")?;
             let on = params["on"]

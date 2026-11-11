@@ -5390,6 +5390,57 @@ async fn limits_are_saved_to_the_project_lock_through_the_backend() {
     client.open(&folder).await;
 }
 
+/// The desktop sets how long Medha waits for the person, its reviewer and its model server, in the person's own settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waits_are_saved_to_the_persons_settings_through_the_backend() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = world.home().join("config.toml");
+    std::fs::write(&config, "[agent]\nquestion_timeout = 120\n").unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("waits");
+    let save = |key: &str, value: Value| json!({"method": "settings.agent.save", "params": {"key": key, "value": value}});
+    for (key, value) in [
+        ("approval_timeout", 600),
+        ("review_timeout", 45),
+        ("server_waits", 0),
+    ] {
+        client
+            .about(&folder, save(key, json!(value)))
+            .await
+            .unwrap();
+    }
+    let waits = client
+        .about(&folder, json!({"method": "settings.agent"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        waits["waits"],
+        json!({"approval_timeout": 600, "question_timeout": 120, "review_timeout": 45, "server_waits": 0}),
+        "{waits}"
+    );
+    // Clearing goes back to Medha's own default.
+    client
+        .about(&folder, save("question_timeout", Value::Null))
+        .await
+        .unwrap();
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(!written.contains("question_timeout"), "{written}");
+    assert!(written.contains("approval_timeout = 600"), "{written}");
+
+    // A reviewer always has a limit, so it cannot be told to take no time or forever.
+    for bad in [
+        save("review_timeout", json!(0)),
+        save("approval_timeout", json!(-1)),
+        save("approval_timeout", json!(1.5)),
+        save("identity", json!(1)),
+    ] {
+        assert!(client.about(&folder, bad.clone()).await.is_err(), "{bad}");
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), written);
+}
+
 /// A new version of an output is linked by what the person's message names,
 /// sent as data. The model reads which output in words and never sees an ID,
 /// and nothing it writes back can name one.

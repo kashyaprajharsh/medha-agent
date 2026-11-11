@@ -782,6 +782,8 @@ async fn settings_request(
         "settings.health.fix",
         "settings.budget",
         "settings.budget.save",
+        "settings.agent",
+        "settings.agent.save",
         "settings.tools",
         "settings.tools.save",
         "settings.tools.switch",

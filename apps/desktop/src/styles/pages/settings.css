@@ -352,6 +352,39 @@
   color: var(--dim);
 }
 
+/* Approvals: the same rows as Limits, under plain section headings, each box with its unit. */
+.wait-section {
+  margin: 0 0 var(--s-6);
+}
+.wait-section h3 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-2);
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+.wait-section h3 span {
+  color: var(--dim);
+  font-size: var(--text-sm);
+  font-weight: 400;
+}
+.limits-list .wait-input {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--s-2);
+}
+.limits-list .wait-input input {
+  flex: 0 0 96px;
+  width: 96px;
+  font-variant-numeric: tabular-nums;
+}
+.limits-list .wait-input small {
+  width: 56px;
+}
+
 .hooks-state {
   display: flex;
   align-items: center;

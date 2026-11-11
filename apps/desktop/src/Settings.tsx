@@ -4,6 +4,7 @@ import { Health } from "./Health";
 import { Keys } from "./Keys";
 import { Usage } from "./Usage";
 import { Memory } from "./Memory";
+import { Approvals } from "./Approvals";
 import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
@@ -187,7 +188,7 @@ export function Settings({
     <div className="app-page">
       <div className="page-content">
         <div className="page-tabs" role="tablist" aria-label="Settings">
-          {["models", "keys", "web search", "instructions", "memory", "usage", "appearance", "health"].map(
+          {["models", "keys", "web search", "instructions", "approvals", "memory", "usage", "appearance", "health"].map(
             (name) => (
               <button
                 role="tab"
@@ -219,6 +220,7 @@ export function Settings({
         {tab === "health" && <Health />}
         {tab === "keys" && <Keys />}
         {tab === "usage" && <Usage />}
+        {tab === "approvals" && <Approvals />}
         {tab === "memory" && <Memory sessionKey={sessionKey} ensureOpen={ensureOpen} />}
         {tab === "models" && (
           <>

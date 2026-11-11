@@ -6,6 +6,7 @@ mod attachments;
 mod backend;
 mod files;
 mod git;
+mod glass;
 mod kept;
 mod live;
 mod outputs;
@@ -854,6 +855,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            glass::window_glass,
             workspace_list,
             workspace_choose,
             folder_choose,

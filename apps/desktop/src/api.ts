@@ -220,6 +220,8 @@ export type Workspace = {
 };
 export type ExtensionSourceKind = "skill_folder" | "skill_file" | "plugin_folder";
 export const desktop = {
+  /** Applies the system's window material where there is one (Mica on Windows 11), and says whether it took. */
+  windowGlass: () => invoke<boolean>("window_glass"),
   admitImage: (bytes: Uint8Array) =>
     invoke<{ mime: string; data: string; note?: string }>("image_admit", bytes),
   workspaces: () =>

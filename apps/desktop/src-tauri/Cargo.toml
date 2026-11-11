@@ -47,6 +47,10 @@ tauri-plugin-updater = { version = "2", default-features = false, features = ["r
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The same version Tauri's own window handle comes from, so the handle passes straight to DWM.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
 [dev-dependencies]
 test-support = { path = "../../../crates/test-support" }
 medha-client = { path = "../../../crates/medha-client", features = ["test-support"] }

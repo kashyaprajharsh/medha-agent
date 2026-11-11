@@ -10,6 +10,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { App } from "./App";
 import { MAC } from "./shortcut";
+import { useWindowGlass } from "./windowGlass";
 import {
   createApi,
   desktop,
@@ -73,11 +74,12 @@ export function WorkspaceHost() {
   );
   const systemDark = useSystemDark();
   const theme = mode === "system" ? (systemDark ? "dark" : "light") : mode;
+  const windowGlass = useWindowGlass(MAC, desktop.windowGlass);
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.platform = MAC ? "mac" : "other";
-    // The window itself is glass where the platform frosts the desktop behind it: macOS today.
-    root.toggleAttribute("data-window-glass", MAC);
+    // The window itself is glass where the platform frosts the desktop behind it: macOS, and Windows 11 once Mica took.
+    root.toggleAttribute("data-window-glass", windowGlass);
     root.dataset.switching = "";
     root.dataset.theme = theme;
     root.dataset.look = look;
@@ -96,7 +98,7 @@ export function WorkspaceHost() {
       /* private storage */
     }
     return () => cancelAnimationFrame(settle);
-  }, [theme, mode, look, textSize]);
+  }, [theme, mode, look, textSize, windowGlass]);
   function select(id: string) {
     setSelected(id);
     setVisited((old) => (old.includes(id) ? old : [...old, id]));

@@ -2087,6 +2087,7 @@ dependencies = [
  "test-support",
  "tokio",
  "transcript-view",
+ "windows",
  "wire",
 ]
 

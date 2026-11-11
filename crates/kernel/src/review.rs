@@ -134,20 +134,22 @@ impl Reviewer {
                 "review",
                 Some(&quiet),
             )
-            .await
-            .ok()?;
+            .await?;
             let mut text = String::new();
             while let Some(block) = stream.next().await {
-                if let Block::Text(piece) = block.ok()? {
+                if let Block::Text(piece) = block? {
                     text.push_str(&piece);
                 }
             }
-            Some(text)
+            Ok::<_, crate::ProviderError>(text)
         })
         .await;
         match answer {
-            Ok(Some(text)) => verdict(&text),
-            Ok(None) => Verdict::Defer("the reviewer could not be reached".into()),
+            Ok(Ok(text)) => verdict(&text),
+            Ok(Err(error)) => Verdict::Defer(format!(
+                "the reviewer could not run: {}",
+                self.secrets.redact(&error.to_string())
+            )),
             Err(_) => Verdict::Defer("the reviewer did not answer in time".into()),
         }
     }

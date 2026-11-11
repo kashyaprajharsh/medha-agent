@@ -363,8 +363,8 @@ impl HumanGate for AutoDeny {
 
     fn denial_reason(&self) -> &'static str {
         "this action needs approval and the run is headless, so no one could be asked; \
-         run medha in a terminal to answer it, or set MEDHA_MODE=autopilot so commands inside \
-         the OS jail run unasked"
+         run medha in a terminal to answer it. In MEDHA_MODE=autopilot a reviewer allows what \
+         the request covers, and refuses the rest when no one can be asked"
     }
 }
 

@@ -17,7 +17,7 @@ serde_json.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 ulid = { workspace = true }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 sha2 = "0.10"
 tokio.workspace = true
 dunce = "1"

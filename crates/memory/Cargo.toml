@@ -18,7 +18,7 @@ ulid = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 
 [dev-dependencies]
 test-support = { path = "../test-support" }

@@ -15,7 +15,7 @@ fn an_update_changes_access_but_never_what_the_key_is_bound_to() {
     apply_mcp_update(
         &mut server,
         &json!({
-            "trust": "trusted", "network": false, "parallel": true,
+            "trust": "trusted", "network": false, "parallel": true, "private_sign_in": true,
             "deny_tools": ["delete_repo", " "], "command": ["rm"], "env": {"X": "1"}
         }),
     )
@@ -23,9 +23,34 @@ fn an_update_changes_access_but_never_what_the_key_is_bound_to() {
     assert_eq!(server.trust, "trusted");
     assert_eq!(server.network, Some(false));
     assert!(server.parallel_calls);
+    assert!(server.private_sign_in);
     assert_eq!(server.deny_tools, ["delete_repo"]);
     assert_eq!(server.command, ["npx", "server"]);
     assert_eq!(server.env.len(), 1);
+}
+
+/// Private sign-in chosen with `mcp add` is saved in the config and reaches the server's sign-in.
+#[test]
+fn private_sign_in_from_mcp_add_is_saved_and_reaches_the_server() {
+    let args = [
+        "corp",
+        "--url",
+        "https://mcp.corp/mcp",
+        "--oauth",
+        "--private-sign-in",
+    ];
+    let parsed = config::parse_mcp_add_args(args).unwrap();
+    assert!(parsed.server.private_sign_in);
+    let saved = toml::to_string(&parsed.server).unwrap();
+    assert!(saved.contains("private_sign_in = true"), "{saved}");
+    let read: config::McpServer = toml::from_str(&saved).unwrap();
+    assert!(config::resolve_mcp_server("corp", &read).private_sign_in);
+    let plain = config::parse_mcp_add_args(["plain", "--url", "https://mcp.corp/mcp"]).unwrap();
+    assert!(
+        !toml::to_string(&plain.server)
+            .unwrap()
+            .contains("private_sign_in")
+    );
 }
 
 #[test]

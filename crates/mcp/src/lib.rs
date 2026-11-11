@@ -260,6 +260,9 @@ pub struct ServerConfig {
     /// Extra read-only roots for this server's jail, e.g. the package that
     /// ships its code. Never widened by approvals.
     pub read_roots: Vec<PathBuf>,
+    /// Lets this server's sign-in reach a host on a private network, as an organisation's own sign-in server is.
+    /// This machine and cloud metadata stay closed.
+    pub private_sign_in: bool,
 }
 
 impl ServerConfig {
@@ -1157,6 +1160,7 @@ impl McpManager {
             self.inner.config.auth_timeout,
             self.inner.config.http_timeout,
             announce,
+            server.private_sign_in,
         )
         .await
         {
@@ -2047,6 +2051,7 @@ impl McpManager {
                     url,
                     renewal::Persisted::new(store, &server.id, url),
                     self.inner.config.http_timeout,
+                    server.private_sign_in,
                 )
                 .await?;
                 let lapse = client.lapse();
@@ -2063,7 +2068,9 @@ impl McpManager {
                 if self.stored_token(&server.id, url).is_some() {
                     return Box::pin(self.connect_remote(server, url, &RemoteAuth::OAuth)).await;
                 }
-                match oauth::probe(url, self.inner.config.http_timeout).await {
+                match oauth::probe(url, self.inner.config.http_timeout, server.private_sign_in)
+                    .await
+                {
                     oauth::Challenge::Open => {
                         Box::pin(self.connect_remote(server, url, &RemoteAuth::None)).await
                     }

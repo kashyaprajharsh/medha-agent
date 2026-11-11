@@ -49,14 +49,19 @@ pub(crate) fn require_secure(url: &str) -> Result<(), Error> {
 #[derive(Clone)]
 struct EndpointPolicy {
     base: url::Url,
+    /// The person allowed this server's sign-in on their organisation's private network.
+    private_sign_in: bool,
 }
 
 impl EndpointPolicy {
-    fn new(base: &str) -> Result<Self, Error> {
+    fn new(base: &str, private_sign_in: bool) -> Result<Self, Error> {
         require_secure(base)?;
         let base =
             url::Url::parse(base).map_err(|error| Error::BadUrl(format!("{base}: {error}")))?;
-        Ok(Self { base })
+        Ok(Self {
+            base,
+            private_sign_in,
+        })
     }
 
     fn validate(&self, candidate: &str) -> Result<url::Url, Error> {
@@ -75,12 +80,32 @@ impl EndpointPolicy {
             return Ok(url);
         }
         let host = url.host_str().unwrap_or_default();
-        if disallowed_host(host) {
+        let literal = match url.host() {
+            Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+            _ => None,
+        };
+        let allowed_private = self.private_sign_in && literal.is_some_and(private_ip);
+        if disallowed_host(host) && !allowed_private {
             return Err(Error::BadUrl(format!(
                 "OAuth endpoint '{url}' targets a private, loopback or metadata host"
             )));
         }
         Ok(url)
+    }
+}
+
+/// The organisation's own networks: RFC 1918, the shared space VPNs use, and IPv6 unique local addresses.
+fn private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_private() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => private_ip(IpAddr::V4(mapped)),
+            None => (ip.segments()[0] & 0xfe00) == 0xfc00,
+        },
     }
 }
 
@@ -171,6 +196,7 @@ fn system_lookup() -> Lookup {
 struct AddressGuard {
     /// The host of the server the person chose.
     chosen: String,
+    private_sign_in: bool,
     lookup: Lookup,
 }
 
@@ -182,7 +208,11 @@ impl AddressGuard {
             .unwrap_or_default()
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        Arc::new(Self { chosen, lookup })
+        Arc::new(Self {
+            chosen,
+            private_sign_in: policy.private_sign_in,
+            lookup,
+        })
     }
 }
 
@@ -190,16 +220,21 @@ impl reqwest::dns::Resolve for AddressGuard {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
         let chosen = host == self.chosen;
+        let private_sign_in = self.private_sign_in;
         let lookup = Arc::clone(&self.lookup);
         Box::pin(async move {
             let addresses = lookup(host.clone()).await?;
             // The chosen server may live anywhere; any other name must answer with public addresses only, all of them,
             // checked here where the connection is made, so a name cannot pass a check and then point elsewhere.
-            if !chosen
-                && let Some(inner) = addresses.iter().find(|address| disallowed_ip(address.ip()))
-            {
+            let refused = |ip: IpAddr| disallowed_ip(ip) && !(private_sign_in && private_ip(ip));
+            if !chosen && let Some(inner) = addresses.iter().find(|address| refused(address.ip())) {
+                let hint = if private_ip(inner.ip()) {
+                    "; if it is your organisation's own sign-in server, turn on private sign-in for this server"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "OAuth endpoint host '{host}' resolves to a private, loopback or metadata address ({})",
+                    "OAuth endpoint host '{host}' resolves to a private, loopback or metadata address ({}){hint}",
                     inner.ip()
                 )
                 .into());
@@ -249,12 +284,11 @@ struct HardenedOAuthClient {
 }
 
 impl HardenedOAuthClient {
-    fn new(base: &str, total: Duration) -> Result<Self, Error> {
-        Self::with_lookup(base, total, system_lookup())
+    fn new(policy: EndpointPolicy, total: Duration) -> Result<Self, Error> {
+        Self::with_lookup(policy, total, system_lookup())
     }
 
-    fn with_lookup(base: &str, total: Duration, lookup: Lookup) -> Result<Self, Error> {
-        let policy = EndpointPolicy::new(base)?;
+    fn with_lookup(policy: EndpointPolicy, total: Duration, lookup: Lookup) -> Result<Self, Error> {
         let guard = AddressGuard::for_policy(&policy, lookup);
         let follow = follow_client(policy.clone(), total, &guard)?;
         let stop = client_builder(total, &guard)
@@ -341,8 +375,8 @@ pub(crate) enum Challenge {
 /// Per the MCP spec an unauthorized endpoint answers 401 with
 /// `WWW-Authenticate`; a `resource_metadata` parameter means OAuth discovery
 /// is available and the browser flow can run unattended.
-pub(crate) async fn probe(url: &str, http: Duration) -> Challenge {
-    let Ok(policy) = EndpointPolicy::new(url) else {
+pub(crate) async fn probe(url: &str, http: Duration, private_sign_in: bool) -> Challenge {
+    let Ok(policy) = EndpointPolicy::new(url, private_sign_in) else {
         return Challenge::Open;
     };
     let guard = AddressGuard::for_policy(&policy, system_lookup());
@@ -405,12 +439,14 @@ pub(crate) async fn client_from_stored(
     url: &str,
     store: Persisted,
     http: Duration,
+    private_sign_in: bool,
 ) -> Result<RenewingClient, Error> {
     // Unreadable is no better than absent: only a sign-in recovers either.
     if store.tokens().await.is_none() {
         return Err(Error::NeedsAuth(store.server().to_string()));
     }
-    let oauth_http = HardenedOAuthClient::new(url, http)?;
+    let policy = EndpointPolicy::new(url, private_sign_in)?;
+    let oauth_http = HardenedOAuthClient::new(policy.clone(), http)?;
     let refused = Arc::clone(&oauth_http.refused);
     let mut manager = AuthorizationManager::new_with_oauth_http_client(url, Arc::new(oauth_http))
         .await
@@ -419,7 +455,6 @@ pub(crate) async fn client_from_stored(
     if !manager.initialize_from_store().await.map_err(auth_failed)? {
         return Err(Error::NeedsAuth(store.server().to_string()));
     }
-    let policy = EndpointPolicy::new(url)?;
     let guard = AddressGuard::for_policy(&policy, system_lookup());
     let resource = follow_client(policy, http, &guard)?;
     Ok(RenewingClient::new(resource, manager, store, refused))
@@ -460,6 +495,7 @@ pub(crate) async fn authorize(
     wait: Duration,
     http: Duration,
     announce: &UrlSink,
+    private_sign_in: bool,
 ) -> Result<String, Error> {
     require_secure(url)?;
     // Bind before starting the flow: the port is part of the redirect URI the
@@ -473,8 +509,8 @@ pub(crate) async fn authorize(
     // so transport policy must hold for the whole exchange. Those go over
     // `http_client` (https-only via `require_secure`); checked here is the one
     // endpoint that leaves the client — where the browser is sent.
-    let policy = EndpointPolicy::new(url)?;
-    let oauth_http = Arc::new(HardenedOAuthClient::new(url, http)?);
+    let policy = EndpointPolicy::new(url, private_sign_in)?;
+    let oauth_http = Arc::new(HardenedOAuthClient::new(policy.clone(), http)?);
     let mut state = register(url, &oauth_http, port)
         .await
         .map_err(auth_failed)?;
@@ -592,6 +628,48 @@ mod tests {
         (format!("http://127.0.0.1:{port}/mcp"), asked)
     }
 
+    /// Private sign-in lets a sign-in host on the organisation's network through, never this machine or cloud metadata.
+    #[tokio::test]
+    async fn private_sign_in_allows_the_organisations_network_and_never_this_machine() {
+        let lookup: Lookup = Arc::new(|host| {
+            Box::pin(async move {
+                let ip = match host.as_str() {
+                    "sso.corp" => "10.0.0.9",
+                    "vpn.corp" => "100.100.1.2",
+                    "v6.corp" => "[fd00::9]",
+                    "meta.corp" => "169.254.169.254",
+                    _ => "127.0.0.1",
+                };
+                Ok(vec![format!("{ip}:0").parse().unwrap()])
+            })
+        });
+        for (private, host, allowed) in [
+            (false, "sso.corp", false),
+            (true, "sso.corp", true),
+            (true, "vpn.corp", true),
+            (true, "v6.corp", true),
+            (true, "meta.corp", false),
+            (true, "local.corp", false),
+        ] {
+            let policy = EndpointPolicy::new("https://mcp.corp/mcp", private).unwrap();
+            let guard = AddressGuard::for_policy(&policy, Arc::clone(&lookup));
+            let name = host.parse().unwrap();
+            let resolved = reqwest::dns::Resolve::resolve(&*guard, name).await;
+            assert_eq!(
+                resolved.is_ok(),
+                allowed,
+                "{host} with private sign-in {private}"
+            );
+        }
+        let on = EndpointPolicy::new("https://mcp.corp/mcp", true).unwrap();
+        assert!(on.validate("https://10.0.0.9/authorize").is_ok());
+        assert!(on.validate("https://[fd00::9]/authorize").is_ok());
+        assert!(on.validate("https://169.254.169.254/latest").is_err());
+        assert!(on.validate("https://127.0.0.1/authorize").is_err());
+        let off = EndpointPolicy::new("https://mcp.corp/mcp", false).unwrap();
+        assert!(off.validate("https://10.0.0.9/authorize").is_err());
+    }
+
     /// A name that points at an inner address is refused when Medha connects, not by how the name reads.
     #[tokio::test]
     async fn an_oauth_host_that_resolves_to_an_inner_address_is_never_reached() {
@@ -618,12 +696,9 @@ mod tests {
         // Both names point at this machine, as a hostile DNS answer would.
         let lookup: Lookup =
             Arc::new(|_| Box::pin(async { Ok(vec!["127.0.0.1:0".parse().unwrap()]) }));
-        let http = HardenedOAuthClient::with_lookup(
-            "https://mcp.example.com/mcp",
-            Duration::from_secs(5),
-            lookup,
-        )
-        .unwrap();
+        let policy = EndpointPolicy::new("https://mcp.example.com/mcp", false).unwrap();
+        let http =
+            HardenedOAuthClient::with_lookup(policy, Duration::from_secs(5), lookup).unwrap();
 
         let attack = http
             .stop
@@ -704,8 +779,9 @@ mod tests {
             names.lock().unwrap().push(host);
             Box::pin(async { Ok(vec!["127.0.0.1:0".parse().unwrap()]) })
         });
+        let policy = EndpointPolicy::new(&url, false).unwrap();
         let http = Arc::new(
-            HardenedOAuthClient::with_lookup(&url, Duration::from_secs(5), lookup).unwrap(),
+            HardenedOAuthClient::with_lookup(policy, Duration::from_secs(5), lookup).unwrap(),
         );
 
         let signed_in = register(&url, &http, 4242).await;
@@ -733,7 +809,8 @@ mod tests {
     #[tokio::test]
     async fn a_provider_that_refuses_the_address_is_asked_again_by_name() {
         let (url, asked) = provider_that_refuses_the_address().await;
-        let http = Arc::new(HardenedOAuthClient::new(&url, Duration::from_secs(5)).unwrap());
+        let policy = EndpointPolicy::new(&url, false).unwrap();
+        let http = Arc::new(HardenedOAuthClient::new(policy, Duration::from_secs(5)).unwrap());
         let state = register(&url, &http, 4242).await.unwrap();
         let sent = state.get_authorization_url().await.unwrap();
         assert!(

@@ -19,6 +19,7 @@ export type McpServer = {
   deny_tools: string[];
   network: boolean | null;
   parallel: boolean;
+  private_sign_in: boolean;
 };
 
 export type McpStatus = { state: string; tools: number; hidden?: number; detail?: string };
@@ -329,6 +330,12 @@ export function McpDetails({ server, status, tools, busy, onUpdate, onSignIn, on
           </p>
         )}
         {server.env_names.length > 0 && <p className="quiet">Environment: {server.env_names.join(", ")}</p>}
+        {server.url && (
+          <label className="checkbox-label" title="For a sign-in server inside your organisation. This computer and cloud metadata stay closed.">
+            <input type="checkbox" disabled={busy} checked={server.private_sign_in} onChange={(event) => onUpdate({ private_sign_in: event.target.checked })} />
+            Allow sign-in on your organisation’s private network
+          </label>
+        )}
       </section>
       <section>
         <h4>

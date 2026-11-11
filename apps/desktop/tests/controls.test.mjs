@@ -3271,3 +3271,20 @@ test("a chat that is running or waiting on you offers no delete, since Medha ref
   await click(document.querySelector('[aria-label="Delete idle"]'));
   assert.deepEqual(deleted, ["idle"]);
 });
+
+test("a remote server's sign-in may be allowed on the organisation's private network, and a local one is not offered it", async () => {
+  const { McpDetails } = await import(await moduleUrl("McpServers"));
+  globalThis.__medhaControlsTest.api.settings = async () => ({ keychain: true });
+  const remote = { id: "corp", hash: "h", url: "https://mcp.corp/mcp", command: [], executable: null, disabled: false,
+    auth: "oauth", trust: "workspace", key_present: false, signed_in: false, env_names: [], allow_tools: [], deny_tools: [],
+    network: null, parallel: false, private_sign_in: false };
+  const patches = [];
+  const details = (server) => h(McpDetails, { server, tools: [], busy: false, onUpdate: (patch) => patches.push(patch), onSignOut() {} });
+  await act(async () => root.render(details(remote)));
+  const box = [...document.querySelectorAll(".checkbox-label")].find((label) => /private network/.test(label.textContent));
+  assert.ok(box, "a remote server offered no private sign-in");
+  await click(box.querySelector("input"));
+  assert.deepEqual(patches, [{ private_sign_in: true }]);
+  await act(async () => root.render(details({ ...remote, url: "", command: ["npx", "server"], auth: "" })));
+  assert.ok(![...document.querySelectorAll(".checkbox-label")].some((label) => /private network/.test(label.textContent)), "a local server offered private sign-in");
+});

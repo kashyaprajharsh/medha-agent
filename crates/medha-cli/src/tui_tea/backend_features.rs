@@ -44,7 +44,7 @@ fn redact_secrets(line: &str) -> String {
     out.join(" ")
 }
 
-/// `/mcp add <id> --url <https://…> [--oauth | --bearer T]` for a hosted server,
+/// `/mcp add <id> --url <https://…> [--oauth | --bearer T] [--private-sign-in]` for a hosted server,
 /// or `/mcp add <id> [--key K] [--trust trusted] [--env K=V] [--allow-tool P]
 /// [--deny-tool P] [--no-network] [--parallel] -- <command>` for a local one.
 fn steer_target(rest: &str, running: &[(String, String)]) -> Result<(String, String), String> {

@@ -124,6 +124,9 @@ pub struct McpServer {
     pub network: Option<bool>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parallel_calls: bool,
+    /// Sign-in may reach the organisation's private network; this machine and cloud metadata stay closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private_sign_in: bool,
 }
 
 pub const MCP_SECRET_FLAGS: &[&str] = &["--key", "--bearer", "--token", "--password"];
@@ -175,6 +178,7 @@ where
     let mut deny_tools = Vec::new();
     let mut network = None;
     let mut parallel_calls = false;
+    let mut private_sign_in = false;
     let mut command = Vec::new();
 
     let mut index = 0;
@@ -224,6 +228,12 @@ where
                 }
                 parallel_calls = true;
             }
+            "--private-sign-in" => {
+                if joined.is_some() {
+                    anyhow::bail!("--private-sign-in does not take a value");
+                }
+                private_sign_in = true;
+            }
             unknown if unknown.starts_with("--") => {
                 anyhow::bail!("unknown MCP option '{unknown}' (put server arguments after --)");
             }
@@ -259,6 +269,7 @@ where
             deny_tools,
             network,
             parallel_calls,
+            private_sign_in,
         },
         key,
     })
@@ -2185,6 +2196,7 @@ fn mcp_server_with(id: &str, server: &McpServer, key: Option<String>) -> mcp::Se
         parallel_calls: server.parallel_calls,
         secret: key,
         read_roots: Vec::new(),
+        private_sign_in: server.private_sign_in,
     }
 }
 

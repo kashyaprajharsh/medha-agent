@@ -240,7 +240,11 @@ impl RenewingClient {
     /// counts as a lost grant. Anything else stays retryable. Called with the
     /// manager lock held, so `refused` describes this refresh and no other.
     async fn judge(&self, error: AuthError) -> HttpError {
-        if matches!(
+        // rmcp names a definite refusal of the refresh token itself; that grant is gone.
+        if matches!(error, AuthError::TokenRefreshRejected(_)) {
+            self.lapse.set(Needs::SignInAgain);
+            tracing::info!(target: "medha_mcp", server = %self.store.server(), %error, "MCP sign-in lapsed");
+        } else if matches!(
             error,
             AuthError::AuthorizationRequired | AuthError::TokenRefreshFailed(_)
         ) {
@@ -269,30 +273,28 @@ impl StreamableHttpClient for RenewingClient {
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
-        let bearer = self.bearer().await?;
-        let first = self
-            .http
-            .post_message(
-                Arc::clone(&uri),
-                message.clone(),
-                session_id.clone(),
-                Some(bearer.clone()),
-                custom_headers.clone(),
-            )
-            .await;
-        let Err(StreamableHttpError::AuthRequired(_)) = first else {
-            return first;
-        };
-        let bearer = self.renew(&bearer).await?;
-        let second = self
-            .http
-            .post_message(uri, message, session_id, Some(bearer), custom_headers)
-            .await;
-        if matches!(second, Err(StreamableHttpError::AuthRequired(_))) {
-            // Refused even when fresh: only a new sign-in can satisfy it.
-            self.lapse.set(Needs::SignInAgain);
-        }
-        second
+        self.post(uri, message, session_id, custom_headers, None)
+            .await
+    }
+
+    // The transport calls this one; forwarding it keeps its configured event size limit on the real client.
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        self.post(
+            uri,
+            message,
+            session_id,
+            custom_headers,
+            Some(max_sse_event_size),
+        )
+        .await
     }
 
     async fn delete_session(
@@ -311,7 +313,7 @@ impl StreamableHttpClient for RenewingClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -320,5 +322,78 @@ impl StreamableHttpClient for RenewingClient {
         self.http
             .get_stream(uri, session_id, last_event_id, Some(bearer), custom_headers)
             .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, HttpError> {
+        let bearer = self.bearer().await?;
+        self.http
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                Some(bearer),
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+}
+
+impl RenewingClient {
+    /// Sends with the current token; a refusal renews it once and sends again, keeping the transport's size limit.
+    async fn post(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: Option<usize>,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        let send = |message: ClientJsonRpcMessage,
+                    bearer: String,
+                    headers: HashMap<HeaderName, HeaderValue>| {
+            let (uri, session_id) = (Arc::clone(&uri), session_id.clone());
+            async move {
+                match max_sse_event_size {
+                    Some(size) => {
+                        self.http
+                            .post_message_with_max_sse_event_size(
+                                uri,
+                                message,
+                                session_id,
+                                Some(bearer),
+                                headers,
+                                size,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.http
+                            .post_message(uri, message, session_id, Some(bearer), headers)
+                            .await
+                    }
+                }
+            }
+        };
+        let bearer = self.bearer().await?;
+        let first = send(message.clone(), bearer.clone(), custom_headers.clone()).await;
+        let Err(StreamableHttpError::AuthRequired(_)) = first else {
+            return first;
+        };
+        let bearer = self.renew(&bearer).await?;
+        let second = send(message, bearer, custom_headers).await;
+        if matches!(second, Err(StreamableHttpError::AuthRequired(_))) {
+            // Refused even when fresh: only a new sign-in can satisfy it.
+            self.lapse.set(Needs::SignInAgain);
+        }
+        second
     }
 }

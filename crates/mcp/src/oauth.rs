@@ -6,7 +6,7 @@
 //! so a model-invoked tool never can.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,8 +16,8 @@ use std::{
 
 use futures::StreamExt;
 use rmcp::transport::auth::{
-    AuthError, AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
-    OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState,
+    AuthError, AuthorizationManager, AuthorizationRequest, OAuthHttpClient, OAuthHttpClientError,
+    OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState,
 };
 use tokio::time::timeout;
 
@@ -117,6 +117,13 @@ fn disallowed_ipv6(addr: Ipv6Addr) -> bool {
         || (segments[0] & 0xfe00) == 0xfc00
 }
 
+fn disallowed_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => disallowed_ipv4(ip),
+        IpAddr::V6(ip) => disallowed_ipv6(ip),
+    }
+}
+
 fn disallowed_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if host == "localhost"
@@ -147,15 +154,75 @@ pub(crate) fn named_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-fn client_builder(total: Duration) -> reqwest::ClientBuilder {
+/// Turns a host name into addresses; the system resolver in use, a fixed answer in tests.
+type Lookup = Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, std::io::Result<Vec<SocketAddr>>>
+        + Send
+        + Sync,
+>;
+
+fn system_lookup() -> Lookup {
+    Arc::new(|host| {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host.as_str(), 0)).await?.collect()) })
+    })
+}
+
+/// Resolves every name an OAuth request connects to.
+struct AddressGuard {
+    /// The host of the server the person chose.
+    chosen: String,
+    lookup: Lookup,
+}
+
+impl AddressGuard {
+    fn for_policy(policy: &EndpointPolicy, lookup: Lookup) -> Arc<Self> {
+        let chosen = policy
+            .base
+            .host_str()
+            .unwrap_or_default()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        Arc::new(Self { chosen, lookup })
+    }
+}
+
+impl reqwest::dns::Resolve for AddressGuard {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+        let chosen = host == self.chosen;
+        let lookup = Arc::clone(&self.lookup);
+        Box::pin(async move {
+            let addresses = lookup(host.clone()).await?;
+            // The chosen server may live anywhere; any other name must answer with public addresses only, all of them,
+            // checked here where the connection is made, so a name cannot pass a check and then point elsewhere.
+            if !chosen
+                && let Some(inner) = addresses.iter().find(|address| disallowed_ip(address.ip()))
+            {
+                return Err(format!(
+                    "OAuth endpoint host '{host}' resolves to a private, loopback or metadata address ({})",
+                    inner.ip()
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn client_builder(total: Duration, guard: &Arc<AddressGuard>) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .timeout(total)
+        .dns_resolver(Arc::clone(guard))
 }
 
-fn follow_client(policy: EndpointPolicy, total: Duration) -> Result<reqwest::Client, Error> {
-    client_builder(total)
+fn follow_client(
+    policy: EndpointPolicy,
+    total: Duration,
+    guard: &Arc<AddressGuard>,
+) -> Result<reqwest::Client, Error> {
+    client_builder(total, guard)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_OAUTH_REDIRECTS
                 || policy.validate(attempt.url().as_str()).is_err()
@@ -183,9 +250,14 @@ struct HardenedOAuthClient {
 
 impl HardenedOAuthClient {
     fn new(base: &str, total: Duration) -> Result<Self, Error> {
+        Self::with_lookup(base, total, system_lookup())
+    }
+
+    fn with_lookup(base: &str, total: Duration, lookup: Lookup) -> Result<Self, Error> {
         let policy = EndpointPolicy::new(base)?;
-        let follow = follow_client(policy.clone(), total)?;
-        let stop = client_builder(total)
+        let guard = AddressGuard::for_policy(&policy, lookup);
+        let follow = follow_client(policy.clone(), total, &guard)?;
+        let stop = client_builder(total, &guard)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(auth_failed)?;
@@ -208,19 +280,19 @@ impl OAuthHttpClient for HardenedOAuthClient {
             } = operation;
             self.policy
                 .validate(&request.uri().to_string())
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))?;
             let client = if matches!(redirect_policy, OAuthHttpRedirectPolicy::Follow) {
                 &self.follow
             } else {
                 &self.stop
             };
             let request = reqwest::Request::try_from(request)
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))?;
             self.refused.store(false, Ordering::Release);
             let response = client
                 .execute(request)
                 .await
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))?;
             self.refused.store(
                 matches!(response.status().as_u16(), 400 | 401),
                 Ordering::Release,
@@ -234,9 +306,9 @@ impl OAuthHttpClient for HardenedOAuthClient {
             let mut body = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+                let chunk = chunk.map_err(|error| OAuthHttpClientError::from(error.to_string()))?;
                 if chunk.len() > MAX_OAUTH_BODY.saturating_sub(body.len()) {
-                    return Err(OAuthHttpClientError::new(format!(
+                    return Err(OAuthHttpClientError::from(format!(
                         "OAuth response exceeds {MAX_OAUTH_BODY} bytes"
                     )));
                 }
@@ -244,7 +316,7 @@ impl OAuthHttpClient for HardenedOAuthClient {
             }
             builder
                 .body(body)
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))
+                .map_err(|error| OAuthHttpClientError::from(error.to_string()))
         })
     }
 }
@@ -273,7 +345,8 @@ pub(crate) async fn probe(url: &str, http: Duration) -> Challenge {
     let Ok(policy) = EndpointPolicy::new(url) else {
         return Challenge::Open;
     };
-    let Ok(client) = follow_client(policy, http) else {
+    let guard = AddressGuard::for_policy(&policy, system_lookup());
+    let Ok(client) = follow_client(policy, http, &guard) else {
         return Challenge::Open;
     };
     let Ok(mut response) = client.get(url).send().await else {
@@ -346,7 +419,9 @@ pub(crate) async fn client_from_stored(
     if !manager.initialize_from_store().await.map_err(auth_failed)? {
         return Err(Error::NeedsAuth(store.server().to_string()));
     }
-    let resource = follow_client(EndpointPolicy::new(url)?, http)?;
+    let policy = EndpointPolicy::new(url)?;
+    let guard = AddressGuard::for_policy(&policy, system_lookup());
+    let resource = follow_client(policy, http, &guard)?;
     Ok(RenewingClient::new(resource, manager, store, refused))
 }
 
@@ -360,7 +435,7 @@ async fn begin(
     let mut state = OAuthState::new_with_oauth_http_client(url, http.clone()).await?;
     let redirect = format!("http://{host}:{port}/callback");
     state
-        .start_authorization(&[], &redirect, Some("Medha"))
+        .start_authorization(AuthorizationRequest::new(redirect).with_client_name("Medha"))
         .await?;
     Ok(state)
 }
@@ -515,6 +590,144 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}/mcp"), asked)
+    }
+
+    /// A name that points at an inner address is refused when Medha connects, not by how the name reads.
+    #[tokio::test]
+    async fn an_oauth_host_that_resolves_to_an_inner_address_is_never_reached() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reached = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reached);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).into_owned();
+                seen.lock()
+                    .unwrap()
+                    .push(head.lines().next().unwrap_or_default().to_string());
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+        // Both names point at this machine, as a hostile DNS answer would.
+        let lookup: Lookup =
+            Arc::new(|_| Box::pin(async { Ok(vec!["127.0.0.1:0".parse().unwrap()]) }));
+        let http = HardenedOAuthClient::with_lookup(
+            "https://mcp.example.com/mcp",
+            Duration::from_secs(5),
+            lookup,
+        )
+        .unwrap();
+
+        let attack = http
+            .stop
+            .get(format!("http://metadata.attacker.test:{port}/token"))
+            .send()
+            .await;
+        assert!(attack.is_err(), "a name resolving to loopback was reached");
+        // The server the person chose may live on this machine, as a development server does.
+        let chosen = http
+            .stop
+            .get(format!("http://mcp.example.com:{port}/mcp"))
+            .send()
+            .await;
+        assert!(chosen.is_ok(), "the chosen server was refused: {chosen:?}");
+        assert_eq!(
+            *reached.lock().unwrap(),
+            ["GET /mcp HTTP/1.1"],
+            "only the chosen server was reached"
+        );
+    }
+
+    /// The whole sign-in, against a server whose discovery names an authorization server that resolves inward:
+    /// the sign-in fails and nothing ever connects to the inner address.
+    #[tokio::test]
+    async fn sign_in_never_follows_discovery_to_an_address_inside_this_machine() {
+        use tokio::io::AsyncReadExt;
+        // The inner service the attack aims at: it records every connection it gets.
+        let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inner_port = inner.local_addr().unwrap().port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = inner.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // The MCP server the person added, which answers discovery by naming the attacker's host.
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            server.local_addr().unwrap().port()
+        );
+        let resource = url.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = server.accept().await {
+                let mut request = [0u8; 8192];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).into_owned();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let (status, body) = if path.starts_with("/.well-known/oauth-protected-resource") {
+                    let metadata = format!(
+                        r#"{{"resource":"{resource}","authorization_servers":["https://auth.attacker.test:{inner_port}"]}}"#
+                    );
+                    ("200 OK", metadata)
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        // A hostile DNS answer: the attacker's host points at this machine. Names asked for are kept.
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let names = Arc::clone(&asked);
+        let lookup: Lookup = Arc::new(move |host| {
+            names.lock().unwrap().push(host);
+            Box::pin(async { Ok(vec!["127.0.0.1:0".parse().unwrap()]) })
+        });
+        let http = Arc::new(
+            HardenedOAuthClient::with_lookup(&url, Duration::from_secs(5), lookup).unwrap(),
+        );
+
+        let signed_in = register(&url, &http, 4242).await;
+        assert!(
+            signed_in.is_err(),
+            "sign-in went on through an inner address"
+        );
+        // The flow did reach the attacker's host, so it was the address check that stopped it.
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|host| host == "auth.attacker.test"),
+            "discovery never tried the attacker's host: {:?}",
+            asked.lock().unwrap()
+        );
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "the inner address was connected to"
+        );
     }
 
     #[tokio::test]

@@ -119,17 +119,32 @@ impl StreamableHttpClient for ChallengeWatch {
             .http
             .post_message(uri, message, session_id, auth_header, custom_headers)
             .await;
-        if let Err(StreamableHttpError::AuthRequired(challenge)) = &result {
-            let discoverable = challenge
-                .www_authenticate_header
-                .to_ascii_lowercase()
-                .contains("resource_metadata");
-            self.lapse.set(if discoverable && !self.bearer {
-                Needs::SignIn
-            } else {
-                Needs::Token
-            });
-        }
+        self.watch(&result);
+        result
+    }
+
+    // The transport calls this one; forwarding it keeps its configured event size limit on the real client.
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        let result = self
+            .http
+            .post_message_with_max_sse_event_size(
+                uri,
+                message,
+                session_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await;
+        self.watch(&result);
         result
     }
 
@@ -148,7 +163,7 @@ impl StreamableHttpClient for ChallengeWatch {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -156,5 +171,43 @@ impl StreamableHttpClient for ChallengeWatch {
         self.http
             .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
             .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, HttpError> {
+        self.http
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+}
+
+impl ChallengeWatch {
+    /// Notes an auth challenge so the person is asked to sign in or for a token.
+    fn watch<T>(&self, result: &Result<T, HttpError>) {
+        if let Err(StreamableHttpError::AuthRequired(challenge)) = result {
+            let discoverable = challenge
+                .www_authenticate_header
+                .to_ascii_lowercase()
+                .contains("resource_metadata");
+            self.lapse.set(if discoverable && !self.bearer {
+                Needs::SignIn
+            } else {
+                Needs::Token
+            });
+        }
     }
 }

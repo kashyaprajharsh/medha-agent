@@ -44,6 +44,8 @@ def catalog():
         if grew: tools.append(spec("sprouted"))
     if mode == "flood":
         tools.append(spec("flood"))
+    if mode == "huge":
+        tools.append(spec("huge"))
     return tools
 
 for line in sys.stdin:
@@ -87,6 +89,8 @@ for line in sys.stdin:
             text = "\n".join(sorted("%s=%s" % kv for kv in os.environ.items()))
         elif name == "big":
             text = "A" * 50000
+        elif name == "huge":
+            text = "A" * (65 * 1024 * 1024)
         else:
             text = "echo: " + str(args.get("text",""))
         result = {"content":[{"type":"text","text":text}],"isError":False}
@@ -183,6 +187,29 @@ fn alive(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// A reply over the size limit fails its call at once and says so, and the server keeps answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reply_over_the_size_limit_fails_at_once_and_the_server_keeps_answering() {
+    let Some(fake) = Fake::new() else { return };
+    let manager = McpManager::new(
+        fake.path().to_path_buf(),
+        config(server("fake", fake.command("huge", None))),
+    );
+    manager.connect_startup().await;
+
+    let error = manager
+        .call("mcp__fake__huge", &json!({}))
+        .await
+        .expect_err("a reply over the limit was taken");
+    assert!(matches!(error, Error::TooLarge { .. }), "{error}");
+    let out = manager
+        .call("mcp__fake__echo", &json!({ "text": "still here" }))
+        .await
+        .expect("the server stopped answering");
+    assert!(out.text.contains("echo: still here"), "{}", out.text);
+    manager.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

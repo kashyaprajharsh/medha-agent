@@ -21,12 +21,12 @@ use std::{
 };
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock, Implementation,
+    CallToolRequestParams, CallToolResult, ClientConfig, ContentBlock, Implementation,
     ReadResourceRequestParams, ReadResourceResult, ResourceContents,
 };
 use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{
-    IntoTransport, TokioChildProcess,
+    IntoTransport,
     streamable_http_client::{StreamableHttpClientTransport, StreamableHttpClientTransportConfig},
 };
 use rmcp::{ClientHandler, model::Tool};
@@ -49,6 +49,7 @@ mod oauth;
 mod outbound;
 mod renewal;
 pub mod session_tools;
+mod stdio;
 
 use lapse::{ChallengeWatch, Lapse, Needs};
 
@@ -138,6 +139,8 @@ pub enum Error {
     Protocol(String),
     #[error("MCP request timed out after {0:?}")]
     Timeout(Duration),
+    #[error("MCP server '{server}' sent a reply larger than {limit_mib} MiB, so it was not read")]
+    TooLarge { server: String, limit_mib: usize },
 }
 
 impl Error {
@@ -556,6 +559,8 @@ struct Slot {
     generation: u64,
     /// Latched by a remote connection whose credentials stopped getting it in.
     lapse: Option<Arc<Lapse>>,
+    /// Counts a local server's messages over the size limit, which are dropped unread.
+    oversized: Option<Arc<stdio::Oversized>>,
 }
 
 impl Slot {
@@ -587,6 +592,7 @@ impl Slot {
             retry_at: None,
             generation: next_generation(),
             lapse: None,
+            oversized: None,
         }
     }
 
@@ -594,6 +600,7 @@ impl Slot {
     fn detach(&mut self) -> Retiree {
         self.peer = None;
         self.lapse = None;
+        self.oversized = None;
         self.proven = false;
         self.generation = next_generation();
         Retiree {
@@ -638,8 +645,8 @@ impl Changes {
 }
 
 impl ClientHandler for Handler {
-    fn get_info(&self) -> ClientInfo {
-        let mut info = ClientInfo::default();
+    fn get_info(&self) -> ClientConfig {
+        let mut info = ClientConfig::default();
         info.client_info = Implementation::new("medha", env!("CARGO_PKG_VERSION"));
         // Tells a server Medha can show its screens, so it offers them.
         if let Ok(shows) = serde_json::from_value(serde_json::json!({ "mimeTypes": [SCREEN_MIME] }))
@@ -669,6 +676,7 @@ struct Connected {
     pid: Option<u32>,
     catalog: Catalog,
     lapse: Option<Arc<Lapse>>,
+    oversized: Option<Arc<stdio::Oversized>>,
 }
 
 struct ManagerInner {
@@ -1467,7 +1475,7 @@ impl McpManager {
     {
         let server = server.to_string();
         self.settle(&server).await;
-        let (peer, gate, generation, picked, admission, lapse) = {
+        let (peer, gate, generation, picked, admission, (lapse, mut oversized)) = {
             let servers = self.inner.servers.lock().await;
             let slot = servers
                 .get(&server)
@@ -1496,7 +1504,10 @@ impl McpManager {
                 slot.generation,
                 picked,
                 admission,
-                slot.lapse.clone(),
+                (
+                    slot.lapse.clone(),
+                    slot.oversized.as_ref().map(|sender| sender.subscribe()),
+                ),
             )
         };
         let _permit = gate.acquire().await.map_err(|_| Error::ServerNotReady {
@@ -1514,7 +1525,14 @@ impl McpManager {
         // wire" for a swap to slip through.
         let _admitted = admission.read().await;
         self.ensure_live_generation(&server, generation).await?;
-        let result = match timeout(self.inner.config.request_timeout, send(peer, &picked)).await {
+        let answered = tokio::select! {
+            answered = timeout(self.inner.config.request_timeout, send(peer, &picked)) => answered,
+            () = stdio::sent_oversized(oversized.as_mut()) => {
+                let limit_mib = stdio::MAX_MESSAGE >> 20;
+                return Err(Error::TooLarge { server, limit_mib });
+            }
+        };
+        let result = match answered {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 let Some(needs) = lapse.and_then(|lapse| lapse.get()) else {
@@ -1765,6 +1783,7 @@ impl McpManager {
                             slot.peer = Some(connected.peer);
                             slot.pid = connected.pid;
                             slot.lapse = connected.lapse;
+                            slot.oversized = connected.oversized;
                             slot.state = ServerState::Ready;
                             slot.detail = None;
                             slot.retry_at = None;
@@ -1957,11 +1976,14 @@ impl McpManager {
             });
         }
         let (command, git_protection) = self.build_command(program, args, env, server)?;
-        let transport = TokioChildProcess::new(command).map_err(|e| Error::Spawn(e.to_string()))?;
+        let oversized = stdio::oversized();
+        let transport = stdio::ChildStdio::spawn(command, Arc::clone(&oversized))
+            .map_err(|e| Error::Spawn(e.to_string()))?;
         let pid = transport.id();
         match self.handshake(server, transport).await {
             Ok(mut connected) => {
                 connected.pid = pid;
+                connected.oversized = Some(oversized);
                 connected.git_protection = Some(git_protection);
                 Ok(connected)
             }
@@ -1983,7 +2005,8 @@ impl McpManager {
         auth: &RemoteAuth,
     ) -> Result<Connected, Error> {
         oauth::require_secure(url)?;
-        let config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        config.max_sse_event_size = stdio::MAX_MESSAGE;
         match auth {
             RemoteAuth::None => {
                 let client = ChallengeWatch::new(oauth::named_client(), false);
@@ -2094,6 +2117,7 @@ impl McpManager {
                 pid: None,
                 catalog: build_catalog(&server.id, &server.tools, server.parallel_calls, tools),
                 lapse: None,
+                oversized: None,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(Error::Timeout(deadline)),

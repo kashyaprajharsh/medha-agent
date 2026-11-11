@@ -680,7 +680,7 @@ fn an_empty_chat_sleeps_quietly_and_wakes_fresh_with_its_settings_and_new_id() {
     };
     let first =
         chat.wait("the greeting", |frame| frame["method"] == "ready")["params"]["session"].clone();
-    chat.call("session.configure", json!({ "mode": "yolo" }));
+    chat.call("session.configure", json!({ "mode": "autopilot" }));
 
     sleep::focus(Some(chat.key.into()));
     chat.sessions.inner.sweep(Instant::now() + sleep::GRACE);
@@ -702,7 +702,7 @@ fn an_empty_chat_sleeps_quietly_and_wakes_fresh_with_its_settings_and_new_id() {
 
     let settings = chat.call("session.settings", json!({}));
     assert_eq!(
-        settings["result"]["mode"], "yolo",
+        settings["result"]["mode"], "autopilot",
         "settings survive the sleep"
     );
     let again = chat.wait("the fresh greeting", |frame| {

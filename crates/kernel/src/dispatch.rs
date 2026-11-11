@@ -212,8 +212,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         lane: Option<&Lane>,
         sink: &dyn StreamSink,
     ) -> Observation {
-        // Read at each call, so a change of mode applies from the next approval.
-        let reviewer = (session.autonomy == crate::types::AutonomyLevel::Autopilot)
+        // Read at each call, so a change of mode applies from the next approval; a sub-agent follows its chat's mode.
+        let mode = self.policy.effective_mode(session.autonomy);
+        let reviewer = (mode == crate::types::AutonomyLevel::Autopilot)
             .then(|| Arc::new(self.reviewer(session.id)));
         let decided = self.dispatch_decided(session, intent, web_tainted, cancel, lane, sink);
         let (observation, answers) =

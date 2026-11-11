@@ -183,6 +183,22 @@ impl Policy for LiveSettings {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(autonomy);
     }
+    fn effective_mode(&self, autonomy: AutonomyLevel) -> AutonomyLevel {
+        if autonomy == AutonomyLevel::Plan {
+            return autonomy;
+        }
+        self.operator_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .or(self.options.autonomy)
+            .unwrap_or_else(|| {
+                let lock = self
+                    .lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                AutonomyLevel::parse(&lock.policy.autonomy).unwrap_or(AutonomyLevel::Careful)
+            })
+    }
     fn authorize(
         &self,
         autonomy: AutonomyLevel,
@@ -199,19 +215,7 @@ impl Policy for LiveSettings {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mode = self
-            .operator_mode
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .or(self.options.autonomy)
-            .unwrap_or_else(|| {
-                AutonomyLevel::parse(&lock.policy.autonomy).unwrap_or(AutonomyLevel::Careful)
-            });
-        let mode = if autonomy == AutonomyLevel::Plan {
-            autonomy
-        } else {
-            mode
-        };
+        let mode = self.effective_mode(autonomy);
         let jail = match lock.backend.containment() {
             kernel::Containment::OsFsJail | kernel::Containment::OsFsJailNoNet => {
                 policy::Jail::Active

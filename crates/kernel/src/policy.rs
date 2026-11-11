@@ -4,6 +4,10 @@ use crate::types::{AutonomyLevel, BlastRadius, Decision, ToolIntent};
 
 pub trait Policy: Send + Sync {
     fn operator_autonomy(&self, _: AutonomyLevel) {}
+    /// The mode this policy decides by for a session at `autonomy`, which a sub-agent's run shares with its chat.
+    fn effective_mode(&self, autonomy: AutonomyLevel) -> AutonomyLevel {
+        autonomy
+    }
     /// Authorize an intent. `None` radius is unregistered; autonomy never
     /// weakens a base `Human` or `Deny` decision.
     fn authorize(

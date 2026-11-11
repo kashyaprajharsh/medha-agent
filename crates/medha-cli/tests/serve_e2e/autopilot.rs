@@ -252,6 +252,87 @@ async fn leaving_the_sandbox_always_asks_the_person_in_autopilot() {
 }
 
 /// Text the chat read from a file reaches the reviewer marked untrusted, never as the person's words.
+/// What the reviewer was sent to read, one request at a time.
+#[cfg(unix)]
+fn reviews_sent(world: &World) -> Vec<String> {
+    std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .filter(|body| {
+            body["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|system| system.starts_with("You review one action"))
+        })
+        .map(|body| {
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A sub-agent's approval is reviewed with the person's own request from the chat that started it, as the person's
+/// words, and the objective the agent was given as untrusted.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sub_agents_reviewer_reads_the_persons_request_from_the_chat_that_started_it() {
+    let world = World::new();
+    // A writing sub-agent works in its own copy of the project, which a repository gives it; a chat looks as it opens.
+    let folder = world.folder("agent-review");
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "start",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&folder)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let (_backend, mut client, _, chat) = autopilot(&world, "agent-review").await;
+    let objective = format!("SCRIPT\n{}", networked("echo REVIEW_ALLOW"));
+    let spawn = json!({"name": "fetcher", "objective": objective, "wait": true, "write": true});
+    let (cards, _) = run(&mut client, &chat, &[format!("agent_spawn {spawn}")], false).await;
+    assert_eq!(cards, 0, "the sub-agent's step asked the person");
+    let reviewed = reviews_sent(&world);
+    assert_eq!(
+        reviewed.len(),
+        1,
+        "the reviewer was asked {} times",
+        reviewed.len()
+    );
+    let parts: Vec<&str> = reviewed[0]
+        .split("\n\n")
+        .map(|part| part.trim_start_matches("<transcript>\n"))
+        .collect();
+    assert!(
+        parts
+            .iter()
+            .any(|part| part.starts_with("[PERSON]") && part.contains("agent_spawn")),
+        "the person's request from the parent chat was not given as theirs: {}",
+        reviewed[0]
+    );
+    assert!(
+        !parts
+            .iter()
+            .any(|part| part.starts_with("[PERSON]") && part.contains("SCRIPT\nshell_exec")),
+        "the objective the agent was given was read as the person's words: {}",
+        reviewed[0]
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reviewer_reads_only_the_persons_messages_as_permission() {

@@ -308,9 +308,15 @@ fn shell_call(body: &Value, asked: &str, id: &str) -> Vec<Value> {
     ]
 }
 
-/// The next call of a `SCRIPT` message, by how many results have come back.
+/// The next call of a `SCRIPT` message, by how many results have come back. A sub-agent's
+/// brief carries its script after `Task:`, up to the blank line that ends the task.
 fn script_call(body: &Value, asked: &str) -> Option<Value> {
-    let lines = asked.strip_prefix("SCRIPT\n")?;
+    let lines = match asked.strip_prefix("SCRIPT\n") {
+        Some(lines) => lines,
+        None => asked
+            .split_once("Task:\nSCRIPT\n")
+            .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())?,
+    };
     let messages = body["messages"].as_array()?;
     let is_tool = |message: &&Value| message["role"] == "tool";
     let results = messages.iter().filter(is_tool).count();

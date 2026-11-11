@@ -109,8 +109,7 @@ impl Reviewer {
         if crate::redact::contains_known(&asked) {
             return Verdict::Defer("it would send out a secret the chat holds".into());
         }
-        let events = self.log.events(self.session).await;
-        let transcript = self.transcript(&crate::project_messages(&events));
+        let transcript = self.transcript(self.entries().await);
         let user = format!(
             "<transcript>\n{transcript}\n</transcript>\n\nThe agent asks for {}:\n<action>\n{}\n</action>\n\n\
              One line: ALLOW, DENY or UNSURE, then why.",
@@ -153,14 +152,57 @@ impl Reviewer {
         }
     }
 
+    /// The chats that started this one, the person's own chat first; none for a chat the person started.
+    async fn ancestors(&self) -> Vec<ulid::Ulid> {
+        let sessions = self.log.sessions().await;
+        let parent_of = |id: ulid::Ulid| {
+            sessions
+                .iter()
+                .find(|meta| meta.id == id)
+                .and_then(|meta| meta.parent)
+        };
+        let mut chain = Vec::new();
+        let mut at = self.session;
+        while let Some(parent) = parent_of(at) {
+            if chain.contains(&parent) || chain.len() >= 8 {
+                break;
+            }
+            chain.push(parent);
+            at = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Each message the reviewer reads, labelled. In a sub-agent, the person's words are those in the chats that
+    /// started it; its own task was written by an agent, so nothing in its own run speaks for the person.
+    async fn entries(&self) -> Vec<String> {
+        let ancestors = self.ancestors().await;
+        let mut entries = Vec::new();
+        for chat in &ancestors {
+            for message in crate::project_messages(&self.log.events(*chat).await) {
+                if is_person(&message) {
+                    entries.push(format!(
+                        "[PERSON] (in the chat that started this agent) {}",
+                        clipped(&message.content, MESSAGE_CHARS)
+                    ));
+                }
+            }
+        }
+        let in_agent = !ancestors.is_empty();
+        entries.extend(
+            crate::project_messages(&self.log.events(self.session).await)
+                .iter()
+                .filter_map(|message| entry(message, in_agent)),
+        );
+        entries
+            .into_iter()
+            .map(|entry| self.secrets.redact(&entry).into_owned())
+            .collect()
+    }
+
     /// The conversation as the reviewer reads it: whose words each part is, newest kept within the bound.
-    fn transcript(&self, messages: &[Message]) -> String {
-        let entries: Vec<String> = messages
-            .iter()
-            .filter_map(|message| {
-                entry(message).map(|text| self.secrets.redact(&text).into_owned())
-            })
-            .collect();
+    fn transcript(&self, entries: Vec<String>) -> String {
         // The person's first message says what the work is, so it stays whatever else is left out.
         let first = entries
             .iter()
@@ -190,13 +232,20 @@ impl Reviewer {
     }
 }
 
-/// One message, labelled by whose words it is.
-fn entry(message: &Message) -> Option<String> {
-    let person =
-        message.role == Role::User && message.trust.is_none_or(|trust| trust == TrustLabel::User);
+/// A message the person wrote themselves.
+fn is_person(message: &Message) -> bool {
+    message.role == Role::User && message.trust.is_none_or(|trust| trust == TrustLabel::User)
+}
+
+/// One message, labelled by whose words it is; in a sub-agent's own run, its task and steers come from an agent.
+fn entry(message: &Message, in_agent: bool) -> Option<String> {
     let (label, limit) = match message.role {
         Role::System => return None,
-        Role::User if person => ("[PERSON]".to_owned(), MESSAGE_CHARS),
+        Role::User if in_agent => (
+            "[UNTRUSTED: the task an agent gave]".to_owned(),
+            MESSAGE_CHARS,
+        ),
+        Role::User if is_person(message) => ("[PERSON]".to_owned(), MESSAGE_CHARS),
         Role::User => (
             format!(
                 "[UNTRUSTED: {}]",

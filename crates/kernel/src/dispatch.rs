@@ -202,7 +202,38 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         observation
     }
 
+    /// One tool call, with every approval answered while it ran logged beside it.
     pub(super) async fn dispatch_one(
+        &self,
+        session: &Session,
+        intent: &ToolIntent,
+        web_tainted: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+        lane: Option<&Lane>,
+        sink: &dyn StreamSink,
+    ) -> Observation {
+        let (observation, answers) = crate::gate::answers_scope(self.dispatch_decided(
+            session,
+            intent,
+            web_tainted,
+            cancel,
+            lane,
+            sink,
+        ))
+        .await;
+        for answered in &answers {
+            if let Err(error) = self
+                .log
+                .append(Event::approval(session, intent, answered))
+                .await
+            {
+                tracing::warn!(%error, tool = %intent.tool, "an approval answer could not be logged");
+            }
+        }
+        observation
+    }
+
+    async fn dispatch_decided(
         &self,
         session: &Session,
         intent: &ToolIntent,

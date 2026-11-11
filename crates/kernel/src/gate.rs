@@ -105,10 +105,134 @@ impl ExecutionAccess {
     }
 }
 
+/// Who gave an approval its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decider {
+    /// A person, at a screen or through a route such as a phone.
+    Person,
+    /// Autopilot's reviewer, deciding for the person.
+    Reviewer,
+    /// No one could be asked, so the answer was no.
+    Nobody,
+}
+
+impl Decider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Decider::Person => "person",
+            Decider::Reviewer => "reviewer",
+            Decider::Nobody => "nobody",
+        }
+    }
+}
+
+/// One approval's answer: what was asked, whether it was allowed, who answered, and why when they said.
+#[derive(Debug, Clone)]
+pub struct Answered {
+    /// `tool`, `network`, `access` or `path`.
+    pub kind: &'static str,
+    pub action: String,
+    pub allowed: bool,
+    pub by: Decider,
+    pub reason: Option<String>,
+}
+
+tokio::task_local! {
+    static ANSWERS: std::sync::Arc<std::sync::Mutex<Vec<Answered>>>;
+}
+
+/// Runs one tool call and returns, beside its result, every approval answered while it ran.
+pub async fn answers_scope<F: std::future::Future>(fut: F) -> (F::Output, Vec<Answered>) {
+    let answers = std::sync::Arc::<std::sync::Mutex<Vec<Answered>>>::default();
+    let output = ANSWERS.scope(std::sync::Arc::clone(&answers), fut).await;
+    let answered = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));
+    (output, answered)
+}
+
+/// Records an answer for the tool call it was given in; outside one, there is nothing to record it to.
+pub fn record_answer(answered: Answered) {
+    let _ = ANSWERS.try_with(|answers| {
+        answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(answered);
+    });
+}
+
+/// The chat's gate with every answer recorded, whoever gives it, for the kernel to log.
+pub struct RecordedGate {
+    inner: std::sync::Arc<dyn HumanGate>,
+}
+
+impl RecordedGate {
+    pub fn new(inner: std::sync::Arc<dyn HumanGate>) -> Self {
+        Self { inner }
+    }
+
+    fn record(&self, kind: &'static str, action: &str, allowed: bool) {
+        record_answer(Answered {
+            kind,
+            action: action.to_owned(),
+            allowed,
+            by: self.inner.answerer(),
+            reason: (!allowed).then(|| self.inner.denial_reason().to_owned()),
+        });
+    }
+}
+
+#[async_trait]
+impl HumanGate for RecordedGate {
+    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> Approval {
+        let approval = self.inner.confirm(action, detail, escalated).await;
+        self.record("tool", action, approval.approved());
+        approval
+    }
+
+    fn answerer(&self) -> Decider {
+        self.inner.answerer()
+    }
+
+    fn denial_reason(&self) -> &'static str {
+        self.inner.denial_reason()
+    }
+
+    async fn confirm_network(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        let decision = self.inner.confirm_network(detail, escalated).await;
+        self.record(
+            "network",
+            detail.unwrap_or("network"),
+            decision != NetworkDecision::Deny,
+        );
+        decision
+    }
+
+    async fn confirm_access(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        let decision = self.inner.confirm_access(detail, escalated).await;
+        self.record(
+            "access",
+            detail.unwrap_or("command access"),
+            decision != NetworkDecision::Deny,
+        );
+        decision
+    }
+
+    async fn confirm_path(&self, request: PathRequest<'_>) -> PathApproval {
+        let action = request.action.to_owned();
+        let approval = self.inner.confirm_path(request).await;
+        self.record("path", &action, approval != PathApproval::Deny);
+        approval
+    }
+}
+
 #[async_trait]
 pub trait HumanGate: Send + Sync {
     /// Ask about a specific action. Trust-flow escalations must not be remembered.
     async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> Approval;
+
+    /// Who answers this gate's approvals when it is asked.
+    fn answerer(&self) -> Decider {
+        Decider::Person
+    }
 
     /// Why a denial happened, so the model is never told a person refused when
     /// no person was asked. Gates backed by a human keep the default.
@@ -195,6 +319,10 @@ pub struct AutoDeny;
 impl HumanGate for AutoDeny {
     async fn confirm(&self, _action: &str, _detail: Option<&str>, _escalated: bool) -> Approval {
         Approval::Deny
+    }
+
+    fn answerer(&self) -> Decider {
+        Decider::Nobody
     }
 
     fn denial_reason(&self) -> &'static str {

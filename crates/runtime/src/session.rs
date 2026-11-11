@@ -151,7 +151,9 @@ pub async fn start(
         auxiliary_vision,
     } = media::admit(&setup, prompt, &model_profiles, artifacts.clone()).await?;
 
-    let surface = surface(&cwd, &prompt);
+    let mut surface = surface(&cwd, &prompt);
+    // Every approval, the kernel's and the sandbox's, is recorded with who answered it.
+    surface.gate = Arc::new(kernel::RecordedGate::new(surface.gate));
     let has_task = !options.first_run_setup && !prompt.trim().is_empty();
     // A rewound branch works in its first chat's scratch folder, where its history's paths point.
     let root = log.root_chat_async(session.id).await.unwrap_or(session.id);

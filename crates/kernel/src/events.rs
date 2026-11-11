@@ -93,6 +93,8 @@ pub enum EventKind {
     ModelMessage,
     ToolObs,
     PolicyDecision,
+    /// How an approval was answered during a tool call, and by whom.
+    ApprovalDecision,
     /// Sanitized result of one host-supervised extension hook invocation.
     HookDecision,
     /// Write-ahead marker emitted between authorization and a state-changing call,
@@ -145,6 +147,7 @@ impl EventKind {
             EventKind::ModelMessage => "model.message",
             EventKind::ToolObs => "tool.observation",
             EventKind::PolicyDecision => "policy.decision",
+            EventKind::ApprovalDecision => "approval.decision",
             EventKind::HookDecision => "hook.decision",
             EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
@@ -180,6 +183,7 @@ impl EventKind {
             "model.message" => EventKind::ModelMessage,
             "tool.observation" => EventKind::ToolObs,
             "policy.decision" => EventKind::PolicyDecision,
+            "approval.decision" => EventKind::ApprovalDecision,
             "hook.decision" => EventKind::HookDecision,
             "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
@@ -582,7 +586,25 @@ impl Event {
         Self::new(
             s,
             EventKind::PolicyDecision,
-            json!({ "tool": intent.tool, "intent_id": intent.id, "decision": verdict, "reason": reason }),
+            json!({ "tool": intent.tool, "intent_id": intent.id, "decision": verdict, "reason": reason, "by": "rule" }),
+            TrustLabel::System,
+        )
+    }
+
+    /// An approval's answer during a tool call, and who gave it.
+    pub fn approval(s: &Session, intent: &ToolIntent, answered: &crate::gate::Answered) -> Self {
+        Self::new(
+            s,
+            EventKind::ApprovalDecision,
+            json!({
+                "tool": intent.tool,
+                "intent_id": intent.id,
+                "kind": answered.kind,
+                "action": answered.action,
+                "outcome": if answered.allowed { "allowed" } else { "denied" },
+                "by": answered.by.as_str(),
+                "reason": answered.reason,
+            }),
             TrustLabel::System,
         )
     }

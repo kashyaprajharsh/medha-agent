@@ -1026,6 +1026,10 @@ impl kernel::HumanGate for AttributedGate {
     fn denial_reason(&self) -> &'static str {
         self.inner.denial_reason()
     }
+
+    fn answerer(&self) -> kernel::Decider {
+        self.inner.answerer()
+    }
 }
 
 /// A step in a child agent's own transcript.

@@ -826,6 +826,14 @@ impl Drop for PendingGuard {
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for Gate {
+    fn answerer(&self) -> kernel::Decider {
+        if self.nobody {
+            kernel::Decider::Nobody
+        } else {
+            kernel::Decider::Person
+        }
+    }
+
     fn denial_reason(&self) -> &'static str {
         if self.nobody {
             NOBODY_TO_ASK

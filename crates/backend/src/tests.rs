@@ -9,6 +9,15 @@ struct Stub {
     opened: AtomicU64,
     /// What a slow request waits for.
     released: tokio::sync::Notify,
+    /// Chats whose run has not yet ended, as a chat's lease does.
+    running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Stub {
+    fn runs(&self, chat: Option<&str>) -> bool {
+        let running = self.running.lock().unwrap();
+        chat.map_or(!running.is_empty(), |chat| running.contains(chat))
+    }
 }
 
 async fn say(output: &mut DuplexStream, frame: Value) {
@@ -103,14 +112,24 @@ impl Chats for Stub {
         let (to_chat, chat_in) = duplex(64 * 1024);
         let (chat_out, from_chat) = duplex(64 * 1024);
         let task = tokio::spawn(chat(chat_in, chat_out));
+        self.running.lock().unwrap().insert(session.clone());
+        let (running, ending, id) = (
+            Arc::clone(&self.running),
+            Duration::from_millis(params["ending_ms"].as_u64().unwrap_or(0)),
+            session.clone(),
+        );
         Ok(Opened {
             session,
             about: json!({"folder": params["folder"]}),
             input: Box::new(to_chat),
             output: Box::new(from_chat),
             done: Box::pin(async move {
-                task.await
-                    .unwrap_or_else(|_| Err("the chat stopped unexpectedly".into()))
+                let ended = task
+                    .await
+                    .unwrap_or_else(|_| Err("the chat stopped unexpectedly".into()));
+                tokio::time::sleep(ending).await;
+                running.lock().unwrap().remove(&id);
+                ended
             }),
             control: (params["out_of_band"] == true).then(|| Arc::new(|_| true) as crate::Control),
         })
@@ -127,13 +146,31 @@ impl Chats for Stub {
             _ => Err("unknown method".into()),
         }
     }
+
+    async fn delete_history(&self, _request: &Value) -> Result<Value, String> {
+        match self.runs(None) {
+            true => Err("a chat in this folder is open".into()),
+            false => Ok(json!({"deleted": true})),
+        }
+    }
+
+    async fn hold_chat(&self, request: &Value) -> Result<Value, String> {
+        match self.runs(request["params"]["session"].as_str()) {
+            true => Err("this chat is open".into()),
+            false => Ok(json!({"held": true})),
+        }
+    }
 }
+
+#[path = "tests/deleting.rs"]
+mod deleting;
 
 fn backend() -> Arc<Backend<Stub>> {
     Backend::new(
         Stub {
             opened: AtomicU64::new(1),
             released: tokio::sync::Notify::new(),
+            running: Arc::default(),
         },
         "test",
     )
@@ -145,6 +182,7 @@ async fn chat_capacity_counts_starts_and_reports_explicit_overload() {
         Stub {
             opened: AtomicU64::new(1),
             released: tokio::sync::Notify::new(),
+            running: Arc::default(),
         },
         "test",
         1,

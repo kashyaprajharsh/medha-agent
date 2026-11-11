@@ -272,6 +272,7 @@ async fn handle<C: Chats>(
             let _work = work;
             let outcome = match about_folder {
                 true if method == "folder.history.delete" => {
+                    backend.let_closing_end(None).await;
                     let deleted = backend.chats.delete_history(&frame).await;
                     if deleted.is_ok() {
                         backend.announce(&frame["folder"]);
@@ -279,6 +280,9 @@ async fn handle<C: Chats>(
                     deleted.map_err(refused)
                 }
                 true if method == "chats.delete" => {
+                    backend
+                        .let_closing_end(frame["params"]["session"].as_str())
+                        .await;
                     let held = backend.chats.hold_chat(&frame).await;
                     if held.is_ok() {
                         backend.announce(&frame["folder"]);

@@ -41,6 +41,8 @@ pub(crate) struct Session {
     urgent: mpsc::Sender<String>,
     waiting: Arc<AtomicUsize>,
     closing: CancellationToken,
+    /// Cancelled once the chat's run has ended and it has left the live table.
+    ended: CancellationToken,
     tied: AtomicBool,
     stream: Mutex<Stream>,
     control: Option<crate::Control>,
@@ -124,6 +126,7 @@ impl Session {
             urgent,
             waiting,
             closing,
+            ended: CancellationToken::new(),
             tied: AtomicBool::new(false),
             stream: Mutex::default(),
             control,
@@ -297,6 +300,18 @@ impl Session {
     pub(crate) fn close(&self) {
         self.cancel_turn();
         self.closing.cancel();
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.is_cancelled()
+    }
+
+    pub(crate) fn end(&self) {
+        self.ended.cancel();
+    }
+
+    pub(crate) async fn ended(&self) {
+        self.ended.cancelled().await;
     }
 
     /// Reads what the chat says until it ends, then tells whoever is still attached.

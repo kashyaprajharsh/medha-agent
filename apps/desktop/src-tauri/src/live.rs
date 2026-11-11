@@ -50,6 +50,8 @@ const REQUESTS: &[&str] = &[
 ];
 const STOPPED: &str = "This session has stopped. Start a new session to continue.";
 const STREAM_INTERVAL: Duration = Duration::from_millis(32);
+/// How long a delete waits for this window's own views of a chat to let it go.
+const LETTING_GO: Duration = Duration::from_secs(5);
 const STREAM_BYTES: usize = 64 * 1024;
 /// What may wait to be drawn for one chat, and to be sent to one. Past this the
 /// window stops following the chat, or refuses the request, and says so.
@@ -172,6 +174,8 @@ struct Live {
     /// Native ownership survives a webview reload and a rewind's durable-id change.
     conversation: Arc<Mutex<Option<String>>>,
     snapshots: Arc<Mutex<HashSet<u64>>>,
+    /// Ends when the thread that tells the backend has let the chat go.
+    left: Option<Receiver<()>>,
 }
 
 #[derive(serde::Serialize)]
@@ -333,7 +337,7 @@ impl LiveSessions {
                 .collect();
             showing.iter().filter_map(|key| open.remove(key)).collect()
         };
-        drop(closed);
+        let_go(closed);
         self.inner
             .backend
             .connection()?
@@ -352,7 +356,7 @@ impl LiveSessions {
 
     /// Closes this window's chats here, then deletes everything Medha keeps for the folder.
     pub fn delete_history(&self) -> Result<(), String> {
-        self.close_all();
+        let_go(self.take_all());
         self.inner
             .backend
             .connection()?
@@ -360,16 +364,17 @@ impl LiveSessions {
     }
 
     pub fn close_all(&self) {
-        let removed = {
-            let mut open = self
-                .inner
-                .open
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.inner.closed.store(true, Ordering::Release);
-            std::mem::take(&mut *open)
-        };
-        drop(removed);
+        drop(self.take_all());
+    }
+
+    fn take_all(&self) -> Vec<Live> {
+        let mut open = self
+            .inner
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.closed.store(true, Ordering::Release);
+        std::mem::take(&mut *open).into_values().collect()
     }
 }
 
@@ -571,7 +576,10 @@ impl Inner {
         let waking = wake.is_some();
         let (resting, over) = (Arc::clone(&rest), Arc::clone(&ended));
         let (behind, gone) = (Arc::clone(&behind), Arc::clone(&closed));
+        let (leaving, left) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            // Dropped on every way out, which tells a delete this chat has been let go.
+            let _leaving = leaving;
             let opened = backend.connection().and_then(|connection| {
                 let chat = connection.open_chat(
                     &folder,
@@ -635,7 +643,21 @@ impl Inner {
             rest,
             conversation,
             snapshots,
+            left: Some(left),
         }
+    }
+}
+
+/// Closes these views, then waits a little until each has told the backend it let go.
+fn let_go(mut closed: Vec<Live>) {
+    let left: Vec<_> = closed
+        .iter_mut()
+        .filter_map(|live| live.left.take())
+        .collect();
+    drop(closed);
+    let deadline = Instant::now() + LETTING_GO;
+    for left in left {
+        let _ = left.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     }
 }
 

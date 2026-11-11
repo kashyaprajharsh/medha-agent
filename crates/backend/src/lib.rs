@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 use session::Session;
 
 pub const PROTOCOL: u64 = 1;
+/// How long a delete waits for chats already closing before the folder's own check refuses it.
+const CLOSING_WAIT: Duration = Duration::from_secs(10);
 
 pub type Input = Box<dyn AsyncWrite + Send + Unpin>;
 pub type Output = Box<dyn AsyncRead + Send + Unpin>;
@@ -282,6 +284,20 @@ impl<C: Chats> Backend<C> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Waits a little for chats already closing to end, `chat` alone when named, so their leases are let go.
+    async fn let_closing_end(&self, chat: Option<&str>) {
+        let closing: Vec<Arc<Session>> = self
+            .table()
+            .values()
+            .filter(|session| session.is_closing() && chat.is_none_or(|chat| session.id == chat))
+            .cloned()
+            .collect();
+        let deadline = tokio::time::Instant::now() + CLOSING_WAIT;
+        for session in closing {
+            let _ = tokio::time::timeout_at(deadline, session.ended()).await;
+        }
+    }
+
     fn find(&self, id: &str) -> Result<Arc<Session>, Failure> {
         self.table()
             .get(id)
@@ -327,6 +343,7 @@ impl<C: Chats> Backend<C> {
         tokio::spawn(async move {
             session.pump(opened.output, opened.done).await;
             backend.table().remove(&session.id);
+            session.end();
         });
         Ok(reply)
     }

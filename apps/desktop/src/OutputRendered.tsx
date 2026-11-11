@@ -1,5 +1,6 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useWorkspace } from "./Workspace";
+import { Boundary, reloadable } from "./ErrorBoundary";
 import { growing, lastLine, slidesOf, type Deck } from "./outputBlocks";
 import type { RenderProps } from "./outputContext";
 import { useFile, useNear } from "./outputFiles";
@@ -8,7 +9,7 @@ import { Picture, Sound, Video } from "./OutputMedia";
 import { Page, Slides } from "./OutputPage";
 import { drawDiagram, drawingUrl } from "./outputRender";
 
-const Paper = lazy(() => import("./OutputPaper"));
+const Paper = reloadable(() => import("./OutputPaper"));
 const BEAT = 200;
 
 /** Any output, drawn: the same call for a plate in the chat, a thumbnail and the viewer. */
@@ -31,9 +32,11 @@ function Content(props: RenderProps) {
   if (kind === "audio") return <Sound {...props} />;
   if (kind === "pdf" || kind === "document" || kind === "table")
     return (
-      <Suspense fallback={<div className="out-wait" />}>
-        <Paper {...props} />
-      </Suspense>
+      <Boundary what="this output">
+        <Suspense fallback={<div className="out-wait" />}>
+          <Paper {...props} />
+        </Suspense>
+      </Boundary>
     );
   if (kind === "deck") return path?.toLowerCase().endsWith(".pptx") ? <DeckFile {...props} /> : <Unopened {...props} />;
   if (path || props.output.storedSource && !props.output.source) return <FromFile {...props} />;

@@ -1,6 +1,6 @@
 import { useWorkspace, useWorkspaceApi } from "./Workspace";
+import { Boundary, reloadable } from "./ErrorBoundary";
 import {
-  lazy,
   Suspense,
   useCallback,
   useEffect,
@@ -37,11 +37,9 @@ import { useLive } from "./useLive";
 import { Starters, Welcome } from "./Welcome";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 
-const TerminalDrawer = lazy(() =>
-  import("./TerminalDrawer").then((module) => ({
-    default: module.TerminalDrawer,
-  })),
-);
+const TerminalDrawer = reloadable(async () => ({
+  default: (await import("./TerminalDrawer")).TerminalDrawer,
+}));
 /** As long as the backend keeps a deleted chat able to be brought back. */
 const UNDO_MS = 8000;
 
@@ -1221,18 +1219,20 @@ export function App() {
         )}
         {home && <Starters folder={folder} onPick={(starter) => submit(starter)} />}
         {terminalUsed && (
-          <Suspense fallback={<p className="quiet">Opening terminal…</p>}>
-            <TerminalDrawer
-              open={terminalOpen}
-              workspace={workspace}
-              onHide={() => {
-                setTerminalOpen(false);
-                appRoot.current
-                  ?.querySelector<HTMLTextAreaElement>(".composer textarea")
-                  ?.focus();
-              }}
-            />
-          </Suspense>
+          <Boundary what="the terminal">
+            <Suspense fallback={<p className="quiet">Opening terminal…</p>}>
+              <TerminalDrawer
+                open={terminalOpen}
+                workspace={workspace}
+                onHide={() => {
+                  setTerminalOpen(false);
+                  appRoot.current
+                    ?.querySelector<HTMLTextAreaElement>(".composer textarea")
+                    ?.focus();
+                }}
+              />
+            </Suspense>
+          </Boundary>
         )}
       </main>
 

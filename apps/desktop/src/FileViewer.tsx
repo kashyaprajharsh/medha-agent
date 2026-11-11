@@ -1,14 +1,15 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import type { FilePreview } from "./api";
+import { Boundary, reloadable } from "./ErrorBoundary";
 import { Icon } from "./Icon";
 import { Markdown, SourceCode } from "./Markdown";
 import { useWorkspaceApi } from "./Workspace";
 import { OutputsProvider, SHOWN_ONLY } from "./outputContext";
 // Outputs inside a previewed file are shown in place: opening one would close the file.
 
-const PdfPreview = lazy(() => import("./PdfPreview"));
-const DocumentPreview = lazy(() => import("./DocumentPreview"));
-const TablePreview = lazy(() => import("./TablePreview"));
+const PdfPreview = reloadable(() => import("./PdfPreview"));
+const DocumentPreview = reloadable(() => import("./DocumentPreview"));
+const TablePreview = reloadable(() => import("./TablePreview"));
 const LANGUAGES: Record<string, string> = {
   py: "python",
   rs: "rust",
@@ -104,26 +105,28 @@ export function FileViewer({
       <div className="preview-body">
         {!file && !error && <p className="quiet">Opening file…</p>}
         {file && (
-          <Suspense fallback={<p className="quiet">Preparing preview…</p>}>
-            {file.kind === "markdown" && !source ? (
-              <OutputsProvider value={SHOWN_ONLY}>
-                <Markdown html={file.html || ""} />
-              </OutputsProvider>
-            ) : file.kind === "pdf" ? (
-              <PdfPreview bytes={file.bytes!} />
-            ) : file.kind === "document" ? (
-              <DocumentPreview bytes={file.bytes!} />
-            ) : file.kind === "spreadsheet" || file.kind === "table" ? (
-              <TablePreview file={file} />
-            ) : file.kind === "image" ? (
-              <ImagePreview file={file} path={path} />
-            ) : (
-              <SourceCode
-                text={file.text || ""}
-                language={LANGUAGES[file.extension] || file.extension}
-              />
-            )}
-          </Suspense>
+          <Boundary what="this preview">
+            <Suspense fallback={<p className="quiet">Preparing preview…</p>}>
+              {file.kind === "markdown" && !source ? (
+                <OutputsProvider value={SHOWN_ONLY}>
+                  <Markdown html={file.html || ""} />
+                </OutputsProvider>
+              ) : file.kind === "pdf" ? (
+                <PdfPreview bytes={file.bytes!} />
+              ) : file.kind === "document" ? (
+                <DocumentPreview bytes={file.bytes!} />
+              ) : file.kind === "spreadsheet" || file.kind === "table" ? (
+                <TablePreview file={file} />
+              ) : file.kind === "image" ? (
+                <ImagePreview file={file} path={path} />
+              ) : (
+                <SourceCode
+                  text={file.text || ""}
+                  language={LANGUAGES[file.extension] || file.extension}
+                />
+              )}
+            </Suspense>
+          </Boundary>
         )}
       </div>
     </aside>

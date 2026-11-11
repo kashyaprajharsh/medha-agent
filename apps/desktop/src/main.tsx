@@ -7,10 +7,13 @@ import "@fontsource/anek-latin/latin-700.css";
 import "@fontsource/anek-latin/latin-ext-400.css";
 import "@fontsource/fragment-mono/latin-400.css";
 import "./styles/index.css";
+import { Boundary } from "./ErrorBoundary";
 import { WorkspaceHost } from "./Workspace";
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <WorkspaceHost />
+    <Boundary what="this window" window>
+      <WorkspaceHost />
+    </Boundary>
   </React.StrictMode>,
 );

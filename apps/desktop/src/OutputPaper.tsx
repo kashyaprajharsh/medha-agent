@@ -1,15 +1,16 @@
-import { lazy, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy } from "pdfjs-dist";
 import worker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import Papa from "papaparse";
 import type { FilePreview } from "./api";
 import DocumentPreview from "./DocumentPreview";
+import { reloadable } from "./ErrorBoundary";
 import { sizeText } from "./outputBlocks";
 import type { RenderProps } from "./outputContext";
 import { useFile, useNear, useWidth } from "./outputFiles";
 
 GlobalWorkerOptions.workerSrc = worker;
-const TablePreview = lazy(() => import("./TablePreview"));
+const TablePreview = reloadable(() => import("./TablePreview"));
 
 const MAX_PAGES = 200;
 const PLATE_ROWS = 5;

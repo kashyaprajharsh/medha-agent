@@ -1,0 +1,50 @@
+/* A part that failed to load or draw, said in its own place. */
+.boundary {
+  display: grid;
+  gap: var(--s-3);
+  justify-items: start;
+  margin: var(--s-3);
+  padding: var(--s-4);
+  border-radius: var(--r-md);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--text);
+}
+.boundary-title {
+  margin: 0;
+  font-size: var(--text-md);
+}
+.boundary-why {
+  max-width: 100%;
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.boundary-why summary {
+  cursor: pointer;
+}
+.boundary-why pre {
+  margin: var(--s-2) 0 0;
+  max-height: 8lh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--code-size);
+}
+.boundary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+/* The whole window failed: solid, so nothing half drawn shows through glass. */
+.boundary-window {
+  position: fixed;
+  inset: 0;
+  margin: 0;
+  border-radius: 0;
+  box-shadow: none;
+  align-content: center;
+  justify-items: center;
+  text-align: center;
+  background: var(--base-canvas);
+}

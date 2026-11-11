@@ -37,6 +37,8 @@ mod modes;
 mod pins;
 #[path = "serve_e2e/real_use.rs"]
 mod real_use;
+#[path = "serve_e2e/remembered.rs"]
+mod remembered;
 #[path = "serve_e2e/stored.rs"]
 mod stored;
 #[path = "serve_e2e/summary.rs"]

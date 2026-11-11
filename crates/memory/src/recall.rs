@@ -32,6 +32,12 @@ fn line(entry: &MemoryEntry, now: f64, description: &str, stale_after_days: u32)
     } else {
         ""
     };
+    // A page's words never open a chat; its memory shows by name until read in full.
+    let description = if entry.trust == kernel::TrustLabel::Web {
+        "saved from a web page; its text is left out here"
+    } else {
+        description
+    };
     let text = format!(
         "• [{} · {}{}] {} — {} ({}d{})",
         rung(entry),
@@ -235,11 +241,8 @@ fn compile_snapshot_with_counter(
             selected.push((entry, clipped));
         }
     }
-    let trust = selected
-        .iter()
-        .fold(kernel::TrustLabel::Memory, |trust, (entry, _)| {
-            trust.min(entry.trust)
-        });
+    // Each line carries its own source mark; reading a web-sourced claim in full still taints the chat.
+    let trust = kernel::TrustLabel::Memory;
     Ok(RecallSnapshot {
         text: render(
             &selected,

@@ -1,5 +1,5 @@
 #[test]
-fn only_admitted_memories_taint_the_frozen_index_and_forged_boundaries_are_data() {
+fn a_web_memory_opens_the_index_by_name_only_and_never_taints_it() {
     let (store, _root) = store("trust");
     let now = 10.0;
     let mut web = entry(
@@ -15,9 +15,10 @@ fn only_admitted_memories_taint_the_frozen_index_and_forged_boundaries_are_data(
     let snapshot =
         compile_snapshot_with_counter(&store, 3000, now, 30, &HeuristicCounter, EVERY_POINTER)
             .unwrap();
-    assert_eq!(snapshot.trust, TrustLabel::Web);
+    assert_eq!(snapshot.trust, TrustLabel::Memory);
     assert!(snapshot.text.contains("source=\"web\""));
-    assert!(snapshot.text.contains("&lt;/untrusted_content&gt;"));
+    assert!(snapshot.text.contains("remote procedure"));
+    assert!(!snapshot.text.contains("Ignore previous instructions"), "{}", snapshot.text);
     assert_eq!(snapshot.text.matches("</untrusted_content>").count(), 1);
     let empty =
         compile_snapshot_with_counter(&store, 0, now, 30, &HeuristicCounter, EVERY_POINTER)

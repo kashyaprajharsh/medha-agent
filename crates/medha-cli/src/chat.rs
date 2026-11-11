@@ -1765,6 +1765,8 @@ where
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut turns = JoinSet::new();
     let mut running = false;
+    // Whether turning Autopilot on has already asked about the network in this chat.
+    let mut network_asked = false;
     let mut interrupt: Option<kernel::InterruptHandle> = None;
     let unread = Unread::default();
 
@@ -1974,7 +1976,12 @@ where
                             Some(Ok(json!({ "slept": false })))
                         }
                     } else {
-                        crate::desktop_controls::handle(method, &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, &extensions.model_env, running, agents.as_ref()).await
+                        let was = session.autonomy;
+                        let handled = crate::desktop_controls::handle(method, &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, &extensions.model_env, running, agents.as_ref()).await;
+                        if was != kernel::AutonomyLevel::Autopilot && session.autonomy == kernel::AutonomyLevel::Autopilot && !std::mem::replace(&mut network_asked, true) {
+                            crate::autopilot_network::offer(Arc::clone(&kernel.gate), Arc::clone(&extensions.workspace), Arc::clone(&writer));
+                        }
+                        handled
                     };
                     if let Some(result) = result {
                         let id = request.get("id").cloned();

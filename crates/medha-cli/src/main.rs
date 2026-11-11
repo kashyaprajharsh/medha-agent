@@ -8,6 +8,7 @@ mod application_mcp;
 mod application_resources;
 mod application_session;
 mod attachments;
+mod autopilot_network;
 mod chat;
 mod chat_agents;
 mod chat_history;

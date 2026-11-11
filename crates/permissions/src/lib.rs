@@ -692,6 +692,12 @@ impl PermissionManager {
         self.network.clone()
     }
 
+    /// Opens the network for the rest of this chat, recorded like any network grant.
+    pub fn open_network(&self, why: &str) -> Result<(), PermissionError> {
+        self.network.grant();
+        self.audit_network(&format!("allowed ({why}, for this chat)"))
+    }
+
     /// Load trusted paths from the machine-local trust file into memory.
     /// Extends rather than replaces: the shared handle may already carry
     /// grants published by another manager on the same trust file.

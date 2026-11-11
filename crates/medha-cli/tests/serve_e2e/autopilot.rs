@@ -1,11 +1,10 @@
 //! Autopilot's reviewer allows what the person asked for, one action at a time, and asks them about the rest.
-//! The approvals here are a sandbox's access cards, so these run where there is an OS sandbox.
-#![cfg(unix)]
+//! Where there is an OS sandbox the approvals are its access cards; on Windows, without one, commands themselves ask.
 use super::*;
 use kernel::EventLog;
 
-/// A backend whose reviewer gives up after three seconds, and an Autopilot chat on a fresh folder.
-async fn autopilot(world: &World, name: &str) -> (Backend, Client, PathBuf, String) {
+/// A backend whose reviewer gives up after three seconds, and a chat on a fresh folder.
+async fn chat_on(world: &World, name: &str) -> (Backend, Client, PathBuf, String) {
     std::fs::create_dir_all(world.home()).unwrap();
     std::fs::write(
         world.home().join("config.toml"),
@@ -16,15 +15,63 @@ async fn autopilot(world: &World, name: &str) -> (Backend, Client, PathBuf, Stri
     let mut client = backend.connect().await;
     let folder = world.folder(name);
     let chat = client.open(&folder).await;
+    (backend, client, folder, chat)
+}
+
+/// Turns Autopilot on and answers the card it opens with; returns that card.
+#[cfg(unix)]
+async fn turn_on(client: &mut Client, chat: &str, open_network: bool) -> Value {
     let set = client
         .ask(
             "session.configure",
-            Some(&chat),
+            Some(chat),
             json!({"mode": "autopilot"}),
         )
         .await;
     assert!(set.get("error").is_none(), "{set}");
+    let (_, card) = client.until(|frame| frame["method"] == "approval").await;
+    let answer = json!({"gate_id": card["params"]["gate_id"], "approve": open_network});
+    client.ask("approval.respond", Some(chat), answer).await;
+    card
+}
+
+/// An Autopilot chat whose network stays closed, so each command needing it goes to the reviewer.
+#[cfg(unix)]
+async fn autopilot(world: &World, name: &str) -> (Backend, Client, PathBuf, String) {
+    let (backend, mut client, folder, chat) = chat_on(world, name).await;
+    turn_on(&mut client, &chat, false).await;
     (backend, client, folder, chat)
+}
+
+/// Turning Autopilot on asks once whether the chat may use the network, saying what Autopilot may allow; yes opens it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_autopilot_on_asks_once_about_the_network_and_yes_opens_it() {
+    let world = World::new();
+    let (_backend, mut client, _, chat) = chat_on(&world, "network-yes").await;
+    let card = turn_on(&mut client, &chat, true).await;
+    let said = card["params"].to_string();
+    assert!(said.contains("network for this chat"), "{said}");
+    assert!(
+        said.contains("reviewer may allow"),
+        "the card did not say what Autopilot may allow: {said}"
+    );
+    for mode in ["careful", "autopilot"] {
+        client
+            .ask("session.configure", Some(&chat), json!({"mode": mode}))
+            .await;
+    }
+    let (cards, notices) = run(&mut client, &chat, &[networked("echo plain")], false).await;
+    assert_eq!(
+        cards, 0,
+        "a networked command asked, or Autopilot asked about the network twice"
+    );
+    assert!(
+        !notices
+            .iter()
+            .any(|notice| notice.starts_with("Allowed by Autopilot")),
+        "{notices:?}"
+    );
 }
 
 /// Runs the script to its end, answering each card with `approve`; returns the cards shown and the notices said.
@@ -78,6 +125,7 @@ async fn answers(world: &World, chat: &str) -> Vec<Value> {
     found
 }
 
+#[cfg(unix)]
 fn networked(command: &str) -> String {
     format!(
         "shell_exec {}",
@@ -85,7 +133,41 @@ fn networked(command: &str) -> String {
     )
 }
 
+/// With nobody to answer, turning Autopilot on asks nothing; a command needing the network the reviewer is unsure of is refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_autopilot_on_with_nobody_to_answer_asks_nothing() {
+    let world = World::new();
+    let (_backend, mut client, folder, _) = chat_on(&world, "network-nobody").await;
+    let made = client
+        .ask(
+            "session.create",
+            None,
+            json!({"folder": folder, "answer": "nobody"}),
+        )
+        .await;
+    let chat = made["result"]["session"].as_str().unwrap().to_owned();
+    client
+        .ask("session.attach", Some(&chat), json!({"after": 0}))
+        .await;
+    let set = client
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"mode": "autopilot"}),
+        )
+        .await;
+    assert!(set.get("error").is_none(), "{set}");
+    let (cards, _) = run(&mut client, &chat, &[networked("echo plain")], false).await;
+    assert_eq!(cards, 0, "someone was asked in a chat no one can answer");
+    let logged = answers(&world, &chat).await;
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged[0]["by"], "nobody", "{logged:?}");
+    assert_eq!(logged[0]["outcome"], "denied", "{logged:?}");
+}
+
 /// What the person asked for runs with no card, once, and the chat says Autopilot allowed it and why.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autopilot_allows_what_the_person_asked_with_no_card_and_says_why() {
     let world = World::new();
@@ -108,6 +190,7 @@ async fn autopilot_allows_what_the_person_asked_with_no_card_and_says_why() {
 }
 
 /// When the reviewer is unsure, or does not answer in time, the person gets the card and the log says why.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autopilot_asks_the_person_when_the_reviewer_is_unsure_or_late() {
     let world = World::new();
@@ -136,6 +219,7 @@ async fn autopilot_asks_the_person_when_the_reviewer_is_unsure_or_late() {
 }
 
 /// Leaving the sandbox is never the reviewer's call: the person is asked even when the reviewer would allow it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leaving_the_sandbox_always_asks_the_person_in_autopilot() {
     let world = World::new();
@@ -168,6 +252,7 @@ async fn leaving_the_sandbox_always_asks_the_person_in_autopilot() {
 }
 
 /// Text the chat read from a file reaches the reviewer marked untrusted, never as the person's words.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reviewer_reads_only_the_persons_messages_as_permission() {
     let world = World::new();
@@ -213,4 +298,46 @@ async fn the_reviewer_reads_only_the_persons_messages_as_permission() {
         });
     assert!(page.starts_with("[UNTRUSTED: tool result]"), "{page}");
     assert!(reviewed[0].contains("[PERSON] SCRIPT"), "{}", reviewed[0]);
+}
+
+/// Without an OS sandbox, as on Windows, the network is never closed, so turning Autopilot on asks nothing; a command
+/// that changes files still asks, and the reviewer answers it first.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_an_os_sandbox_the_reviewer_answers_commands_and_nothing_asks_about_the_network() {
+    let world = World::new();
+    let (_backend, mut client, folder, chat) = chat_on(&world, "no-sandbox").await;
+    let set = client
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"mode": "autopilot"}),
+        )
+        .await;
+    assert!(set.get("error").is_none(), "{set}");
+    let command = json!({"command": "echo made > REVIEW_ALLOW.txt"});
+    let (cards, notices) = run(
+        &mut client,
+        &chat,
+        &[format!("shell_exec {command}")],
+        false,
+    )
+    .await;
+    assert_eq!(
+        cards, 0,
+        "the person was asked about the network or the command"
+    );
+    assert!(
+        folder.join("REVIEW_ALLOW.txt").exists(),
+        "the command did not run"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.starts_with("Allowed by Autopilot")),
+        "{notices:?}"
+    );
+    let logged = answers(&world, &chat).await;
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged[0]["by"], "reviewer", "{logged:?}");
 }

@@ -65,6 +65,8 @@ fn verb(name: &str, args: &Value) -> String {
         "agent.cancel" => "Stopped",
         "clarify" => "Asked you",
         "skill" | "skill.load" => "Loaded skill",
+        "skill.save" if args["job"] == "search" => "Searched for skills",
+        "skill.save" if args["job"] == "install" => "Installed skill",
         "skill.save" => "Saved skill",
         "memory.search" => "Searched memory",
         "memory.write" => "Remembered",
@@ -128,6 +130,7 @@ fn target(name: &str, args: &Value) -> Option<String> {
             "url",
             "query",
             "name",
+            "source",
         ]
         .iter()
         .find_map(|key| text(args, key))

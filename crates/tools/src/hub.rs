@@ -25,6 +25,18 @@ pub fn default_taps() -> Vec<Tap> {
     }]
 }
 
+/// Every source a search reads: the built-in ones first, then the person's own from `taps`, each once.
+pub fn browse_taps(taps: &Path) -> Vec<Tap> {
+    let defaults = default_taps();
+    let own: Vec<Tap> = TapStore::new(taps.to_path_buf())
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tap| !defaults.iter().any(|default| default.key() == tap.key()))
+        .collect();
+    defaults.into_iter().chain(own).collect()
+}
+
 /// One registered source: a GitHub repo plus the subpath its skills live under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tap {

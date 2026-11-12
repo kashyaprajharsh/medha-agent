@@ -14,39 +14,25 @@ pub(crate) struct Source {
     pub built_in: bool,
 }
 
-/// The user's registered sources; empty when the file is missing or unreadable.
-pub(crate) fn registered() -> Vec<Tap> {
-    config::user_taps_path()
-        .ok()
-        .map(TapStore::new)
-        .and_then(|store| store.list().ok())
-        .unwrap_or_default()
-}
-
 /// Built-ins first, then the user's own; a user source that shadows a built-in
 /// is listed once, as the built-in.
 pub(crate) fn sources() -> Vec<Source> {
     let defaults = hub::default_taps();
-    let own: Vec<Tap> = registered()
-        .into_iter()
-        .filter(|tap| !defaults.iter().any(|d| d.key() == tap.key()))
-        .collect();
-    defaults
+    browse()
         .into_iter()
         .map(|tap| Source {
+            built_in: defaults.iter().any(|default| default.key() == tap.key()),
             tap,
-            built_in: true,
         })
-        .chain(own.into_iter().map(|tap| Source {
-            tap,
-            built_in: false,
-        }))
         .collect()
 }
 
 /// Every source search should read, so search works before anything is added.
 pub(crate) fn browse() -> Vec<Tap> {
-    sources().into_iter().map(|source| source.tap).collect()
+    match config::user_taps_path() {
+        Ok(path) => hub::browse_taps(&path),
+        Err(_) => hub::default_taps(),
+    }
 }
 
 /// Returns the parsed source and whether it was new (false: updated in place).

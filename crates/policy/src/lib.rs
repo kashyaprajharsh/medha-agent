@@ -136,6 +136,10 @@ impl DefaultPolicy {
     /// it lacks gets its own card; without one, only reads skip the card in Autopilot.
     fn asks(&self, autonomy: AutonomyLevel, intent: &ToolIntent) -> bool {
         let shell = intent.tool == "shell.exec";
+        // Searching for skills reads public catalogs; only writing or installing one is gated.
+        if intent.tool == "skill.save" && intent.args["job"] == "search" {
+            return false;
+        }
         match (autonomy, self.jail) {
             (AutonomyLevel::Normal, Jail::Active) if shell => false,
             (AutonomyLevel::Autopilot, Jail::Missing) if shell => {
@@ -177,7 +181,8 @@ impl Policy for DefaultPolicy {
                 self.jail,
             ),
             "git" => authorize_git(intent),
-            "skill.save" => Decision::Human,
+            // Only a search reads; anything else, an unknown job included, adds a skill and asks.
+            "skill.save" if intent.args["job"] != "search" => Decision::Human,
             // Applying an unseen sub-agent patch always requires review.
             "agent.apply" => Decision::Human,
             // The verb lives behind `op`, so the gate reads the argument rather
@@ -1008,10 +1013,24 @@ mod tests {
     #[test]
     fn saving_a_skill_always_requires_human_approval() {
         let p = DefaultPolicy::new();
-        assert!(matches!(
-            auth(&p, &intent("skill.save", json!({}))),
-            Decision::Human
-        ));
+        for args in [
+            json!({}),
+            json!({"job": "write"}),
+            json!({"job": "install"}),
+            json!({"job": "nonsense"}),
+        ] {
+            assert!(
+                matches!(
+                    auth(&p, &intent("skill.save", args.clone())),
+                    Decision::Human
+                ),
+                "{args}"
+            );
+        }
+        // Searching only reads catalogs, even where a project's lock names skill.save for approval.
+        let gated = DefaultPolicy::requiring_approval(["edit", "skill.save"]);
+        let search = intent("skill.save", json!({"job": "search", "query": "pdf"}));
+        assert!(matches!(auth(&gated, &search), Decision::Allow));
     }
 
     #[test]

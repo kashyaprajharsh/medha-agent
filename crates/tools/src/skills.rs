@@ -872,11 +872,24 @@ impl SkillStore {
     /// written; the kebab-validated frontmatter name cannot escape the skills
     /// dir. Installing over an existing name is an upgrade.
     pub async fn install_from(&self, src: &str) -> Result<InstallReport, String> {
-        let user_dir = self
-            .user_dir
-            .as_ref()
-            .ok_or("no user home directory available")?
-            .clone();
+        self.install_into(src, SkillScope::User).await
+    }
+
+    /// Installs into the person's skills or this project's; staged beside the target, so the move is atomic.
+    pub async fn install_into(
+        &self,
+        src: &str,
+        scope: SkillScope,
+    ) -> Result<InstallReport, String> {
+        let user_dir = match scope {
+            SkillScope::User => self
+                .user_dir
+                .as_ref()
+                .ok_or("no user home directory available")?
+                .clone(),
+            SkillScope::Project => self.project_dir.clone(),
+            SkillScope::Plugin => return Err("plugin skills come with their plugin".into()),
+        };
         std::fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
         let stage = unique_sibling(&user_dir, ".installing-skill");
         std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
@@ -2056,20 +2069,37 @@ impl SkillSave {
     }
 }
 
+/// The one thing a `skill.save` call does, named by the call itself.
+fn save_job(args: &Value) -> Result<&str, ToolError> {
+    match args.get("job").and_then(Value::as_str) {
+        Some(job @ ("write" | "search" | "install")) => Ok(job),
+        _ => Err(ToolError::Args(
+            "job must be \"write\", \"search\" or \"install\"".into(),
+        )),
+    }
+}
+
 #[async_trait]
 impl Tool for SkillSave {
     fn name(&self) -> &str {
         "skill.save"
     }
     fn description(&self) -> &str {
-        "Save a reusable procedure as a skill so it is available in future \
-         sessions. Use when the user asks to remember a procedure, or OFFER \
-         (ask first) when the user has repeated an instruction or when web \
-         research produced a reusable procedure. Writes a SKILL.md; always \
-         requires the user's approval."
+        "Add skills. job=write saves a reusable procedure as a SKILL.md: when the user asks to remember a \
+         procedure, or OFFER (ask first) when they repeated an instruction or web research produced a reusable \
+         procedure. job=search lists installable skills from the person's skill sources that match `query`. \
+         job=install installs one from `source`: a search hit's install_url, a GitHub /tree/ folder URL, a raw \
+         SKILL.md URL, or a local folder or file; it is scanned first. write and install always ask the user, \
+         and go to the person's skills (every project) unless they asked for this project."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::ReversibleLocal
+    }
+    fn call_radius(&self, args: &Value) -> BlastRadius {
+        match save_job(args) {
+            Ok("search") => BlastRadius::Read,
+            _ => BlastRadius::ReversibleLocal,
+        }
     }
     fn category(&self) -> ToolCategory {
         ToolCategory::Write
@@ -2081,6 +2111,9 @@ impl Tool for SkillSave {
         json!({
             "type": "object",
             "properties": {
+                "job": { "type": "string", "enum": ["write", "search", "install"] },
+                "query": { "type": "string", "description": "search: words to match" },
+                "source": { "type": "string", "description": "install: where the skill comes from" },
                 "name": { "type": "string", "description": "kebab-case skill name" },
                 "description": { "type": "string", "description": "what the skill does and when to use it (≤1024 chars) — shown in the skills list" },
                 "procedure": { "type": "string", "description": "the skill body: steps, decision points, known failure modes (markdown)" },
@@ -2089,10 +2122,15 @@ impl Tool for SkillSave {
                 "required_tools": { "type": "array", "items": { "type": "string" }, "description": "registered tool names the procedure needs, such as shell.exec or web; provider-facing underscore aliases are accepted and normalized" },
                 "scope": { "type": "string", "enum": ["user", "project"], "description": "user (personal, default) or project (committed with the repo)" }
             },
-            "required": ["name", "description", "procedure"]
+            "required": ["job"]
         })
     }
     async fn preview(&self, args: &Value) -> Option<String> {
+        match save_job(args).ok()? {
+            "write" => {}
+            "install" => return install_preview(args),
+            _ => return None,
+        }
         let known_tools = self.catalog.current();
         let spec = self.normalized_spec(args, &known_tools).ok()?;
         let dir = match spec.scope {
@@ -2128,6 +2166,11 @@ impl Tool for SkillSave {
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        match save_job(args)? {
+            "search" => return search_sources(&self.store, args).await,
+            "install" => return install_skill(&self.store, args).await,
+            _ => {}
+        }
         let known_tools = self.catalog.current();
         let spec = self.normalized_spec(args, &known_tools)?;
         let (path, version) = self
@@ -2144,6 +2187,74 @@ impl Tool for SkillSave {
             "note": "Available to load with skill; appears in the skills list next session."
         }))
     }
+}
+
+/// What the approval card says an install will do.
+fn install_preview(args: &Value) -> Option<String> {
+    let source = args.get("source").and_then(Value::as_str)?;
+    let place = match args.get("scope").and_then(Value::as_str) {
+        Some("project") => "this project's skills",
+        _ => "your skills, for every project",
+    };
+    Some(format!(
+        "Install a skill from {source}\ninto {place}. It is scanned before it is added."
+    ))
+}
+
+/// Skills the person's sources offer that match the query: the built-in sources, then their own.
+async fn search_sources(store: &SkillStore, args: &Value) -> Result<Value, ToolError> {
+    let query = crate::arg_str(args, "query")?;
+    let taps = match &store.user_dir {
+        Some(dir) => crate::hub::browse_taps(&dir.join("taps.toml")),
+        None => crate::hub::default_taps(),
+    };
+    let found = crate::hub::search(&taps, &query)
+        .await
+        .map_err(ToolError::Failed)?;
+    let hits: Vec<Value> = found
+        .hits
+        .iter()
+        .take(20)
+        .map(|hit| json!({"name": hit.name, "description": hit.description, "from": hit.repo, "install_url": hit.install_url}))
+        .collect();
+    Ok(json!({"hits": hits, "errors": found.errors}))
+}
+
+/// Installs through the one staged, scanned path every install uses; a skill the scan is unsure of stays off.
+async fn install_skill(store: &SkillStore, args: &Value) -> Result<Value, ToolError> {
+    let source = crate::arg_str(args, "source")?;
+    let scope = match args.get("scope").and_then(Value::as_str) {
+        None | Some("user") => SkillScope::User,
+        Some("project") => SkillScope::Project,
+        Some(other) => {
+            return Err(ToolError::Args(format!(
+                "unknown scope '{other}' (user|project)"
+            )));
+        }
+    };
+    let report = store
+        .install_into(&source, scope)
+        .await
+        .map_err(ToolError::Failed)?;
+    // As the desktop does: held until the person has looked at what the scan found.
+    let held = report.scan_verdict == "caution";
+    if held {
+        store
+            .set_enabled(&report.name, false)
+            .map_err(ToolError::Failed)?;
+    }
+    Ok(json!({
+        "installed": report.name,
+        "scope": scope.as_str(),
+        "replaced": report.replaced,
+        "scan": report.scan_verdict,
+        "findings": report.scan_findings,
+        "note": if held {
+            "Installed but switched off: the scan found things the person should review before it is used."
+        } else {
+            "Ready: load it with skill."
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -2791,6 +2902,7 @@ mod tests {
         };
 
         let saved = futures::executor::block_on(tool.execute(&json!({
+            "job": "write",
             "name": "wire-aliases",
             "description": "Checks nested tool names",
             "procedure": "Run the required tools.",
@@ -2817,6 +2929,7 @@ mod tests {
         };
 
         let error = futures::executor::block_on(tool.execute(&json!({
+            "job": "write",
             "name": "bad-tool",
             "description": "Must not be saved",
             "procedure": "Nothing.",
@@ -2828,6 +2941,7 @@ mod tests {
         assert!(!proj.join("bad-tool/SKILL.md").exists());
 
         let malformed = futures::executor::block_on(tool.execute(&json!({
+            "job": "write",
             "name": "malformed-tools",
             "description": "Must not be saved",
             "procedure": "Nothing.",
@@ -2971,6 +3085,7 @@ mod tests {
         assert_eq!(connected["skills"][0]["available"], true);
         assert!(futures::executor::block_on(load.execute(&json!({ "name": "mcp-echo" }))).is_ok());
         let saved = futures::executor::block_on(save.execute(&json!({
+            "job": "write",
             "name": "saved-mcp",
             "description": "Saved while the MCP tool is connected",
             "procedure": "Call the MCP tool.",
@@ -3005,6 +3120,7 @@ mod tests {
             catalog: catalog_from(known.clone()),
         };
         let args = json!({
+            "job": "write",
             "name": "note-taker",
             "description": "Capture a decision as a note",
             "procedure": "## Steps\n1. write it down",

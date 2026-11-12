@@ -335,7 +335,7 @@ pub(crate) fn given(args: &Value, key: &str) -> bool {
     }
 }
 
-fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
+pub(crate) fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
     args.get(key)
         .and_then(Value::as_str)
         .map(str::to_owned)

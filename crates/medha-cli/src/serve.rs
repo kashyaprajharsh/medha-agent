@@ -300,6 +300,13 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    // Nobody reads a backend's stderr, so a panic is written to its log as well, naming the thread it hit.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        tracing::error!(thread = thread.name().unwrap_or("unnamed"), "panic: {info}");
+        report(info);
+    }));
 
     let _catalogue = providers::catalogue::start_background();
 

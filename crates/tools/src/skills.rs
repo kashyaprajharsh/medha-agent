@@ -65,11 +65,13 @@ fn requirement_available(name: &str, known: &HashSet<String>) -> bool {
 
 /// Where a skill was found. Project (workspace-committed) shadows user (personal).
 /// Plugin skills are namespaced by their plugin id, so they never shadow either.
+/// Built-in skills ship inside Medha and give way to a project or user skill of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillScope {
     Project,
     User,
     Plugin,
+    System,
 }
 
 impl SkillScope {
@@ -78,8 +80,26 @@ impl SkillScope {
             SkillScope::Project => "project",
             SkillScope::User => "user",
             SkillScope::Plugin => "plugin",
+            SkillScope::System => "built-in",
         }
     }
+}
+
+/// Skills built into Medha, served from the binary so nothing on disk can change them.
+const BUILT_IN: &[&str] = &[include_str!("system_skills/skill-creator/SKILL.md")];
+
+fn built_in_skills() -> Vec<Skill> {
+    BUILT_IN
+        .iter()
+        .filter_map(|text| parse_skill_md(text).ok())
+        .map(|parsed| {
+            // A name only: a built-in skill has no folder, so it bundles no files.
+            let path = PathBuf::from("built-in")
+                .join(&parsed.0.name)
+                .join("SKILL.md");
+            build_skill(parsed, SkillScope::System, path)
+        })
+        .collect()
 }
 
 /// Recorded source and security receipt for an installed skill.
@@ -261,10 +281,21 @@ impl SkillStore {
             .iter()
             .find(|listing| !listing.shadowed && listing.skill.name == name)
             .ok_or("Skill not found")?;
-        if listing.skill.scope == SkillScope::Plugin {
-            return Err("Manage this skill through its plugin".into());
-        }
-        let marker = listing.skill.path.with_file_name("SKILL.disabled");
+        let marker = match listing.skill.scope {
+            SkillScope::Plugin => return Err("Manage this skill through its plugin".into()),
+            SkillScope::System => {
+                let marker = self
+                    .built_in_off(name)
+                    .ok_or("no user home directory available")?;
+                if let Some(dir) = marker.parent() {
+                    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+                }
+                marker
+            }
+            SkillScope::Project | SkillScope::User => {
+                listing.skill.path.with_file_name("SKILL.disabled")
+            }
+        };
         if enabled {
             match std::fs::remove_file(marker) {
                 Ok(()) => Ok(()),
@@ -300,6 +331,15 @@ impl SkillStore {
             *current = skills;
         }
         problems
+    }
+
+    /// Where turning a built-in skill off is remembered: a hidden file the folder scan skips.
+    fn built_in_off(&self, name: &str) -> Option<PathBuf> {
+        Some(
+            self.user_dir
+                .as_ref()?
+                .join(format!(".built-in-{name}.disabled")),
+        )
     }
 
     fn plugin_skill_list(&self) -> Vec<Skill> {
@@ -393,6 +433,23 @@ impl SkillStore {
                 }
             }
         }
+        for skill in built_in_skills() {
+            let shadowed = !seen.insert(skill.name.clone());
+            let missing_tools = skill
+                .required_tools
+                .iter()
+                .filter(|t| !requirement_available(t, known_tools))
+                .cloned()
+                .collect();
+            out.listings.push(SkillListing {
+                disabled: self
+                    .built_in_off(&skill.name)
+                    .is_some_and(|marker| marker.exists()),
+                skill,
+                shadowed,
+                missing_tools,
+            });
+        }
         for skill in &self.plugin_skill_list() {
             let missing_tools = skill
                 .required_tools
@@ -447,7 +504,11 @@ impl SkillStore {
         // its files so those references are resolvable, not dead ends.
         let dir = s.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let files = s.package.as_ref().map_or_else(
-            || bundled_files(&dir),
+            // A built-in skill's path is a name, never a folder to read.
+            || match s.scope {
+                SkillScope::System => Vec::new(),
+                _ => bundled_files(&dir),
+            },
             |package| {
                 package
                     .files
@@ -548,6 +609,9 @@ impl SkillStore {
                 "skill '{name}' needs tools not available in this session: {}",
                 listing.missing_tools.join(", ")
             ));
+        }
+        if listing.skill.scope == SkillScope::System {
+            return Err(format!("built-in skill '{name}' has no bundled files"));
         }
         let dir = listing
             .skill
@@ -760,7 +824,9 @@ impl SkillStore {
                 .user_dir
                 .as_ref()
                 .ok_or("no user home directory available; save to project scope instead")?,
-            SkillScope::Plugin => return Err("plugin skills are read-only".into()),
+            SkillScope::Plugin | SkillScope::System => {
+                return Err("plugin and built-in skills are read-only".into());
+            }
         };
         let target = dir.join(&spec.name).join("SKILL.md");
         let version = next_version(&target);
@@ -778,7 +844,7 @@ impl SkillStore {
         let dir = match spec.scope {
             SkillScope::Project => &self.project_dir,
             SkillScope::User => self.user_dir.as_ref()?,
-            SkillScope::Plugin => return None,
+            SkillScope::Plugin | SkillScope::System => return None,
         };
         let target = dir.join(&spec.name).join("SKILL.md");
         let text = std::fs::read_to_string(&target).ok()?;
@@ -888,7 +954,9 @@ impl SkillStore {
                 .ok_or("no user home directory available")?
                 .clone(),
             SkillScope::Project => self.project_dir.clone(),
-            SkillScope::Plugin => return Err("plugin skills come with their plugin".into()),
+            SkillScope::Plugin | SkillScope::System => {
+                return Err("plugin and built-in skills are not installed".into());
+            }
         };
         std::fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
         let stage = unique_sibling(&user_dir, ".installing-skill");
@@ -2136,7 +2204,7 @@ impl Tool for SkillSave {
         let dir = match spec.scope {
             SkillScope::Project => "<workspace>/.medha/skills",
             SkillScope::User => "~/.medha/skills",
-            SkillScope::Plugin => return None,
+            SkillScope::Plugin | SkillScope::System => return None,
         };
         // Updating an existing skill previews as a diff (what actually
         // changes), not a full re-dump of the file.
@@ -2358,7 +2426,11 @@ mod tests {
         );
         let known = tools(&["shell.exec"]);
         let listing = store.discover(&known);
-        let skill = &listing.effective().next().unwrap().skill;
+        let skill = &listing
+            .effective()
+            .find(|listing| listing.skill.scope != SkillScope::System)
+            .unwrap()
+            .skill;
         assert_eq!(skill.name, "dev.me.kit:deploy-fly");
         assert_eq!(skill.scope, SkillScope::Plugin);
 
@@ -2374,7 +2446,10 @@ mod tests {
 
         assert!(store.set_plugin_skills(&[]).is_empty());
         assert!(
-            store.discover(&known).effective().next().is_none(),
+            !store
+                .discover(&known)
+                .effective()
+                .any(|listing| listing.skill.scope == SkillScope::Plugin),
             "disabling a plugin removes its skills from the running session"
         );
     }
@@ -2458,7 +2533,9 @@ mod tests {
         );
         let store = trusted_store(proj, Some(user));
         let disc = store.discover(&tools(&["shell.exec"]));
-        assert_eq!(disc.effective().count(), 2); // deploy-fly (project) + rust-review (user)
+        // deploy-fly (project) + rust-review (user), beside the built-in ones.
+        let own = |listing: &&SkillListing| listing.skill.scope != SkillScope::System;
+        assert_eq!(disc.effective().filter(own).count(), 2);
         let shadowed: Vec<_> = disc.listings.iter().filter(|l| l.shadowed).collect();
         assert_eq!(shadowed.len(), 1);
         assert_eq!(shadowed[0].skill.scope, SkillScope::User);
@@ -2473,7 +2550,8 @@ mod tests {
         write_skill(&proj, "bad", "no frontmatter at all");
         let store = trusted_store(proj, Some(root.join("user")));
         let disc = store.discover(&tools(&["shell.exec"]));
-        assert_eq!(disc.effective().count(), 1);
+        let own = |listing: &&SkillListing| listing.skill.scope != SkillScope::System;
+        assert_eq!(disc.effective().filter(own).count(), 1);
         assert_eq!(disc.errors.len(), 1);
         assert!(disc.errors[0].0.ends_with("SKILL.md"));
         std::fs::remove_dir_all(&root).ok();
@@ -2848,7 +2926,8 @@ mod tests {
         let store = trusted_store(proj, Some(root.join("user")));
         let m = store.manifest(&tools(&["skill"]), Some("please do kw7 now"));
         assert!(m.contains("skill-7"));
-        assert!(m.contains("and 34 more — call skill without a name"));
+        // The test's other 34 skills, and the built-in creator.
+        assert!(m.contains("and 35 more — call skill without a name"));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2859,10 +2938,16 @@ mod tests {
         write_skill(&proj, "deploy-fly", DEPLOY);
         let store = trusted_store(proj, Some(root.join("user")));
         let index = store.list(&tools(&["shell.exec"]));
-        assert_eq!(index["skills"].as_array().unwrap().len(), 1);
-        assert_eq!(index["skills"][0]["name"], "deploy-fly");
-        assert_eq!(index["skills"][0]["available"], true);
-        assert!(index["skills"][0].get("procedure").is_none());
+        let own: Vec<&Value> = index["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|skill| skill["scope"] != "built-in")
+            .collect();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0]["name"], "deploy-fly");
+        assert_eq!(own[0]["available"], true);
+        assert!(own[0].get("procedure").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3039,7 +3124,14 @@ mod tests {
             catalog: fixed_catalog(&["shell.exec"]),
         };
         let told = futures::executor::block_on(tool.execute(&json!({}))).unwrap();
-        assert_eq!(told["skills"], json!([]), "the agent was told of it");
+        assert!(
+            !told["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["name"] == "deploy-fly"),
+            "the agent was told of it"
+        );
         let settings = store.list(&tools(&["shell.exec"]));
         assert_eq!(settings["skills"][0]["name"], "deploy-fly");
         std::fs::remove_dir_all(&root).ok();

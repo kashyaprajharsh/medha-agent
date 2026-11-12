@@ -87,3 +87,53 @@ async fn a_skill_installed_for_this_project_stays_in_the_project() {
         "a project skill went into the person's skills"
     );
 }
+
+/// The built-in skill creator is there without installing anything, loads in full, can be turned off, and cannot be deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_built_in_skill_creator_loads_turns_off_and_stays() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("creator");
+    let chat = client.open(&folder).await;
+    // The newest tool result alone: earlier results stay in the conversation.
+    let asked = |world: &World| {
+        let body = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+            .last()
+            .unwrap();
+        body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    answered(&mut client, &chat, &["skill {}".into()], true).await;
+    let listed = asked(&world);
+    assert!(
+        listed.contains("skill-creator"),
+        "the built-in creator is not listed: {listed}"
+    );
+    let load = format!("skill {}", json!({"name": "skill-creator"}));
+    answered(&mut client, &chat, std::slice::from_ref(&load), true).await;
+    let loaded = asked(&world);
+    assert!(
+        loaded.contains("job: \\\"write\\\""),
+        "the creator's procedure did not load: {loaded}"
+    );
+
+    let off = json!({"method": "extensions.skill.configure", "params": {"name": "skill-creator", "enabled": false}});
+    client.about(&folder, off).await.unwrap();
+    answered(&mut client, &chat, &[load], true).await;
+    assert!(
+        !asked(&world).contains("job: \\\"write\\\""),
+        "a built-in skill that was turned off still loaded"
+    );
+
+    let remove = json!({"method": "extensions.skill.remove", "params": {"name": "skill-creator"}});
+    assert!(
+        client.about(&folder, remove).await.is_err(),
+        "a built-in skill could be deleted"
+    );
+    let on = json!({"method": "extensions.skill.configure", "params": {"name": "skill-creator", "enabled": true}});
+    client.about(&folder, on).await.unwrap();
+}

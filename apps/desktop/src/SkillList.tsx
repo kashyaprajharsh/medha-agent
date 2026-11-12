@@ -15,6 +15,7 @@ const GROUPS = [
   ["user", "Yours", "used in every project", "Every project on this computer"],
   ["project", "This project", "travels with the repository", "This project only"],
   ["plugin", "From plugins", "on and off with their plugin", "Wherever its plugin is on"],
+  ["built-in", "Built in", "comes with Medha", "Every project, from Medha itself"],
 ] as const;
 
 // How much of a description the sheet shows before offering the rest.

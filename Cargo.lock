@@ -1135,6 +1135,7 @@ dependencies = [
  "git-safety",
  "kernel",
  "medha-extension-api",
+ "policy",
  "reqwest 0.12.28",
  "sandbox",
  "serde",

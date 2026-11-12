@@ -29,6 +29,47 @@ pub(crate) enum DeleteTier {
 }
 
 /// Refused in every mode: no jail or approval makes these safe to run.
+/// Whether any command in the line is fed its program through a pipe.
+pub(crate) fn pipes_code(reading: &Reading) -> bool {
+    reading.commands.iter().any(feeds_code)
+}
+
+/// A piped shell or interpreter that reads its program from the pipe: `| sh`, `| python`, `| bash -s`.
+/// Given its program (`perl -pe '…'`, `python -c '…'`, a script path), the pipe only carries data.
+fn feeds_code(command: &Command) -> bool {
+    if !command.piped_in {
+        return false;
+    }
+    let Some(program) = command.program() else {
+        return false;
+    };
+    if program.name == "eval" {
+        return true;
+    }
+    if !interpreter(&program.name) {
+        return false;
+    }
+    for arg in program.args {
+        let text = arg.text.as_str();
+        if text == "-" || text == "-s" {
+            return true;
+        }
+        match text.strip_prefix('-') {
+            None => return false,
+            Some(flags)
+                if !flags.starts_with('-')
+                    && flags
+                        .chars()
+                        .any(|flag| matches!(flag, 'c' | 'e' | 'E' | 'm' | 'r')) =>
+            {
+                return false;
+            }
+            Some(_) => {}
+        }
+    }
+    true
+}
+
 pub(crate) fn danger(reading: &Reading, workspace: Option<&str>, jailed: bool) -> Option<String> {
     if reading.self_forking {
         return Some("a function that starts copies of itself without end (fork bomb)".into());
@@ -94,8 +135,8 @@ fn command_danger(command: &Command, jailed: bool) -> Option<&'static str> {
         return Some("changes ownership or permissions across a system folder");
     }
     // Inside the jail a piped interpreter is contained, and fetching what it runs needs network approval.
-    if !jailed && command.piped_in && (interpreter(name) || name == "eval") {
-        return Some("pipes data into a shell or interpreter");
+    if !jailed && feeds_code(command) {
+        return Some("pipes code into a shell or interpreter");
     }
     None
 }

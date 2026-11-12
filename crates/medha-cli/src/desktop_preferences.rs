@@ -70,7 +70,7 @@ pub(crate) fn plugins(store: &extensions::Store) -> Result<Value> {
         let manifest = &plugin.package.manifest;
         let grant = plugin.requested_grant();
         let components: Vec<Value> = manifest.components.iter().map(|component| json!({ "id": component.id(), "kind": match component { extensions::ExtensionComponent::Skill { .. } => "Skill", extensions::ExtensionComponent::Action { .. } => "Action", extensions::ExtensionComponent::Mcp { .. } => "MCP server", extensions::ExtensionComponent::Hook { .. } => "Hook" } })).collect();
-        json!({ "id": manifest.id, "name": manifest.name, "description": manifest.description, "version": manifest.version, "scope": plugin.scope.as_str(), "activation": plugin.activation.as_str(), "hash": plugin.package.content_hash, "permissions": manifest.permissions, "can_rollback": store.can_rollback(&manifest.id), "grant": grant.as_ref().ok(), "blocked": grant.err().map(|e| e.to_string()), "components": components,
+        json!({ "id": manifest.id, "name": manifest.name, "description": manifest.description, "version": manifest.version, "scope": plugin.scope.as_str(), "activation": plugin.activation.as_str(), "hash": plugin.package.content_hash, "permissions": manifest.permissions, "can_rollback": store.can_rollback(&manifest.id), "grant": grant.as_ref().ok(), "blocked": grant.err().map(|e| e.to_string()), "findings": plugin.scan_findings(), "components": components,
             "health": store.component_health(&manifest.id, &plugin.package.content_hash).iter().map(|health| json!({"id": health.component_id, "state": health.state.as_str(), "error": health.last_failure})).collect::<Vec<_>>() })
     }).collect();
     Ok(json!({ "plugins": rows, "notices": discovery.notices() }))

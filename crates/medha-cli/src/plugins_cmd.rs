@@ -324,6 +324,13 @@ fn inspect(plugin: &extensions::ListedPlugin) {
     if let Some(description) = &manifest.description {
         println!("description: {description}");
     }
+    let findings = plugin.scan_findings();
+    if !findings.is_empty() {
+        println!("scan findings to review:");
+        for finding in findings {
+            println!("  {finding}");
+        }
+    }
     println!("access requested:");
     match plugin.requested_grant() {
         Ok(requested) if requested.is_empty() => println!("  none"),

@@ -14,6 +14,7 @@ file-ops = { path = "../file-ops" }
 git-safety = { path = "../git-safety" }
 medha-extension-api = { path = "../extension-api" }
 kernel = { path = "../kernel" }
+policy = { path = "../policy" }
 sandbox = { path = "../sandbox" }
 async-trait.workspace = true
 fd-lock = "4"

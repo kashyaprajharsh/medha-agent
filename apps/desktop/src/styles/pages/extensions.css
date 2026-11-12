@@ -755,6 +755,14 @@
   font-size: var(--text-xs);
   overflow-wrap: anywhere;
 }
+/* One scan finding per line, quieter than the line that introduces them. */
+.sheet-finding {
+  display: block;
+  margin-top: var(--s-1);
+  color: var(--dim);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
 .ext-seg button {
   white-space: nowrap;
 }

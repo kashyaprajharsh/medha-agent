@@ -176,6 +176,11 @@ impl Store {
                 return Err(outcome.err().unwrap_or(Error::SourceChanged));
             }
         };
+        // An update is scanned like an install, before the version in use is moved aside.
+        if let Err(error) = crate::package::screen(&staging) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
         let _ = fs::remove_dir_all(&previous);
         if let Some(parent) = previous.parent() {
             fs::create_dir_all(parent)

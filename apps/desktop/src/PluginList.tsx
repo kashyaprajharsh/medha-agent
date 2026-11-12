@@ -13,6 +13,7 @@ export type Plugin = {
   grant: Record<string, unknown> | null;
   can_rollback: boolean;
   blocked?: string;
+  findings?: string[];
   components: { id: string; kind: string }[];
   permissions: {
     network_hosts: string[];
@@ -137,6 +138,22 @@ export function PluginList({ plugins, disabled, onReview, onTurnOff, onCheckUpda
             </dd>
             <dt>Used in</dt>
             <dd>{SCOPE[open.scope] ?? open.scope}</dd>
+            <dt>Scan</dt>
+            <dd className={open.findings?.length ? "warn" : ""}>
+              {open.findings?.length ? (
+                <>
+                  {many(open.findings.length, "thing")} to read before turning it on:
+                  {open.findings.slice(0, 6).map((finding) => (
+                    <span className="sheet-finding" key={finding}>
+                      {finding}
+                    </span>
+                  ))}
+                  {open.findings.length > 6 && <span className="sheet-finding">and {open.findings.length - 6} more</span>}
+                </>
+              ) : (
+                "Nothing found in its files"
+              )}
+            </dd>
           </dl>
           <h3 className="sheet-h">What it adds</h3>
           <ul className="sheet-parts">

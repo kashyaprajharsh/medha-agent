@@ -59,6 +59,25 @@ pub struct ListedPlugin {
 }
 
 impl ListedPlugin {
+    /// What the content scan found in these exact files, to read before turning the plugin on.
+    pub fn scan_findings(&self) -> Vec<String> {
+        // Keyed by the content hash, which names these exact files, so a kept result is never stale.
+        static SCANNED: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+        > = std::sync::OnceLock::new();
+        let scanned = SCANNED.get_or_init(Default::default);
+        let hash = &self.package.content_hash;
+        if let Some(found) = scanned.lock().ok().and_then(|kept| kept.get(hash).cloned()) {
+            return found;
+        }
+        let found = crate::package::screen(&self.package.root)
+            .unwrap_or_else(|error| vec![error.to_string()]);
+        if let Ok(mut kept) = scanned.lock() {
+            kept.insert(hash.clone(), found.clone());
+        }
+        found
+    }
+
     /// Access this package needs; an error explains why it can never be granted.
     pub fn requested_grant(&self) -> Result<Grant, Error> {
         Grant::for_request(&self.package.manifest.permissions)
@@ -314,6 +333,11 @@ impl Store {
                 return Err(error);
             }
         };
+        // Scanned as staged, so what is checked is exactly what would be installed.
+        if let Err(error) = crate::package::screen(&staging) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
         // Publish a disabled pin before package code becomes discoverable. This
         // also closes the window where an old stale pin could activate a newly
         // installed package with the same ID.

@@ -320,6 +320,45 @@ fn is_executable(path: &Path) -> Result<bool, Error> {
     }
 }
 
+/// The content scan of a plugin's files: what could harm on install refuses it, the rest is for the review.
+pub(crate) fn screen(root: &Path) -> Result<Vec<String>, Error> {
+    use policy::guard::{Finding, PackageKind, ScanVerdict, Severity, scan_package_as};
+    let mut files = Vec::new();
+    for path in scan_files(root)? {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            Error::UnsafePackage(format!("{} is outside the package", path.display()))
+        })?;
+        files.push((
+            portable_relative_path(relative)?,
+            read_regular_bounded(&path, MAX_FILE_BYTES)?,
+            is_executable(&path)?,
+        ));
+    }
+    let report = scan_package_as(
+        PackageKind::Plugin,
+        files
+            .iter()
+            .map(|(path, bytes, executable)| (path.as_str(), bytes.as_slice(), *executable)),
+    );
+    let said = |finding: &Finding| match finding.line {
+        Some(line) => format!("{}:{line}: {}", finding.file, finding.reason),
+        None => format!("{}: {}", finding.file, finding.reason),
+    };
+    if report.verdict == ScanVerdict::Dangerous {
+        let harm: Vec<String> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == Severity::Dangerous)
+            .map(said)
+            .collect();
+        return Err(Error::UnsafePackage(format!(
+            "it was not installed: the scan found what could harm on install\n  {}",
+            harm.join("\n  ")
+        )));
+    }
+    Ok(report.findings.iter().map(said).collect())
+}
+
 pub(crate) fn copy_package(source: &Path, target: &Path) -> Result<(), Error> {
     let source_files = scan_files(source)?;
     fs::create_dir(target)

@@ -58,15 +58,14 @@ fn separating_documentation_does_not_relax_executable_package_checks() {
             .iter()
             .any(|finding| finding.severity == Severity::Dangerous)
     );
+    // A command written in a skill is still reported; it runs only through the command checks.
     let mut findings = Vec::new();
     guard::scan_text(
         "SKILL.md",
         "Run `sudo apt install malicious-package`.",
         &mut findings,
     );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.severity == Severity::Dangerous)
-    );
+    assert!(findings.iter().any(|finding| {
+        finding.severity == Severity::Caution && finding.reason.contains("privilege escalation")
+    }));
 }

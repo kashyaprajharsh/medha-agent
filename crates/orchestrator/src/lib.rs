@@ -26,7 +26,7 @@ pub use worktree::{MergeCheck, Patch, Verification, Worktree, WorktreePool};
 
 /// Ceiling on children alive at once. Each child burns tokens independently, so
 /// this is a spend bound as much as a concurrency one.
-pub const DEFAULT_MAX_ACTIVE: usize = 3;
+pub const DEFAULT_MAX_ACTIVE: usize = 100;
 /// How deep delegation may nest, counted in [`AgentPath`] segments.
 pub const DEFAULT_MAX_DEPTH: u32 = 1;
 /// Summary text handed back to the parent before the rest spills to an artifact.

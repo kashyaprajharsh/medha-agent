@@ -2995,7 +2995,7 @@ http_timeout_ms = 60000         # per-request deadline for remote servers
 # ───────────────────────────────────────────────────────────
 [agents]
 enabled = true
-max_active = 3                  # children alive at once, across the whole tree
+max_active = 100                # children alive at once, across the whole tree
 max_depth = 1                   # 1 keeps delegation flat (a child cannot spawn)
 write = true                    # allow writing children (worktree + patch)
 max_turns = 100                 # operator ceiling on ONE child's turns

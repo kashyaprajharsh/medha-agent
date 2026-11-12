@@ -262,7 +262,7 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_active: 3,
+            max_active: 100,
             max_depth: 1,
             write: true,
             max_turns: 100,

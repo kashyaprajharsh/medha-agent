@@ -218,9 +218,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .then(|| Arc::new(self.reviewer(session.id)));
         let decided = self.dispatch_decided(session, intent, web_tainted, cancel, lane, sink);
         let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
-        let decided =
-            crate::gate::answers_scope(answers, crate::review::review_scope(reviewer, decided));
-        tokio::pin!(decided);
+        // On the heap: a sub-agent's call nests inside its parent's, and Windows gives the main thread 1 MiB.
+        let mut decided = Box::pin(crate::gate::answers_scope(
+            answers,
+            crate::review::review_scope(reviewer, decided),
+        ));
         // While an answer is being logged the call waits, so nothing it allows starts before its record.
         let observation = loop {
             tokio::select! {

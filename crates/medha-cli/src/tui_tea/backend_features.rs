@@ -475,6 +475,7 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::SkillSources(args) => skill_sources(model, &args),
         A::SearchSkills(query) => search_skills(model, &query),
         A::AddSkill(arg) => add_skill(model, &arg),
+        A::NewSkill(name) => new_draft(model, protocol::DraftKind::Skill, &name),
         A::UpdateSkills(arg) => update_skills(model, &arg),
         A::LockSkills => lock_skills(model),
         A::SyncSkills => sync_skills(model),
@@ -1379,6 +1380,11 @@ pub(super) fn resource_reply(model: &mut Model, resource: Resource, after: After
         Resource::Marketplaces(markets) => backend_plugins::markets(model, markets),
         Resource::Hooks(hooks) => backend_plugins::hooks(model, hooks),
         Resource::PluginInstalled { id } => { request(model, Effect::Read(Read::Plugins, After::PluginEnable(id))); },
+        Resource::Preview(preview) => {
+            model.push_notice(describe_preview(&preview));
+            let source = match after { After::Intake(source) => source, _ => String::new() };
+            model.picker = Some(Picker::new(PickerKind::Intake { source, preview }));
+        }
     }
 }
 
@@ -1402,16 +1408,129 @@ pub(super) fn search_skills(model: &mut Model, query: &str) {
         ),
     );
 }
+/// Every way in shows what a source is before it is added; the picker that follows adds it.
 pub(super) fn install_skill(model: &mut Model, source: &str) {
+    preview_source(model, source);
+}
+pub(super) fn preview_source(model: &mut Model, source: &str) {
+    if source.trim().is_empty() {
+        model.push_notice("usage: /skill add <link, path or words> · /plugins install <source>");
+        return;
+    }
     request(
         model,
-        Effect::Change(
+        Effect::Read(
+            Read::Preview {
+                source: source.trim().into(),
+            },
+            After::Intake(source.trim().into()),
+        ),
+    );
+}
+pub(super) fn add_previewed(
+    model: &mut Model,
+    source: &str,
+    preview: &protocol::IntakePreview,
+    project: bool,
+) {
+    let effect = match preview.kind.as_str() {
+        "plugin" => Effect::Change(
+            Change::InstallPlugin {
+                source: source.into(),
+            },
+            After::Plugins,
+        ),
+        _ => Effect::Change(
             Change::InstallSkill {
                 source: source.into(),
+                project,
             },
             After::Reload(Box::new(After::Skills)),
         ),
+    };
+    request(model, effect);
+}
+pub(super) fn new_draft(model: &mut Model, kind: protocol::DraftKind, name: &str) {
+    if name.is_empty() {
+        model.push_notice(match kind {
+            protocol::DraftKind::Skill => {
+                "usage: /skill new <name>, in short kebab-case like release-notes"
+            }
+            protocol::DraftKind::Plugin => "usage: /plugins new <id>, like dev.you.my-plugin",
+        });
+        return;
+    }
+    request(
+        model,
+        Effect::Change(
+            Change::NewDraft {
+                kind,
+                name: name.into(),
+                text: None,
+            },
+            After::Notice,
+        ),
     );
+}
+/// What a source is, in the words the picker under it acts on.
+pub(super) fn describe_preview(preview: &protocol::IntakePreview) -> String {
+    let name = preview.name.clone().unwrap_or_default();
+    let mut lines = vec![match preview.kind.as_str() {
+        "plugin" => format!("Plugin {name}"),
+        "connector" => format!("Connector {name}"),
+        _ => format!("Skill {name}"),
+    }];
+    if let Some(description) = preview.description.as_ref().filter(|text| !text.is_empty()) {
+        lines.push(format!("  how Medha will list it: {description}"));
+    }
+    if let Some(url) = &preview.url {
+        lines.push(format!("  address: {url}"));
+    }
+    if !preview.files.is_empty() {
+        lines.push(format!("  files: {}", preview.files.join(", ")));
+    }
+    for (kind, label) in [
+        ("skill", "skills"),
+        ("action", "commands"),
+        ("mcp", "servers"),
+        ("hook", "scripts that run on their own"),
+    ] {
+        let parts: Vec<&str> = preview
+            .adds
+            .iter()
+            .filter(|part| part.kind == kind)
+            .map(|part| part.id.as_str())
+            .collect();
+        if !parts.is_empty() {
+            lines.push(format!("  {label}: {}", parts.join(", ")));
+        }
+    }
+    if preview.kind == "plugin" {
+        lines.push(match preview.hosts.is_empty() {
+            true => "  internet: nothing".into(),
+            false => format!("  internet: only {}", preview.hosts.join(", ")),
+        });
+    }
+    if let Some(refused) = &preview.refused {
+        lines.push(format!(
+            "  it cannot be added: {}",
+            refused
+                .lines()
+                .skip(1)
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    } else if preview.kind != "connector" {
+        lines.push(match preview.findings.len() {
+            0 => "  scan: nothing found".into(),
+            _ => format!(
+                "  scan, to read before adding: {}",
+                preview.findings.join("; ")
+            ),
+        });
+    }
+    lines.join("\n")
 }
 pub(super) fn add_skill(model: &mut Model, source: &str) {
     if looks_like_source(source) {

@@ -106,6 +106,8 @@ pub(super) enum After {
     AgentTranscript(String),
     Patch(String),
     Reload(Box<After>),
+    /// A previewed source, to be offered for adding.
+    Intake(String),
 }
 
 pub(super) struct Draft {
@@ -2477,6 +2479,38 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
     {
         return;
     }
+    // A new skill Medha proposes can be kept as a draft to edit; its own save is then declined.
+    if matches!(key.code, KeyCode::Char('e' | 'E'))
+        && let Some((name, text)) = proposed_skill(&prompt)
+    {
+        request(
+            model,
+            Effect::Change(
+                protocol::ChangeResource::NewDraft {
+                    kind: protocol::DraftKind::Skill,
+                    name,
+                    text: Some(text),
+                },
+                After::Notice,
+            ),
+        );
+        if request(
+            model,
+            Effect::Approve(protocol::AnswerApproval {
+                gate_id: id,
+                decision: protocol::ApprovalDecision::Deny,
+            }),
+        ) {
+            model
+                .remote
+                .as_mut()
+                .expect("viewer")
+                .approvals_answering
+                .insert(id);
+        }
+        model.dirty = true;
+        return;
+    }
     let choice = match key.code {
         KeyCode::Char('y' | 'Y' | '1') => Some(0),
         KeyCode::Char('a' | 'A' | '2') => Some(1),
@@ -2511,6 +2545,17 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
             .insert(id);
     }
     model.dirty = true;
+}
+
+/// The name and SKILL.md of a new skill an approval proposes; the backend's preview puts the file after the first blank line.
+pub(super) fn proposed_skill(prompt: &protocol::ApprovalPrompt) -> Option<(String, String)> {
+    let detail = prompt.detail.as_deref()?;
+    let rest = (prompt.action == "skill.save")
+        .then(|| detail.strip_prefix("Save new skill '"))
+        .flatten()?;
+    let name = rest.split_once('\'')?.0.to_string();
+    let text = detail.split_once("\n\n")?.1.to_string();
+    Some((name, text))
 }
 
 pub(super) fn submit_clarify(model: &mut Model) {

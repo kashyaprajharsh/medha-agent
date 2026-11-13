@@ -446,6 +446,21 @@ pub(crate) async fn read<L: EventLog>(
             )
             .await?,
         )?),
+        Read::Preview { source } => {
+            let store = plugin_store(workspace)?;
+            let mut seen = crate::desktop_intake::preview(
+                &local_source(workspace, &source)?,
+                workspace,
+                &store,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            seen["hosts"] = seen["access"]["network_hosts"].take();
+            if seen["hosts"].is_null() {
+                seen["hosts"] = json!([]);
+            }
+            Reply::Preview(decoded(seen)?)
+        }
         Read::SkillUpdates { name } => Reply::SkillUpdates(decoded(
             skill_hub(
                 workspace,
@@ -610,10 +625,25 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
             json!({"provider": provider, "key": key, "url": url}),
         ),
         Change::PulseFix => ("settings.health.fix", json!({})),
-        Change::InstallSkill { source } => (
+        Change::InstallSkill { source, project } => (
             "extensions.skill.install",
-            json!({"source": local_source(workspace, &source)?}),
+            json!({"source": local_source(workspace, &source)?, "scope": if project { "project" } else { "user" }}),
         ),
+        Change::NewDraft { kind, name, text } => {
+            let folder = crate::desktop_intake::new_draft(kind, &name, text.as_deref())
+                .map_err(|error| error.to_string())?;
+            let add = match kind {
+                protocol::DraftKind::Skill => "/skill add",
+                protocol::DraftKind::Plugin => "/plugins install",
+            };
+            return Ok(Reply::Changed(protocol::ResourceNotice {
+                messages: vec![format!(
+                    "Draft written to {}. Edit it in your editor, then {add} {} to check it and add it.",
+                    folder.display(),
+                    folder.display()
+                )],
+            }));
+        }
         Change::RemoveSkill { name } => ("extensions.skill.remove", json!({"name": name})),
         Change::ConfigureSkill { name, enabled } => (
             "extensions.skill.configure",

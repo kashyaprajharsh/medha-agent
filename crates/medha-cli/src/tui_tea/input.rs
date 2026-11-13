@@ -722,6 +722,8 @@ pub(super) enum SlashAction {
     SearchSkills(String),
     /// `/skill add <word-or-link>` — search the catalog or install a link/path.
     AddSkill(String),
+    /// `/skill new <name>`: a SKILL.md template in the person's drafts, to edit and then add.
+    NewSkill(String),
     /// `/skill update [<name> | --all]` — check (and optionally apply) updates.
     UpdateSkills(String),
     /// `/skill lock` — write the skills lockfile from what's installed.
@@ -861,6 +863,9 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
         }
         c if c.strip_prefix("skill add").is_some_and(is_cmd_boundary) => {
             SlashAction::AddSkill(c.strip_prefix("skill add").unwrap_or("").trim().to_string())
+        }
+        c if c.strip_prefix("skill new").is_some_and(is_cmd_boundary) => {
+            SlashAction::NewSkill(c.strip_prefix("skill new").unwrap_or("").trim().to_string())
         }
         "skill lock" => SlashAction::LockSkills,
         "skill sync" => SlashAction::SyncSkills,

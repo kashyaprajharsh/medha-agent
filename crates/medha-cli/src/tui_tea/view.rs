@@ -2508,6 +2508,13 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
                     pending.escalated,
                 )
             };
+            let ApprovalResponder::Remote(prompt) = &pending.responder;
+            if super::backend_ui::proposed_skill(prompt).is_some() {
+                rows.push(Line::from(Span::styled(
+                    "e  keep it as a draft to edit in your own editor, instead of saving it as it is",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
             // If more approvals are queued behind the current one, say so — so the
             // user knows to expect another prompt right after this one.
             if model.pending_approvals.len() > 1 {

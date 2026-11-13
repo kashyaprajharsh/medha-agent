@@ -15,6 +15,16 @@ pub(super) fn activate(model: &mut Model) -> bool {
         model.picker = None;
         match action {
             Some("add") => search_skills(model, ""),
+            Some("write") => prefill_command(
+                model,
+                "/skill new ",
+                "type a name in short kebab-case, like release-notes, then Enter",
+            ),
+            Some("create") => prefill_command(
+                model,
+                "Use the skill-creator skill to help me write a skill that ",
+                "finish the sentence and send it; you read the skill before it is saved",
+            ),
             Some("manage") => {
                 model.picker = Some(Picker::new(PickerKind::SkillManage));
             }
@@ -28,6 +38,28 @@ pub(super) fn activate(model: &mut Model) -> bool {
                     }
                 }
             }
+        }
+        return true;
+    }
+    if let PickerKind::Intake { source, preview } = &picker.kind {
+        let choice = intake_choices(preview)
+            .get(picker.selected)
+            .map(|(_, id)| *id);
+        let (source, preview) = (source.clone(), preview.clone());
+        model.picker = None;
+        match choice {
+            Some("user") => add_previewed(model, &source, &preview, false),
+            Some("project") => add_previewed(model, &source, &preview, true),
+            Some("connector") => prefill_command(
+                model,
+                &format!(
+                    "/mcp add {} --url {}",
+                    preview.name.unwrap_or_default(),
+                    preview.url.unwrap_or(source)
+                ),
+                "Enter to add it; add --oauth or --bearer <token> if the server needs a sign-in",
+            ),
+            _ => model.push_notice("Not added"),
         }
         return true;
     }

@@ -1456,3 +1456,43 @@ async fn large_returned_messages_are_compact_in_the_editor_and_can_be_sent_intac
     };
     assert_eq!(draft.request.content, raw);
 }
+
+/// A new skill Medha proposes can be kept as a draft to edit instead of saved as is; Medha's own save is then declined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proposed_skill_can_be_kept_as_a_draft_to_edit() {
+    let mut f = fixture().await;
+    let draft = "---\nname: notes\ndescription: Keeps meeting notes.\n---\n\n1. Ask.\n";
+    approval(
+        &mut f.model,
+        protocol::ApprovalPrompt {
+            gate_id: 9,
+            action: "skill.save".into(),
+            detail: Some(format!(
+                "Save new skill 'notes' (user scope) → ~/.medha/skills/notes/SKILL.md\n\n{draft}"
+            )),
+            escalated: true,
+            kind: protocol::ApprovalKind::Action,
+            choices: vec![
+                protocol::ApprovalDecision::Once,
+                protocol::ApprovalDecision::Deny,
+            ],
+            folder: None,
+            path: None,
+        },
+    );
+    f.model.approval_ready = true;
+    handle_approval_key(
+        &mut f.model,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let sent = &f.model.remote.as_ref().unwrap().pending;
+    assert!(sent.iter().any(|asked| matches!(
+        &asked.effect,
+        Effect::Change(protocol::ChangeResource::NewDraft { kind: protocol::DraftKind::Skill, name, text: Some(text) }, _)
+            if name == "notes" && text == draft
+    )), "the draft was not kept");
+    assert!(sent.iter().any(|asked| matches!(
+        &asked.effect,
+        Effect::Approve(answer) if answer.gate_id == 9 && matches!(answer.decision, protocol::ApprovalDecision::Deny)
+    )), "Medha's own save was not declined");
+}

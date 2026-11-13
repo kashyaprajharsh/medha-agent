@@ -53,6 +53,8 @@ mod skill_write;
 mod stored;
 #[path = "serve_e2e/summary.rs"]
 mod summary;
+#[path = "serve_e2e/tui_intake.rs"]
+mod tui_intake;
 
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut request = Vec::new();

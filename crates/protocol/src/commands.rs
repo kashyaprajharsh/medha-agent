@@ -79,11 +79,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/skill",
-        "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load  ·  /skill enable|disable <name>",
+        "skill hub: use a skill, add one (search, a link or a path, shown before it is added), write one with /skill new <name>, or create one with Medha; /skill <name> loads one; /skill enable|disable <name>",
     ),
     (
         "/plugins",
-        "plugins — install from GitHub or a marketplace · discover · on/off · update",
+        "plugins: install from GitHub, a marketplace, a folder or a .zip, shown before it is added; /plugins new <id> writes one; discover, on/off, update",
     ),
     (
         "/hooks",

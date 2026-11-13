@@ -372,10 +372,20 @@ pub enum ReadResource {
     Pulse,
     Sessions,
     Skills,
-    Skill { name: String },
+    Skill {
+        name: String,
+    },
     SkillSources,
-    SkillSearch { query: String },
-    SkillUpdates { name: Option<String> },
+    SkillSearch {
+        query: String,
+    },
+    /// What a source is and what adding it would bring; nothing is added.
+    Preview {
+        source: String,
+    },
+    SkillUpdates {
+        name: Option<String>,
+    },
     SkillLockfile,
     Plugins,
     PluginDoctor,
@@ -394,6 +404,7 @@ pub enum ResourceResult {
     Skill(SkillInfo),
     SkillSources(Vec<SkillSource>),
     SkillSearch(SkillSearch),
+    Preview(IntakePreview),
     SkillUpdates(Vec<SkillUpdate>),
     SkillLockfile {
         path: PathBuf,
@@ -495,6 +506,17 @@ pub enum ChangeResource {
     PulseFix,
     InstallSkill {
         source: String,
+        /// For this project only, rather than every project.
+        #[serde(default)]
+        project: bool,
+    },
+    /// A template in the person's drafts, to edit in their own editor and then add.
+    NewDraft {
+        kind: DraftKind,
+        name: String,
+        /// A skill's SKILL.md to start from, such as one Medha proposed.
+        #[serde(default)]
+        text: Option<String>,
     },
     RemoveSkill {
         name: String,
@@ -553,6 +575,58 @@ pub enum ChangeResource {
         event: String,
         file: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftKind {
+    Skill,
+    Plugin,
+}
+
+/// A part a plugin would add, by its kind: skill, action, mcp or hook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntakePart {
+    pub id: String,
+    pub kind: String,
+}
+
+/// What a dropped, pasted or drafted source is, before anything is added.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IntakePreview {
+    /// skill, plugin or connector.
+    pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A skill's files, SKILL.md first.
+    #[serde(default, deserialize_with = "files_or_count")]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    /// Why an install would refuse it.
+    #[serde(default)]
+    pub refused: Option<String>,
+    /// A plugin's requested internet hosts.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub adds: Vec<IntakePart>,
+    /// A connector's address.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// A plugin preview counts its files; a skill's lists them.
+fn files_or_count<'de, D: serde::Deserializer<'de>>(raw: D) -> Result<Vec<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(raw)? {
+        serde_json::Value::Array(files) => files
+            .into_iter()
+            .filter_map(|file| file.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

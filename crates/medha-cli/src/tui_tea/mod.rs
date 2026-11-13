@@ -85,10 +85,39 @@ pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
         "add",
     ),
     (
+        "✎ Write a skill…     a template to edit in your editor",
+        "write",
+    ),
+    (
+        "✨ Create with Medha…  a chat that drafts it with you",
+        "create",
+    ),
+    (
         "⚙  Manage skills…    updates · sources · lock / sync",
         "manage",
     ),
 ];
+
+/// `(label, action id)` rows offered under a preview; a refused one can only be cancelled.
+pub(super) fn intake_choices(
+    preview: &protocol::IntakePreview,
+) -> &'static [(&'static str, &'static str)] {
+    if preview.refused.is_some() {
+        return &[("Cancel: it cannot be added", "cancel")];
+    }
+    match preview.kind.as_str() {
+        "plugin" => &[
+            ("Add the plugin. It stays off until you turn it on", "user"),
+            ("Cancel", "cancel"),
+        ],
+        "connector" => &[("Add connector", "connector"), ("Cancel", "cancel")],
+        _ => &[
+            ("Add for me, every project", "user"),
+            ("Add for this project only", "project"),
+            ("Cancel", "cancel"),
+        ],
+    }
+}
 
 /// `(label, action id)` rows in the skill-management submenu.
 pub(super) const SKILL_MANAGE_ACTIONS: &[(&str, &str)] = &[
@@ -825,6 +854,11 @@ enum PickerKind {
     /// `/skill search` results: pick one to install. Holds the ranked hits;
     /// Enter installs the selected one through the guard-gated installer.
     SkillSearch(Vec<protocol::SkillHit>),
+    /// A source shown before it is added: where to add it, or not at all.
+    Intake {
+        source: String,
+        preview: protocol::IntakePreview,
+    },
     /// The skill hub's "Manage skills…" sub-menu (updates / sources / lock /
     /// sync). Fixed rows from [`SKILL_MANAGE_ACTIONS`]; no data to carry.
     SkillManage,
@@ -1025,6 +1059,10 @@ impl PickerKind {
                 " web search — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
             PickerKind::SkillSearch(_) => " add a skill — ↑↓ select · Enter · Esc back ".into(),
+            PickerKind::Intake { preview, .. } => format!(
+                " add this {}? read it above · ↑↓ move · Enter choose · Esc cancel ",
+                preview.kind
+            ),
             PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
             PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
             PickerKind::BackendPlugins(screen) => screen.title(),
@@ -1359,6 +1397,10 @@ impl PickerKind {
             PickerKind::Tools { scope, tools } => backend_tools::labels(*scope, tools),
             // Row 0 is always "install from a link" (never a dead end); the rest
             // are the browsable catalog, one row per skill.
+            PickerKind::Intake { preview, .. } => intake_choices(preview)
+                .iter()
+                .map(|(label, _)| (*label).to_string())
+                .collect(),
             PickerKind::SkillSearch(hits) => {
                 std::iter::once("🔗 Install from a link or local folder…".to_string())
                     .chain(hits.iter().map(|h| {

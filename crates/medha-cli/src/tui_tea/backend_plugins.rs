@@ -579,14 +579,9 @@ fn enter(model: &mut Model, current: Screen, selected: usize) {
                         Effect::Read(Read::Plugins, After::PluginEnable(row.id.clone())),
                     );
                 } else {
-                    request(
+                    backend_features::preview_source(
                         model,
-                        Effect::Change(
-                            Change::InstallPlugin {
-                                source: format!("{}@{}", row.name, row.market),
-                            },
-                            After::PluginEnable(row.id.clone()),
-                        ),
+                        &format!("{}@{}", row.name, row.market),
                     );
                 }
             } else {
@@ -751,12 +746,14 @@ pub(super) fn run_command(model: &mut Model, args: &str) {
             open(model);
             return;
         }
-        "install" => Effect::Change(
-            Change::InstallPlugin {
-                source: rest.into(),
-            },
-            After::Plugins,
-        ),
+        "install" => {
+            backend_features::preview_source(model, rest);
+            return;
+        }
+        "new" => {
+            backend_features::new_draft(model, protocol::DraftKind::Plugin, rest);
+            return;
+        }
         "enable" => Effect::Read(Read::Plugins, After::PluginEnable(rest.into())),
         "disable" => Effect::Read(Read::Plugins, After::PluginDisable(rest.into())),
         "remove" => Effect::Read(Read::Plugins, After::PluginRemove(rest.into())),
@@ -790,7 +787,7 @@ pub(super) fn run_command(model: &mut Model, args: &str) {
             }
         }
         _ => {
-            model.push_notice("usage: /plugins [install|enable|disable|remove|update|rollback|doctor|discover|marketplace]");
+            model.push_notice("usage: /plugins [install|new|enable|disable|remove|update|rollback|doctor|discover|marketplace]");
             return;
         }
     };

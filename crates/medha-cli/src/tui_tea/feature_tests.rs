@@ -964,3 +964,101 @@ async fn resume_lists_personal_chats_and_opens_one_where_it_lives() {
         "the personal chat was not opened in its own folder"
     );
 }
+
+/// Adding a skill or plugin here shows what it is first; it is added only from the choice under it, and a refused one cannot be added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_is_shown_before_it_is_added_and_added_where_chosen() {
+    let mut f = fixture().await;
+    let last = |model: &Model| {
+        let mut notices = model.items.iter().filter_map(|entry| match &entry.item {
+            Item::Notice(text) => Some(text.clone()),
+            _ => None,
+        });
+        notices.next_back().unwrap_or_default()
+    };
+    backend_features::add_skill(&mut f.model, "/drafts/notes");
+    let asked = &f.model.remote.as_ref().unwrap().pending;
+    assert!(asked.iter().any(|asked| matches!(&asked.effect, Effect::Read(protocol::ReadResource::Preview { source }, _) if source == "/drafts/notes")));
+    assert!(
+        !asked
+            .iter()
+            .any(|asked| matches!(&asked.effect, Effect::Change(..))),
+        "a source was added before it was shown"
+    );
+    f.model.remote.as_mut().unwrap().pending.clear();
+
+    let skill = protocol::IntakePreview {
+        kind: "skill".into(),
+        name: Some("notes".into()),
+        description: Some("Keeps meeting notes.".into()),
+        files: vec!["SKILL.md".into(), "scripts/fetch.sh".into()],
+        findings: vec!["scripts/fetch.sh: executable package file requires explicit review".into()],
+        ..Default::default()
+    };
+    backend_features::resource_reply(
+        &mut f.model,
+        Resource::Preview(skill),
+        After::Intake("/drafts/notes".into()),
+    );
+    let shown = last(&f.model);
+    assert!(
+        shown.contains("how Medha will list it: Keeps meeting notes."),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("files: SKILL.md, scripts/fetch.sh"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("scan, to read before adding: scripts/fetch.sh"),
+        "{shown}"
+    );
+    let rows = f.model.picker.as_ref().unwrap().kind.labels();
+    assert_eq!(
+        rows,
+        [
+            "Add for me, every project",
+            "Add for this project only",
+            "Cancel"
+        ]
+    );
+    input::handle_key(&mut f.model, key(KeyCode::Down));
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    let sent = &f.model.remote.as_ref().unwrap().pending;
+    assert!(sent.iter().any(|asked| matches!(
+        &asked.effect,
+        Effect::Change(protocol::ChangeResource::InstallSkill { source, project: true }, _) if source == "/drafts/notes"
+    )));
+    f.model.remote.as_mut().unwrap().pending.clear();
+
+    let refused = protocol::IntakePreview {
+        kind: "plugin".into(),
+        name: Some("Bad".into()),
+        refused: Some("it was not installed: the scan found what could harm on install\n  hooks/run.sh:2: pipes a download into a shell".into()),
+        adds: vec![protocol::IntakePart { id: "run".into(), kind: "hook".into() }],
+        ..Default::default()
+    };
+    backend_features::resource_reply(
+        &mut f.model,
+        Resource::Preview(refused),
+        After::Intake("/x/bad".into()),
+    );
+    let shown = last(&f.model);
+    assert!(
+        shown.contains("scripts that run on their own: run"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("it cannot be added: hooks/run.sh:2"),
+        "{shown}"
+    );
+    assert_eq!(
+        f.model.picker.as_ref().unwrap().kind.labels(),
+        ["Cancel: it cannot be added"]
+    );
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    assert!(
+        f.model.remote.as_ref().unwrap().pending.is_empty(),
+        "a refused plugin was added"
+    );
+}

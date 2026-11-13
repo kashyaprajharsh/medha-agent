@@ -196,6 +196,63 @@ pub(crate) async fn write_skill(workspace: &Path, params: &Value) -> Result<Valu
     install_skill(workspace, &staged.root.to_string_lossy(), params).await
 }
 
+fn skill_template(name: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: What it does and when to use it.\n---\n\n# Steps\n\n1. \n"
+    )
+}
+
+fn plugin_template(id: &str) -> String {
+    format!(
+        "schema_version = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\nmedha = \">=0.1.0\"\ndescription = \"What it adds, in one line.\"\n\n[permissions]\nnetwork_hosts = []\n\n[[components]]\nkind = \"skill\"\nid = \"my-skill\"\npath = \"skills/my-skill\"\n"
+    )
+}
+
+/// A template in the person's drafts folder, never over one already there; returns its folder.
+pub(crate) fn new_draft(
+    kind: protocol::DraftKind,
+    name: &str,
+    text: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let plain = !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+    if !plain || name.contains("..") {
+        return Err(anyhow!(
+            "{name} must be lowercase letters, digits, dots or hyphens"
+        ));
+    }
+    let files = match kind {
+        protocol::DraftKind::Skill => {
+            let text = text.map_or_else(|| skill_template(name), str::to_string);
+            tools::check_skill_md(&text).map_err(anyhow::Error::msg)?;
+            vec![("SKILL.md".to_string(), text)]
+        }
+        protocol::DraftKind::Plugin => vec![
+            ("plugin.toml".to_string(), plugin_template(name)),
+            (
+                "skills/my-skill/SKILL.md".to_string(),
+                skill_template("my-skill"),
+            ),
+        ],
+    };
+    let folder = config::medha_home()?.join("drafts").join(name);
+    if folder.exists() {
+        return Err(anyhow!(
+            "A draft named {name} already exists at {}",
+            folder.display()
+        ));
+    }
+    for (path, text) in files {
+        let file = folder.join(path);
+        std::fs::create_dir_all(file.parent().unwrap_or(&folder))?;
+        std::fs::write(file, text)?;
+    }
+    Ok(folder)
+}
+
 /// A remote MCP server: an https address that is not a code host. Named after its site.
 fn connector_name(source: &str) -> Option<String> {
     let rest = source.strip_prefix("https://")?;

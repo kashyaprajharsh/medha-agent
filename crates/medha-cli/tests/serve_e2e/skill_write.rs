@@ -115,3 +115,46 @@ async fn a_written_skill_is_saved_with_its_files_and_never_over_another() {
     assert!(refused.is_err(), "{refused:?}");
     assert!(!world.home().join("skills/other").exists() && !folder.join("outside.md").exists());
 }
+
+/// A skill the model proposes reaches the approval card as the SKILL.md itself, so the person can finish it in the editor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proposed_skill_can_be_taken_to_the_editor() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("write");
+    let chat = client.open(&folder).await;
+    let save = json!({"job": "write", "name": "notes", "description": "Keeps meeting notes in one plain format.", "procedure": "1. Ask for the meeting."});
+    client
+        .send(&chat, &format!("SCRIPT\nskill_save {save}"))
+        .await;
+    let (_, frame) = client
+        .until(|frame| frame["method"] == "approval" || kind(frame, "turn.done"))
+        .await;
+    assert_eq!(frame["params"]["action"], "skill.save", "{frame}");
+    let detail = frame["params"]["detail"].as_str().unwrap();
+    let (head, draft) = detail.split_once("\n\n").unwrap();
+    assert!(head.starts_with("Save new skill 'notes'"), "{detail}");
+    let seen = call(
+        &mut client,
+        &folder,
+        "extensions.skill.check",
+        json!({"text": draft}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(seen["name"], "notes", "{seen}");
+    assert!(draft.contains("1. Ask for the meeting."), "{draft}");
+    client
+        .ask(
+            "approval.respond",
+            Some(&chat),
+            json!({"gate_id": frame["params"]["gate_id"], "approve": false}),
+        )
+        .await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(
+        !world.home().join("skills/notes").exists(),
+        "a declined draft was saved"
+    );
+}

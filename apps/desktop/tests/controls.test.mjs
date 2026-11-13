@@ -847,6 +847,36 @@ test("a path approval offers each answer the backend sends, and the folder says 
   assert.deepEqual(answered, [[4, "folder"]]);
 });
 
+test("a skill Medha proposes can be finished in the editor instead of saved as is", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  const draft = "---\nname: notes\ndescription: Keeps meeting notes in one plain format.\n---\n\n1. Ask for the meeting.\n";
+  let state = reduceLive(startingLive(), { method: "ready", params: { session: "s" } });
+  state = reduceLive(state, { method: "approval", params: {
+    gate_id: 7, action: "skill.save", escalated: true, kind: "action", choices: ["once", "deny"],
+    detail: `Save new skill 'notes' (user scope) → ~/.medha/skills/notes/SKILL.md\n\n${draft}`,
+  } });
+  globalThis.__medhaControlsTest.api = { extensions: async () => ({ name: "notes", description: "Keeps meeting notes in one plain format." }) };
+  const answered = [];
+  const render = (current) => act(() => root.render(h(LiveTail, {
+    state: current, onAnswer() {}, onOpenAgent() {},
+    onApprove: (approval, decision) => answered.push([approval.gateId, decision]),
+  })));
+  await render(state);
+  await click(namedButton("Open in the editor"));
+  assert.deepEqual(answered, [[7, "deny"]], "the model's own save is declined");
+  const editor = document.querySelector('[aria-label="Write a skill"] textarea');
+  assert.equal(editor.value, draft);
+
+  state = reduceLive(state, { method: "approval", params: {
+    gate_id: 8, action: "skill.save", escalated: true, kind: "action", choices: ["once", "deny"],
+    detail: "Update skill 'notes' (user scope, v1 → v2) → ~/.medha/skills/notes/SKILL.md\n\n--- current\n+++ proposed\n",
+  } });
+  await render(state);
+  const update = [...document.querySelectorAll(".ask")].at(-1);
+  assert.equal([...update.querySelectorAll("button")].some((node) => node.textContent === "Open in the editor"), false, "an update is a diff, not a draft");
+});
+
 test("directory and unknown targets never claim an exact file grant", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive } = await import(await moduleUrl("live"));
@@ -2598,6 +2628,7 @@ const sheetButton = (label) =>
 
 async function extensionForm(kind, chooseExtensionSource) {
   const writes = [];
+  const asked = [];
   const looked = [];
   globalThis.__medhaControlsTest.chooseExtensionSource = chooseExtensionSource;
   globalThis.__medhaControlsTest.api = {
@@ -2619,12 +2650,12 @@ async function extensionForm(kind, chooseExtensionSource) {
   cache.set("Connectors", "data:text/javascript," + encodeURIComponent("export function Connectors(){return null}"));
   const { Extensions } = await import(await moduleUrl("Extensions", cache));
   const render = async (locked = false) => act(async () => root.render(h(Extensions, {
-    sessionKey: null, ensureOpen: async () => {}, locked, onAsk() {},
+    sessionKey: null, ensureOpen: async () => {}, locked, onAsk: (prompt) => asked.push(prompt),
   })));
   await render();
   await click(namedButton(kind === "skill" ? "Skills" : "Plugins"));
   await click(namedButton(`Add ${kind}`));
-  return { writes, looked, render };
+  return { writes, looked, asked, render };
 }
 
 test("Add shows a chosen skill before adding it, and adds it only where the person chose", async () => {
@@ -2686,6 +2717,14 @@ test("picker errors and unknown sources can be retried, and nothing is chosen wh
   assert.equal(namedButton("Choose folder").disabled, true);
   assert.equal(document.querySelector('[aria-label="Link or path"]').disabled, true);
   assert.deepEqual(writes, []);
+});
+
+test("Create with Medha starts a chat that drafts the skill with the built-in creator", async () => {
+  const { asked } = await extensionForm("skill", async () => null);
+  await click([...document.querySelectorAll(".intake-start")].find((node) => node.querySelector("b").textContent === "Create with Medha"));
+  assert.deepEqual(asked, ["Use the skill-creator skill to help me write a skill that "]);
+  await act(() => new Promise((done) => setTimeout(done, 700)));
+  assert.equal(document.querySelector('[aria-label="Add to Medha"]'), null);
 });
 
 test("Write a skill checks it as the backend reads it, and asks before replacing one", async () => {

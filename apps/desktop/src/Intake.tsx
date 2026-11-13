@@ -23,6 +23,8 @@ type Props = {
   onClose: () => void;
   /** Start a skill from nothing, in the editor. */
   onWrite: () => void;
+  /** Start a new chat that drafts a skill with the built-in skill creator. */
+  onCreate: (prompt: string) => void;
   onAdd: (method: string, params: Record<string, unknown>) => Promise<void>;
   onConnector: (args: string[]) => Promise<void>;
 };
@@ -36,7 +38,7 @@ const PARTS = [
 ] as const;
 
 /** One way in for a skill, a plugin or a connector: given anything, it says what it is before it is added. */
-export function Intake({ disabled, onClose, onWrite, onAdd, onConnector }: Props) {
+export function Intake({ disabled, onClose, onWrite, onCreate, onAdd, onConnector }: Props) {
   const api = useWorkspaceApi();
   const [typed, setTyped] = useState("");
   const [source, setSource] = useState("");
@@ -170,6 +172,16 @@ export function Intake({ disabled, onClose, onWrite, onAdd, onConnector }: Props
             <button className="intake-start" disabled={disabled} onClick={onWrite}>
               <b>Write a skill</b>
               <span>An editor that checks it as you type and shows how Medha will list it.</span>
+            </button>
+            <button
+              className="intake-start"
+              onClick={() => {
+                onClose();
+                onCreate("Use the skill-creator skill to help me write a skill that ");
+              }}
+            >
+              <b>Create with Medha</b>
+              <span>A new chat that drafts it with you. You read it before it is saved, or finish it in the editor.</span>
             </button>
           </div>
         </>

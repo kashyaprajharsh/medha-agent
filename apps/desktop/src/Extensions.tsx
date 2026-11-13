@@ -385,6 +385,7 @@ export function Extensions({
               setInstalling(false);
               setWriting(true);
             }}
+            onCreate={onAsk}
             onAdd={(method, params) => act(method, params)}
             onConnector={(args) => act("settings.mcp.save", { args })}
           />

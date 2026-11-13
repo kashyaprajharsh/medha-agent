@@ -1,4 +1,5 @@
-import { Fragment, memo, useMemo } from "react";
+import { Fragment, memo, useMemo, useState } from "react";
+import { SkillWriter } from "./SkillWriter";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
 import { summaryLine } from "./turnSummary";
@@ -30,6 +31,13 @@ const LIVE = 1e12;
 
 /** Who is asking and for what. A path request arrives as "Read access to /a/b",
  *  with the agent's name in front when one of Medha's agents is the one asking. */
+/** The SKILL.md a new skill's approval proposes; the backend's preview puts it after the first blank line. */
+export function skillDraft(approval: Approval): string | undefined {
+  if (approval.action !== "skill.save" || !approval.detail?.startsWith("Save new skill '")) return undefined;
+  const at = approval.detail.indexOf("\n\n");
+  return at < 0 ? undefined : approval.detail.slice(at + 2);
+}
+
 function asks(approval: Approval): string {
   if (approval.kind !== "path") return `Medha wants to ${approval.action}`;
   const parts = approval.action.split(" · ");
@@ -81,6 +89,7 @@ export const LiveTail = memo(function LiveTail({
   onOpenAgent,
   onSwitchModel,
 }: Props) {
+  const [editing, setEditing] = useState<string>();
   const plan = state.error ? planRefusal(state.error) : undefined;
   const working =
     state.status === "running" ||
@@ -177,6 +186,20 @@ export const LiveTail = memo(function LiveTail({
                   : answerLabel(choice, approval)}
               </button>
             ))}
+            {skillDraft(approval) && (
+              <button
+                type="button"
+                className="btn-line"
+                disabled={approval.pending}
+                onClick={() => {
+                  // The person saves it from the editor, so the model's own save is declined.
+                  setEditing(skillDraft(approval));
+                  onApprove(approval, "deny");
+                }}
+              >
+                Open in the editor
+              </button>
+            )}
           </div>
         </div>
       ))}
@@ -232,6 +255,14 @@ export const LiveTail = memo(function LiveTail({
           </b>
           <span>{explainError(state.error) ?? state.error}</span>
         </div>
+      )}
+      {editing !== undefined && (
+        <SkillWriter
+          disabled={false}
+          initial={[{ path: "SKILL.md", text: editing }]}
+          onClose={() => setEditing(undefined)}
+          onSaved={() => window.dispatchEvent(new CustomEvent("medha-preferences"))}
+        />
       )}
     </div>
   );

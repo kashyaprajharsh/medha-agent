@@ -870,6 +870,12 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
         }
         "extensions.skill.check" => Ok(crate::desktop_intake::check_skill(text(params, "text")?)),
         "extensions.skill.write" => crate::desktop_intake::write_skill(workspace, params).await,
+        "extensions.plugin.check" => {
+            crate::desktop_intake::check_plugin(params, &plugin_store(workspace)?)
+        }
+        "extensions.plugin.write" => {
+            crate::desktop_intake::write_plugin(params, &plugin_store(workspace)?)
+        }
         "extensions.update.preview" | "extensions.update.apply" => {
             let store = plugin_store(workspace)?;
             let plan = store.plan_update(text(params, "id")?)?;

@@ -3,6 +3,7 @@ import { desktop, type ExtensionSourceKind } from "./api";
 import { McpForm } from "./McpServers";
 import { Sheet } from "./Sheet";
 import { useWorkspaceApi } from "./Workspace";
+import type { WriterKind } from "./SkillWriter";
 
 /** What `extensions.preview` says a source is; nothing has been added yet. */
 export type Preview =
@@ -21,8 +22,8 @@ export type Preview =
 type Props = {
   disabled: boolean;
   onClose: () => void;
-  /** Start a skill from nothing, in the editor. */
-  onWrite: () => void;
+  /** Start a skill or plugin from nothing, in the editor. */
+  onWrite: (kind: WriterKind) => void;
   /** Start a new chat that drafts a skill with the built-in skill creator. */
   onCreate: (prompt: string) => void;
   onAdd: (method: string, params: Record<string, unknown>) => Promise<void>;
@@ -169,9 +170,13 @@ export function Intake({ disabled, onClose, onWrite, onCreate, onAdd, onConnecto
         <>
           <h3 className="sheet-h intake-scratch">Or start from nothing</h3>
           <div className="intake-starts">
-            <button className="intake-start" disabled={disabled} onClick={onWrite}>
+            <button className="intake-start" disabled={disabled} onClick={() => onWrite("skill")}>
               <b>Write a skill</b>
               <span>An editor that checks it as you type and shows how Medha will list it.</span>
+            </button>
+            <button className="intake-start" disabled={disabled} onClick={() => onWrite("plugin")}>
+              <b>Write a plugin</b>
+              <span>Its manifest and folders, checked as you type: what it adds and what it can touch.</span>
             </button>
             <button
               className="intake-start"

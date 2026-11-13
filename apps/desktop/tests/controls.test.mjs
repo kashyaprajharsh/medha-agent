@@ -2769,6 +2769,49 @@ test("Write a skill checks it as the backend reads it, and asks before replacing
   assert.match(document.querySelector('[role="status"]').textContent, /Saved notes/);
 });
 
+test("Write a plugin checks every file as an install would, and a harmful one cannot be saved", async () => {
+  await extensionForm("plugin", async () => null);
+  const saves = [];
+  const checked = [];
+  const extensions = globalThis.__medhaControlsTest.api.extensions;
+  globalThis.__medhaControlsTest.api.extensions = async (method, params) => {
+    if (method === "extensions.plugin.check") {
+      checked.push(params.files.map((file) => file.path));
+      const hostile = params.files.some((file) => file.path === "hooks/run.sh");
+      return {
+        kind: "plugin", name: "My plugin", version: "0.1.0", adds: [{ id: "my-skill", kind: "skill" }, ...(hostile ? [{ id: "run", kind: "hook" }] : [])],
+        access: { network_hosts: [], read_paths: [], write_paths: [], secrets: [] }, findings: [],
+        refused: hostile ? "it was not installed: the scan found what could harm on install\n  hooks/run.sh:2: pipes a download into a shell" : null,
+      };
+    }
+    if (method === "extensions.plugin.write") {
+      saves.push(params);
+      return { id: "dev.you.my-plugin", installed: true, enabled: false };
+    }
+    return extensions(method, params);
+  };
+  await click([...document.querySelectorAll(".intake-start")].find((node) => node.querySelector("b").textContent === "Write a plugin"));
+  const sheet = () => document.querySelector('[aria-label="Write a plugin"]');
+  const settle = () => act(() => new Promise((done) => setTimeout(done, 300)));
+  await settle();
+  assert.deepEqual(checked.at(-1), ["plugin.toml", "skills/my-skill/SKILL.md"]);
+  assert.match(sheet().textContent, /My plugin 0\.1\.0 reads as a plugin/);
+  assert.match(sheet().textContent, /Skills: my-skill/);
+  await click(sheetButtonIn(sheet(), "Add file"));
+  const path = sheet().querySelector('[aria-label="File path"]');
+  await inputValue(path, "hooks/run.sh");
+  await settle();
+  assert.match(sheet().textContent, /Scripts that run on their own: run/);
+  assert.match(sheet().textContent, /cannot be added.*hooks\/run\.sh:2/);
+  assert.equal(sheetButtonIn(sheet(), "Save plugin").disabled, true, "a plugin the scan refuses cannot be saved");
+  await click(sheetButtonIn(sheet(), "Remove file"));
+  await settle();
+  await click(sheetButtonIn(sheet(), "Save plugin"));
+  assert.deepEqual(saves[0].files.map((file) => file.path), ["plugin.toml", "skills/my-skill/SKILL.md"]);
+  assert.equal(sheet(), null);
+  assert.match(document.querySelector('[role="status"]').textContent, /Saved dev\.you\.my-plugin, turned off/);
+});
+
 const sheetButtonIn = (sheet, label) => [...sheet.querySelectorAll("button")].find((node) => node.textContent.trim() === label);
 
 const screenshotData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";

@@ -259,6 +259,10 @@
 .writer-spacer {
   flex: 1;
 }
+.writer-note {
+  margin: 0;
+  max-width: 46ch;
+}
 @media (max-width: 700px) {
   .writer {
     grid-template-columns: 1fr;

@@ -4,8 +4,50 @@ import { Sheet } from "./Sheet";
 import { useWorkspaceApi } from "./Workspace";
 
 type File = { path: string; text: string };
-/** The backend's own reading of SKILL.md, the same one an install uses. */
-type Check = { name?: string; description?: string; required_tools?: string[]; error?: string };
+/** The backend's own reading of what is written, the same one an install uses. */
+type Check = {
+  name?: string;
+  description?: string;
+  required_tools?: string[];
+  error?: string;
+  version?: string;
+  adds?: { id: string; kind: string }[];
+  access?: { network_hosts: string[]; read_paths: string[]; write_paths: string[]; secrets: string[] };
+  findings?: string[];
+  refused?: string | null;
+};
+export type WriterKind = "skill" | "plugin";
+
+const PLUGIN_START: File[] = [
+  {
+    path: "plugin.toml",
+    text: `schema_version = 1
+id = "dev.you.my-plugin"
+name = "My plugin"
+version = "0.1.0"
+medha = ">=0.1.0"
+description = "What it adds, in one line."
+
+[permissions]
+network_hosts = []
+
+[[components]]
+kind = "skill"
+id = "my-skill"
+path = "skills/my-skill"
+`,
+  },
+  {
+    path: "skills/my-skill/SKILL.md",
+    text: `---
+name: my-skill
+description: What it does and when to use it.
+---
+
+1.
+`,
+  },
+];
 
 const START = `---
 name:
@@ -21,6 +63,8 @@ const SHORT = 40;
 const LIMIT = 1024;
 
 type Props = {
+  /** A skill by default; a plugin is its manifest and its folders. */
+  kind?: WriterKind;
   disabled: boolean;
   /** A draft to start from, such as one made in a chat. */
   initial?: File[];
@@ -28,10 +72,11 @@ type Props = {
   onSaved: (name: string, enabled: boolean, findings: string[]) => void;
 };
 
-/** Writing a skill by hand: SKILL.md and its files, checked as they are typed, saved through the install scan. */
-export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
+/** Writing a skill or plugin by hand: its files, checked as they are typed, saved through the install scan. */
+export function SkillWriter({ kind = "skill", disabled, initial, onClose, onSaved }: Props) {
   const api = useWorkspaceApi();
-  const [files, setFiles] = useState<File[]>(initial ?? [{ path: "SKILL.md", text: START }]);
+  const plugin = kind === "plugin";
+  const [files, setFiles] = useState<File[]>(initial ?? (plugin ? PLUGIN_START : [{ path: "SKILL.md", text: START }]));
   const [open, setOpen] = useState(0);
   const [check, setCheck] = useState<Check>({});
   const [scope, setScope] = useState<"user" | "project">("user");
@@ -39,12 +84,14 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
   const [error, setError] = useState("");
   const [taken, setTaken] = useState(false);
   const skillMd = files[0].text;
+  // A skill is read from its SKILL.md; a plugin from all of its files.
+  const checked = plugin ? JSON.stringify(files) : skillMd;
 
   useEffect(() => {
     let current = true;
     const wait = setTimeout(() => {
       void api
-        .extensions("extensions.skill.check", { text: skillMd })
+        .extensions(plugin ? "extensions.plugin.check" : "extensions.skill.check", plugin ? { files } : { text: skillMd })
         .then((seen) => current && setCheck(seen as Check))
         .catch((cause) => current && setCheck({ error: String(cause) }));
     }, 250);
@@ -52,15 +99,17 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
       current = false;
       clearTimeout(wait);
     };
-  }, [skillMd]);
+  }, [checked]);
 
   async function save(replace = false) {
     setSaving(true);
     setError("");
     setTaken(false);
     try {
-      const saved = await api.extensions("extensions.skill.write", { files, scope, replace });
-      onSaved(String(saved.name), Boolean(saved.enabled), (saved.findings as string[]) ?? []);
+      const saved = plugin
+        ? await api.extensions("extensions.plugin.write", { files })
+        : await api.extensions("extensions.skill.write", { files, scope, replace });
+      onSaved(String(saved.name ?? saved.id), Boolean(saved.enabled), (saved.findings as string[]) ?? []);
       onClose();
     } catch (cause) {
       const said = String(cause);
@@ -80,8 +129,9 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
   };
   const rename = (path: string) => setFiles(files.map((file, index) => (index === open ? { ...file, path } : file)));
   const add = () => {
-    let path = "references/notes.md";
-    for (let n = 2; files.some((file) => file.path === path); n++) path = `references/notes-${n}.md`;
+    const base = plugin ? "skills/another/SKILL.md" : "references/notes.md";
+    let path = base;
+    for (let n = 2; files.some((file) => file.path === path); n++) path = base.replace(plugin ? "another" : "notes", (plugin ? "another-" : "notes-") + n);
     setFiles([...files, { path, text: "" }]);
     setOpen(files.length);
   };
@@ -90,12 +140,14 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
     setOpen(0);
   };
   const length = check.description?.length ?? 0;
-  const ready = !check.error && Boolean(check.name);
+  const ready = !check.error && Boolean(check.name) && !check.refused;
+  const title = plugin ? "Write a plugin" : "Write a skill";
+  const parts = (kindOf: string) => check.adds?.filter((part) => part.kind === kindOf).map((part) => part.id) ?? [];
 
   return (
-    <Sheet label="Write a skill" onClose={onClose} wide>
+    <Sheet label={title} onClose={onClose} wide>
       <div className="sheet-title">
-        <h2>Write a skill</h2>
+        <h2>{title}</h2>
       </div>
       <div className="writer">
         <nav className="writer-files" aria-label="Files">
@@ -132,13 +184,44 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
         </div>
       </div>
       <ul className="writer-checks" aria-label="Checks">
-        {skillMd === START ? (
+        {!plugin && skillMd === START ? (
           <>
             <li className="quiet">Name it in short kebab-case, like release-notes</li>
             <li className="quiet">Describe what it does and when to use it</li>
           </>
         ) : check.error ? (
           <li className="bad">{check.error}</li>
+        ) : plugin && check.name ? (
+          <>
+            <li>
+              {check.name} {check.version} reads as a plugin
+            </li>
+            {[
+              ["skill", "Skills"],
+              ["action", "Commands"],
+              ["mcp", "Servers"],
+              ["hook", "Scripts that run on their own"],
+            ].map(([kindOf, label]) =>
+              parts(kindOf).length ? (
+                <li key={kindOf} className={kindOf === "hook" ? "warn" : undefined}>
+                  {label}: {parts(kindOf).join(", ")}
+                </li>
+              ) : null,
+            )}
+            <li>
+              Internet:{" "}
+              {check.access?.network_hosts.length ? `only ${check.access.network_hosts.join(", ")}` : "nothing"}
+            </li>
+            {check.refused ? (
+              <li className="bad">It cannot be added: {check.refused.split("\n").slice(1).join(" ").trim()}</li>
+            ) : (
+              check.findings?.map((finding) => (
+                <li key={finding} className="warn">
+                  {finding}
+                </li>
+              ))
+            )}
+          </>
         ) : check.name ? (
           <>
             <li>Name {check.name} is short kebab-case</li>
@@ -153,7 +236,7 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
           <li className="quiet">Checking</li>
         )}
       </ul>
-      {ready && (
+      {ready && !plugin && (
         <>
           <h3 className="sheet-h">How Medha will see it</h3>
           <p className="intake-listing">
@@ -168,14 +251,20 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
         </p>
       )}
       <div className="sheet-actions writer-actions">
-        <label className="intake-choice">
-          <input type="radio" name="writer-for" checked={scope === "user"} onChange={() => choose("user")} /> Me, every
-          project
-        </label>
-        <label className="intake-choice">
-          <input type="radio" name="writer-for" checked={scope === "project"} onChange={() => choose("project")} />{" "}
-          This project only
-        </label>
+        {plugin ? (
+          <span className="intake-note writer-note">Added off: you choose where it is on, and see its access again, when you turn it on.</span>
+        ) : (
+          <>
+            <label className="intake-choice">
+              <input type="radio" name="writer-for" checked={scope === "user"} onChange={() => choose("user")} /> Me,
+              every project
+            </label>
+            <label className="intake-choice">
+              <input type="radio" name="writer-for" checked={scope === "project"} onChange={() => choose("project")} />{" "}
+              This project only
+            </label>
+          </>
+        )}
         <span className="writer-spacer" />
         <button className="btn-line" onClick={onClose}>
           Cancel
@@ -186,7 +275,7 @@ export function SkillWriter({ disabled, initial, onClose, onSaved }: Props) {
           </button>
         ) : (
           <button className="btn-gold" disabled={disabled || saving || !ready} onClick={() => void save()}>
-            Save skill
+            {plugin ? "Save plugin" : "Save skill"}
           </button>
         )}
       </div>

@@ -39,6 +39,8 @@ mod intake;
 mod modes;
 #[path = "serve_e2e/pins.rs"]
 mod pins;
+#[path = "serve_e2e/plugin_write.rs"]
+mod plugin_write;
 #[path = "serve_e2e/real_use.rs"]
 mod real_use;
 #[path = "serve_e2e/remembered.rs"]

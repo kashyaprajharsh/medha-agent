@@ -9,7 +9,7 @@ import { SkillBrowse } from "./SkillBrowse";
 import { Sheet } from "./Sheet";
 import { SkillList, type Skill } from "./SkillList";
 import { SkillManage } from "./SkillManage";
-import { SkillWriter } from "./SkillWriter";
+import { SkillWriter, type WriterKind } from "./SkillWriter";
 import { Add, Find, PageTop, ViewBar } from "./ExtensionParts";
 import { Intake } from "./Intake";
 import { Hooks } from "./Hooks";
@@ -88,7 +88,7 @@ export function Extensions({
   const [autoConnect, setAutoConnect] = useState(false);
   const [adding, setAdding] = useState(false);
   const [installing, setInstalling] = useState(false);
-  const [writing, setWriting] = useState(false);
+  const [writing, setWriting] = useState<WriterKind>();
   const [notices, setNotices] = useState<string[]>([]);
   useEffect(() => {
     let active = true;
@@ -381,9 +381,9 @@ export function Extensions({
           <Intake
             disabled={busy || locked}
             onClose={() => setInstalling(false)}
-            onWrite={() => {
+            onWrite={(kind) => {
               setInstalling(false);
-              setWriting(true);
+              setWriting(kind);
             }}
             onCreate={onAsk}
             onAdd={(method, params) => act(method, params)}
@@ -392,12 +392,17 @@ export function Extensions({
         )}
         {writing && (
           <SkillWriter
+            kind={writing}
             disabled={busy || locked}
-            onClose={() => setWriting(false)}
+            onClose={() => setWriting(undefined)}
             onSaved={(name, enabled, findings) => {
               setRefresh((value) => value + 1);
               setNotice(
-                enabled ? `Saved ${name}` : `Saved ${name}, turned off. Review these findings before turning it on: ${findings.join("; ")}`,
+                writing === "plugin"
+                  ? `Saved ${name}, turned off. Open the plugin to review its access and turn it on.`
+                  : enabled
+                    ? `Saved ${name}`
+                    : `Saved ${name}, turned off. Review these findings before turning it on: ${findings.join("; ")}`,
               );
               window.dispatchEvent(new CustomEvent("medha-preferences"));
             }}

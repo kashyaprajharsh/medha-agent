@@ -54,15 +54,7 @@ pub(crate) async fn preview(
     let plugin = plugins
         .preview_from(&source, &markets)
         .map_err(|error| anyhow!("Not a skill ({not_skill}) or a plugin ({error})"))?;
-    let manifest = &plugin.manifest;
-    let adds: Vec<Value> = manifest
-        .components
-        .iter()
-        .map(|component| json!({"id": component.id(), "kind": json!(component)["kind"]}))
-        .collect();
-    Ok(
-        json!({"kind": "plugin", "name": manifest.name, "id": manifest.id, "description": manifest.description, "version": manifest.version, "access": manifest.permissions, "adds": adds, "files": plugin.files, "findings": plugin.findings, "refused": plugin.refused}),
-    )
+    Ok(plugin_json(&plugin))
 }
 
 fn skill_store(workspace: &Path) -> Result<tools::SkillStore> {
@@ -109,7 +101,8 @@ pub(crate) fn check_skill(text: &str) -> Value {
 }
 
 /// Saves a skill written in the app by installing it from a private folder, so it passes the same scan.
-pub(crate) async fn write_skill(workspace: &Path, params: &Value) -> Result<Value> {
+/// The files a person wrote in the app, each a path inside the package.
+fn files_of(params: &Value) -> Result<Vec<(&str, &str)>> {
     let files = params["files"]
         .as_array()
         .ok_or_else(|| anyhow!("files must be a list"))?;
@@ -124,10 +117,67 @@ pub(crate) async fn write_skill(workspace: &Path, params: &Value) -> Result<Valu
                 .components()
                 .all(|part| matches!(part, std::path::Component::Normal(_)));
         if !inside {
-            return Err(anyhow!("{path} must be a path inside the skill"));
+            return Err(anyhow!("{path} must be a path inside the package"));
         }
         written.push((path, text));
     }
+    Ok(written)
+}
+
+/// Written files in a private folder, removed when dropped.
+struct Staged {
+    folder: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.folder);
+    }
+}
+
+fn stage(files: &[(&str, &str)], leaf: &str) -> Result<Staged> {
+    let folder = std::env::temp_dir().join(format!("medha-write-{}", ulid::Ulid::new()));
+    let staged = Staged {
+        root: folder.join(leaf),
+        folder,
+    };
+    for (path, text) in files {
+        let file = staged.root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap_or(&staged.root))?;
+        std::fs::write(file, text)?;
+    }
+    Ok(staged)
+}
+
+fn plugin_json(plugin: &extensions::Preview) -> Value {
+    let manifest = &plugin.manifest;
+    let adds: Vec<Value> = manifest
+        .components
+        .iter()
+        .map(|component| json!({"id": component.id(), "kind": json!(component)["kind"]}))
+        .collect();
+    json!({"kind": "plugin", "name": manifest.name, "id": manifest.id, "description": manifest.description, "version": manifest.version, "access": manifest.permissions, "adds": adds, "files": plugin.files, "findings": plugin.findings, "refused": plugin.refused})
+}
+
+/// The live check in the plugin editor: the files read as an install would read them.
+pub(crate) fn check_plugin(params: &Value, plugins: &extensions::Store) -> Result<Value> {
+    let staged = stage(&files_of(params)?, "plugin")?;
+    Ok(match plugins.preview(&staged.root) {
+        Ok(plugin) => plugin_json(&plugin),
+        Err(error) => json!({"error": error.to_string()}),
+    })
+}
+
+/// Saves a plugin written in the app by installing it from a private folder, through the plugin scan; it is added off.
+pub(crate) fn write_plugin(params: &Value, plugins: &extensions::Store) -> Result<Value> {
+    let staged = stage(&files_of(params)?, "plugin")?;
+    let package = plugins.install(&staged.root)?;
+    Ok(json!({"id": package.manifest.id, "installed": true, "enabled": false}))
+}
+
+pub(crate) async fn write_skill(workspace: &Path, params: &Value) -> Result<Value> {
+    let written = files_of(params)?;
     let skill_md = written
         .iter()
         .find(|(path, _)| *path == "SKILL.md")
@@ -142,22 +192,8 @@ pub(crate) async fn write_skill(workspace: &Path, params: &Value) -> Result<Valu
     if target.join(&name).exists() && params["replace"] != true {
         return Err(anyhow!("A skill named {name} already exists there"));
     }
-    let folder = std::env::temp_dir().join(format!("medha-write-{}", ulid::Ulid::new()));
-    let root = folder.join(&name);
-    let staged = (|| {
-        for (path, text) in &written {
-            let file = root.join(path);
-            std::fs::create_dir_all(file.parent().unwrap_or(&root))?;
-            std::fs::write(file, text)?;
-        }
-        Ok::<_, std::io::Error>(())
-    })();
-    let saved = match staged {
-        Ok(()) => install_skill(workspace, &root.to_string_lossy(), params).await,
-        Err(error) => Err(error.into()),
-    };
-    let _ = std::fs::remove_dir_all(&folder);
-    saved
+    let staged = stage(&written, &name)?;
+    install_skill(workspace, &staged.root.to_string_lossy(), params).await
 }
 
 /// A remote MCP server: an https address that is not a code host. Named after its site.

@@ -65,6 +65,101 @@ pub(crate) async fn preview(
     )
 }
 
+fn skill_store(workspace: &Path) -> Result<tools::SkillStore> {
+    Ok(tools::SkillStore::new(
+        workspace.join(".medha/skills"),
+        Some(config::user_skills_dir()?),
+    )
+    .with_project_source(runtime::project_trust::skill_source()))
+}
+
+fn scope_of(params: &Value) -> Result<tools::SkillScope> {
+    match params["scope"].as_str() {
+        None | Some("user") => Ok(tools::SkillScope::User),
+        Some("project") => Ok(tools::SkillScope::Project),
+        Some(other) => Err(anyhow!("scope must be user or project, not {other}")),
+    }
+}
+
+/// Installs through the scan; a skill with findings to read is added turned off.
+pub(crate) async fn install_skill(workspace: &Path, source: &str, params: &Value) -> Result<Value> {
+    let skills = skill_store(workspace)?;
+    let report = skills
+        .install_into(source, scope_of(params)?)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    if report.scan_verdict == "caution" {
+        skills
+            .set_enabled(&report.name, false)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(
+        json!({"name": report.name, "installed": true, "enabled": report.scan_verdict == "safe", "findings": report.scan_findings}),
+    )
+}
+
+/// The live check in the editor: the install's own reading of SKILL.md.
+pub(crate) fn check_skill(text: &str) -> Value {
+    match tools::check_skill_md(text) {
+        Ok((name, description, required_tools)) => {
+            json!({"name": name, "description": description, "required_tools": required_tools})
+        }
+        Err(error) => json!({"error": error}),
+    }
+}
+
+/// Saves a skill written in the app by installing it from a private folder, so it passes the same scan.
+pub(crate) async fn write_skill(workspace: &Path, params: &Value) -> Result<Value> {
+    let files = params["files"]
+        .as_array()
+        .ok_or_else(|| anyhow!("files must be a list"))?;
+    let mut written = Vec::new();
+    for file in files {
+        let path = file["path"].as_str().unwrap_or_default();
+        let text = file["text"]
+            .as_str()
+            .ok_or_else(|| anyhow!("{path} has no text"))?;
+        let inside = !path.is_empty()
+            && Path::new(path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)));
+        if !inside {
+            return Err(anyhow!("{path} must be a path inside the skill"));
+        }
+        written.push((path, text));
+    }
+    let skill_md = written
+        .iter()
+        .find(|(path, _)| *path == "SKILL.md")
+        .ok_or_else(|| anyhow!("a skill needs a SKILL.md"))?
+        .1;
+    let (name, _, _) = tools::check_skill_md(skill_md).map_err(anyhow::Error::msg)?;
+    let scope = scope_of(params)?;
+    let target = match scope {
+        tools::SkillScope::Project => workspace.join(".medha/skills"),
+        _ => config::user_skills_dir()?,
+    };
+    if target.join(&name).exists() && params["replace"] != true {
+        return Err(anyhow!("A skill named {name} already exists there"));
+    }
+    let folder = std::env::temp_dir().join(format!("medha-write-{}", ulid::Ulid::new()));
+    let root = folder.join(&name);
+    let staged = (|| {
+        for (path, text) in &written {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap_or(&root))?;
+            std::fs::write(file, text)?;
+        }
+        Ok::<_, std::io::Error>(())
+    })();
+    let saved = match staged {
+        Ok(()) => install_skill(workspace, &root.to_string_lossy(), params).await,
+        Err(error) => Err(error.into()),
+    };
+    let _ = std::fs::remove_dir_all(&folder);
+    saved
+}
+
 /// A remote MCP server: an https address that is not a code host. Named after its site.
 fn connector_name(source: &str) -> Option<String> {
     let rest = source.strip_prefix("https://")?;

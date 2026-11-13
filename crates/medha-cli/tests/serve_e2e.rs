@@ -43,6 +43,8 @@ mod real_use;
 mod remembered;
 #[path = "serve_e2e/skill_install.rs"]
 mod skill_install;
+#[path = "serve_e2e/skill_write.rs"]
+mod skill_write;
 #[path = "serve_e2e/stored.rs"]
 mod stored;
 #[path = "serve_e2e/summary.rs"]

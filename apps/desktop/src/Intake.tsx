@@ -21,6 +21,8 @@ export type Preview =
 type Props = {
   disabled: boolean;
   onClose: () => void;
+  /** Start a skill from nothing, in the editor. */
+  onWrite: () => void;
   onAdd: (method: string, params: Record<string, unknown>) => Promise<void>;
   onConnector: (args: string[]) => Promise<void>;
 };
@@ -34,7 +36,7 @@ const PARTS = [
 ] as const;
 
 /** One way in for a skill, a plugin or a connector: given anything, it says what it is before it is added. */
-export function Intake({ disabled, onClose, onAdd, onConnector }: Props) {
+export function Intake({ disabled, onClose, onWrite, onAdd, onConnector }: Props) {
   const api = useWorkspaceApi();
   const [typed, setTyped] = useState("");
   const [source, setSource] = useState("");
@@ -160,6 +162,17 @@ export function Intake({ disabled, onClose, onAdd, onConnector }: Props) {
         <p className="surface-error" role="alert">
           {error}
         </p>
+      )}
+      {!preview && (
+        <>
+          <h3 className="sheet-h intake-scratch">Or start from nothing</h3>
+          <div className="intake-starts">
+            <button className="intake-start" disabled={disabled} onClick={onWrite}>
+              <b>Write a skill</b>
+              <span>An editor that checks it as you type and shows how Medha will list it.</span>
+            </button>
+          </div>
+        </>
       )}
       {preview?.kind === "skill" && (
         <SkillPreview

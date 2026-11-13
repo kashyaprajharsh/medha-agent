@@ -865,30 +865,11 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             .await
         }
         "extensions.skill.install" => {
-            let skills = tools::SkillStore::new(
-                workspace.join(".medha/skills"),
-                Some(config::user_skills_dir()?),
-            )
-            .with_project_source(runtime::project_trust::skill_source());
             let source = crate::desktop_intake::expand_home(text(params, "source")?)?;
-            let scope = match params["scope"].as_str() {
-                None | Some("user") => tools::SkillScope::User,
-                Some("project") => tools::SkillScope::Project,
-                Some(other) => bail!("scope must be user or project, not {other}"),
-            };
-            let report = skills
-                .install_into(&source, scope)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            if report.scan_verdict == "caution" {
-                skills
-                    .set_enabled(&report.name, false)
-                    .map_err(anyhow::Error::msg)?;
-            }
-            Ok(
-                json!({"name": report.name, "installed": true, "enabled": report.scan_verdict == "safe", "findings": report.scan_findings}),
-            )
+            crate::desktop_intake::install_skill(workspace, &source, params).await
         }
+        "extensions.skill.check" => Ok(crate::desktop_intake::check_skill(text(params, "text")?)),
+        "extensions.skill.write" => crate::desktop_intake::write_skill(workspace, params).await,
         "extensions.update.preview" | "extensions.update.apply" => {
             let store = plugin_store(workspace)?;
             let plan = store.plan_update(text(params, "id")?)?;

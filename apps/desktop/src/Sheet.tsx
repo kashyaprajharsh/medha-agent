@@ -6,7 +6,20 @@ import { Icon } from "./Icon";
  * The one thing a row opens: its full detail, from the right, over the page.
  * It leaves the way it came, so `onClose` is told only once it is gone.
  */
-export function Sheet({ label, onClose, onBack, children }: { label: string; onClose: () => void; onBack?: () => void; children: ReactNode }) {
+export function Sheet({
+  label,
+  onClose,
+  onBack,
+  wide,
+  children,
+}: {
+  label: string;
+  onClose: () => void;
+  onBack?: () => void;
+  /** Room for an editor beside its file list. */
+  wide?: boolean;
+  children: ReactNode;
+}) {
   const [leaving, setLeaving] = useState(false);
   const close = () => (matchMedia("(prefers-reduced-motion: reduce)").matches ? onClose() : setLeaving(true));
   useEffect(() => {
@@ -25,7 +38,7 @@ export function Sheet({ label, onClose, onBack, children }: { label: string; onC
     <>
       <div className={`cx-scrim${leaving ? " leaving" : ""}`} onClick={close} />
       <aside
-        className={`cx-sheet${leaving ? " leaving" : ""}`}
+        className={`cx-sheet${wide ? " wide" : ""}${leaving ? " leaving" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-label={label}

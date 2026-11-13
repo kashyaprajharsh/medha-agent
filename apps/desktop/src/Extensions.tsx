@@ -9,6 +9,7 @@ import { SkillBrowse } from "./SkillBrowse";
 import { Sheet } from "./Sheet";
 import { SkillList, type Skill } from "./SkillList";
 import { SkillManage } from "./SkillManage";
+import { SkillWriter } from "./SkillWriter";
 import { Add, Find, PageTop, ViewBar } from "./ExtensionParts";
 import { Intake } from "./Intake";
 import { Hooks } from "./Hooks";
@@ -87,6 +88,7 @@ export function Extensions({
   const [autoConnect, setAutoConnect] = useState(false);
   const [adding, setAdding] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [writing, setWriting] = useState(false);
   const [notices, setNotices] = useState<string[]>([]);
   useEffect(() => {
     let active = true;
@@ -379,8 +381,25 @@ export function Extensions({
           <Intake
             disabled={busy || locked}
             onClose={() => setInstalling(false)}
+            onWrite={() => {
+              setInstalling(false);
+              setWriting(true);
+            }}
             onAdd={(method, params) => act(method, params)}
             onConnector={(args) => act("settings.mcp.save", { args })}
+          />
+        )}
+        {writing && (
+          <SkillWriter
+            disabled={busy || locked}
+            onClose={() => setWriting(false)}
+            onSaved={(name, enabled, findings) => {
+              setRefresh((value) => value + 1);
+              setNotice(
+                enabled ? `Saved ${name}` : `Saved ${name}, turned off. Review these findings before turning it on: ${findings.join("; ")}`,
+              );
+              window.dispatchEvent(new CustomEvent("medha-preferences"));
+            }}
           />
         )}
         {tab === "MCP" && (

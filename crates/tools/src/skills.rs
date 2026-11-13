@@ -1872,6 +1872,12 @@ pub(crate) fn skill_meta(text: &str) -> Result<(String, String, u32), String> {
     Ok((fm.name, fm.description, fm.version))
 }
 
+/// What a SKILL.md being written says about itself, read by the same rules as an install.
+pub fn check_skill_md(text: &str) -> Result<(String, String, Vec<String>), String> {
+    let (fm, _) = parse_skill_md(text)?;
+    Ok((fm.name, fm.description, fm.required_tools))
+}
+
 fn parse_skill_md(text: &str) -> Result<ParsedMd, String> {
     if text.len() > MAX_SKILL_MD_BYTES {
         return Err(format!(

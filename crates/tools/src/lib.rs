@@ -38,7 +38,7 @@ use sandbox::WorkspaceSandbox;
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-pub use skills::{InstallReport, REFUSED, SkillScope, SkillStore};
+pub use skills::{InstallReport, REFUSED, SkillScope, SkillStore, check_skill_md};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};

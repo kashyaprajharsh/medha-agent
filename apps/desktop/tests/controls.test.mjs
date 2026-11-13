@@ -2688,6 +2688,50 @@ test("picker errors and unknown sources can be retried, and nothing is chosen wh
   assert.deepEqual(writes, []);
 });
 
+test("Write a skill checks it as the backend reads it, and asks before replacing one", async () => {
+  await extensionForm("skill", async () => null);
+  const saves = [];
+  const extensions = globalThis.__medhaControlsTest.api.extensions;
+  globalThis.__medhaControlsTest.api.extensions = async (method, params) => {
+    if (method === "extensions.skill.check")
+      return /name: notes\n/.test(params.text)
+        ? { name: "notes", description: "Keeps meeting notes in one plain format, when asked to take notes.", required_tools: ["git"] }
+        : { error: "invalid frontmatter name: name '' must be 1-64 characters of kebab-case" };
+    if (method === "extensions.skill.write") {
+      saves.push(params);
+      if (!params.replace) throw new Error("A skill named notes already exists there");
+      return { name: "notes", enabled: true, findings: [] };
+    }
+    return extensions(method, params);
+  };
+  await click([...document.querySelectorAll(".intake-start")].find((node) => node.querySelector("b").textContent === "Write a skill"));
+  const sheet = () => document.querySelector('[aria-label="Write a skill"]');
+  const settle = () => act(() => new Promise((done) => setTimeout(done, 300)));
+  await settle();
+  assert.match(sheet().textContent, /kebab-case/);
+  assert.equal(sheetButtonIn(sheet(), "Save skill").disabled, true, "a SKILL.md that does not parse cannot be saved");
+  const editor = sheet().querySelector("textarea");
+  const text = "---\nname: notes\ndescription: Keeps meeting notes in one plain format, when asked to take notes.\n---\n\n1. Ask.\n";
+  await act(() => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(editor, text);
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await settle();
+  assert.match(sheet().textContent, /Needs git/);
+  assert.match(sheet().querySelector(".intake-listing").textContent, /notes.*Keeps meeting notes/);
+  await click(sheetButtonIn(sheet(), "Add file"));
+  await click(sheetButtonIn(sheet(), "Save skill"));
+  assert.deepEqual(saves[0].files.map((file) => file.path), ["SKILL.md", "references/notes.md"]);
+  assert.equal(saves[0].scope, "user");
+  assert.match(sheet().querySelector('[role="alert"]').textContent, /already exists/);
+  await click(sheetButtonIn(sheet(), "Replace it"));
+  assert.equal(saves[1].replace, true);
+  assert.equal(sheet(), null);
+  assert.match(document.querySelector('[role="status"]').textContent, /Saved notes/);
+});
+
+const sheetButtonIn = (sheet, label) => [...sheet.querySelectorAll("button")].find((node) => node.textContent.trim() === label);
+
 const screenshotData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 async function attachmentChat() {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));

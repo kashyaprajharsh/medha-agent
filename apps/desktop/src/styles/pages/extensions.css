@@ -115,6 +115,161 @@
   color: var(--dim);
   font-size: var(--text-sm);
 }
+.intake-scratch {
+  margin-top: var(--s-2);
+}
+.intake-starts {
+  display: grid;
+  gap: var(--s-3);
+}
+.intake-start {
+  display: grid;
+  gap: var(--s-1);
+  padding: var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.intake-start:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
+}
+.intake-start b {
+  font-weight: 500;
+  font-size: var(--text-sm);
+}
+.intake-start span {
+  color: var(--dim);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+/* Write a skill: files beside the editor, checks under it. */
+.cx-sheet.wide {
+  width: min(880px, calc(100vw - 20px));
+}
+.writer {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  min-height: 300px;
+  margin: 0 0 var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.writer-files {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: var(--s-2);
+  border-right: 1px solid var(--line);
+}
+.writer-files button {
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--text-xs);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.writer-files button.on {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+.writer-add {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+}
+.writer-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.writer-path {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+.writer-path input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+}
+.writer-code {
+  flex: 1;
+  min-height: 260px;
+  margin: 0;
+  padding: var(--s-3);
+  border: 0;
+  resize: none;
+  background: transparent;
+  color: inherit;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  line-height: 1.7;
+}
+.writer-code:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 60%, transparent);
+}
+.writer-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-4);
+  margin: 0 0 var(--s-4);
+  padding: 0;
+  list-style: none;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.writer-checks li::before {
+  content: "✓ ";
+  color: var(--gold);
+}
+.writer-checks li.warn::before,
+.writer-checks li.bad::before {
+  content: "! ";
+}
+.writer-checks li.bad {
+  color: var(--err);
+}
+.writer-checks li.quiet::before {
+  content: "";
+}
+.writer-actions {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.writer-spacer {
+  flex: 1;
+}
+@media (max-width: 700px) {
+  .writer {
+    grid-template-columns: 1fr;
+  }
+  .writer-files {
+    display: flex;
+    flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+}
 .access-list {
   padding-left: 18px !important;
   color: var(--dim);

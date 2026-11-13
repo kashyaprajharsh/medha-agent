@@ -673,6 +673,8 @@ async fn extension_request(
         "extensions.preview",
         "extensions.skill.configure",
         "extensions.skill.install",
+        "extensions.skill.check",
+        "extensions.skill.write",
         "extensions.skill.remove",
         "extensions.skill.use",
         "extensions.skills.search",

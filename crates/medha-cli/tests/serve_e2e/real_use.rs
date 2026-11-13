@@ -14,7 +14,7 @@ async fn logged(world: &World, chat: &str) -> Vec<kernel::Event> {
 }
 
 #[cfg(unix)]
-fn git(folder: &Path, args: &[&str]) {
+pub(crate) fn git(folder: &Path, args: &[&str]) {
     let done = Command::new("git")
         .args(args)
         .current_dir(folder)

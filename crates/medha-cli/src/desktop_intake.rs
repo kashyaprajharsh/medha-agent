@@ -30,7 +30,16 @@ pub(crate) async fn preview(
         workspace.join(".medha/skills"),
         Some(config::user_skills_dir()?),
     );
-    let not_skill = match skills.preview(&source).await {
+    let listed = matches!(
+        extensions::sources::parse(&source),
+        extensions::sources::Spec::Listed { .. }
+    );
+    let skill = if listed {
+        Err("it is listed in a plugin marketplace".to_string())
+    } else {
+        skills.preview(&source).await
+    };
+    let not_skill = match skill {
         Ok(report) => {
             return Ok(
                 json!({"kind": "skill", "name": report.name, "description": report.description, "files": report.listed, "findings": report.scan_findings}),
@@ -41,11 +50,9 @@ pub(crate) async fn preview(
         }
         Err(why) => why,
     };
-    if !Path::new(&source).exists() {
-        return Err(anyhow!("{not_skill}"));
-    }
+    let markets = crate::plugins_cmd::marketplaces(&config::medha_home()?);
     let plugin = plugins
-        .preview(Path::new(&source))
+        .preview_from(&source, &markets)
         .map_err(|error| anyhow!("Not a skill ({not_skill}) or a plugin ({error})"))?;
     let manifest = &plugin.manifest;
     let adds: Vec<Value> = manifest

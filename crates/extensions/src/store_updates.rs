@@ -35,6 +35,31 @@ impl UpdatePlan {
     }
 }
 
+/// The repository, id and entry a marketplace lists for `plugin`.
+fn listed(
+    plugin: &str,
+    marketplace: &str,
+    markets: &Marketplaces,
+) -> Result<(GitSource, String, String), Error> {
+    let market = markets.get(marketplace)?;
+    let Some(listing) = market.plugins.iter().find(|listing| listing.name == plugin) else {
+        let names: Vec<&str> = market
+            .plugins
+            .iter()
+            .map(|listing| listing.name.as_str())
+            .collect();
+        return Err(Error::Source(format!(
+            "marketplace {marketplace} does not list {plugin}; it lists: {}",
+            names.join(", ")
+        )));
+    };
+    Ok((
+        listing.source.clone(),
+        sources::listed_id(&market.name, plugin),
+        crate::compat::entry_for(listing),
+    ))
+}
+
 impl Store {
     /// Installs from a folder, `owner/repo[@ref]`, a git URL, or
     /// `plugin@marketplace`. The result is disabled until enabled.
@@ -46,24 +71,33 @@ impl Store {
                 plugin,
                 marketplace,
             } => {
-                let market = markets.get(&marketplace)?;
-                let Some(listing) = market.plugins.iter().find(|listing| listing.name == plugin)
-                else {
-                    let names: Vec<&str> = market
-                        .plugins
-                        .iter()
-                        .map(|listing| listing.name.as_str())
-                        .collect();
-                    return Err(Error::Source(format!(
-                        "marketplace {marketplace} does not list {plugin}; it lists: {}",
-                        names.join(", ")
-                    )));
-                };
-                let id = sources::listed_id(&market.name, &plugin);
-                let entry = crate::compat::entry_for(listing);
-                self.install_git(&listing.source, Some(id), Some(entry))
+                let (source, id, entry) = listed(&plugin, &marketplace, markets)?;
+                self.install_git(&source, Some(id), Some(entry))
             }
         }
+    }
+
+    /// What [`Store::install_from`] would add, fetched to a temporary checkout and then dropped.
+    pub fn preview_from(
+        &self,
+        spec: &str,
+        markets: &Marketplaces,
+    ) -> Result<super::Preview, Error> {
+        let (source, id, entry) = match sources::parse(spec) {
+            Spec::Local(path) => return self.preview(&path),
+            Spec::Git(source) => (source, None, None),
+            Spec::Listed {
+                plugin,
+                marketplace,
+            } => {
+                let (source, id, entry) = listed(&plugin, &marketplace, markets)?;
+                (source, Some(id), Some(entry))
+            }
+        };
+        let checkout = sources::fetch(&source)?;
+        let root = checkout.root(&source)?;
+        let package = self.load_fetched(&root, &source, id.as_deref(), entry.as_deref())?;
+        super::preview_package(package)
     }
 
     fn install_git(

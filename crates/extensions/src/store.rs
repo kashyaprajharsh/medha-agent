@@ -61,7 +61,10 @@ pub struct Preview {
 }
 
 fn preview_dir(root: &Path, medha_version: &str) -> Result<Preview, Error> {
-    let package = Package::load(root, medha_version)?;
+    preview_package(Package::load(root, medha_version)?)
+}
+
+pub(super) fn preview_package(package: Package) -> Result<Preview, Error> {
     let (findings, refused) = match crate::package::screen(&package.root) {
         Ok(findings) => (findings, None),
         Err(Error::UnsafePackage(why)) => (Vec::new(), Some(why)),

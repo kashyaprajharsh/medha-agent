@@ -99,3 +99,58 @@ async fn what_is_dropped_is_recognised_and_shown_before_it_is_added() {
         "{seen}"
     );
 }
+
+/// A plugin given by its repository or as plugin@marketplace is fetched, described and not installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_from_a_repository_or_a_marketplace_is_shown_before_it_is_added() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("intake");
+    client.open(&folder).await;
+    let repo = world.folder("tidy-repo");
+    for (path, text) in [
+        (
+            ".claude-plugin/plugin.json",
+            r#"{"name": "tidy", "version": "1.0.0", "description": "Keeps code tidy"}"#,
+        ),
+        (
+            ".claude-plugin/marketplace.json",
+            r#"{"name": "tidy-market", "plugins": [{"name": "tidy", "source": "./", "description": "Keeps code tidy"}]}"#,
+        ),
+        (
+            "skills/tidy/SKILL.md",
+            "---\nname: tidy\ndescription: Tidies code.\n---\nTidy.\n",
+        ),
+    ] {
+        std::fs::create_dir_all(repo.join(path).parent().unwrap()).unwrap();
+        std::fs::write(repo.join(path), text).unwrap();
+    }
+    real_use::git(&repo, &["init", "-q", "-b", "main"]);
+    real_use::git(&repo, &["add", "."]);
+    real_use::git(&repo, &["commit", "-q", "-m", "one"]);
+    let url = format!("file://{}", repo.display());
+
+    let seen = preview(&mut client, &folder, &url).await;
+    assert_eq!(seen["kind"], "plugin", "{seen}");
+    assert!(seen["adds"].to_string().contains("tidy"), "{seen}");
+
+    client
+        .about(
+            &folder,
+            json!({"method": "extensions.marketplace.add", "params": {"source": url}}),
+        )
+        .await
+        .unwrap();
+    let seen = preview(&mut client, &folder, "tidy@tidy-market").await;
+    assert_eq!(seen["kind"], "plugin", "{seen}");
+    assert_eq!(seen["description"], "Keeps code tidy", "{seen}");
+    let listed = client
+        .about(&folder, json!({"method": "extensions.list"}))
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains("tidy-market.tidy"),
+        "a preview installed the plugin: {listed}"
+    );
+}

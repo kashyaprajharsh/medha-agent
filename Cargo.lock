@@ -1237,7 +1237,9 @@ name = "file-ops"
 version = "0.1.12"
 dependencies = [
  "dunce",
+ "flate2",
  "windows-sys 0.60.2",
+ "zip",
 ]
 
 [[package]]
@@ -2547,6 +2549,7 @@ dependencies = [
  "url",
  "windows-sys 0.60.2",
  "wire",
+ "zip",
 ]
 
 [[package]]

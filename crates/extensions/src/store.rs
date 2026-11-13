@@ -285,8 +285,27 @@ impl Store {
     }
 
     pub fn install(&self, source: impl AsRef<Path>) -> Result<Package, Error> {
+        let source = source.as_ref();
+        if crate::package::is_archive(source) {
+            return self.install_archive(source);
+        }
         let package = Package::load(source, &self.medha_version)?;
         self.install_package(&package, None)
+    }
+
+    /// A `.zip` or `.plugin`, unpacked beside the store and then installed exactly as a folder is.
+    fn install_archive(&self, archive: &Path) -> Result<Package, Error> {
+        fs::create_dir_all(&self.user_root)
+            .map_err(|error| io_error("creating plugin directory", &self.user_root, error))?;
+        let unpacked = self
+            .user_root
+            .join(format!(".upload-{}", ulid::Ulid::new()));
+        let installed = crate::package::unpack_archive(archive, &unpacked).and_then(|()| {
+            let package = Package::load(&unpacked, &self.medha_version)?;
+            self.install_package(&package, None)
+        });
+        let _ = fs::remove_dir_all(&unpacked);
+        installed
     }
 
     /// Copies a loaded package into the managed store, disabled. `origin`

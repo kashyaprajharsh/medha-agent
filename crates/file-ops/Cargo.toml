@@ -9,6 +9,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# zip leaves the inflate backend to its user; this is the pure-Rust one already in the build.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 [target.'cfg(windows)'.dependencies]
 dunce = "1"
 windows-sys = { version = "0.60", features = [

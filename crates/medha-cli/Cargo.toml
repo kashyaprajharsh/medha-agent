@@ -101,6 +101,7 @@ medha-client = { path = "../medha-client", features = ["test-support"] }
 test-support = { path = "../test-support" }
 flate2 = "1"
 tokio = { workspace = true, features = ["test-util"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 portable-pty = "0.9"

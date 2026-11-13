@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+pub mod archive;
 pub mod opening;
 
 /// A path as a person or model reads it: Windows drops the `\\?\` that canonicalizing adds.

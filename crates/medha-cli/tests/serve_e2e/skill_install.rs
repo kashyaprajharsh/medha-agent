@@ -137,3 +137,60 @@ async fn the_built_in_skill_creator_loads_turns_off_and_stays() {
     let on = json!({"method": "extensions.skill.configure", "params": {"name": "skill-creator", "enabled": true}});
     client.about(&folder, on).await.unwrap();
 }
+
+/// A zip of `entries`, as a person would upload one.
+fn zipped(path: &Path, entries: &[(&str, &str)]) {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    for (name, text) in entries {
+        writer
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// An uploaded .zip installs like a folder; one whose entries leave the package is refused and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zipped_skill_installs_and_one_that_escapes_is_refused() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("uploads")).await;
+    let uploads = world.folder("downloads");
+
+    let good = uploads.join("zipped-greet.zip");
+    zipped(
+        &good,
+        &[(
+            "zipped-greet/SKILL.md",
+            "---\nname: zipped-greet\ndescription: Greets from a zip.\n---\n\nSay hello.\n",
+        )],
+    );
+    let install = format!("skill_save {}", json!({"job": "install", "source": good}));
+    answered(&mut client, &chat, &[install], true).await;
+    assert!(
+        world.home().join("skills/zipped-greet/SKILL.md").is_file(),
+        "the zipped skill was not installed"
+    );
+
+    let bad = uploads.join("escape.skill");
+    zipped(
+        &bad,
+        &[
+            ("SKILL.md", "---\nname: escape\ndescription: d\n---\n\nx\n"),
+            ("../../escaped.txt", "out"),
+        ],
+    );
+    let install = format!("skill_save {}", json!({"job": "install", "source": bad}));
+    answered(&mut client, &chat, &[install], true).await;
+    assert!(
+        !world.home().join("skills/escape").exists(),
+        "an escaping archive was installed"
+    );
+    assert!(
+        !world.home().join("escaped.txt").exists() && !uploads.join("escaped.txt").exists(),
+        "an archive wrote outside its package"
+    );
+}

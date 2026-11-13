@@ -229,3 +229,43 @@ fn a_plugin_is_scanned_before_install_and_only_real_harm_is_refused() {
         "the finding was not shown for review: {inspect}"
     );
 }
+
+/// A plugin uploaded as a .zip or a .plugin installs, off, like one from a folder.
+#[test]
+fn a_plugin_archive_installs_like_a_folder() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    for (file, id) in [
+        ("pack.zip", "dev.medha.zipped"),
+        ("pack.plugin", "dev.medha.packed"),
+    ] {
+        let archive = temp.path().join(file);
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("pack/plugin.toml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        write!(
+            writer,
+            "schema_version = 1\nid = \"{id}\"\nname = \"Packed\"\nversion = \"0.1.0\"\nmedha = \">=0.1.0, <0.2.0\"\n\n[[components]]\nkind = \"action\"\nid = \"go\"\ntitle = \"Go\"\ndescription = \"Go\"\nprompt = \"Go.\"\n"
+        )
+        .unwrap();
+        writer.finish().unwrap();
+        let installed = medha(
+            &workspace,
+            &home,
+            &["plugins", "install", archive.to_str().unwrap()],
+        );
+        assert!(
+            installed.status.success(),
+            "{file}: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        assert!(
+            stdout(&medha(&workspace, &home, &["plugins", "list"])).contains(id),
+            "{file} was not listed"
+        );
+    }
+}

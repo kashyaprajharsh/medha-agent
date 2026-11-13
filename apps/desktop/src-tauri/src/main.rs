@@ -158,8 +158,8 @@ async fn extension_source_choose(kind: ExtensionSourceKind) -> Result<Option<Str
         }
         ExtensionSourceKind::SkillFile => {
             dialog
-                .set_title("Choose SKILL.md")
-                .add_filter("Markdown", &["md"])
+                .set_title("Choose a skill file")
+                .add_filter("Skill", &["md", "zip", "skill"])
                 .pick_file()
                 .await
         }

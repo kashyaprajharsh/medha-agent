@@ -2,7 +2,6 @@
 
 use crate::{Error, io_error};
 use std::{
-    io::Read,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -105,59 +104,12 @@ fn get(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, Error> {
 
 /// The archive's files under `dir`, without GitHub's `owner-repo-commit/` wrapper folder.
 fn unpack(bytes: &[u8], dir: &Path) -> Result<(), Error> {
-    let unreadable = |error: zip::result::ZipError| {
-        Error::Source(format!("GitHub sent an unreadable archive: {error}"))
+    let limits = file_ops::archive::Limits {
+        entries: MAX_ENTRIES,
+        bytes: MAX_UNPACKED_BYTES,
     };
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(unreadable)?;
-    if archive.len() > MAX_ENTRIES {
-        return Err(Error::UnsafePackage(format!(
-            "the repository has more than {MAX_ENTRIES} files"
-        )));
-    }
-    let (mut unpacked, mut links) = (0u64, Vec::new());
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(unreadable)?;
-        let path = entry.enclosed_name().ok_or_else(|| {
-            Error::UnsafePackage(format!(
-                "archive entry {} leaves its folder",
-                entry.name().as_deref().unwrap_or("?")
-            ))
-        })?;
-        let relative: PathBuf = path.components().skip(1).collect();
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let target = dir.join(&relative);
-        if entry.is_symlink() {
-            let mut pointee = String::new();
-            entry
-                .read_to_string(&mut pointee)
-                .map_err(|error| io_error("reading link", &target, error))?;
-            links.push((relative, pointee));
-            continue;
-        }
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|error| io_error("unpacking", &target, error))?;
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| io_error("unpacking", parent, error))?;
-        }
-        let mut file = std::fs::File::create(&target)
-            .map_err(|error| io_error("unpacking", &target, error))?;
-        unpacked += std::io::copy(
-            &mut (&mut entry).take(MAX_UNPACKED_BYTES - unpacked + 1),
-            &mut file,
-        )
-        .map_err(|error| io_error("unpacking", &target, error))?;
-        if unpacked > MAX_UNPACKED_BYTES {
-            return Err(Error::UnsafePackage(
-                "the repository unpacks to more than 500 MB".into(),
-            ));
-        }
-    }
+    let links = file_ops::archive::unpack_zip(bytes, dir, limits, file_ops::archive::Top::Drop)
+        .map_err(archive_error)?;
     // As with a clone: a link to something inside the repository becomes a copy, any other is dropped.
     for (link, pointee) in links {
         let Some(target) = inside(&link, &pointee) else {
@@ -168,6 +120,17 @@ fn unpack(bytes: &[u8], dir: &Path) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// An unpacking failure in the plugin store's own terms.
+pub(crate) fn archive_error(error: file_ops::archive::UnpackError) -> Error {
+    match error {
+        file_ops::archive::UnpackError::Unreadable(why) => {
+            Error::Source(format!("the archive cannot be read: {why}"))
+        }
+        file_ops::archive::UnpackError::Unsafe(why) => Error::UnsafePackage(why),
+        file_ops::archive::UnpackError::Io { path, error } => io_error("unpacking", &path, error),
+    }
 }
 
 /// Where a link's text points, relative to the repository root, if it stays inside it.

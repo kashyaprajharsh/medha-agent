@@ -320,6 +320,30 @@ fn is_executable(path: &Path) -> Result<bool, Error> {
     }
 }
 
+/// A plugin uploaded as one file rather than a folder.
+pub(crate) fn is_archive(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "zip" | "plugin")
+            })
+}
+
+/// Unpacks an uploaded plugin within the package limits; links are dropped, never followed.
+pub(crate) fn unpack_archive(archive: &Path, target: &Path) -> Result<(), Error> {
+    let bytes = read_regular_bounded(archive, MAX_PACKAGE_BYTES)?;
+    let limits = file_ops::archive::Limits {
+        entries: MAX_PACKAGE_FILES,
+        bytes: MAX_PACKAGE_BYTES,
+    };
+    fs::create_dir_all(target).map_err(|error| io_error("unpacking", target, error))?;
+    file_ops::archive::unpack_zip(&bytes, target, limits, file_ops::archive::Top::DropIfShared)
+        .map(|_links| ())
+        .map_err(crate::github_download::archive_error)
+}
+
 /// The content scan of a plugin's files: what could harm on install refuses it, the rest is for the review.
 pub(crate) fn screen(root: &Path) -> Result<Vec<String>, Error> {
     use policy::guard::{Finding, PackageKind, ScanVerdict, Severity, scan_package_as};

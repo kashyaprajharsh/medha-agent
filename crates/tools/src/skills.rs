@@ -990,6 +990,14 @@ impl SkillStore {
                 if path.is_dir() {
                     copy_dir_recursive(path, &stage, &mut budget)?;
                     ("local-folder".to_string(), None)
+                } else if is_skill_archive(path) {
+                    // Unpacked beside the target, then copied in as a folder is: same budget, same checks.
+                    let unpacked = unique_sibling(&user_dir, ".unpacking-skill");
+                    let copied = unpack_skill_archive(path, &unpacked)
+                        .and_then(|()| copy_dir_recursive(&unpacked, &stage, &mut budget));
+                    std::fs::remove_dir_all(&unpacked).ok();
+                    copied?;
+                    ("local-archive".to_string(), None)
                 } else {
                     let text = read_text_limited(path, MAX_SKILL_MD_BYTES)?;
                     budget.admit(text.len(), path)?;
@@ -1353,6 +1361,39 @@ fn read_text_limited(path: &Path, cap: usize) -> Result<String, String> {
         ));
     }
     std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A skill uploaded as one `.zip` or `.skill` file.
+fn is_skill_archive(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "zip" | "skill")
+            })
+}
+
+/// Unpacks an uploaded skill within the install limits; links are dropped, never followed.
+fn unpack_skill_archive(archive: &Path, target: &Path) -> Result<(), String> {
+    let size = std::fs::metadata(archive)
+        .map_err(|e| format!("{}: {e}", archive.display()))?
+        .len() as usize;
+    if size > MAX_INSTALL_TOTAL_BYTES {
+        return Err(format!(
+            "{} is {size} bytes; maximum supported size is {MAX_INSTALL_TOTAL_BYTES}",
+            archive.display()
+        ));
+    }
+    let bytes = std::fs::read(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    let limits = file_ops::archive::Limits {
+        entries: MAX_INSTALL_FILES,
+        bytes: MAX_INSTALL_TOTAL_BYTES as u64,
+    };
+    file_ops::archive::unpack_zip(&bytes, target, limits, file_ops::archive::Top::DropIfShared)
+        .map(|_links| ())
+        .map_err(|error| error.to_string())
 }
 
 fn unique_sibling(parent: &Path, prefix: &str) -> PathBuf {

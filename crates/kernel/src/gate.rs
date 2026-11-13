@@ -139,21 +139,31 @@ pub struct Answered {
     pub review: Option<String>,
 }
 
+/// An answer, and how its logger says it is logged.
+pub type AnswerSent = (Answered, tokio::sync::oneshot::Sender<()>);
+
 tokio::task_local! {
-    static ANSWERS: tokio::sync::mpsc::UnboundedSender<Answered>;
+    static ANSWERS: tokio::sync::mpsc::UnboundedSender<AnswerSent>;
 }
 
 /// Runs one tool call with each approval answered during it sent to `answers` as it is given.
 pub async fn answers_scope<F: std::future::Future>(
-    answers: tokio::sync::mpsc::UnboundedSender<Answered>,
+    answers: tokio::sync::mpsc::UnboundedSender<AnswerSent>,
     fut: F,
 ) -> F::Output {
     ANSWERS.scope(answers, fut).await
 }
 
-/// Passes on an answer for the tool call it was given in; outside one, there is nothing to pass it to.
-pub fn record_answer(answered: Answered) {
-    let _ = ANSWERS.try_with(|answers| answers.send(answered));
+/// Passes on an answer for the tool call it was given in and waits until it is logged, so what it allows runs after its record.
+pub async fn record_answer(answered: Answered) {
+    let (logged, waited) = tokio::sync::oneshot::channel();
+    let sent = ANSWERS
+        .try_with(|answers| answers.send((answered, logged)).is_ok())
+        .unwrap_or(false);
+    if sent {
+        // A logger that stops early drops the sender; the call goes on either way.
+        let _ = waited.await;
+    }
 }
 
 /// The chat's gate with every answer recorded, whoever gives it, for the kernel to log. In Autopilot the
@@ -186,14 +196,21 @@ impl RecordedGate {
                     by: Decider::Reviewer,
                     reason: Some(why),
                     review: None,
-                });
+                })
+                .await;
                 Ok(())
             }
             crate::review::Verdict::Defer(why) => Err(Some(why)),
         }
     }
 
-    fn record(&self, kind: &'static str, action: &str, allowed: bool, review: Option<String>) {
+    async fn record(
+        &self,
+        kind: &'static str,
+        action: &str,
+        allowed: bool,
+        review: Option<String>,
+    ) {
         record_answer(Answered {
             kind,
             action: action.to_owned(),
@@ -201,7 +218,8 @@ impl RecordedGate {
             by: self.inner.answerer(),
             reason: (!allowed).then(|| self.inner.denial_reason().to_owned()),
             review,
-        });
+        })
+        .await;
     }
 }
 
@@ -214,7 +232,8 @@ impl HumanGate for RecordedGate {
             Err(review) => review,
         };
         let approval = self.inner.confirm(action, detail, escalated).await;
-        self.record("tool", action, approval.approved(), review);
+        self.record("tool", action, approval.approved(), review)
+            .await;
         approval
     }
 
@@ -233,7 +252,8 @@ impl HumanGate for RecordedGate {
             Err(review) => review,
         };
         let decision = self.inner.confirm_network(detail, escalated).await;
-        self.record("network", action, decision != NetworkDecision::Deny, review);
+        self.record("network", action, decision != NetworkDecision::Deny, review)
+            .await;
         decision
     }
 
@@ -244,7 +264,8 @@ impl HumanGate for RecordedGate {
             Err(review) => review,
         };
         let decision = self.inner.confirm_access(detail, escalated).await;
-        self.record("access", action, decision != NetworkDecision::Deny, review);
+        self.record("access", action, decision != NetworkDecision::Deny, review)
+            .await;
         decision
     }
 
@@ -255,7 +276,8 @@ impl HumanGate for RecordedGate {
             Err(review) => review,
         };
         let approval = self.inner.confirm_path(request).await;
-        self.record("path", &action, approval != PathApproval::Deny, review);
+        self.record("path", &action, approval != PathApproval::Deny, review)
+            .await;
         approval
     }
 }

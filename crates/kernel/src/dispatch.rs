@@ -223,16 +223,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             answers,
             crate::review::review_scope(reviewer, decided),
         ));
-        // While an answer is being logged the call waits, so nothing it allows starts before its record.
+        // The call waits on `logged` while its answer is written, so nothing it allows starts before its record,
+        // and it never sits in the log's queue ahead of its own answer.
         let observation = loop {
             tokio::select! {
                 biased;
-                Some(answer) = answered.recv() => self.record_answer(session, intent, &answer, sink).await,
+                Some((answer, logged)) = answered.recv() => {
+                    self.record_answer(session, intent, &answer, sink).await;
+                    let _ = logged.send(());
+                }
                 observation = &mut decided => break observation,
             }
         };
-        while let Ok(answer) = answered.try_recv() {
+        while let Ok((answer, logged)) = answered.try_recv() {
             self.record_answer(session, intent, &answer, sink).await;
+            let _ = logged.send(());
         }
         observation
     }

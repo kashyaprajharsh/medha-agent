@@ -26,8 +26,8 @@ pub use medha_extension_api::{
 pub use package::{Package, PackageSource};
 pub use state::{Grant, Origin};
 pub use store::{
-    Activation, Discovery, DiscoveryError, HookSource, ListedPlugin, OperatorAction, Scope, Store,
-    UpdatePlan,
+    Activation, Discovery, DiscoveryError, HookSource, ListedPlugin, OperatorAction, Preview,
+    Scope, Store, UpdatePlan,
 };
 
 use std::path::Path;

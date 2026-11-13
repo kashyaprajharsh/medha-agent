@@ -676,6 +676,7 @@ async fn extension_request(
         "extensions.enable",
         "extensions.disable",
         "extensions.install",
+        "extensions.preview",
         "extensions.skill.configure",
         "extensions.skill.install",
         "extensions.skill.remove",

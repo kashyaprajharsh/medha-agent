@@ -20,6 +20,7 @@ mod connectors;
 mod desktop_changes;
 mod desktop_controls;
 mod desktop_extensions;
+mod desktop_intake;
 mod desktop_keys;
 mod desktop_mcp_registry;
 mod desktop_memory;

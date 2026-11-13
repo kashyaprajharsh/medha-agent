@@ -49,6 +49,32 @@ impl Activation {
     }
 }
 
+/// A plugin as an install would see it, before anything is copied.
+#[derive(Debug, Clone)]
+pub struct Preview {
+    pub manifest: crate::Manifest,
+    pub files: usize,
+    /// Findings to review; empty when the scan saw nothing.
+    pub findings: Vec<String>,
+    /// Why an install would refuse it, when the scan found harm.
+    pub refused: Option<String>,
+}
+
+fn preview_dir(root: &Path, medha_version: &str) -> Result<Preview, Error> {
+    let package = Package::load(root, medha_version)?;
+    let (findings, refused) = match crate::package::screen(&package.root) {
+        Ok(findings) => (findings, None),
+        Err(Error::UnsafePackage(why)) => (Vec::new(), Some(why)),
+        Err(error) => return Err(error),
+    };
+    Ok(Preview {
+        manifest: package.manifest,
+        files: package.files,
+        findings,
+        refused,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ListedPlugin {
     pub package: Package,
@@ -291,6 +317,18 @@ impl Store {
         }
         let package = Package::load(source, &self.medha_version)?;
         self.install_package(&package, None)
+    }
+
+    /// What installing `source` would add, with nothing kept; a harmful package comes back with `refused`.
+    pub fn preview(&self, source: &Path) -> Result<Preview, Error> {
+        if !crate::package::is_archive(source) {
+            return preview_dir(source, &self.medha_version);
+        }
+        let unpacked = std::env::temp_dir().join(format!(".medha-preview-{}", ulid::Ulid::new()));
+        let seen = crate::package::unpack_archive(source, &unpacked)
+            .and_then(|()| preview_dir(&unpacked, &self.medha_version));
+        let _ = fs::remove_dir_all(&unpacked);
+        seen
     }
 
     /// A `.zip` or `.plugin`, unpacked beside the store and then installed exactly as a folder is.

@@ -125,6 +125,7 @@ pub struct SkillProvenance {
 #[derive(Debug, Clone)]
 pub struct InstallReport {
     pub name: String,
+    pub description: String,
     pub path: PathBuf,
     pub source: String,
     pub revision: Option<String>,
@@ -140,7 +141,12 @@ pub struct InstallReport {
     /// Human-readable guard findings (`"file:line — reason"`), empty when safe.
     /// Surfaced by the caller so a caution install is never silent.
     pub scan_findings: Vec<String>,
+    /// The package's files, SKILL.md first.
+    pub listed: Vec<String>,
 }
+
+/// Opens every refusal from the install scan, so a preview can tell a refusal from a failure.
+pub const REFUSED: &str = "refusing to install";
 
 /// YAML frontmatter with a legacy TOML read path. Unknown keys are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -947,6 +953,20 @@ impl SkillStore {
         src: &str,
         scope: SkillScope,
     ) -> Result<InstallReport, String> {
+        self.install_or_preview(src, scope, false).await
+    }
+
+    /// Everything an install would check and show, with nothing kept: the staged copy is removed.
+    pub async fn preview(&self, src: &str) -> Result<InstallReport, String> {
+        self.install_or_preview(src, SkillScope::User, true).await
+    }
+
+    async fn install_or_preview(
+        &self,
+        src: &str,
+        scope: SkillScope,
+        preview: bool,
+    ) -> Result<InstallReport, String> {
         let user_dir = match scope {
             SkillScope::User => self
                 .user_dir
@@ -1049,7 +1069,7 @@ impl SkillStore {
         if scan.verdict == policy::guard::ScanVerdict::Dangerous {
             std::fs::remove_dir_all(&stage).ok();
             return Err(format!(
-                "refusing to install '{name}': the package contains dangerous content:\n  {}",
+                "{REFUSED} '{name}': the package contains dangerous content:\n  {}",
                 scan_findings.join("\n  ")
             ));
         }
@@ -1071,7 +1091,7 @@ impl SkillStore {
                             crate::judge::JudgeVerdict::Dangerous => {
                                 std::fs::remove_dir_all(&stage).ok();
                                 return Err(format!(
-                                    "refusing to install '{name}': security review flagged it — {}",
+                                    "{REFUSED} '{name}': security review flagged it — {}",
                                     o.reason
                                 ));
                             }
@@ -1096,6 +1116,29 @@ impl SkillStore {
         if let Err(error) = quarantine_executable_modes(&stage) {
             std::fs::remove_dir_all(&stage).ok();
             return Err(error);
+        }
+        let mut listed = vec!["SKILL.md".to_string()];
+        listed.extend(
+            bundled_files(&stage)
+                .into_iter()
+                .filter(|file| file != "SKILL.md"),
+        );
+        if preview {
+            std::fs::remove_dir_all(&stage).ok();
+            return Ok(InstallReport {
+                name,
+                description,
+                path: PathBuf::new(),
+                source: src.to_string(),
+                revision,
+                files: budget.files,
+                bytes: budget.bytes,
+                replaced: false,
+                content_hash,
+                scan_verdict,
+                scan_findings,
+                listed,
+            });
         }
         // Write provenance now that the verdict is known (the sidecar is a
         // dotfile, so it is excluded from both the hash and the scan above).
@@ -1130,6 +1173,7 @@ impl SkillStore {
         }
         Ok(InstallReport {
             name,
+            description,
             path: dest.join("SKILL.md"),
             source: src.to_string(),
             revision,
@@ -1139,6 +1183,7 @@ impl SkillStore {
             content_hash,
             scan_verdict,
             scan_findings,
+            listed,
         })
     }
 }

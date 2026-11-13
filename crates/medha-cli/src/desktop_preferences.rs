@@ -678,17 +678,7 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             Ok(json!({"saved": true}))
         }
         "extensions.install" => {
-            let source = text(params, "source")?;
-            let source = if let Some(rest) = source.strip_prefix("~/") {
-                config::medha_home()?
-                    .parent()
-                    .ok_or_else(|| anyhow!("Home is unavailable"))?
-                    .join(rest)
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                source.into()
-            };
+            let source = crate::desktop_intake::expand_home(text(params, "source")?)?;
             let package = plugin_store(workspace)?
                 .install_from(&source, &plugins_cmd::marketplaces(&config::medha_home()?))?;
             Ok(json!({ "id": package.manifest.id, "installed": true, "enabled": false }))
@@ -866,23 +856,21 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             };
             Ok(json!({ "published": published }))
         }
+        "extensions.preview" => {
+            crate::desktop_intake::preview(
+                text(params, "source")?,
+                workspace,
+                &plugin_store(workspace)?,
+            )
+            .await
+        }
         "extensions.skill.install" => {
             let skills = tools::SkillStore::new(
                 workspace.join(".medha/skills"),
                 Some(config::user_skills_dir()?),
             )
             .with_project_source(runtime::project_trust::skill_source());
-            let source = text(params, "source")?;
-            let source = if let Some(rest) = source.strip_prefix("~/") {
-                config::medha_home()?
-                    .parent()
-                    .ok_or_else(|| anyhow!("Home unavailable"))?
-                    .join(rest)
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                source.into()
-            };
+            let source = crate::desktop_intake::expand_home(text(params, "source")?)?;
             let report = skills
                 .install_from(&source)
                 .await

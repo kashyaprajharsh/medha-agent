@@ -31,6 +31,8 @@ mod cleanup;
 mod deleting;
 #[path = "serve_e2e/folders.rs"]
 mod folders;
+#[path = "serve_e2e/intake.rs"]
+mod intake;
 #[path = "serve_e2e/modes.rs"]
 mod modes;
 #[path = "serve_e2e/pins.rs"]

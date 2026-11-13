@@ -85,7 +85,17 @@ function useKeyPlace() {
 
 /** Everything `/mcp add` takes, as a form: remote servers sign in with OAuth or a
  * token, local ones get an API key and environment; secrets go to the key store. */
-export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (args: string[]) => Promise<void>; initial?: McpPrefill }) {
+export function McpForm({
+  busy,
+  onSave,
+  initial,
+  submitLabel = "Save server",
+}: {
+  busy: boolean;
+  onSave: (args: string[]) => Promise<void>;
+  initial?: McpPrefill;
+  submitLabel?: string;
+}) {
   const place = useKeyPlace();
   const secrets = initial?.variables?.filter((variable) => variable.secret) ?? [];
   const [id, setId] = useState(initial?.id ?? "");
@@ -274,7 +284,7 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
         </p>
       )}
       <button className="btn-gold" disabled={busy}>
-        Save server
+        {submitLabel}
       </button>
     </form>
   );

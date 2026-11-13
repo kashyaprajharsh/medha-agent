@@ -2586,13 +2586,29 @@ test("first-run provider selection chooses Gemini without a protocol question an
   assert.equal(closed, 1);
 });
 
+const previews = {
+  "/Users/test/My skills/research": { kind: "skill", name: "research", description: "Researches a topic.", files: ["SKILL.md", "scripts/fetch.sh"], findings: ["scripts/fetch.sh: executable package file requires explicit review"] },
+  "owner/repo": { kind: "plugin", name: "Acme tools", access: { network_hosts: ["api.acme.dev"], read_paths: [], write_paths: [], secrets: [] }, adds: [{ id: "status", kind: "action" }, { id: "after", kind: "hook" }], findings: [], refused: null },
+  "/Users/test/hostile": { kind: "plugin", name: "Bad", access: { network_hosts: [], read_paths: [], write_paths: [], secrets: [] }, adds: [], findings: [], refused: "it was not installed: the scan found what could harm on install\n  hooks/run.sh:2: pipes a download into a shell" },
+};
+
+// The page's own "Add skill" toggle shares its label with the sheet's button.
+const sheetButton = (label) =>
+  [...(document.querySelector('[aria-label="Add to Medha"]')?.querySelectorAll("button") ?? [])].find((node) => node.textContent.trim() === label);
+
 async function extensionForm(kind, chooseExtensionSource) {
   const writes = [];
+  const looked = [];
   globalThis.__medhaControlsTest.chooseExtensionSource = chooseExtensionSource;
   globalThis.__medhaControlsTest.api = {
     settings: async () => ({ mcp: [] }),
     extensions: async (method, params) => {
       if (!method) return { plugins: [], skills: [], notices: [], skill_errors: [] };
+      if (method === "extensions.preview") {
+        looked.push(params.source);
+        if (!previews[params.source]) throw new Error(`Not a skill or a plugin: ${params.source}`);
+        return previews[params.source];
+      }
       assert.ok(["extensions.skill.install", "extensions.install"].includes(method));
       writes.push([method, params]);
       return { enabled: true };
@@ -2608,100 +2624,68 @@ async function extensionForm(kind, chooseExtensionSource) {
   await render();
   await click(namedButton(kind === "skill" ? "Skills" : "Plugins"));
   await click(namedButton(`Add ${kind}`));
-  return { writes, render };
+  return { writes, looked, render };
 }
 
-test("Add skill browses a folder or Markdown file and waits for an explicit install", async () => {
+test("Add shows a chosen skill before adding it, and adds it only where the person chose", async () => {
   const picked = [];
   const folder = "/Users/test/My skills/research";
-  const file = "/Users/test/Documents/SKILL.md";
-  const { writes } = await extensionForm("skill", async (kind) => {
+  const { writes, looked } = await extensionForm("skill", async (kind) => {
     picked.push(kind);
-    return kind === "skill_folder" ? folder : file;
+    return folder;
   });
-  await click(document.querySelector('[aria-label="Choose local skill"]'));
   await click(namedButton("Choose folder"));
-  assert.deepEqual(picked, ["skill_folder"]);
-  assert.equal(document.querySelector('[aria-label="Skill source"]').value, folder);
-  assert.deepEqual(writes, [], "selecting a source must not install it");
-  await click(namedButton("Install skill"));
-  assert.deepEqual(writes, [["extensions.skill.install", { source: folder }]]);
-  assert.match(document.querySelector('[role="status"]').textContent, /Skill installed/);
-
-  await click(namedButton("Add skill"));
-  await click(document.querySelector('[aria-label="Choose local skill"]'));
-  await key(namedButton("Choose folder"), "Escape");
-  assert.equal(document.querySelector('[aria-label="Choose a skill from your files"]'), null);
-  assert.equal(document.activeElement, document.querySelector('[aria-label="Choose local skill"]'));
-  await click(document.querySelector('[aria-label="Choose local skill"]'));
-  await click(namedButton("Choose SKILL.md"));
-  assert.deepEqual(picked, ["skill_folder", "skill_file"]);
-  assert.equal(document.querySelector('[aria-label="Skill source"]').value, file);
-  assert.equal(writes.length, 1);
-  await click(namedButton("Install skill"));
-  assert.deepEqual(writes[1], ["extensions.skill.install", { source: file }]);
+  assert.deepEqual(picked, ["folder"]);
+  assert.deepEqual(looked, [folder]);
+  const sheet = () => document.querySelector('[aria-label="Add to Medha"]');
+  assert.match(sheet().textContent, /research.*Researches a topic\./);
+  assert.match(sheet().textContent, /scripts\/fetch\.sh: executable package file requires explicit review/);
+  assert.deepEqual(writes, [], "looking at a source must not add it");
+  await click([...sheet().querySelectorAll("label")].find((label) => /This project only/.test(label.textContent)).querySelector("input"));
+  await click(sheetButton("Add skill"));
+  assert.deepEqual(writes, [["extensions.skill.install", { source: folder, scope: "project" }]]);
+  assert.equal(sheet(), null, "the sheet closes once it is added");
 });
 
-test("Add plugin retains pasted sources on cancel and installs a chosen folder with review still required", async () => {
-  const picked = [];
-  let selection = null;
-  const { writes } = await extensionForm("plugin", async (kind) => {
-    picked.push(kind);
-    return selection;
-  });
-  const input = () => document.querySelector('[aria-label="Plugin source"]');
-  await inputValue(input(), "owner/repo");
-  await click(document.querySelector('[aria-label="Choose local plugin"]'));
-  assert.equal(input().value, "owner/repo", "cancel does not erase a pasted source");
-  await click(namedButton("Install"));
-  assert.deepEqual(writes[0], ["extensions.install", { source: "owner/repo" }]);
+test("Add shows a plugin's parts and access, and a harmful one cannot be added", async () => {
+  const { writes } = await extensionForm("plugin", async () => "/Users/test/hostile");
+  const sheet = () => document.querySelector('[aria-label="Add to Medha"]');
+  await inputValue(document.querySelector('[aria-label="Link or path"]'), "owner/repo");
+  await click(namedButton("Look"));
+  assert.match(sheet().textContent, /Commands\s*status/);
+  assert.match(sheet().textContent, /1 script that runs without being asked: after/);
+  assert.match(sheet().textContent, /Only api\.acme\.dev/);
+  await click(namedButton("Change"));
+  assert.equal(document.querySelector('[aria-label="Link or path"]').value, "owner/repo", "Change keeps what was pasted");
+  await click(namedButton("Choose folder"));
+  assert.match(sheet().textContent, /cannot be added.*hooks\/run\.sh:2: pipes a download into a shell/);
+  assert.equal(sheetButton("Add plugin"), undefined, "a refused plugin offers no way to add it");
+  await click(namedButton("Change"));
+  await click(namedButton("Look"));
+  await click(sheetButton("Add plugin"));
+  assert.deepEqual(writes, [["extensions.install", { source: "owner/repo" }]]);
   assert.match(document.querySelector('[role="status"]').textContent, /Installed and off.*review its access/);
-
-  await click(namedButton("Add plugin"));
-  selection = "/Users/test/Downloads/My plugin";
-  await click(document.querySelector('[aria-label="Choose local plugin"]'));
-  assert.equal(input().value, selection);
-  assert.equal(writes.length, 1);
-  await click(namedButton("Install"));
-  assert.deepEqual(writes[1], ["extensions.install", { source: selection }]);
-  assert.deepEqual(picked, ["plugin_folder", "plugin_folder"]);
 });
 
-test("picker errors allow retry, pending selections cannot install or leak into another extension form", async () => {
+test("picker errors and unknown sources can be retried, and nothing is chosen while locked", async () => {
   let choose = async () => { throw new Error("Picker failed"); };
-  const { writes, render } = await extensionForm("skill", (kind) => choose(kind));
-  const input = () => document.querySelector('[aria-label="Skill source"]');
-  const browse = () => document.querySelector('[aria-label="Choose local skill"]');
-  await inputValue(input(), "https://github.com/owner/repo/tree/main/skill");
-  await click(browse());
-  await click(namedButton("Choose SKILL.md"));
-  assert.match(document.querySelector('[role="alert"]').textContent, /Picker failed/);
-  assert.equal(browse().disabled, false);
+  const { writes, looked, render } = await extensionForm("skill", (kind) => choose(kind));
+  const sheet = () => document.querySelector('[aria-label="Add to Medha"]');
+  await click(namedButton("Choose file"));
+  assert.match(sheet().querySelector('[role="alert"]').textContent, /Picker failed/);
   choose = async () => null;
-  await click(browse());
-  await click(namedButton("Choose SKILL.md"));
-  assert.equal(document.querySelector('[role="alert"]'), null);
-  assert.equal(input().value, "https://github.com/owner/repo/tree/main/skill");
-  await click(namedButton("Install skill"));
-  assert.deepEqual(writes[0], ["extensions.skill.install", { source: "https://github.com/owner/repo/tree/main/skill" }]);
-
-  await click(namedButton("Add skill"));
+  await click(namedButton("Choose file"));
+  assert.equal(sheet().querySelector('[role="alert"]'), null);
+  assert.deepEqual(looked, [], "a cancelled picker looks at nothing");
+  await inputValue(document.querySelector('[aria-label="Link or path"]'), "nonsense");
+  await click(namedButton("Look"));
+  assert.match(sheet().querySelector('[role="alert"]').textContent, /Not a skill or a plugin: nonsense/);
+  assert.equal(sheetButton("Add skill"), undefined);
   await render(true);
-  assert.equal(browse().disabled, true);
-  assert.equal(input().disabled, true);
-  await render(false);
-  let finish;
-  choose = () => new Promise((resolve) => { finish = resolve; });
-  await click(browse());
-  await click(namedButton("Choose folder"));
-  assert.equal(browse().disabled, true);
-  assert.equal(input().disabled, true);
-  await act(() => document.querySelector(".plugin-install").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
-  assert.equal(writes.length, 1);
-  await click(namedButton("Plugins"));
-  await act(async () => finish("/Users/test/old skill"));
-  assert.equal(document.querySelector('[aria-label="Plugin source"]').value, "");
-  assert.equal(writes.length, 1);
+  assert.equal(namedButton("Choose file").disabled, true);
+  assert.equal(namedButton("Choose folder").disabled, true);
+  assert.equal(document.querySelector('[aria-label="Link or path"]').disabled, true);
+  assert.deepEqual(writes, []);
 });
 
 const screenshotData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";

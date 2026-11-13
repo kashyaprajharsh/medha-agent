@@ -9,7 +9,8 @@ import { SkillBrowse } from "./SkillBrowse";
 import { Sheet } from "./Sheet";
 import { SkillList, type Skill } from "./SkillList";
 import { SkillManage } from "./SkillManage";
-import { Add, Find, InstallSource, PageTop, ViewBar } from "./ExtensionParts";
+import { Add, Find, PageTop, ViewBar } from "./ExtensionParts";
+import { Intake } from "./Intake";
 import { Hooks } from "./Hooks";
 import { ToolPreset } from "./ToolPreset";
 import { ToolAccess, type Tool } from "./ToolAccess";
@@ -81,7 +82,6 @@ export function Extensions({
   const [busy, setBusy] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [ready, setReady] = useState(0);
-  const [source, setSource] = useState("");
   const [review, setReview] = useState<Plugin>();
   const [connect, setConnect] = useState<Mcp>();
   const [autoConnect, setAutoConnect] = useState(false);
@@ -164,7 +164,6 @@ export function Extensions({
       setUpdating(undefined);
       setAdding(false);
       setInstalling(false);
-      setSource("");
       setNotice(
         method === "extensions.install"
           ? "Installed and off. Open the plugin to review its access."
@@ -288,17 +287,6 @@ export function Extensions({
         )}
         {tab === "skills" && skillView === "installed" && (
           <>
-            {installing && (
-              <InstallSource
-                key="skill"
-                kind="skill"
-                value={source}
-                disabled={busy || locked}
-                onChange={setSource}
-                onInstall={(from) => act("extensions.skill.install", { source: from })}
-                onError={setError}
-              />
-            )}
             <SkillList
               skills={skills}
               matches={matches}
@@ -346,17 +334,6 @@ export function Extensions({
         )}
         {tab === "plugins" && pluginView === "installed" && (
           <>
-            {installing && (
-              <InstallSource
-                key="plugin"
-                kind="plugin"
-                value={source}
-                disabled={busy || locked}
-                onChange={setSource}
-                onInstall={(from) => act("extensions.install", { source: from })}
-                onError={setError}
-              />
-            )}
             {notices.map((message) => (
               <p className="surface-error" key={message}>
                 {message}
@@ -397,6 +374,14 @@ export function Extensions({
             />
             <PluginDoctor />
           </>
+        )}
+        {installing && (tab === "skills" || tab === "plugins") && (
+          <Intake
+            disabled={busy || locked}
+            onClose={() => setInstalling(false)}
+            onAdd={(method, params) => act(method, params)}
+            onConnector={(args) => act("settings.mcp.save", { args })}
+          />
         )}
         {tab === "MCP" && (
           <>

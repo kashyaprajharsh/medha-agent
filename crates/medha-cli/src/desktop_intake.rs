@@ -58,7 +58,7 @@ pub(crate) async fn preview(
     let adds: Vec<Value> = manifest
         .components
         .iter()
-        .map(|component| json!({"id": component.id()}))
+        .map(|component| json!({"id": component.id(), "kind": json!(component)["kind"]}))
         .collect();
     Ok(
         json!({"kind": "plugin", "name": manifest.name, "id": manifest.id, "description": manifest.description, "version": manifest.version, "access": manifest.permissions, "adds": adds, "files": plugin.files, "findings": plugin.findings, "refused": plugin.refused}),

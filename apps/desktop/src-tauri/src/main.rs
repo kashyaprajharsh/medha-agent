@@ -13,6 +13,7 @@ mod outputs;
 mod sleep;
 mod terminal;
 mod update;
+mod upload;
 mod view;
 mod workspaces;
 
@@ -142,30 +143,23 @@ async fn folder_choose(title: String) -> Option<String> {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ExtensionSourceKind {
-    SkillFolder,
-    SkillFile,
-    PluginFolder,
+    File,
+    Folder,
 }
 #[tauri::command]
 async fn extension_source_choose(kind: ExtensionSourceKind) -> Result<Option<String>, String> {
     let dialog = rfd::AsyncFileDialog::new();
     let selection = match kind {
-        ExtensionSourceKind::SkillFolder => {
+        ExtensionSourceKind::File => {
             dialog
-                .set_title("Choose a skill folder")
-                .pick_folder()
-                .await
-        }
-        ExtensionSourceKind::SkillFile => {
-            dialog
-                .set_title("Choose a skill file")
-                .add_filter("Skill", &["md", "zip", "skill"])
+                .set_title("Choose a skill or plugin file")
+                .add_filter("Skill or plugin", &["md", "zip", "skill", "plugin"])
                 .pick_file()
                 .await
         }
-        ExtensionSourceKind::PluginFolder => {
+        ExtensionSourceKind::Folder => {
             dialog
-                .set_title("Choose a plugin folder")
+                .set_title("Choose a skill or plugin folder")
                 .pick_folder()
                 .await
         }
@@ -863,6 +857,7 @@ fn main() {
             workspace_choose,
             folder_choose,
             extension_source_choose,
+            upload::extension_upload,
             workspace_info,
             workspace_reveal,
             workspace_history,

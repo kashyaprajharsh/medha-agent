@@ -871,8 +871,13 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
             )
             .with_project_source(runtime::project_trust::skill_source());
             let source = crate::desktop_intake::expand_home(text(params, "source")?)?;
+            let scope = match params["scope"].as_str() {
+                None | Some("user") => tools::SkillScope::User,
+                Some("project") => tools::SkillScope::Project,
+                Some(other) => bail!("scope must be user or project, not {other}"),
+            };
             let report = skills
-                .install_from(&source)
+                .install_into(&source, scope)
                 .await
                 .map_err(anyhow::Error::msg)?;
             if report.scan_verdict == "caution" {

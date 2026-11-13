@@ -68,7 +68,11 @@ async fn what_is_dropped_is_recognised_and_shown_before_it_is_added() {
         seen["access"].to_string().contains("api.acme.dev"),
         "{seen}"
     );
-    assert!(seen["adds"].to_string().contains("status"), "{seen}");
+    assert_eq!(
+        seen["adds"],
+        json!([{"id": "status", "kind": "action"}]),
+        "{seen}"
+    );
     assert!(
         !world.home().join("plugins").join("dev.acme.tools").exists(),
         "a preview installed the plugin"
@@ -152,5 +156,40 @@ async fn a_plugin_from_a_repository_or_a_marketplace_is_shown_before_it_is_added
     assert!(
         !listed.to_string().contains("tidy-market.tidy"),
         "a preview installed the plugin: {listed}"
+    );
+}
+
+/// "For: this project only" puts the skill in the project's own folder, not the person's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_skill_added_for_this_project_lands_in_the_project() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("intake");
+    client.open(&folder).await;
+    let skill = world.folder("given").join("release-notes");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: release-notes\ndescription: Writes release notes.\n---\n\nSteps.\n",
+    )
+    .unwrap();
+    let added = client
+        .about(
+            &folder,
+            json!({"method": "extensions.skill.install", "params": {"source": skill.to_str().unwrap(), "scope": "project"}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(added["installed"], true, "{added}");
+    assert!(
+        folder
+            .join(".medha/skills/release-notes/SKILL.md")
+            .is_file(),
+        "{added}"
+    );
+    assert!(
+        !world.home().join("skills/release-notes").exists(),
+        "it went to the person's skills"
     );
 }

@@ -12,21 +12,106 @@
   align-items: center;
   gap: var(--s-2);
 }
-.extension-source {
-  margin-bottom: var(--s-3);
+/* The Add sheet: one way in for a skill, plugin or connector. */
+.intake-drop {
+  margin: 0 0 var(--s-5);
+  padding: var(--s-5);
+  border: 1px dashed color-mix(in srgb, var(--text) 22%, transparent);
+  border-radius: var(--r-lg);
+  text-align: center;
+  transition: border-color 0.15s, background 0.15s;
 }
-.extension-source .plugin-install {
-  margin-bottom: 0;
+.intake-drop.over {
+  border-color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 6%, transparent);
 }
-.extension-source-choices {
+.intake-drop.given {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--text) 12%, transparent);
+  padding: var(--s-3) var(--s-4);
+  text-align: left;
+}
+.intake-ask {
+  margin: 0 0 var(--s-3);
+  font-size: var(--text-md);
+}
+.intake-paste-row {
   display: flex;
-  flex-wrap: wrap;
   gap: var(--s-2);
-  margin-top: var(--s-2);
 }
-.extension-source-choices p {
-  flex-basis: 100%;
-  margin: 0;
+.intake-paste {
+  flex: 1;
+  min-width: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: var(--text-sm);
+}
+.intake-pick {
+  display: flex;
+  justify-content: center;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+.intake-kinds {
+  margin: var(--s-3) 0 0;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.intake-given {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+.intake-kind {
+  padding: 2px var(--s-2);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--gold) 16%, transparent);
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+.intake-source {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+}
+.intake-change {
+  padding: 2px var(--s-2);
+  font-size: var(--text-xs);
+}
+.intake-listing {
+  display: grid;
+  gap: var(--s-1);
+  margin: 0 0 var(--s-5);
+  padding: var(--s-3);
+  border-left: 2px solid var(--gold);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.intake-listing b {
+  font-weight: 500;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+}
+.intake-filelist {
+  display: grid;
+  gap: 2px;
+}
+.intake-choice {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--text-sm);
+}
+.intake-note {
+  margin: 0 0 var(--s-4);
   color: var(--dim);
   font-size: var(--text-sm);
 }

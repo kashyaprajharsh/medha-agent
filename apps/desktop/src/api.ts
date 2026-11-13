@@ -218,7 +218,7 @@ export type Workspace = {
   path: string;
   personal: boolean;
 };
-export type ExtensionSourceKind = "skill_folder" | "skill_file" | "plugin_folder";
+export type ExtensionSourceKind = "file" | "folder";
 export const desktop = {
   /** Applies the system's window material where there is one (Mica on Windows 11), and says whether it took. */
   windowGlass: () => invoke<boolean>("window_glass"),
@@ -235,6 +235,11 @@ export const desktop = {
   chooseFolder: (title: string) => invoke<string | null>("folder_choose", { title }),
   chooseExtensionSource: (kind: ExtensionSourceKind) =>
     invoke<string | null>("extension_source_choose", { kind }),
+  /** Keeps a dropped file where the backend can read it, and returns that path. */
+  uploadExtension: async (file: File) =>
+    invoke<string>("extension_upload", new Uint8Array(await file.arrayBuffer()), {
+      headers: { "x-medha-name": encodeURIComponent(file.name) },
+    }),
   chooseAttachments: async (kind: "files" | "folder"): Promise<Attachment[] | null> => {
     type Picked = Omit<ImageAttachment, "id" | "preview"> & { kind: "image" }
       | Omit<LocalAttachment, "id">;

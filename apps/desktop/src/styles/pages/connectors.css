@@ -91,6 +91,18 @@
   box-shadow: 0 0 0 1px var(--hair);
   transition: scale var(--t-base) var(--ease-out);
 }
+.cx-letter {
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: color-mix(in srgb, var(--gold) 14%, transparent);
+  color: var(--text);
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+.cx-page > .ext-add {
+  margin: 0 0 var(--s-5);
+}
 .cx-row:hover .cx-plate {
   scale: 1.05;
 }

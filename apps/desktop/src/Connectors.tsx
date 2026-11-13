@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
 import { useWorkspaceApi } from "./Workspace";
-import { useMcpSignIn, type McpStatus } from "./McpServers";
+import { McpForm, useMcpSignIn, type McpStatus } from "./McpServers";
+import { Add } from "./ExtensionParts";
 
 export type Connector = {
   id: string;
@@ -29,10 +30,22 @@ const CATEGORIES: [string, string][] = [
   ["sales", "Sales"],
   ["health", "Health"],
   ["search", "Search"],
+  ["custom", "Your servers"],
 ];
 const LABEL = Object.fromEntries(CATEGORIES);
 const LOGOS = import.meta.glob("./assets/connectors/*.png", { eager: true, import: "default" }) as Record<string, string>;
 const logo = (id: string) => LOGOS[`./assets/connectors/${id}.png`];
+/** A catalog app's own mark, or the first letter of a server the person added. */
+function Plate({ c }: { c: Connector }) {
+  const src = logo(c.id);
+  return src ? (
+    <img className="cx-plate" src={src} alt="" />
+  ) : (
+    <span className="cx-plate cx-letter" aria-hidden="true">
+      {c.name.slice(0, 1).toUpperCase()}
+    </span>
+  );
+}
 const domain = (c: Connector) => new URL(c.source).hostname.split(".").slice(-2).join(".");
 
 function ago(ts: number) {
@@ -77,6 +90,8 @@ export function Connectors({
   const [openId, setOpenId] = useState<string>();
   const [phase, setPhase] = useState<Phase>("idle");
   const [problem, setProblem] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState("");
   const created = useRef<string | null>(null);
   const waitingFor = useRef<string | null>(null);
   const signIn = useMcpSignIn(sessionKey, (event) => {
@@ -169,7 +184,7 @@ export function Connectors({
       onClick={() => show(c.id)}
       aria-label={`${c.name}: ${detail}`}
     >
-      <img className="cx-plate" src={logo(c.id)} alt="" />
+      <Plate c={c} />
       <span className="cx-text">
         <span className="cx-name">{c.name}</span>
         <span className="cx-desc">{detail}</span>
@@ -209,6 +224,36 @@ export function Connectors({
     <div className="cx-page">
       <h2>Connectors</h2>
       <p className="cx-lede">Sign in once and Medha can work in the apps you already use. Your sign-ins stay on this computer.</p>
+      <Add label="Add custom connector" open={adding} onClick={() => setAdding(!adding)} />
+      {adding && (
+        <Sheet label="Add custom connector" onClose={() => setAdding(false)}>
+          <div className="sheet-title">
+            <h2>Add custom connector</h2>
+          </div>
+          <p className="sheet-lead">The address of a remote MCP server. A server on this computer can be a command instead.</p>
+          <p className="intake-note">Only connect servers you trust: Medha cannot see what a server does with what it is sent.</p>
+          {addError && (
+            <p className="surface-error" role="alert">
+              {addError}
+            </p>
+          )}
+          <McpForm
+            busy={false}
+            initial={{ id: "", transport: "remote", url: "" }}
+            submitLabel="Add connector"
+            onSave={async (args) => {
+              setAddError("");
+              try {
+                await api.settings("settings.mcp.save", { args });
+                setAdding(false);
+                onChanged();
+              } catch (cause) {
+                setAddError(String(cause));
+              }
+            }}
+          />
+        </Sheet>
+      )}
       {error && (
         <p className="surface-error" role="alert">
           {error}
@@ -245,17 +290,19 @@ export function Connectors({
       {open && (
           <Sheet label={open.name} onClose={() => show(undefined)}>
             <div className="cx-hero">
-              <img className="cx-plate" src={logo(open.id)} alt="" />
+              <Plate c={open} />
               <div>
                 <h2>{open.name}</h2>
                 <small>{LABEL[open.category]}</small>
               </div>
             </div>
             <p className="cx-about">
-              {open.description} Ask Medha in plain words and it works in {open.name} for you.
+              {open.category === "custom"
+                ? `${open.source}. Ask Medha in plain words and it uses this server's tools for you.`
+                : `${open.description} Ask Medha in plain words and it works in ${open.name} for you.`}
             </p>
-            <h4>Try asking</h4>
-            <ul className="cx-asks">
+            {open.asks.length > 0 && <h4>Try asking</h4>}
+            <ul className="cx-asks" hidden={!open.asks.length}>
               {open.asks.map((ask) => (
                 <li key={ask}>
                   <button
@@ -271,7 +318,11 @@ export function Connectors({
             <ul className="cx-facts">
               <li>
                 <Icon name="lock" />
-                <span>You sign in on {open.name}'s own page. Medha never sees your password.</span>
+                <span>
+                  {open.category === "custom"
+                    ? "If the server asks for a sign-in, it happens on its own page. Medha never sees your password."
+                    : `You sign in on ${open.name}'s own page. Medha never sees your password.`}
+                </span>
               </li>
               <li>
                 <Icon name="shield" />
@@ -279,7 +330,11 @@ export function Connectors({
               </li>
               <li>
                 <Icon name="link" />
-                <span>Provided by {open.name}. Disconnect any time.</span>
+                <span>
+                  {open.category === "custom"
+                    ? "Added by you. Only keep servers you trust: Medha cannot see what a server does with what it is sent."
+                    : `Provided by ${open.name}. Disconnect any time.`}
+                </span>
               </li>
             </ul>
             <Action

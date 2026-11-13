@@ -289,7 +289,7 @@ pub(crate) async fn listing<L: EventLog>(
     let calls = log.tool_calls_since(now - 30.0 * 86_400.0).await;
     activity(&calls, now, &mut used);
     let project = Project::scan(workspace);
-    let rows: Vec<Value> = catalog()
+    let mut rows: Vec<Value> = catalog()
         .iter()
         .map(|connector| {
             let server = connector.configured(servers);
@@ -306,6 +306,29 @@ pub(crate) async fn listing<L: EventLog>(
             row
         })
         .collect();
+    // A remote server the person added by address, that no catalog app claims, is their own connector.
+    let claimed: Vec<&str> = catalog()
+        .iter()
+        .filter_map(|connector| connector.configured(servers))
+        .collect();
+    for (id, server) in servers {
+        if server.url.is_empty() || claimed.contains(&id.as_str()) {
+            continue;
+        }
+        rows.push(json!({
+            "id": format!("custom:{id}"),
+            "name": id,
+            "url": server.url,
+            "source": server.url,
+            "description": format!("Your server at {}", url::Url::parse(&server.url).ok().and_then(|url| url.host_str().map(str::to_owned)).unwrap_or_else(|| server.url.clone())),
+            "category": "custom",
+            "asks": [],
+            "server": id,
+            "off": server.disabled,
+            "activity": used.get(id),
+            "evidence": null,
+        }));
+    }
     json!({ "connectors": rows })
 }
 

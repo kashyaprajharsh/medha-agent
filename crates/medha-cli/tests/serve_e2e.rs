@@ -27,6 +27,8 @@ mod checkpoint_caps;
 
 #[path = "serve_e2e/cleanup.rs"]
 mod cleanup;
+#[path = "serve_e2e/custom_connector.rs"]
+mod custom_connector;
 #[path = "serve_e2e/deleting.rs"]
 mod deleting;
 #[path = "serve_e2e/folders.rs"]

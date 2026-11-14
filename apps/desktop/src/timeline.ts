@@ -111,6 +111,7 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
           step.output = event.output;
           step.sourceEvent = event.id;
           step.screen = event.screen ? { ...event.screen, source_event: event.id } : undefined;
+          step.images = event.images?.length ? event.images : undefined;
           step.ended = event.ts;
         }
         break;

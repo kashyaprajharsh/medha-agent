@@ -780,6 +780,14 @@ fn tool_view(steps: &mut transcript_view::Steps, event: &Event) -> Option<EventV
                 error_code: outcome.error_code,
                 status: Some(status.to_owned()),
                 screen: event.payload.get("screen").cloned(),
+                // A picture the tool made, such as a screenshot, is shown on its step.
+                images: event
+                    .payload
+                    .get("media")
+                    .cloned()
+                    .and_then(|media| serde_json::from_value::<Vec<kernel::MediaPart>>(media).ok())
+                    .map(|parts| crate::chat_history::images(&parts))
+                    .unwrap_or_default(),
                 ..event_view(event, "tool_result", String::new())
             })
         }

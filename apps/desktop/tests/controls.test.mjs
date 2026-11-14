@@ -1146,6 +1146,23 @@ test("sending through useLive preserves the initial prompt and mid-turn follow-u
   assert.equal(live.live.chat.items.at(-1).text, "Please change direction");
 });
 
+test("a step that made a picture opens to show it, though it names no file", async () => {
+  const { StepGroup } = await import(await moduleUrl("Steps"));
+  const shot = {
+    id: "render",
+    tool: "read",
+    verb: "Read",
+    target: "https://medha.example.com/",
+    status: "ok",
+    images: [{ hash: "a".repeat(64), name: "screenshot of https://medha.example.com/", mime: "image/png", preview: "data:image/png;base64,AA==" }],
+  };
+  await act(() => root.render(h(StepGroup, { steps: [shot], live: true })));
+  const row = document.querySelector(".step-main");
+  assert.equal(row.disabled, false, "the step can be opened");
+  await click(row);
+  assert.ok(document.querySelector(".step .sent-image img"), "the screenshot is shown");
+});
+
 test("closed work groups update completed steps and release their spinners", async () => {
   const { StepGroup } = await import(await moduleUrl("Steps"));
   const running = {

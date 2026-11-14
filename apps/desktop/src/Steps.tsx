@@ -3,6 +3,7 @@ import { memo, useEffect, useState, type ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 import type { Plan, Step } from "./live";
 import { Diff } from "./GitChanges";
+import { MessageAttachments } from "./MessageAttachments";
 import { SourceCode } from "./Markdown";
 import { Spinner } from "./Spinner";
 import { stepStatusLabel, stepVerb } from "./timeline";
@@ -160,7 +161,7 @@ const StepRow = memo(
       step.started !== undefined
         ? (step.ended ?? (step.status === "running" ? now : undefined))
         : undefined;
-    const expandable = Boolean(step.detail || step.input || step.output);
+    const expandable = Boolean(step.detail || step.input || step.output || step.images?.length);
     return (
       <li
         className={`step ${bad ? "failed" : ""} ${step.status === "running" ? "running" : ""}`}
@@ -292,6 +293,9 @@ const StepRow = memo(
                       )}
                     </div>
                   )}
+                  {step.images?.length ? (
+                    <MessageAttachments images={step.images} files={[]} />
+                  ) : null}
                   {step.status === "running" && !step.output && (
                     <p className="io-waiting">Waiting for the result…</p>
                   )}

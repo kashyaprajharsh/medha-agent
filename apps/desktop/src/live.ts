@@ -68,6 +68,8 @@ export type Step = {
   output?: string;
   /** A screen the tool's server offers for this result. */
   screen?: ToolScreen;
+  /** Pictures the step made, such as a page screenshot, shown when it is opened. */
+  images?: MessageImage[];
   started?: number;
   ended?: number;
 };

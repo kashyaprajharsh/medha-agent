@@ -1402,6 +1402,47 @@ async fn a_reopened_branch_shares_its_chats_scratch_folder() {
     );
 }
 
+/// A step whose result is a picture carries that picture for the desktop to show on the step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_that_made_a_picture_carries_it_for_the_desktop() {
+    const PNG: [u8; 70] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x38,
+        0x71, 0xe2, 0xc4, 0x7f, 0x00, 0x08, 0x0c, 0x03, 0x58, 0x1f, 0xff, 0xb6, 0xf3, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("picture-step");
+    std::fs::write(folder.join("dot.png"), PNG).unwrap();
+    let chat = client.open(&folder).await;
+    let picture = json!({"path": "dot.png"});
+    scripted(&mut client, &world, &chat, &[format!("read {picture}")]).await;
+    let events = json!({"method": "sessions.events", "session_id": chat});
+    let events = client.about(&folder, events).await.unwrap();
+    let result = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "tool_result")
+        .cloned()
+        .unwrap();
+    let images = result["images"].as_array().cloned().unwrap_or_default();
+    assert_eq!(images.len(), 1, "{result}");
+    assert!(
+        images[0]["mime"]
+            .as_str()
+            .is_some_and(|mime| mime.starts_with("image/"))
+    );
+    assert_eq!(
+        images[0]["hash"].as_str().map(str::len),
+        Some(64),
+        "{result}"
+    );
+}
+
 /// A step that read a web address is never opened as a file; a step that read a file still is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_that_read_a_web_address_never_opens_it_as_a_file() {

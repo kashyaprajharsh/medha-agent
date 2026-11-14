@@ -8,7 +8,7 @@ pub(crate) async fn commit(
     content: &str,
     state: &sandbox::GuardedFileState,
 ) -> Result<Option<String>, ToolError> {
-    sandbox.write_guarded_checked(guard, content, Some(state)).await.map_err(|error| {
+    sandbox.write_guarded_checked(guard, content.as_bytes(), Some(state)).await.map_err(|error| {
         if let sandbox::SandboxError::Published { snapshot, message } = error {
             ToolError::Structured(json!({"path":guard.resolved(), "written":true, "changed":true,
                 "verified":false, "snapshot":snapshot, "expected":"unknown", "error":message,

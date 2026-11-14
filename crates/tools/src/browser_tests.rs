@@ -487,6 +487,40 @@ async fn a_browser_that_exits_before_render_reports_its_status_and_output() {
     );
 }
 
+/// A render can be kept as a PNG file in the folder, listed as an output; outside the folder it is refused.
+#[tokio::test]
+async fn a_render_saved_as_a_file_lands_in_the_folder_and_nowhere_else() {
+    let Some(browser) = installed_browser() else {
+        return;
+    };
+    let base = scratch("render-save");
+    std::fs::write(base.path().join("index.html"), "<h1>kept</h1>").unwrap();
+    let page = BrowserScreenshot {
+        sbx: Arc::new(sandbox::WorkspaceSandbox::new_jailed(base.path()).unwrap()),
+        artifacts: Arc::new(MemArtifacts::default()),
+        browser,
+    };
+    let saved = page
+        .render(&json!({"path": "index.html", "render": true, "save_as": "shots/page.png"}))
+        .await
+        .unwrap();
+    let file = std::fs::read(base.path().join("shots/page.png")).unwrap();
+    assert!(file.starts_with(b"\x89PNG"), "the file is a PNG");
+    assert_eq!(saved["saved"], "shots/page.png", "{saved}");
+    assert_eq!(saved[crate::outputs::FIELD]["kind"], "image", "{saved}");
+    let outside = page
+        .render(&json!({"path": "index.html", "render": true, "save_as": "../escape.png"}))
+        .await;
+    assert!(outside.is_err(), "a render was saved outside the folder");
+    let wrong = page
+        .render(&json!({"path": "index.html", "render": true, "save_as": "shots/page.txt"}))
+        .await;
+    assert!(
+        wrong.is_err(),
+        "a render was saved under a name that is not a PNG"
+    );
+}
+
 /// `read` with `render: true` returns the picture; an ungranted URL never starts a browser.
 #[tokio::test]
 async fn read_render_returns_the_page_as_an_image_and_refuses_ungranted_urls() {

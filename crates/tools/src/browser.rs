@@ -452,13 +452,40 @@ impl BrowserScreenshot {
             _ => unreachable!("a file target always has a server"),
         };
         let host = server.as_ref().map(|server| server.host.as_str());
+        let save_as = args.get("save_as").and_then(Value::as_str);
+        if save_as.is_some_and(|name| !name.to_ascii_lowercase().ends_with(".png")) {
+            return Err(ToolError::Args("save_as must name a .png file".into()));
+        }
         let raw = once_more_if_cancelled(|| self.shoot(&url, size, host, network)).await?;
         drop(server);
+        let saved = match save_as {
+            Some(name) => Some((name, self.save(name, &raw).await?)),
+            None => None,
+        };
         let image = tokio::task::spawn_blocking(move || media::for_history(raw))
             .await
             .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
             .map_err(|error| ToolError::Failed(format!("screenshot: {error}")))?;
-        self.finish(&requested, network, image).await
+        let mut result = self.finish(&requested, network, image).await?;
+        if let Some((name, output)) = saved {
+            result["saved"] = json!(name);
+            result[crate::outputs::FIELD] = output;
+        }
+        Ok(result)
+    }
+
+    /// Keeps the picture as a file in the folder, written as any file is, and lists it as an output.
+    async fn save(&self, name: &str, png: &[u8]) -> Result<Value, ToolError> {
+        self.sbx
+            .write_bytes(name, png)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let written = self.sbx.resolve_if_permitted(name).await.ok_or_else(|| {
+            ToolError::Failed(format!("{name} was written but cannot be read back"))
+        })?;
+        crate::outputs::manifest(&self.sbx, &written, png)
+            .await
+            .map_err(ToolError::Failed)
     }
 
     /// One browser run with a profile of its own: the picture, or what went wrong with Chrome's own words.

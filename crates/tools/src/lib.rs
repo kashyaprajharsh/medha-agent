@@ -1734,13 +1734,15 @@ impl Tool for Read {
                 "limit": { "type": "integer", "minimum": 1, "description": "How many lines to return" },
                 "column": { "type": "integer", "minimum": 1, "description": "Start line `offset` at this byte" },
                 "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" },
-                "render": { "type": "boolean", "description": "Screenshot the page at `path` (HTML file or URL)" }
+                "render": { "type": "boolean", "description": "Screenshot the page at `path` (HTML file or URL)" },
+                "save_as": { "type": "string", "description": "With render: also keep the screenshot as this .png in the workspace. Never run a browser yourself for a screenshot" }
             }
         });
         if !self.sees_images()
             && let Some(properties) = schema["properties"].as_object_mut()
         {
             properties.remove("render");
+            properties.remove("save_as");
         }
         schema
     }

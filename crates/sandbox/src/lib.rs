@@ -2923,6 +2923,16 @@ impl WorkspaceSandbox {
         self.write_guarded(&guard, contents).await
     }
 
+    /// [`write`](Self::write) for bytes that are not text, such as a picture, through the same guard.
+    pub async fn write_bytes(
+        &self,
+        path: &str,
+        contents: &[u8],
+    ) -> Result<Option<String>, SandboxError> {
+        let guard = self.path_guard(path).await?;
+        self.write_guarded_checked(&guard, contents, None).await
+    }
+
     /// Write through a previously authorised canonical target while its
     /// per-target lock is held. Read-modify-write tools use this instead of
     /// resolving the raw path again after acquiring [`WritePathGuard`].
@@ -2931,7 +2941,8 @@ impl WorkspaceSandbox {
         guard: &WritePathGuard,
         contents: &str,
     ) -> Result<Option<String>, SandboxError> {
-        self.write_guarded_checked(guard, contents, None).await
+        self.write_guarded_checked(guard, contents.as_bytes(), None)
+            .await
     }
 
     /// Write through a held capability, optionally requiring the target to
@@ -2940,14 +2951,14 @@ impl WorkspaceSandbox {
     pub async fn write_guarded_checked(
         &self,
         guard: &WritePathGuard,
-        contents: &str,
+        contents: &[u8],
         expected: Option<&GuardedFileState>,
     ) -> Result<Option<String>, SandboxError> {
         #[cfg(unix)]
         {
             let capability = guard.capability.try_clone()?;
             let snapshots = self.snapshots.clone();
-            let contents = contents.as_bytes().to_vec();
+            let contents = contents.to_vec();
             let expected = expected.cloned();
             tokio::task::spawn_blocking(move || {
                 write_through_capability(&capability, &snapshots, &contents, expected.as_ref())
@@ -2961,7 +2972,7 @@ impl WorkspaceSandbox {
 
             let resolved = guard.resolved.clone();
             let snapshots = self.snapshots.clone();
-            let contents = contents.as_bytes().to_vec();
+            let contents = contents.to_vec();
             let expected = expected.cloned();
             tokio::task::spawn_blocking(move || {
                 let current = match std::fs::File::open(&resolved) {

@@ -12,3 +12,7 @@ rust-version.workspace = true
 [dependencies]
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
+tree-sitter-powershell = "=0.26.4"
+
+[dev-dependencies]
+serde_json = { workspace = true }

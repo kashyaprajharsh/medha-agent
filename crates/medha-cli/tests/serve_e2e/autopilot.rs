@@ -464,6 +464,56 @@ async fn without_an_os_sandbox_the_reviewer_answers_commands_and_nothing_asks_ab
     assert_eq!(logged[0]["by"], "reviewer", "{logged:?}");
 }
 
+/// Where PowerShell runs commands, one that only reads runs without the reviewer; one that writes still goes to it.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_powershell_a_reading_command_skips_the_reviewer_and_a_write_does_not() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home()).unwrap();
+    std::fs::write(
+        world.home().join("config.toml"),
+        "[agent]\nreview_timeout = 3\n",
+    )
+    .unwrap();
+    let powershell = format!(
+        r"{}\System32\WindowsPowerShell\v1.0\powershell.exe",
+        std::env::var("SystemRoot").unwrap()
+    );
+    let backend = world.backend_in(&[("MEDHA_SHELL", powershell.as_str())]);
+    let mut client = backend.connect().await;
+    let folder = world.folder("powershell");
+    std::fs::write(folder.join("notes.txt"), "kept\n").unwrap();
+    let chat = client.open(&folder).await;
+    let set = client
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"mode": "autopilot"}),
+        )
+        .await;
+    assert!(set.get("error").is_none(), "{set}");
+    let read = json!({"command": "Get-ChildItem | Select-Object -First 5 2>$null"});
+    let write = json!({"command": "New-Item -ItemType File REVIEW_ALLOW.txt | Out-Null"});
+    let (cards, _) = run(
+        &mut client,
+        &chat,
+        &[format!("shell_exec {read}"), format!("shell_exec {write}")],
+        false,
+    )
+    .await;
+    assert_eq!(cards, 0, "the person was asked");
+    assert!(
+        folder.join("REVIEW_ALLOW.txt").exists(),
+        "the write did not run"
+    );
+    let logged = answers(&world, &chat).await;
+    assert_eq!(
+        logged.len(),
+        1,
+        "only the write goes to the reviewer: {logged:?}"
+    );
+}
+
 /// A plugin hook that wants a person asked always reaches the person, even where the reviewer would allow.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

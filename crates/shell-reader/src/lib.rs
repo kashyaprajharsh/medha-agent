@@ -1,6 +1,7 @@
 //! One reading of a shell command line, shared by admission, backups and lanes.
 
 mod parse;
+mod powershell;
 mod program;
 mod readers;
 mod word;
@@ -10,6 +11,22 @@ pub use program::Program;
 /// Reads `line` with a bash grammar.
 pub fn read(line: &str) -> Reading {
     parse::read(line)
+}
+
+/// The interpreter that will run a line, which decides its grammar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shell {
+    #[default]
+    Posix,
+    PowerShell,
+}
+
+/// Reads `line` as the shell that runs it will; a line PowerShell would run is never read as bash.
+pub fn read_as(line: &str, shell: Shell) -> Reading {
+    match shell {
+        Shell::Posix => parse::read(line),
+        Shell::PowerShell => powershell::read(line),
+    }
 }
 
 /// What "always allow" for this line covers: each program and its first plain word, such as
@@ -137,6 +154,8 @@ pub struct Command {
     pub background: bool,
     /// Runs inside `$(...)`, backquotes or `<(...)`.
     pub substituted: bool,
+    /// The shell that runs it, which decides what its program's name means.
+    pub shell: Shell,
 }
 
 impl Command {
@@ -154,7 +173,9 @@ impl Command {
         let set_env = self.words[..program.at]
             .iter()
             .any(|word| word.text.contains('='));
-        by_name && !set_env && !program.fed && readers::reads_only(&program.name, program.args)
+        let reads = readers::reads_only(&program.name, program.args)
+            || (self.shell == Shell::PowerShell && readers::cmdlet_reads_only(&program.name));
+        by_name && !set_env && !program.fed && reads
     }
 }
 

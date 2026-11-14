@@ -234,7 +234,11 @@ impl Policy for LiveSettings {
             ))
             .with_workspace(&self.folder)
             .with_memory_write_approval(&lock.memory.write_approval)
-            .with_jail(jail);
+            .with_jail(jail)
+            .with_shell(match sandbox::exec::shell_name(lock.backend.label()) {
+                "PowerShell" => policy::Shell::PowerShell,
+                _ => policy::Shell::Posix,
+            });
         if let Some(scratch) = &self.scratch {
             policy = policy.with_scratch(scratch);
         }

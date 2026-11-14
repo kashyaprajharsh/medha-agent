@@ -42,6 +42,58 @@ pub(crate) fn reads_only(program: &str, args: &[Word]) -> bool {
     }
 }
 
+/// PowerShell cmdlets that only read, and their built-in aliases; only a line PowerShell runs gets these.
+pub(crate) fn cmdlet_reads_only(program: &str) -> bool {
+    matches!(
+        program,
+        "get-childitem"
+            | "gci"
+            | "dir"
+            | "get-content"
+            | "gc"
+            | "select-string"
+            | "sls"
+            | "test-path"
+            | "get-location"
+            | "gl"
+            | "get-item"
+            | "gi"
+            | "get-itemproperty"
+            | "gp"
+            | "resolve-path"
+            | "rvpa"
+            | "split-path"
+            | "join-path"
+            | "measure-object"
+            | "measure"
+            | "select-object"
+            | "select"
+            | "sort-object"
+            | "format-table"
+            | "ft"
+            | "format-list"
+            | "fl"
+            | "format-wide"
+            | "fw"
+            | "out-string"
+            | "out-null"
+            | "write-output"
+            | "write"
+            | "write-host"
+            | "get-command"
+            | "gcm"
+            | "get-filehash"
+            | "get-date"
+            | "compare-object"
+            | "compare"
+            | "convertfrom-json"
+            | "convertto-json"
+            | "get-unique"
+            | "group-object"
+            | "group"
+    )
+}
+
 /// `git <reader>` with nothing before the subcommand and no option that writes or runs a program.
 fn git_reads(args: &[Word]) -> bool {
     let reader = args.first().is_some_and(|sub| {

@@ -4,6 +4,7 @@ mod admission;
 pub mod guard;
 
 use admission::DeleteTier;
+pub use shell_reader::Shell;
 
 use kernel::{AutonomyLevel, BlastRadius, Decision, Policy, ToolIntent};
 use regex::Regex;
@@ -17,6 +18,8 @@ pub struct DefaultPolicy {
     memory_write_approval: MemoryWriteApproval,
     jail: Jail,
     scratch: Option<String>,
+    /// The shell commands run in, which decides how a line is read for whether it asks.
+    shell: shell_reader::Shell,
 }
 
 fn scan_root(root: &std::path::Path) -> Option<String> {
@@ -51,6 +54,7 @@ impl DefaultPolicy {
             memory_write_approval: MemoryWriteApproval::UserScope,
             jail: Jail::Off,
             scratch: None,
+            shell: shell_reader::Shell::Posix,
         }
     }
 
@@ -66,11 +70,18 @@ impl DefaultPolicy {
             memory_write_approval: MemoryWriteApproval::UserScope,
             jail: Jail::Off,
             scratch: None,
+            shell: shell_reader::Shell::Posix,
         }
     }
 
     pub fn with_jail(mut self, jail: Jail) -> Self {
         self.jail = jail;
+        self
+    }
+
+    /// Commands run in `shell`; a PowerShell line is read as PowerShell when deciding whether it asks.
+    pub fn with_shell(mut self, shell: shell_reader::Shell) -> Self {
+        self.shell = shell;
         self
     }
 
@@ -143,7 +154,7 @@ impl DefaultPolicy {
         match (autonomy, self.jail) {
             (AutonomyLevel::Normal, Jail::Active) if shell => false,
             (AutonomyLevel::Autopilot, Jail::Missing) if shell => {
-                self.approve.contains("shell.exec") && !only_reads(intent)
+                self.approve.contains("shell.exec") && !only_reads(intent, self.shell)
             }
             _ => self.escalates(autonomy, &intent.tool),
         }
@@ -151,13 +162,13 @@ impl DefaultPolicy {
 }
 
 /// True when no command in the line builds, tests, deletes or otherwise runs workspace code.
-fn only_reads(intent: &ToolIntent) -> bool {
+fn only_reads(intent: &ToolIntent, shell: shell_reader::Shell) -> bool {
     let command = intent
         .args
         .get("command")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    shell_reader::read(command).reads_only()
+    shell_reader::read_as(command, shell).reads_only()
 }
 
 impl Policy for DefaultPolicy {
@@ -179,6 +190,7 @@ impl Policy for DefaultPolicy {
                 self.workspace.as_deref(),
                 self.scratch.as_deref(),
                 self.jail,
+                self.shell,
             ),
             "git" => authorize_git(intent),
             // Only a search reads; anything else, an unknown job included, adds a skill and asks.
@@ -249,12 +261,14 @@ fn scan_command(
     workspace: Option<&str>,
     scratch: Option<&str>,
     jail: Jail,
+    shell: shell_reader::Shell,
 ) -> Decision {
     let command = intent
         .args
         .get("command")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    // Refusals keep the bash reading in every shell, so reading PowerShell never lets more through.
     let reading = shell_reader::read(command);
     let jailed = jail == Jail::Active;
     if let Some(reason) = admission::danger(&reading, workspace, jailed) {
@@ -271,7 +285,12 @@ fn scan_command(
         Some(DeleteTier::Unseen) if !jailed => return Decision::Human,
         _ => {}
     }
-    if !jailed && admission::review(&reading, workspace, scratch).is_some() {
+    // Whether it asks is read as the shell will run it: an unread line still asks.
+    let asked = match shell {
+        shell_reader::Shell::Posix => reading,
+        shell_reader::Shell::PowerShell => shell_reader::read_as(command, shell),
+    };
+    if !jailed && admission::review(&asked, workspace, scratch).is_some() {
         return Decision::Human;
     }
     Decision::Allow
@@ -452,6 +471,56 @@ mod tests {
                 );
             }
             assert!(!policy.escalates(AutonomyLevel::Careful, "read"));
+        }
+    }
+
+    /// Where PowerShell runs commands with no jail, a line it only reads runs unasked in Autopilot;
+    /// writes and lines it cannot read still ask, and refusals are the same as in any shell.
+    #[test]
+    fn powershell_reads_run_unasked_and_nothing_else_loosens() {
+        let policy = |kind| {
+            DefaultPolicy::requiring_approval(["shell.exec"])
+                .with_jail(Jail::Missing)
+                .with_shell(kind)
+        };
+        let decide = |kind, command: &str| {
+            policy(kind).authorize(
+                AutonomyLevel::Autopilot,
+                &shell(command),
+                radius_of("shell.exec"),
+            )
+        };
+        let asks = |kind, command: &str| {
+            policy(kind).asks(AutonomyLevel::Autopilot, &shell(command))
+                || matches!(decide(kind, command), Decision::Human)
+        };
+        for command in [
+            "Get-ChildItem -Recurse -Filter *.ts | Select-Object -First 20",
+            "Get-Content src\\main.rs -TotalCount 40",
+            "Select-String -Path README.md -Pattern 'TODO' 2>$null",
+            "git status 2>&1 | Out-String",
+        ] {
+            assert!(!asks(Shell::PowerShell, command), "{command}");
+            assert!(
+                asks(Shell::Posix, command),
+                "bash never ran this unasked: {command}"
+            );
+        }
+        for command in [
+            "Remove-Item build -Recurse -Force",
+            "npm test",
+            "if (Test-Path dist) { Remove-Item dist -Recurse }",
+            "Get-Content notes.txt > out.txt",
+            "Get-Content $env:USERPROFILE\\.ssh\\id_rsa",
+        ] {
+            assert!(asks(Shell::PowerShell, command), "{command}");
+        }
+        for command in ["rm -rf /", "Remove-Item -Recurse -Force C:\\ ; rm -rf /"] {
+            assert_eq!(
+                matches!(decide(Shell::PowerShell, command), Decision::Deny { .. }),
+                matches!(decide(Shell::Posix, command), Decision::Deny { .. }),
+                "{command}"
+            );
         }
     }
 

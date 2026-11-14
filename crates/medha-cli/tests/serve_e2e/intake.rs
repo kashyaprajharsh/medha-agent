@@ -133,7 +133,7 @@ async fn a_plugin_from_a_repository_or_a_marketplace_is_shown_before_it_is_added
     real_use::git(&repo, &["init", "-q", "-b", "main"]);
     real_use::git(&repo, &["add", "."]);
     real_use::git(&repo, &["commit", "-q", "-m", "one"]);
-    let url = format!("file://{}", repo.display());
+    let url = url::Url::from_file_path(&repo).unwrap().to_string();
 
     let seen = preview(&mut client, &folder, &url).await;
     assert_eq!(seen["kind"], "plugin", "{seen}");

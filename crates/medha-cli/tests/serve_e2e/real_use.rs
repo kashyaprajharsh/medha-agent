@@ -13,7 +13,6 @@ async fn logged(world: &World, chat: &str) -> Vec<kernel::Event> {
     log.events(chat.parse().unwrap()).await
 }
 
-#[cfg(unix)]
 pub(crate) fn git(folder: &Path, args: &[&str]) {
     let done = Command::new("git")
         .args(args)

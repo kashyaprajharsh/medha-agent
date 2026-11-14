@@ -53,9 +53,15 @@ fn keep_in(root: &Path, name: &str, bytes: &[u8]) -> Result<String, String> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     ));
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let builder = {
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+    };
+    // On Windows a folder under the user's temp is private to them already.
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder.create(&folder).map_err(|error| error.to_string())?;
     let path = folder.join(name);
     std::fs::write(&path, bytes).map_err(|error| error.to_string())?;

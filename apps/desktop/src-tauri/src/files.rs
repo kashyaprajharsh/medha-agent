@@ -9,7 +9,12 @@ const MAX_TEXT: u64 = 2 * 1024 * 1024;
 const MAX_BINARY: u64 = 24 * 1024 * 1024;
 
 pub fn resolve(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let path = dunce::canonicalize(root.join(requested)).map_err(|e| e.to_string())?;
+    let path = dunce::canonicalize(root.join(requested)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{requested} is not in this folder. A reply can name a file before it is saved."
+        ),
+        _ => e.to_string(),
+    })?;
     if !path.starts_with(root) {
         return Err("This file is outside the selected workspace".into());
     }
@@ -171,6 +176,21 @@ mod tests {
         }
         fs::write(workspace.join("binary"), [0, 3]).unwrap();
         assert!(read(&workspace, "binary").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A file a reply only named says it is not there yet, in words, on every system.
+    #[test]
+    fn a_named_file_that_was_never_saved_says_so_plainly() {
+        let root = std::env::temp_dir().join(format!("medha-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let root = dunce::canonicalize(root).unwrap();
+        let said = read(&root, "screenshots/medha-home.png").unwrap_err();
+        assert_eq!(
+            said,
+            "screenshots/medha-home.png is not in this folder. A reply can name a file before it is saved."
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

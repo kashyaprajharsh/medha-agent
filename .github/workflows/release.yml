@@ -313,6 +313,23 @@ jobs:
           -Windowed src-tauri/target/${{ matrix.target }}/release/medha-desktop.exe
           -Console src-tauri/binaries/medha-${{ matrix.target }}.exe
 
+      # An install while the backend runs replaces its file and leaves it running, as an update does.
+      - name: Install over a running backend
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          $dir = Join-Path $env:RUNNER_TEMP 'medha-install'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "$env:SystemRoot\System32\PING.EXE" "$dir\medha.exe"
+          $running = Start-Process "$dir\medha.exe" -ArgumentList '-n','600','127.0.0.1' -WindowStyle Hidden -PassThru
+          Start-Process $installer.FullName -ArgumentList '/S',"/D=$dir" -Wait
+          $installed = (Get-FileHash "$dir\medha.exe").Hash
+          $built = (Get-FileHash "src-tauri/binaries/medha-${{ matrix.target }}.exe").Hash
+          if ($installed -ne $built) { throw "the running medha.exe was not replaced" }
+          if ($running.HasExited) { throw "installing stopped the running backend" }
+          Stop-Process -Id $running.Id -Force
+
       # One flat folder of installers, each named for its system and chip, with its
       # checksum and, when signed, its update signature.
       - name: Collect installers

@@ -53,6 +53,11 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh"
+      }
     }
   }
 }

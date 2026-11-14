@@ -153,6 +153,11 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// The command these arguments run and where, for an access card. Default: not a command.
+    fn command_line(&self, _args: &Value) -> Option<kernel::CommandLine> {
+        None
+    }
+
     /// What the model reads for a successful result, when the tool can say it
     /// more compactly than its full payload. The payload itself is kept whole
     /// for people and for the record. Default: the model reads the payload.
@@ -1459,7 +1464,7 @@ impl Executor for ToolRegistry {
     async fn grant_access(
         &self,
         access: &kernel::ExecutionAccess,
-        detail: &str,
+        ask: &kernel::AccessAsk,
         escalated: bool,
     ) -> Result<kernel::NetworkDecision, String> {
         let sbx = self
@@ -1467,7 +1472,7 @@ impl Executor for ToolRegistry {
             .as_ref()
             .ok_or("shell workspace is unavailable")?;
         sbx.permission_manager()
-            .request_execution_access(access, detail, escalated)
+            .request_execution_access(access, ask, escalated)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1615,6 +1620,10 @@ impl Executor for ToolRegistry {
             Some(t) => t.preview(&intent.args).await,
             None => None,
         }
+    }
+
+    fn command_line(&self, intent: &ToolIntent) -> Option<kernel::CommandLine> {
+        self.tools.get(&intent.tool)?.command_line(&intent.args)
     }
 }
 
@@ -7235,6 +7244,14 @@ impl Tool for ShellExec {
             plan.workdir.display(),
             plan.command
         ))
+    }
+
+    fn command_line(&self, args: &Value) -> Option<kernel::CommandLine> {
+        let plan = ShellPlan::parse(args, &self.sbx).ok()?;
+        Some(kernel::CommandLine {
+            workdir: plan.workdir.display().to_string(),
+            command: plan.command,
+        })
     }
 }
 

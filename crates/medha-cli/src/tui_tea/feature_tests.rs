@@ -208,6 +208,7 @@ fn access(model: &mut Model) {
             ],
             folder: None,
             path: None,
+            access: None,
         },
     );
     model.approval_ready = true;
@@ -280,6 +281,7 @@ async fn path_approval_labels_match_the_reviewed_scope_and_send_each_offered_ans
                 path: Some(protocol::ApprovalPath {
                     path: "/outside/project/target".into(), kind, access: protocol::PathAccess::Write,
                 }),
+                access: None,
             };
             observed(
                 &mut f.model,

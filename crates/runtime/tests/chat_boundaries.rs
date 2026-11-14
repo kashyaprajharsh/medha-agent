@@ -19,7 +19,7 @@ impl kernel::HumanGate for ForThisChat {
     async fn confirm_network(&self, _: Option<&str>, _: bool) -> NetworkDecision {
         NetworkDecision::Session
     }
-    async fn confirm_access(&self, _: Option<&str>, _: bool) -> NetworkDecision {
+    async fn confirm_access(&self, _: &kernel::AccessAsk, _: bool) -> NetworkDecision {
         NetworkDecision::Session
     }
 }
@@ -74,7 +74,7 @@ async fn a_grant_given_to_one_chat_is_not_usable_from_another() {
         ..Default::default()
     };
     let decision = permissions(&granted)
-        .request_execution_access(&access, "read outside", false)
+        .request_execution_access(&access, &kernel::AccessAsk::text("read outside"), false)
         .await
         .unwrap();
     assert_eq!(decision, NetworkDecision::Session);

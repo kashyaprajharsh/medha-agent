@@ -905,6 +905,7 @@ async fn an_approval_recovered_at_the_same_barrier_keeps_its_review_position() {
         ],
         folder: None,
         path: None,
+        access: None,
     };
     approval(&mut f.model, prompt.clone());
     f.model.approval_sel = 1;
@@ -1478,6 +1479,7 @@ async fn a_proposed_skill_can_be_kept_as_a_draft_to_edit() {
             ],
             folder: None,
             path: None,
+            access: None,
         },
     );
     f.model.approval_ready = true;

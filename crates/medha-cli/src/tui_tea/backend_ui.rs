@@ -1358,6 +1358,7 @@ fn approval(model: &mut Model, prompt: protocol::ApprovalPrompt) {
     };
     model.pending_approvals.push_back(PendingApproval {
         action: prompt.action.clone(),
+        question: prompt.access.is_some(),
         detail,
         escalated: prompt.escalated,
         responder: ApprovalResponder::Remote(prompt),

@@ -51,6 +51,70 @@
 .ask-deny {
   margin-left: auto;
 }
+/* A command-access card: the command, then what it may reach, indented under the question. */
+.ask-command {
+  margin: -4px 18px var(--s-3);
+  padding-left: 28px;
+}
+.ask-command code {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--code-size);
+  line-height: 1.6;
+  color: var(--code);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ask-command small {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ask-gets {
+  display: grid;
+  gap: 8px;
+  margin: 0 18px var(--s-3);
+  padding: 0 0 0 28px;
+  list-style: none;
+}
+.ask-gets:empty {
+  display: none;
+}
+.ask-gets li {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.ask-gets .icon {
+  flex: none;
+  margin-top: 3px;
+  color: var(--dim);
+}
+.ask-gets span {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.ask-gets b {
+  font-weight: 500;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.ask-gets small {
+  font-size: var(--text-xs);
+  color: var(--dim);
+}
+.ask-gets .risky .icon,
+.ask-gets .risky b {
+  color: var(--err);
+}
+.ask-why {
+  padding-left: 28px;
+}
 .question-card {
   margin-bottom: var(--s-5);
   border: 1px solid color-mix(in srgb, var(--gold) 30%, var(--line));

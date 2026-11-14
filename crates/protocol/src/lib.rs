@@ -540,6 +540,50 @@ pub struct ApprovalPrompt {
     pub folder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<ApprovalPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessPrompt>,
+}
+
+/// A command-access card in parts, so a screen shows the command apart from what it may reach.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessPrompt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub outside_sandbox: bool,
+    #[serde(default)]
+    pub network: bool,
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
+    /// It follows untrusted content, so the answer is never remembered.
+    #[serde(default)]
+    pub untrusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+impl AccessPrompt {
+    /// The card's question, in the person's terms.
+    pub fn question(&self) -> String {
+        let reach = self.read.len() + self.write.len();
+        let folders = match reach {
+            1 => "one more folder".to_string(),
+            n => format!("{n} more folders"),
+        };
+        match (self.outside_sandbox, self.network, reach) {
+            (true, _, _) => "Run this command outside the sandbox?".into(),
+            (false, true, 0) => "Let this command use the network?".into(),
+            (false, true, _) => format!("Let this command use the network and reach {folders}?"),
+            (false, false, 0) => "Run this command?".into(),
+            (false, false, _) => format!("Let this command reach {folders}?"),
+        }
+    }
 }
 
 impl ApprovalPrompt {

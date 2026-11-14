@@ -8,11 +8,13 @@ import {
   planRefusal,
   queuedMessages,
   type LiveItem,
+  type AccessParts,
   type Approval,
   type ApprovalChoice,
   type LiveAgent,
   type LiveState,
   type QuestionForm,
+  type Step,
 } from "./live";
 import { LiveAgents } from "./LiveAgents";
 import { Screens } from "./OutputPlate";
@@ -38,7 +40,73 @@ export function skillDraft(approval: Approval): string | undefined {
   return at < 0 ? undefined : approval.detail.slice(at + 2);
 }
 
+const NO_STEPS: Step[] = [];
+
+/** The command on its own, then each thing it may reach on its own line, the riskiest first. */
+function AccessBody({ parts }: { parts: AccessParts }) {
+  return (
+    <>
+      {(parts.command || parts.agent) && (
+        <div className="ask-command">
+          {parts.command && <code>{parts.command}</code>}
+          {parts.workdir && <small title={parts.workdir}>in {parts.workdir}</small>}
+          {parts.agent && <small>Asked by agent {parts.agent}</small>}
+        </div>
+      )}
+      <ul className="ask-gets">
+        {parts.outsideSandbox && (
+          <li className="risky">
+            <Icon name="alert" />
+            <span>
+              <b>Everything your account can reach</b>
+              <small>Your files, keys and apps, for this one run</small>
+            </span>
+          </li>
+        )}
+        {parts.network && (
+          <li>
+            <Icon name="globe" />
+            <span>
+              <b>The internet</b>
+              <small>Any website, for this command</small>
+            </span>
+          </li>
+        )}
+        {parts.write.map((path) => (
+          <li key={`w${path}`}>
+            <Icon name="folder" />
+            <span>
+              <b>Read and change {path}</b>
+              <small>And every folder inside it</small>
+            </span>
+          </li>
+        ))}
+        {parts.read.map((path) => (
+          <li key={`r${path}`}>
+            <Icon name="folder" />
+            <span>
+              <b>Read {path}</b>
+              <small>And every folder inside it</small>
+            </span>
+          </li>
+        ))}
+        {parts.hook && (
+          <li>
+            <Icon name="shield" />
+            <span>
+              <b>A hook asks you to check this</b>
+              <small>{parts.hook}</small>
+            </span>
+          </li>
+        )}
+      </ul>
+    </>
+  );
+}
+
 function asks(approval: Approval): string {
+  // A command-access card's action is already the whole question.
+  if (approval.access) return approval.action;
   if (approval.kind !== "path") return `Medha wants to ${approval.action}`;
   const parts = approval.action.split(" · ");
   const request = parts.pop() ?? "";
@@ -96,8 +164,8 @@ export const LiveTail = memo(function LiveTail({
     (state.status === "starting" && state.sent.length > 0);
   const last = state.items.at(-1);
   const queued = queuedMessages(state);
-  const steps = useMemo(
-    () => state.items.flatMap((item) => (item.kind === "tools" ? item.steps : [])),
+  const lastTools = useMemo(
+    () => state.items.reduce((found, item, index) => (item.kind === "tools" ? index : found), -1),
     [state.items],
   );
   let replying = false;
@@ -136,9 +204,9 @@ export const LiveTail = memo(function LiveTail({
           </Fragment>
         );
       })}
-      {/* Every screen of the turn sits here, from the first piece of its call to
-          its result, so the one that drew the pieces is never replaced by another. */}
-      <Screens steps={steps} writing={state.writing} at={LIVE} fresh />
+      {/* A screen still being written sits with the newest work, until its result
+          puts it under the step that made it. */}
+      <Screens steps={NO_STEPS} writing={state.writing} at={LIVE} fresh />
       {queued.map((message) => (
         <UserMessage key={message.id} message={message} pending />
       ))}
@@ -155,13 +223,21 @@ export const LiveTail = memo(function LiveTail({
             <Icon name="shield" />
             <b>{asks(approval)}</b>
           </div>
-          {approval.detail && (
-            <pre className="ask-detail">{approval.detail}</pre>
+          {approval.access ? (
+            <AccessBody parts={approval.access} />
+          ) : (
+            approval.detail && <pre className="ask-detail">{approval.detail}</pre>
           )}
-          {approval.escalated && (
-            <p className="ask-note">
-              This action always asks, even if you allowed it before.
+          {approval.access?.untrusted ? (
+            <p className="ask-note ask-why">
+              It read web content earlier in this chat, so this is asked every time and can't be remembered.
             </p>
+          ) : (
+            approval.escalated && (
+              <p className={approval.access ? "ask-note ask-why" : "ask-note"}>
+                This action always asks, even if you allowed it before.
+              </p>
+            )
           )}
           {approval.folder && (
             <p className="ask-note">Its folder: {approval.folder}</p>
@@ -278,7 +354,14 @@ export const LiveTail = memo(function LiveTail({
           expanded={showReasoning}
         />
       );
-    if (item.kind === "tools") return <StepGroup steps={item.steps} live />;
+    // What a step made sits under it, as in a finished chat; only the newest group opens its screen.
+    if (item.kind === "tools")
+      return (
+        <>
+          <StepGroup steps={item.steps} live />
+          <Screens steps={item.steps} at={LIVE + index} fresh={index === lastTools} />
+        </>
+      );
     if (item.kind === "plan") return <PlanCard plan={item.plan} />;
     // Once the model has moved on to a tool call, this text is finished: the
     // status line below shows the work, not a caret after the last word.

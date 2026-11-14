@@ -26,7 +26,20 @@ export type Approval = {
   choices: ApprovalChoice[];
   /** The folder the "folder" answer would remember. */
   folder?: string;
+  /** A command-access card in parts: the command apart from what it may reach. */
+  access?: AccessParts;
   pending?: boolean;
+};
+export type AccessParts = {
+  command?: string;
+  workdir?: string;
+  outsideSandbox: boolean;
+  network: boolean;
+  read: string[];
+  write: string[];
+  untrusted: boolean;
+  hook?: string;
+  agent?: string;
 };
 export type QuestionForm = {
   id: number;
@@ -185,6 +198,24 @@ function toAgents(value: unknown): LiveAgent[] {
 }
 
 const str = (value: unknown) => (typeof value === "string" ? value : undefined);
+const strings = (value: unknown) =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+
+function accessParts(value: unknown): AccessParts | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const parts = value as Record<string, unknown>;
+  return {
+    command: str(parts.command),
+    workdir: str(parts.workdir),
+    outsideSandbox: parts.outside_sandbox === true,
+    network: parts.network === true,
+    read: strings(parts.read),
+    write: strings(parts.write),
+    untrusted: parts.untrusted === true,
+    hook: str(parts.hook),
+    agent: str(parts.agent),
+  };
+}
 const now = () => Date.now() / 1000;
 let serial = 0;
 const nextId = (kind: string) => `${kind}-${(serial += 1)}`;
@@ -351,6 +382,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
               ? (params.choices as ApprovalChoice[])
               : ["once", "deny"],
             folder: str(params.folder),
+            access: accessParts(params.access),
           },
         ],
       };

@@ -22,6 +22,7 @@ fn path_approvals_preserve_the_resolved_target_and_one_set_of_choices() {
                 kind,
                 access: PathAccess::Read,
             }),
+            access: None,
         };
         let value = serde_json::to_value(&prompt).unwrap();
         let current: ApprovalPrompt = serde_json::from_value(value).unwrap();

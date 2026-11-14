@@ -105,6 +105,34 @@ impl ExecutionAccess {
     }
 }
 
+/// A command as it will run, shown apart from the access it asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandLine {
+    pub workdir: String,
+    pub command: String,
+}
+
+/// One command-access review: the whole text, and its parts for a screen to lay out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessAsk {
+    pub text: String,
+    pub command: Option<CommandLine>,
+    pub access: ExecutionAccess,
+    /// The command follows untrusted content, so the answer is never remembered.
+    pub untrusted: bool,
+    pub hook: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl AccessAsk {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Who gave an approval its answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decider {
@@ -257,13 +285,13 @@ impl HumanGate for RecordedGate {
         decision
     }
 
-    async fn confirm_access(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
-        let action = detail.unwrap_or("command access");
+    async fn confirm_access(&self, ask: &AccessAsk, escalated: bool) -> NetworkDecision {
+        let action = ask.text.as_str();
         let review = match self.reviewed("access", action, None).await {
             Ok(()) => return NetworkDecision::Once,
             Err(review) => review,
         };
-        let decision = self.inner.confirm_access(detail, escalated).await;
+        let decision = self.inner.confirm_access(ask, escalated).await;
         self.record("access", action, decision != NetworkDecision::Deny, review)
             .await;
         decision
@@ -314,11 +342,11 @@ pub trait HumanGate: Send + Sync {
     }
 
     /// One review for a command and its missing network/filesystem capabilities.
-    async fn confirm_access(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+    async fn confirm_access(&self, ask: &AccessAsk, escalated: bool) -> NetworkDecision {
         // Some plain/editor gates remember Standard approvals by action. Include
         // the reviewed request so remembering one card cannot approve new roots.
-        let action = format!("command access: {}", detail.unwrap_or_default());
-        match self.confirm(&action, detail, escalated).await {
+        let action = format!("command access: {}", ask.text);
+        match self.confirm(&action, Some(&ask.text), escalated).await {
             Approval::Once => NetworkDecision::Once,
             Approval::Always if !escalated => NetworkDecision::Persistent,
             Approval::Always => NetworkDecision::Once,
@@ -462,13 +490,13 @@ mod tests {
     async fn escalated_access_never_defaults_to_a_remembered_grant() {
         assert_eq!(
             Fixed(Approval::Always)
-                .confirm_access(Some("network"), true)
+                .confirm_access(&AccessAsk::text("network"), true)
                 .await,
             NetworkDecision::Once
         );
         assert_eq!(
             Fixed(Approval::Always)
-                .confirm_access(Some("network"), false)
+                .confirm_access(&AccessAsk::text("network"), false)
                 .await,
             NetworkDecision::Persistent
         );

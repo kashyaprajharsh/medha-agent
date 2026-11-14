@@ -1027,11 +1027,15 @@ impl kernel::HumanGate for AttributedGate {
 
     async fn confirm_access(
         &self,
-        detail: Option<&str>,
+        ask: &kernel::AccessAsk,
         escalated: bool,
     ) -> kernel::NetworkDecision {
-        let detail = format!("agent '{}' · {}", self.agent, detail.unwrap_or_default());
-        self.inner.confirm_access(Some(&detail), escalated).await
+        let ask = kernel::AccessAsk {
+            text: format!("agent '{}' · {}", self.agent, ask.text),
+            agent: Some(self.agent.clone()),
+            ..ask.clone()
+        };
+        self.inner.confirm_access(&ask, escalated).await
     }
 
     fn denial_reason(&self) -> &'static str {

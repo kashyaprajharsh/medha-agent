@@ -60,9 +60,10 @@ pub use events::{
 };
 pub use executor::{BackgroundTask, Executor, TaskEnd};
 pub use gate::{
-    Answered, Approval, AutoDeny, Decider, ExecutionAccess, HumanGate, NetworkDecision, PathAccess,
-    PathApproval, PathKind, PathRequest, RecordedGate, answers_scope, execution_access,
-    execution_access_scope, network_once_active, network_once_scope, record_answer,
+    AccessAsk, Answered, Approval, AutoDeny, CommandLine, Decider, ExecutionAccess, HumanGate,
+    NetworkDecision, PathAccess, PathApproval, PathKind, PathRequest, RecordedGate, answers_scope,
+    execution_access, execution_access_scope, network_once_active, network_once_scope,
+    record_answer,
 };
 pub use hooks::{
     HookAudit, HookBatch, HookContext, HookDirective, HookRequest, HookRunner, HookStatus, NoHooks,

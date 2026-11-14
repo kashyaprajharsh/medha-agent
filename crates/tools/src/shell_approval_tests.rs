@@ -15,8 +15,8 @@ impl kernel::HumanGate for AccessGate {
         self.standard.fetch_add(1, Ordering::SeqCst);
         kernel::Approval::Once
     }
-    async fn confirm_access(&self, detail: Option<&str>, _: bool) -> kernel::NetworkDecision {
-        self.cards.lock().unwrap().push(detail.unwrap().to_string());
+    async fn confirm_access(&self, ask: &kernel::AccessAsk, _: bool) -> kernel::NetworkDecision {
+        self.cards.lock().unwrap().push(ask.text.clone());
         self.decisions
             .lock()
             .unwrap()

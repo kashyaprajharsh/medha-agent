@@ -777,7 +777,7 @@ impl PermissionManager {
     pub async fn request_execution_access(
         &self,
         access: &kernel::ExecutionAccess,
-        detail: &str,
+        ask: &kernel::AccessAsk,
         escalated: bool,
     ) -> Result<NetworkDecision, PermissionError> {
         let reads = access
@@ -801,7 +801,7 @@ impl PermissionManager {
             .ok_or(PermissionError::NoHumanGate)?;
         // Leaving the jail is reviewed on every run: never offer to remember it.
         let escalated = escalated || access.outside_sandbox;
-        let mut decision = gate.confirm_access(Some(detail), escalated).await;
+        let mut decision = gate.confirm_access(ask, escalated).await;
         if escalated
             && matches!(
                 decision,
@@ -2051,7 +2051,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            mgr.request_execution_access(&grant, "read a profile", false)
+            mgr.request_execution_access(&grant, &kernel::AccessAsk::text("read a profile"), false)
                 .await,
             Err(PermissionError::Protected { .. })
         ));

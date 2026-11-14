@@ -870,6 +870,7 @@ fn render_reconciliation(card: &serde_json::Value) -> Vec<Line<'static>> {
 }
 
 /// Renders an approval inline in the scrollable transcript.
+#[cfg(test)]
 pub(super) fn render_approval(
     action: &str,
     detail: Option<&str>,
@@ -877,30 +878,40 @@ pub(super) fn render_approval(
     opts: &[&str],
     escalated: bool,
 ) -> Vec<Line<'static>> {
-    render_approval_detail(action, detail, sel, opts, 18, escalated)
+    render_approval_detail(
+        approval_heading(action, false),
+        detail,
+        sel,
+        opts,
+        18,
+        escalated,
+    )
+}
+
+/// "Allow <subject>?", or the action itself when it is already the whole question.
+pub(super) fn approval_heading(action: &str, question: bool) -> Line<'static> {
+    let strong = Style::default()
+        .fg(theme::warn())
+        .add_modifier(Modifier::BOLD);
+    if question {
+        return Line::from(Span::styled(action.to_owned(), strong));
+    }
+    Line::from(vec![
+        Span::styled("Allow ", Style::default().fg(theme::text())),
+        Span::styled(approval_subject(action), strong),
+        Span::styled("?", Style::default().fg(theme::text())),
+    ])
 }
 
 fn render_approval_detail(
-    action: &str,
+    heading: Line<'static>,
     detail: Option<&str>,
     sel: usize,
     opts: &[&str],
     detail_limit: usize,
     escalated: bool,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Allow ", Style::default().fg(theme::text())),
-            Span::styled(
-                approval_subject(action),
-                Style::default()
-                    .fg(theme::warn())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("?", Style::default().fg(theme::text())),
-        ]),
-    ];
+    let mut lines = vec![Line::from(""), heading];
     if escalated {
         lines.push(Line::from(Span::styled(
             "⚠ this action follows untrusted web content — reviewed every time",
@@ -2438,7 +2449,11 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         && area.height > 4
     {
         f.render_widget(
-            Paragraph::new(format!("Allow {}?", approval_subject(&pending.action))).style(
+            Paragraph::new(match pending.question {
+                true => pending.action.clone(),
+                false => format!("Allow {}?", approval_subject(&pending.action)),
+            })
+            .style(
                 Style::default()
                     .fg(theme::warn())
                     .add_modifier(Modifier::BOLD),
@@ -2490,24 +2505,18 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         }
         // Approval rows participate in the same physical-row scroll model.
         model.approval_rows = if let Some(pending) = model.pending_approval() {
-            let mut rows = if model.approval_expanded {
-                render_approval_detail(
-                    &pending.action,
-                    pending.detail.as_deref(),
-                    model.approval_sel,
-                    &pending.responder.options_for(pending.escalated),
-                    MAX_TOOL_OUTPUT_LINES,
-                    pending.escalated,
-                )
-            } else {
-                render_approval(
-                    &pending.action,
-                    pending.detail.as_deref(),
-                    model.approval_sel,
-                    &pending.responder.options_for(pending.escalated),
-                    pending.escalated,
-                )
-            };
+            let mut rows = render_approval_detail(
+                approval_heading(&pending.action, pending.question),
+                pending.detail.as_deref(),
+                model.approval_sel,
+                &pending.responder.options_for(pending.escalated),
+                if model.approval_expanded {
+                    MAX_TOOL_OUTPUT_LINES
+                } else {
+                    18
+                },
+                pending.escalated,
+            );
             let ApprovalResponder::Remote(prompt) = &pending.responder;
             if super::backend_ui::proposed_skill(prompt).is_some() {
                 rows.push(Line::from(Span::styled(

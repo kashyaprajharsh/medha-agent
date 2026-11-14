@@ -595,6 +595,8 @@ impl ApprovalResponder {
 /// Pending inline approval.
 struct PendingApproval {
     action: String,
+    /// The action is already the whole question, as a command-access card's is.
+    question: bool,
     detail: Option<String>,
     /// Trust-escalated actions cannot be remembered or auto-approved.
     escalated: bool,

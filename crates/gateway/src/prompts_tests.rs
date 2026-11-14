@@ -11,6 +11,7 @@ fn approval(gate: u64, choices: Vec<ApprovalDecision>) -> ApprovalPrompt {
         choices,
         folder: None,
         path: None,
+        access: None,
     }
 }
 

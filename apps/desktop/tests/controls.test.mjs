@@ -963,6 +963,43 @@ test("action approvals keep their action label", async () => {
   assert.deepEqual([...document.querySelectorAll(".ask-actions button")].map(button => button.textContent), ["Allow", "Always allow", "Deny"]);
 });
 
+test("a command-access card asks its question and lists the command and each access on its own", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  const detail = "Working directory: /work\n$ node render.js\n\nAdditional access required before running:";
+  const state = reduceLive(startingLive(), { method: "approval", params: {
+    gate_id: 4, action: "Run this command outside the sandbox?", detail, escalated: true, kind: "access", choices: ["once", "deny"],
+    access: { command: "node render.js", workdir: "/work", outside_sandbox: true, network: true, read: ["/data"], write: [], untrusted: true },
+  }});
+  await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
+  assert.equal(document.querySelector(".ask-top b").textContent, "Run this command outside the sandbox?");
+  assert.equal(document.querySelector(".ask-command code").textContent, "node render.js");
+  assert.deepEqual([...document.querySelectorAll(".ask-gets b")].map((line) => line.textContent),
+    ["Everything your account can reach", "The internet", "Read /data"]);
+  assert.ok(document.querySelector(".ask-gets .risky"), "leaving the sandbox is marked as the risk");
+  assert.equal(document.querySelector(".ask-detail"), null, "the text block is not shown as well");
+  assert.match(document.querySelector(".ask-why").textContent, /read web content earlier/);
+});
+
+test("while a turn runs, what a step made sits under that step, not after everything below it", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  const { OutputsProvider, SHOWN_ONLY } = await import(await moduleUrl("outputContext"));
+  const event = (kind, params = {}) => ({ method: "event", params: { kind, ...params } });
+  const screen = { server: "drawing", tool: "create_view", resource: "ui://drawing", input: {}, result: { isError: true } };
+  let state = reduceLive(startingLive(), event("turn.started"));
+  state = reduceLive(state, event("tool.call", { id: "draw", tool: "mcp__drawing__create_view" }));
+  state = reduceLive(state, event("tool.screen", { id: "draw", screen }));
+  state = reduceLive(state, event("tool.observation", { id: "draw", ok: false, summary: "Invalid drawing" }));
+  state = reduceLive(state, event("model.text", { delta: "Next I read the notes." }));
+  await act(() => root.render(h(OutputsProvider, { value: SHOWN_ONLY },
+    h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} }))));
+  const made = document.querySelector(".out-failed");
+  const later = [...document.querySelectorAll(".prose")].find((prose) => prose.textContent.includes("Next I read the notes."));
+  assert.ok(made && later, "both the output and the later text are shown");
+  assert.ok(made.compareDocumentPosition(later) & 4, "the output comes before the text written after its step");
+});
+
 test("a long compaction says so instead of looking stuck on Working", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive, recordSent } = await import(await moduleUrl("live"));

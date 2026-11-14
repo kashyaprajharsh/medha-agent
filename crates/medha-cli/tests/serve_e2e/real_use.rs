@@ -1120,6 +1120,41 @@ async fn a_wait_says_its_command_still_runs_and_a_new_message_ends_it() {
     );
 }
 
+/// A command-access card asks one plain question and sends the command and each folder as their own parts.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_access_card_asks_a_plain_question_with_its_parts() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("project");
+    let elsewhere = world.folder("elsewhere");
+    let chat = client.open(&folder).await;
+    let list =
+        json!({"command": "ls", "network": false, "workdir": elsewhere, "read_paths": [elsewhere]});
+    client
+        .send(&chat, &format!("SCRIPT\nshell_exec {list}"))
+        .await;
+    let (_, frame) = client.until(|frame| frame["method"] == "approval").await;
+    let card = &frame["params"];
+    assert_eq!(card["kind"], "access", "{card}");
+    assert_eq!(
+        card["action"], "Let this command reach one more folder?",
+        "{card}"
+    );
+    let parts = &card["access"];
+    assert_eq!(parts["command"], "ls", "{card}");
+    assert!(
+        parts["workdir"].as_str().is_some_and(|dir| !dir.is_empty()),
+        "{card}"
+    );
+    assert_eq!(parts["read"].as_array().map(Vec::len), Some(1), "{card}");
+    assert_eq!(parts["outside_sandbox"], false, "{card}");
+    let gate = json!({"gate_id": card["gate_id"], "approve": false});
+    client.ask("approval.respond", Some(&chat), gate).await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+}
+
 /// A write refused to a relative path names the folder it was refused in, never the shell that reported it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

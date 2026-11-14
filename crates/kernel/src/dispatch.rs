@@ -424,9 +424,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         detail.push_str("\nA pre-tool hook requires approval: ");
                         detail.push_str(reason);
                     }
-                    let grant = self
-                        .executor
-                        .grant_access(&access, &detail, access_escalated);
+                    let ask = crate::AccessAsk {
+                        text: detail,
+                        command: self.executor.command_line(intent),
+                        access: access.clone(),
+                        untrusted: trust_escalated
+                            || (access.network && follows_web(radius, web_tainted, jailed)),
+                        hook: hook_approval_reason.clone(),
+                        agent: None,
+                    };
+                    let grant = self.executor.grant_access(&access, &ask, access_escalated);
                     // Leaving the sandbox, or a hook wanting a person, is never the reviewer's call.
                     if access.outside_sandbox || hook_approval_reason.is_some() {
                         crate::review::withheld(grant).await

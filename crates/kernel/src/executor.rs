@@ -144,7 +144,7 @@ pub trait Executor: Send + Sync {
     async fn grant_access(
         &self,
         _access: &crate::ExecutionAccess,
-        _detail: &str,
+        _ask: &crate::AccessAsk,
         _escalated: bool,
     ) -> Result<NetworkDecision, String> {
         Ok(NetworkDecision::Deny)
@@ -168,6 +168,11 @@ pub trait Executor: Send + Sync {
     /// human gate. Async because building a real diff means reading the file's
     /// current contents through the (async) sandbox.
     async fn preview(&self, _intent: &ToolIntent) -> Option<String> {
+        None
+    }
+
+    /// The command an intent runs and where, for an access card. Default: not a command.
+    fn command_line(&self, _intent: &ToolIntent) -> Option<crate::CommandLine> {
         None
     }
 

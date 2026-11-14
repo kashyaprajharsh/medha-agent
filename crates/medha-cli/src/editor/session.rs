@@ -737,6 +737,7 @@ mod approval_tests {
                 access,
             }),
             folder: Some("/projects/other folder".into()),
+            access: None,
         }
     }
 

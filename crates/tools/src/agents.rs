@@ -234,10 +234,10 @@ impl kernel::Executor for Rebound {
     async fn grant_access(
         &self,
         access: &kernel::ExecutionAccess,
-        detail: &str,
+        ask: &kernel::AccessAsk,
         escalated: bool,
     ) -> Result<kernel::NetworkDecision, String> {
-        self.inner.grant_access(access, detail, escalated).await
+        self.inner.grant_access(access, ask, escalated).await
     }
 
     fn allows_network_retry(&self, intent: &kernel::ToolIntent) -> bool {
@@ -271,6 +271,13 @@ impl kernel::Executor for Rebound {
         match self.tools.get(&intent.tool) {
             Some(tool) => tool.preview(&intent.args).await,
             None => self.inner.preview(intent).await,
+        }
+    }
+
+    fn command_line(&self, intent: &kernel::ToolIntent) -> Option<kernel::CommandLine> {
+        match self.tools.get(&intent.tool) {
+            Some(tool) => tool.command_line(&intent.args),
+            None => self.inner.command_line(intent),
         }
     }
 

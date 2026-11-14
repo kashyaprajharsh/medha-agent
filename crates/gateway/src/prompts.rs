@@ -77,7 +77,10 @@ impl Prompts {
             prompt.choices.iter().copied().zip(labels).collect(),
         );
         // A command or diff is shown as written: its `*` or `-` lines are not formatting.
-        let mut text = format!("Medha asks to: {}", literal(&prompt.action));
+        let mut text = match prompt.access {
+            Some(_) => literal(&prompt.action),
+            None => format!("Medha asks to: {}", literal(&prompt.action)),
+        };
         if let Some(detail) = prompt
             .detail
             .as_deref()

@@ -237,10 +237,10 @@ impl Executor for NarrowedExecutor {
     async fn grant_access(
         &self,
         access: &kernel::ExecutionAccess,
-        detail: &str,
+        ask: &kernel::AccessAsk,
         escalated: bool,
     ) -> Result<kernel::NetworkDecision, String> {
-        self.inner.grant_access(access, detail, escalated).await
+        self.inner.grant_access(access, ask, escalated).await
     }
 
     fn allows_network_retry(&self, intent: &ToolIntent) -> bool {
@@ -272,6 +272,13 @@ impl Executor for NarrowedExecutor {
             return None;
         }
         self.inner.preview(intent).await
+    }
+
+    fn command_line(&self, intent: &ToolIntent) -> Option<kernel::CommandLine> {
+        if !self.allows_intent(intent) {
+            return None;
+        }
+        self.inner.command_line(intent)
     }
 
     fn images_reach_model(&self, reach: bool) {

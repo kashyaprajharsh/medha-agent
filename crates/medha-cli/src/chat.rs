@@ -893,6 +893,7 @@ impl kernel::HumanGate for Gate {
                     choices,
                     folder: None,
                     path: None,
+                    access: None,
                 },
             )
         };
@@ -962,6 +963,7 @@ impl kernel::HumanGate for Gate {
                     kernel::PathAccess::Write => protocol::PathAccess::Write,
                 },
             }),
+            access: None,
         };
         if !self.writer.notify_params("approval", &prompt) {
             return kernel::PathApproval::Deny;
@@ -978,21 +980,38 @@ impl kernel::HumanGate for Gate {
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::NetworkDecision {
-        self.access("grant network access and retry", detail, escalated)
+        self.access("grant network access and retry", detail, None, escalated)
             .await
     }
 
     async fn confirm_access(
         &self,
-        detail: Option<&str>,
+        ask: &kernel::AccessAsk,
         escalated: bool,
     ) -> kernel::NetworkDecision {
-        self.access(
-            &format!("command access: {}", detail.unwrap_or_default()),
-            detail,
-            escalated,
-        )
-        .await
+        let parts = protocol::AccessPrompt {
+            command: ask.command.as_ref().map(|line| line.command.clone()),
+            workdir: ask.command.as_ref().map(|line| line.workdir.clone()),
+            outside_sandbox: ask.access.outside_sandbox,
+            network: ask.access.network,
+            read: ask
+                .access
+                .read_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            write: ask
+                .access
+                .write_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            untrusted: ask.untrusted,
+            hook: ask.hook.clone(),
+            agent: ask.agent.clone(),
+        };
+        self.access(&parts.question(), Some(&ask.text), Some(parts), escalated)
+            .await
     }
 }
 
@@ -1001,9 +1020,14 @@ impl Gate {
         &self,
         action: &str,
         detail: Option<&str>,
+        parts: Option<protocol::AccessPrompt>,
         escalated: bool,
     ) -> kernel::NetworkDecision {
-        if self.nobody_to_ask(action) {
+        let refused = match parts {
+            Some(_) => "a command that needs more access",
+            None => action,
+        };
+        if self.nobody_to_ask(refused) {
             return kernel::NetworkDecision::Deny;
         }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1041,6 +1065,7 @@ impl Gate {
                 choices,
                 folder: None,
                 path: None,
+                access: parts,
             },
         ) {
             return kernel::NetworkDecision::Deny;
@@ -2776,10 +2801,11 @@ mod tests {
             ("deny", N::Deny),
         ] {
             let asking = Arc::clone(&gate);
-            let asked =
-                tokio::spawn(
-                    async move { asking.confirm_access(Some("read /reviewed"), false).await },
-                );
+            let asked = tokio::spawn(async move {
+                asking
+                    .confirm_access(&kernel::AccessAsk::text("read /reviewed"), false)
+                    .await
+            });
             let frame = tokio::time::timeout(Duration::from_secs(1), output.recv())
                 .await
                 .unwrap()
@@ -2908,8 +2934,10 @@ mod tests {
         let (writer, mut output) = capture_writer();
         let pending: Pending = Arc::default();
         let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
-        let asked =
-            tokio::spawn(async move { gate.confirm_access(Some("outside sandbox"), true).await });
+        let asked = tokio::spawn(async move {
+            gate.confirm_access(&kernel::AccessAsk::text("outside sandbox"), true)
+                .await
+        });
         let frame = output.recv().await.unwrap();
         let Outbound::Frame(frame) = frame else {
             panic!("expected an approval")

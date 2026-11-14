@@ -11,8 +11,9 @@ const KINDS: [&str; 4] = ["zip", "skill", "plugin", "md"];
 
 #[tauri::command]
 pub async fn extension_upload(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    // Bytes arrive as JSON only when the window's channel to the app was blocked.
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
-        return Err("Drop a file".into());
+        return Err("The file did not reach Medha as a file; restart Medha and try again".into());
     };
     if bytes.len() > MAX_BYTES {
         return Err("Drop a file below 32 MB".into());

@@ -963,6 +963,14 @@ test("action approvals keep their action label", async () => {
   assert.deepEqual([...document.querySelectorAll(".ask-actions button")].map(button => button.textContent), ["Allow", "Always allow", "Deny"]);
 });
 
+test("the window lets Tauri's own channel through on every platform, so bytes reach the app unchanged", async () => {
+  const config = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const connect = config.app.security.csp.split(";").map((part) => part.trim()).find((part) => part.startsWith("connect-src"));
+  const sources = connect.split(/\s+/).slice(1);
+  assert.ok(sources.includes("ipc:"), `macOS and Linux reach Tauri at ipc:, ${connect}`);
+  assert.ok(sources.includes("http://ipc.localhost"), `Windows reaches Tauri at http://ipc.localhost, ${connect}`);
+});
+
 test("a command-access card asks its question and lists the command and each access on its own", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive } = await import(await moduleUrl("live"));

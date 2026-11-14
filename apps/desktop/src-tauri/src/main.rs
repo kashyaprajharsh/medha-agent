@@ -818,7 +818,9 @@ async fn image_admit(request: tauri::ipc::Request<'_>) -> Result<Value, String> 
         tauri::ipc::InvokeBody::Raw(bytes) if bytes.len() <= media::MAX_SOURCE_BYTES => {
             bytes.clone()
         }
-        _ => return Err("Choose an image below 64 MB".into()),
+        tauri::ipc::InvokeBody::Raw(_) => return Err("Choose an image below 64 MB".into()),
+        // Bytes arrive as JSON only when the window's channel to the app was blocked.
+        _ => return Err("The image did not reach Medha as a file; restart Medha and try again".into()),
     };
     tauri::async_runtime::spawn_blocking(move || {
         use base64::Engine;

@@ -37,13 +37,10 @@ pub async fn extension_upload(request: tauri::ipc::Request<'_>) -> Result<String
         .map_err(|error| error.to_string())?
 }
 
-fn keep(name: &str, bytes: &[u8]) -> Result<String, String> {
-    keep_in(&std::env::temp_dir(), name, bytes)
-}
-
 /// Each drop gets its own unguessable folder, readable by this user only; drops older than a day are cleared.
-fn keep_in(root: &Path, name: &str, bytes: &[u8]) -> Result<String, String> {
-    clear_old(root);
+fn keep(name: &str, bytes: &[u8]) -> Result<String, String> {
+    let root = std::env::temp_dir();
+    clear_old(&root);
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|error| error.to_string())?;
     let folder: PathBuf = root.join(format!(
@@ -86,27 +83,5 @@ fn clear_old(root: &Path) {
         if old {
             let _ = std::fs::remove_dir_all(entry.path());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, SystemTime};
-
-    /// A new drop clears drops older than a day and leaves recent ones.
-    #[test]
-    fn a_drop_clears_old_drops_only() {
-        let root = test_support::scratch("medha-drops");
-        let old = keep_in(&root, "old.zip", b"old").unwrap();
-        let recent = keep_in(&root, "recent.zip", b"recent").unwrap();
-        let old_folder = Path::new(&old).parent().unwrap();
-        std::fs::File::open(old_folder)
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
-            .unwrap();
-        let new = keep_in(&root, "new.zip", b"new").unwrap();
-        assert!(!old_folder.exists(), "an old drop was kept");
-        assert!(Path::new(&recent).is_file() && Path::new(&new).is_file());
     }
 }

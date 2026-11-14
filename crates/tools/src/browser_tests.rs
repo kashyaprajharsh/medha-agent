@@ -393,6 +393,65 @@ impl kernel::ArtifactStore for MemArtifacts {
     }
 }
 
+/// A stand-in browser: each run takes its next line from `outcomes`; `abort` says what Chrome says when it cancels the
+/// first navigation, `shoot` writes the picture.
+#[cfg(unix)]
+fn scripted_browser(base: &std::path::Path, outcomes: &[&str]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let picture = base.join("picture.png");
+    image::RgbImage::from_pixel(4, 4, image::Rgb([200, 30, 30]))
+        .save(&picture)
+        .unwrap();
+    std::fs::write(base.join("outcomes"), outcomes.join("\n") + "\n").unwrap();
+    let browser = base.join("browser");
+    std::fs::write(
+        &browser,
+        format!(
+            "#!/bin/sh\nbase='{}'\nnext=$(head -n 1 \"$base/outcomes\")\ntail -n +2 \"$base/outcomes\" > \"$base/rest\"; mv \"$base/rest\" \"$base/outcomes\"\necho run >> \"$base/runs\"\nfor arg; do case \"$arg\" in --screenshot=*) out=\"${{arg#--screenshot=}}\";; esac; done\ncase \"$next\" in\n  abort) printf '[1:1:ERROR:headless_command_handler.cc:403] Page load failed: net::ERR_ABORTED\\n' >&2; exit 0;;\n  shoot) cp \"$base/picture.png\" \"$out\"; sleep 5;;\nesac\n",
+            base.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+    browser
+}
+
+#[cfg(unix)]
+fn scripted_page(base: &std::path::Path, browser: std::path::PathBuf) -> BrowserScreenshot {
+    std::fs::write(base.join("index.html"), "<h1>test</h1>").unwrap();
+    BrowserScreenshot {
+        sbx: Arc::new(sandbox::WorkspaceSandbox::new_jailed(base).unwrap()),
+        artifacts: Arc::new(MemArtifacts::default()),
+        browser,
+    }
+}
+
+#[cfg(unix)]
+fn runs(base: &std::path::Path) -> usize {
+    std::fs::read_to_string(base.join("runs"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Chrome cancelling its first navigation is tried once more, with a new profile, and the picture is returned.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_navigation_chrome_cancels_is_tried_once_more() {
+    let base = scratch("aborted-once");
+    let page = scripted_page(
+        base.path(),
+        scripted_browser(base.path(), &["abort", "shoot"]),
+    );
+    let payload = page
+        .render(&json!({"path": "index.html", "render": true}))
+        .await
+        .unwrap();
+    let media: Vec<kernel::MediaPart> = serde_json::from_value(payload[MEDIA].clone()).unwrap();
+    assert_eq!(media.len(), 1);
+    assert_eq!(runs(base.path()), 2);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_browser_that_exits_before_render_reports_its_status_and_output() {

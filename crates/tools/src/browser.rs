@@ -171,6 +171,22 @@ pub(crate) fn browser_args(
     args
 }
 
+/// Chrome can cancel a fresh profile's first navigation (net::ERR_ABORTED) before it reaches the page; one more
+/// try, with a new profile, only for that. Any other failure, or a second cancel, is reported with Chrome's words.
+async fn once_more_if_cancelled<F, Fut>(mut shoot: F) -> Result<Vec<u8>, ToolError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    match shoot().await {
+        Ok(raw) => Ok(raw),
+        Err(first) if first.contains("net::ERR_ABORTED") => shoot()
+            .await
+            .map_err(|second| ToolError::Failed(format!("{first}; tried again: {second}"))),
+        Err(first) => Err(ToolError::Failed(first)),
+    }
+}
+
 /// Serves the workspace at the root of an unguessable `<token>.localhost` origin.
 pub(crate) struct PageServer {
     /// `<token>.localhost:<port>`; only requests naming it are served.
@@ -423,7 +439,6 @@ impl BrowserScreenshot {
                 "network access was not granted; the page was not opened".into(),
             ));
         }
-        let scratch = Scratch::new().map_err(|error| ToolError::Failed(error.to_string()))?;
         let server = match &target {
             Target::File { root, .. } => Some(
                 PageServer::start(root)
@@ -436,20 +451,39 @@ impl BrowserScreenshot {
             (Target::Url(url), _) => url.clone(),
             _ => unreachable!("a file target always has a server"),
         };
+        let host = server.as_ref().map(|server| server.host.as_str());
+        let raw = once_more_if_cancelled(|| self.shoot(&url, size, host, network)).await?;
+        drop(server);
+        let image = tokio::task::spawn_blocking(move || media::for_history(raw))
+            .await
+            .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
+            .map_err(|error| ToolError::Failed(format!("screenshot: {error}")))?;
+        self.finish(&requested, network, image).await
+    }
+
+    /// One browser run with a profile of its own: the picture, or what went wrong with Chrome's own words.
+    async fn shoot(
+        &self,
+        url: &str,
+        size: (u32, u32),
+        host: Option<&str>,
+        network: bool,
+    ) -> Result<Vec<u8>, String> {
+        let scratch = Scratch::new().map_err(|error| error.to_string())?;
         let out = scratch.0.join("screenshot.png");
         let mut command = tokio::process::Command::new(&self.browser);
         command
             .args(browser_args(
                 &scratch.0.join("profile"),
                 &out,
-                &url,
+                url,
                 size,
-                server.as_ref().map(|server| server.host.as_str()),
+                host,
                 network,
             ))
             .stdin(std::process::Stdio::null());
         let process = sandbox::exec::spawn_background(command, false)
-            .map_err(|error| ToolError::Failed(format!("could not start the browser: {error}")))?;
+            .map_err(|error| format!("could not start the browser: {error}"))?;
         // Headless browsers can outlive their screenshot, so stop at the image.
         let started = Instant::now();
         let mut last_size = 0;
@@ -472,10 +506,10 @@ impl BrowserScreenshot {
         }
         process.kill();
         process.wait().await;
-        drop(server);
-        let raw = std::fs::read(&out).map_err(|_| {
+        std::fs::read(&out).map_err(|_| {
             let (stdout, stderr) = process.snapshot();
-            let tail = |text: &str| text.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+            // Enough of Chrome's own log to name the cause; its last lines are often unrelated warnings.
+            let tail = |text: &str| text.lines().rev().take(20).collect::<Vec<_>>().join(" | ");
             let outcome = if timed_out {
                 "the browser did not produce a screenshot within 30s".into()
             } else if let Some(code) = early_exit {
@@ -486,17 +520,22 @@ impl BrowserScreenshot {
             } else {
                 "the browser produced no readable screenshot".into()
             };
-            ToolError::Failed(format!(
+            format!(
                 "{outcome}; browser {}; stdout: {}; stderr: {}",
                 self.browser.display(),
                 tail(&stdout),
                 tail(&stderr)
-            ))
-        })?;
-        let image = tokio::task::spawn_blocking(move || media::for_history(raw))
-            .await
-            .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
-            .map_err(|error| ToolError::Failed(format!("screenshot: {error}")))?;
+            )
+        })
+    }
+
+    /// The picture stored, and the result that points at it.
+    async fn finish(
+        &self,
+        requested: &str,
+        network: bool,
+        image: media::Image,
+    ) -> Result<Value, ToolError> {
         let (width, height, mime) = (image.width, image.height, image.mime);
         let byte_size = image.bytes.len();
         let hash = Arc::clone(&self.artifacts)

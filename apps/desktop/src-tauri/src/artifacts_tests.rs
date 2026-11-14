@@ -33,6 +33,31 @@ fn a_page_shows_the_files_it_loads_even_when_they_were_written_after_it() {
     assert_eq!(missing, ["../secret.png", "gone.png"]);
 }
 
+/// Files a page's script loads with fetch or new URL are part of the page too.
+#[test]
+fn a_page_shows_the_files_its_script_loads() {
+    let root = dunce::canonicalize(test_support::scratch("desktop-assets-script")).unwrap();
+    let site = root.join("site");
+    std::fs::create_dir_all(site.join("data")).unwrap();
+    std::fs::create_dir_all(site.join("img")).unwrap();
+    let html = "<script type=module src=app.js></script>";
+    std::fs::write(site.join("index.html"), html).unwrap();
+    std::fs::write(
+        site.join("app.js"),
+        "const items = await fetch('data/items.json').then((r) => r.json());\n\
+         const logo = new URL(\"img/logo.png\", import.meta.url);",
+    )
+    .unwrap();
+    std::fs::write(site.join("data/items.json"), "[1,2]").unwrap();
+    std::fs::write(site.join("img/logo.png"), b"logo").unwrap();
+
+    let (assets, missing) = assets_now(&root, &site.join("index.html"), html, Vec::new());
+    let mut names: Vec<&str> = assets.iter().map(|asset| asset.path.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["app.js", "data/items.json", "img/logo.png"]);
+    assert!(missing.is_empty(), "{missing:?}");
+}
+
 /// A saved page's assets are read as they are now, and only from the page's own
 /// folder inside the workspace: no name in a manifest can reach anything else.
 #[test]

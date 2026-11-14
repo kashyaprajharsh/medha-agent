@@ -29,7 +29,10 @@ pub fn mime(path: &Path) -> Option<&'static str> {
 }
 
 static URLS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:url\(\s*|@import\s+|(?:from|import)\s*|import\(\s*)["']?([^\s"'<>);]+)"#)
+    // A script names a file only in quotes: `import.meta` or `fetch(apiUrl)` is no address.
+    Regex::new(
+        r#"(?i)(?:url\(\s*["']?|@import\s+["']?|\b(?:from|import)\s*["']|\bimport\(\s*["']|\bfetch\(\s*["'])([^\s"'<>);]+)"#,
+    )
         .expect("asset references")
 });
 

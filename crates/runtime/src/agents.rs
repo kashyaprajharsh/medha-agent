@@ -162,10 +162,21 @@ impl kernel::StreamSink for AgentSink {
 }
 
 fn child_prompt(run: &ChildRun) -> String {
+    // A follow-up's agent already holds its brief in its history.
+    if run.resumed {
+        return match &run.spec.contract {
+            Some(contract) => format!("{}\n\nYour answer must be: {contract}", run.spec.objective),
+            None => run.spec.objective.clone(),
+        };
+    }
+    let sees = match run.history.is_empty() {
+        true => {
+            "you cannot see the conversation that produced it, so work only from what is written here"
+        }
+        false => "the conversation that led to it is above, for context",
+    };
     let mut prompt = format!(
-        "You are a focused sub-agent. You have been delegated one task and you \
-         cannot see the conversation that produced it, so work only from what is \
-         written here.\n\nTask:\n{}\n",
+        "You are a focused sub-agent. You have been delegated one task and {sees}.\n\nTask:\n{}\n",
         run.spec.objective
     );
     if let Some(contract) = &run.spec.contract {
@@ -1638,6 +1649,7 @@ mod child_prompt_tests {
                 ..Default::default()
             },
             history: Vec::new(),
+            resumed: false,
             executor: Arc::new(Holding(tools)),
             budget: kernel::Budget::turns(10),
             cancel: tokio_util::sync::CancellationToken::new(),

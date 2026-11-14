@@ -369,6 +369,8 @@ pub struct ChildRun {
     /// The runner puts this *before* the objective, so the child reads the
     /// history and then what it is being asked to do.
     pub history: Vec<kernel::Message>,
+    /// A follow-up to an agent that already holds its own brief in `history`.
+    pub resumed: bool,
     /// Already narrowed — the runner must use exactly this, never the parent's.
     /// For a writer it is also already *rooted at the worktree*.
     pub executor: Arc<dyn Executor>,
@@ -1412,6 +1414,7 @@ impl AgentControl {
             session,
             path,
             history,
+            resumed: resuming.is_some(),
             cancel,
             interrupts,
             executor,
@@ -1590,6 +1593,7 @@ struct Admitted {
     /// The caller's conversation, filtered at admission so a fork reads the
     /// history as it was when the spawn was requested.
     history: Vec<kernel::Message>,
+    resumed: bool,
     cancel: CancellationToken,
     /// The child's steer queue, moved into its run. Not cloneable: exactly one
     /// session loop may own it, which is what makes "who receives this text"
@@ -1657,6 +1661,7 @@ async fn execute(
         interrupts,
         path,
         history,
+        resumed,
         supersedes,
         progress,
     } = admitted;
@@ -1673,6 +1678,7 @@ async fn execute(
         path: path.clone(),
         spec: spec.clone(),
         history,
+        resumed,
         executor,
         budget,
         cancel: cancel.clone(),

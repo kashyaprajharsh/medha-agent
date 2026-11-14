@@ -614,6 +614,54 @@ async fn an_agent_is_continued_by_asking_for_it_and_never_by_a_stray_field() {
     );
 }
 
+/// A continued agent receives only the follow-up, not its first brief again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_continued_agent_receives_only_the_follow_up() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("agent-follow-up")).await;
+    let first = json!({"name": "inv", "objective": "first job", "wait": true});
+    let more = json!({"action": "continue", "agent": "inv", "text": "second job", "wait": true});
+    client
+        .send(
+            &chat,
+            &format!("SCRIPT\nagent_spawn {first}\nagent_spawn {more}"),
+        )
+        .await;
+    loop {
+        let (_, frame) = client
+            .until(|frame| frame["method"] == "approval" || kind(frame, "turn.done"))
+            .await;
+        if frame["method"] != "approval" {
+            break;
+        }
+        let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
+        client.ask("approval.respond", Some(&chat), gate).await;
+    }
+    let last_asks: Vec<String> = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
+        .filter_map(|body| {
+            let last = body["messages"].as_array()?.last()?.clone();
+            let content = &last["content"];
+            let text = content
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| content[0]["text"].as_str().map(str::to_owned))?;
+            (last["role"] == "user" && !text.starts_with("SCRIPT")).then_some(text)
+        })
+        .collect();
+    assert!(
+        last_asks
+            .iter()
+            .any(|text| text.contains("first job") && text.contains("focused sub-agent")),
+        "the first brief carries the agent's setup: {last_asks:?}"
+    );
+    assert!(
+        last_asks.iter().any(|text| text == "second job"),
+        "the follow-up arrives as itself: {last_asks:?}"
+    );
+}
+
 /// A `medha.lock` broken mid-chat keeps the settings already in force and says why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lock_broken_mid_chat_keeps_its_settings_and_says_so() {

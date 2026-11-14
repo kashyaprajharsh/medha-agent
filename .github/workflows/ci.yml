@@ -163,6 +163,9 @@ jobs:
           Expand-Archive $archive -DestinationPath $folder
           $browser = Join-Path $folder 'chrome-win64/chrome.exe'
           if (!(Test-Path $browser)) { throw 'Chrome for Testing executable is missing' }
+          # An unzipped Chrome lacks the ACL its sandboxed network service needs, as an installed one has.
+          icacls $folder /grant '*S-1-15-2-2:(OI)(CI)(RX)' /T /Q
+          if ($LASTEXITCODE -ne 0) { throw 'Could not grant the sandbox read access to Chrome' }
           Write-Output "Browser: $browser; version: $((Get-Item $browser).VersionInfo.FileVersion)"
           "MEDHA_BROWSER=$browser" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 

@@ -1,14 +1,12 @@
 //! What makes a written file an output: its kind and a bounded, explicitly
 //! referenced asset manifest. Reading a file never publishes it as an output.
 
-use regex::Regex;
+use file_ops::page_assets::{mime, references, relative};
 use sandbox::WorkspaceSandbox;
-use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
-    path::{Component, Path, PathBuf},
-    sync::LazyLock,
+    path::{Path, PathBuf},
 };
 
 pub const FIELD: &str = kernel::events::TOOL_ARTIFACT_FIELD;
@@ -32,96 +30,6 @@ pub fn kind(path: &Path) -> Option<&'static str> {
             _ => return None,
         },
     )
-}
-
-fn mime(path: &Path) -> Option<&'static str> {
-    Some(
-        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-            "css" => "text/css",
-            "js" | "mjs" => "text/javascript",
-            "json" => "application/json",
-            "svg" => "image/svg+xml",
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "woff" => "font/woff",
-            "woff2" => "font/woff2",
-            "ttf" => "font/ttf",
-            "otf" => "font/otf",
-            _ => return None,
-        },
-    )
-}
-
-static URLS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:url\(\s*|@import\s+|(?:from|import)\s*|import\(\s*)["']?([^\s"'<>);]+)"#)
-        .expect("asset references")
-});
-
-fn references(text: &str, html: bool) -> Vec<String> {
-    let mut found: Vec<String> = URLS
-        .captures_iter(text)
-        .take(257)
-        .map(|cap| cap[1].to_owned())
-        .collect();
-    if html {
-        let document = Html::parse_document(text);
-        let selector =
-            Selector::parse("[src],link[href],[poster],[srcset]").expect("asset elements");
-        for element in document.select(&selector) {
-            if found.len() >= 257 {
-                break;
-            }
-            for attribute in ["src", "href", "poster"] {
-                if let Some(value) = element.value().attr(attribute) {
-                    found.push(value.to_owned());
-                }
-            }
-            if let Some(set) = element.value().attr("srcset") {
-                found.extend(
-                    set.split(',')
-                        .take(64)
-                        .filter_map(|entry| entry.split_whitespace().next())
-                        .map(str::to_owned),
-                );
-            }
-        }
-    }
-    found.truncate(257);
-    found
-}
-
-fn relative(from: &Path, requested: &str) -> Option<PathBuf> {
-    let requested = requested.split(['?', '#']).next()?.trim();
-    if requested.is_empty()
-        || requested.len() > 1024
-        || requested.starts_with('/')
-        || requested.contains(':')
-        || requested.contains('\\')
-    {
-        return None;
-    }
-    let decoded = urlencoding::decode(requested).ok()?;
-    if decoded.contains(['\\', ':', '%', '?', '#'])
-        || requested.to_ascii_lowercase().contains("%2f")
-    {
-        return None;
-    }
-    let mut path = from.to_path_buf();
-    for step in Path::new(decoded.as_ref()).components() {
-        match step {
-            Component::Normal(part) => path.push(part),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !path.pop() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    Some(path)
 }
 
 /// What a written document needs to be shown again. Its text is already in the
@@ -371,9 +279,15 @@ mod tests {
             relative(Path::new("css"), "../images/logo.png?v=1"),
             Some(PathBuf::from("images/logo.png"))
         );
+        // A root path is the page's own folder, never the machine's root.
+        assert_eq!(
+            relative(Path::new("css"), "/etc/passwd"),
+            Some(PathBuf::from("etc/passwd"))
+        );
         for url in [
             "../../secret",
-            "/etc/passwd",
+            "/../secret",
+            "//example.com/a",
             "file:///secret",
             "%2fetc/passwd",
             "https://example.com/a",

@@ -4,6 +4,7 @@ use std::path::Path;
 
 pub mod archive;
 pub mod opening;
+pub mod page_assets;
 
 /// A path as a person or model reads it: Windows drops the `\\?\` that canonicalizing adds.
 pub fn shown(path: &Path) -> &Path {

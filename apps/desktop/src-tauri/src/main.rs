@@ -563,9 +563,24 @@ async fn file_preview(
         state
             .workspaces
             .resolve(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || files::read(&runtime.path, &path))
-        .await
-        .map_err(|error| error.to_string())?
+    let views = state.views.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut read = files::read(&runtime.path, &path)?;
+        // A page opened as it is now loads its own files as they are now.
+        if let (Some("html" | "htm"), Some(text)) =
+            (read["extension"].as_str(), read["text"].as_str())
+        {
+            let page = files::resolve(&runtime.path, &path)?;
+            let (assets, missing) = artifacts::assets_now(&runtime.path, &page, text, Vec::new());
+            if !assets.is_empty() {
+                read["bundle"] = serde_json::json!(views.bundle(assets)?);
+            }
+            read["missing"] = serde_json::json!(missing);
+        }
+        Ok(read)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -820,7 +835,11 @@ async fn image_admit(request: tauri::ipc::Request<'_>) -> Result<Value, String> 
         }
         tauri::ipc::InvokeBody::Raw(_) => return Err("Choose an image below 64 MB".into()),
         // Bytes arrive as JSON only when the window's channel to the app was blocked.
-        _ => return Err("The image did not reach Medha as a file; restart Medha and try again".into()),
+        _ => {
+            return Err(
+                "The image did not reach Medha as a file; restart Medha and try again".into(),
+            );
+        }
     };
     tauri::async_runtime::spawn_blocking(move || {
         use base64::Engine;

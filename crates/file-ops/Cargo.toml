@@ -13,6 +13,9 @@ rust-version.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # zip leaves the inflate backend to its user; this is the pure-Rust one already in the build.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+regex = "1"
+scraper = "0.20"
+urlencoding = "2"
 
 [target.'cfg(windows)'.dependencies]
 dunce = "1"

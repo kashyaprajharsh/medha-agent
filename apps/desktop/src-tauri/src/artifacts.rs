@@ -69,6 +69,75 @@ fn current(root: &std::path::Path, folder: &std::path::Path, asset: &str) -> Opt
     Some(data)
 }
 
+/// What a page loads from its own folder as the folder is now, after the copies it kept.
+pub(crate) fn assets_now(
+    root: &std::path::Path,
+    page: &std::path::Path,
+    html: &str,
+    kept: Vec<view::Asset>,
+) -> (Vec<view::Asset>, Vec<String>) {
+    use file_ops::page_assets::{mime, references, relative};
+    use std::path::PathBuf;
+    let Some(folder) = page.parent() else {
+        return (kept, Vec::new());
+    };
+    let mut total: usize = kept.iter().map(|asset| asset.data.len()).sum();
+    let mut seen: std::collections::HashSet<String> =
+        kept.iter().map(|asset| asset.path.clone()).collect();
+    let mut assets = kept;
+    let mut missing = Vec::new();
+    let mut pending: std::collections::VecDeque<(PathBuf, String)> = references(html, true)
+        .into_iter()
+        .map(|url| (PathBuf::new(), url))
+        .collect();
+    while let Some((from, url)) = pending.pop_front() {
+        let Some(path) = relative(&from, &url) else {
+            // Web addresses are the preview's own business; a local name that leaves the folder is reported.
+            if url.starts_with("../") || url.starts_with('/') && !url.starts_with("//") {
+                missing.push(url.chars().take(300).collect());
+            }
+            continue;
+        };
+        let name = path.to_string_lossy().replace('\\', "/");
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if assets.len() >= 64 {
+            missing.push("More than 64 local assets; remaining assets were left out.".into());
+            break;
+        }
+        let (Some(mime), Some(data)) = (mime(&path), current(root, folder, &name)) else {
+            missing.push(name);
+            continue;
+        };
+        if data.len() > MAX_ASSET || total + data.len() > MAX_BUNDLE {
+            missing.push(name);
+            continue;
+        }
+        total += data.len();
+        // Only stylesheets and scripts are read on, for what they load in turn.
+        if matches!(mime, "text/css" | "text/javascript")
+            && let Ok(text) = std::str::from_utf8(&data)
+        {
+            let parent = path
+                .parent()
+                .unwrap_or(std::path::Path::new(""))
+                .to_path_buf();
+            pending.extend(
+                references(text, false)
+                    .into_iter()
+                    .map(|url| (parent.clone(), url)),
+            );
+        }
+        assets.push(view::Asset {
+            path: name,
+            mime: mime.into(),
+            data,
+        });
+    }
+    (assets, missing)
+}
+
 pub fn preview(
     runtime: &Runtime,
     views: &view::Views,
@@ -86,43 +155,45 @@ pub fn preview(
     )?;
     let mut preview = files::preview_bytes(std::path::Path::new(&manifest.path), data)?;
     let mut total = manifest.size;
-    let mut assets = Vec::new();
-    let mut missing = manifest.missing;
+    let mut kept = Vec::new();
     if manifest.assets.len() > 64 {
         return Err("The artifact has too many assets.".into());
     }
-    let folder = std::path::Path::new(&manifest.path).parent();
+    // Copies the revision kept come first; everything else it loads is read from its folder as it is now.
     for asset in manifest.assets {
-        let data = match &asset.hash {
-            Some(hash) => {
-                if asset.size > MAX_ASSET || total.saturating_add(asset.size) > MAX_BUNDLE {
-                    return Err("The artifact's asset bundle is too large.".into());
-                }
-                bytes(
-                    runtime,
-                    session,
-                    revision,
-                    Some(&asset.path),
-                    asset.size,
-                    hash,
-                )?
-            }
-            // Not kept: read as it is now, from the document's own folder.
-            None => match folder.and_then(|folder| current(&runtime.path, folder, &asset.path)) {
-                Some(data) if data.len() <= MAX_ASSET && total + data.len() <= MAX_BUNDLE => data,
-                _ => {
-                    missing.push(asset.path);
-                    continue;
-                }
-            },
+        let Some(hash) = &asset.hash else {
+            continue;
         };
+        if asset.size > MAX_ASSET || total.saturating_add(asset.size) > MAX_BUNDLE {
+            return Err("The artifact's asset bundle is too large.".into());
+        }
+        let data = bytes(
+            runtime,
+            session,
+            revision,
+            Some(&asset.path),
+            asset.size,
+            hash,
+        )?;
         total += data.len();
-        assets.push(view::Asset {
+        kept.push(view::Asset {
             path: asset.path,
             mime: asset.mime,
             data,
         });
     }
+    let (assets, missing) = match preview["extension"].as_str() {
+        Some("html" | "htm") => {
+            let page = preview["text"].as_str().unwrap_or_default().to_owned();
+            assets_now(
+                &runtime.path,
+                std::path::Path::new(&manifest.path),
+                &page,
+                kept,
+            )
+        }
+        _ => (kept, manifest.missing),
+    };
     if !assets.is_empty() {
         preview["bundle"] = json!(views.bundle(assets)?);
     }

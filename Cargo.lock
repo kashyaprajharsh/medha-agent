@@ -1238,6 +1238,9 @@ version = "0.1.12"
 dependencies = [
  "dunce",
  "flate2",
+ "regex",
+ "scraper",
+ "urlencoding",
  "windows-sys 0.60.2",
  "zip",
 ]

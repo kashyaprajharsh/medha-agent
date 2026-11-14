@@ -47,7 +47,7 @@ async fn a_draft_is_written_previewed_and_added_for_this_project() {
     )
     .await
     .unwrap();
-    let draft = world.home().join("drafts/notes");
+    let draft = world.home().join("drafts").join("notes");
     assert!(
         matches!(&made, ResourceResult::Changed(notice) if notice.messages.join(" ").contains(&draft.display().to_string())),
         "{made:?}"
@@ -148,7 +148,14 @@ async fn a_draft_is_written_previewed_and_added_for_this_project() {
     .await
     .unwrap();
     assert_eq!(
-        std::fs::read_to_string(world.home().join("drafts/proposed/SKILL.md")).unwrap(),
+        std::fs::read_to_string(
+            world
+                .home()
+                .join("drafts")
+                .join("proposed")
+                .join("SKILL.md")
+        )
+        .unwrap(),
         proposed
     );
 
@@ -158,7 +165,8 @@ async fn a_draft_is_written_previewed_and_added_for_this_project() {
         ReadResource::Preview {
             source: world
                 .home()
-                .join("drafts/dev.me.tools")
+                .join("drafts")
+                .join("dev.me.tools")
                 .display()
                 .to_string(),
         },

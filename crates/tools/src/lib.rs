@@ -1916,6 +1916,9 @@ impl Tool for ImageView {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
         let resolved = self.sbx.resolve(&path).await.map_err(|error| {
+            if matches!(error, sandbox::SandboxError::WebAddress(_)) {
+                return ToolError::Args(error.to_string());
+            }
             // A screenshot dragged into the composer is already attached, and
             // its temporary file is usually gone by now. Say that instead of
             // reporting a path-resolution failure the model will try to debug.

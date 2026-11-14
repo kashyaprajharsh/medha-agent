@@ -47,6 +47,10 @@ pub use scratch::Scratch;
 pub enum SandboxError {
     #[error("path escapes the workspace jail: {0}")]
     Escape(String),
+    #[error(
+        "{0} is a web address, not a file: use `web` to fetch it, or `read` with `render: true` to see the page"
+    )]
+    WebAddress(String),
     #[error("io error: {0}")]
     Io(String),
     #[error("permission denied: {0}")]
@@ -174,6 +178,15 @@ fn refuse_protected(path: PathBuf) -> Result<PathBuf, SandboxError> {
 }
 
 /// Git later runs what its config and hooks name, outside any jail, so no file tool writes them.
+/// A web address handed to a file tool is said to be one, rather than looked for as a file named `https:`.
+fn refuse_web_address(path: &str) -> Result<(), SandboxError> {
+    let lower = path.trim_start().to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Err(SandboxError::WebAddress(path.to_string()));
+    }
+    Ok(())
+}
+
 fn refuse_git_control(path: PathBuf) -> Result<PathBuf, SandboxError> {
     let parts: Vec<&std::ffi::OsStr> = path.components().map(|part| part.as_os_str()).collect();
     let named = |part: &std::ffi::OsStr, name: &str| part.eq_ignore_ascii_case(name);
@@ -2580,6 +2593,7 @@ impl WorkspaceSandbox {
     }
 
     async fn resolve_any(&self, path: &str) -> Result<PathBuf, SandboxError> {
+        refuse_web_address(path)?;
         let path = Path::new(path);
 
         let is_simple_relative = path.is_relative()
@@ -2624,6 +2638,7 @@ impl WorkspaceSandbox {
     }
 
     async fn resolve_any_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
+        refuse_web_address(path)?;
         let path = Path::new(path);
 
         let is_simple_relative = path.is_relative()

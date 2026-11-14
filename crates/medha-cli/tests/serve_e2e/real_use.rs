@@ -1306,3 +1306,26 @@ async fn a_reopened_branch_shares_its_chats_scratch_folder() {
         "the chat opened beside its branch was shown another scratch folder"
     );
 }
+
+/// `read` given a web address says to fetch it with `web`, instead of failing as a missing local file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reading_a_web_address_points_to_web_not_a_missing_file() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&world.folder("read-url")).await;
+    let page = json!({"path": "https://medha.example.com/"});
+    let picture = json!({"path": "https://medha.example.com/logo.png"});
+    let raw = scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("read {page}"), format!("read {picture}")],
+    )
+    .await;
+    assert_eq!(raw.matches("use `web` to fetch").count(), 2, "{raw}");
+    assert!(
+        !raw.contains("No such file") && !raw.contains("cannot open attachment"),
+        "a web address was read as a local file: {raw}"
+    );
+}

@@ -639,17 +639,29 @@ async fn a_continued_agent_receives_only_the_follow_up() {
         let gate = json!({"gate_id": frame["params"]["gate_id"], "approve": true});
         client.ask("approval.respond", Some(&chat), gate).await;
     }
-    let last_asks: Vec<String> = std::iter::from_fn(|| world.provider.seen.try_recv().ok())
-        .filter_map(|body| {
-            let last = body["messages"].as_array()?.last()?.clone();
-            let content = &last["content"];
-            let text = content
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| content[0]["text"].as_str().map(str::to_owned))?;
-            (last["role"] == "user" && !text.starts_with("SCRIPT")).then_some(text)
-        })
-        .collect();
+    // A continued agent runs on in the background, so its request may come after the turn ends.
+    let mut last_asks = Vec::new();
+    while !last_asks.iter().any(|text| text == "second job") {
+        let Ok(body) = world.provider.seen.recv_timeout(Duration::from_secs(30)) else {
+            break;
+        };
+        let Some(last) = body["messages"]
+            .as_array()
+            .and_then(|all| all.last())
+            .cloned()
+        else {
+            continue;
+        };
+        let content = &last["content"];
+        let text = content
+            .as_str()
+            .or_else(|| content[0]["text"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if last["role"] == "user" && !text.starts_with("SCRIPT") {
+            last_asks.push(text);
+        }
+    }
     assert!(
         last_asks
             .iter()

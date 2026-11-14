@@ -18,6 +18,12 @@ pub struct Call {
     pub plan: Option<Value>,
 }
 
+/// A page the tool read from the web is no file to open, as the sandbox also says.
+fn web_address(path: &str) -> bool {
+    let lower = path.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 pub(crate) fn describe(name: &str, tool: &str, args: &Value) -> Call {
     let (input_label, input) = match input(name, args) {
         Some((label, text)) => (Some(label), Some(bounded(&text, INPUT_LIMIT))),
@@ -29,6 +35,7 @@ pub(crate) fn describe(name: &str, tool: &str, args: &Value) -> Call {
             .then(|| {
                 text(args, "path")
                     .or_else(|| text(args, "file_path"))
+                    .filter(|path| !web_address(path))
                     .map(str::to_owned)
             })
             .flatten(),

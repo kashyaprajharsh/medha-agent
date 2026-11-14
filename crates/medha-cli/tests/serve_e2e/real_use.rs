@@ -1402,6 +1402,36 @@ async fn a_reopened_branch_shares_its_chats_scratch_folder() {
     );
 }
 
+/// A step that read a web address is never opened as a file; a step that read a file still is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_that_read_a_web_address_never_opens_it_as_a_file() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("read-url-step");
+    std::fs::write(folder.join("notes.txt"), "kept\n").unwrap();
+    let chat = client.open(&folder).await;
+    let page = json!({"path": "https://medha.example.com/", "render": true});
+    let notes = json!({"path": "notes.txt"});
+    scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("read {page}"), format!("read {notes}")],
+    )
+    .await;
+    let events = json!({"method": "sessions.events", "session_id": chat});
+    let events = client.about(&folder, events).await.unwrap();
+    let opened: Vec<Value> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "tool_call")
+        .map(|event| event["file_path"].clone())
+        .collect();
+    assert_eq!(opened, [Value::Null, json!("notes.txt")], "{events}");
+}
+
 /// `read` given a web address says to fetch it with `web`, instead of failing as a missing local file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reading_a_web_address_points_to_web_not_a_missing_file() {

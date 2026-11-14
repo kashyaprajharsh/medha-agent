@@ -1,4 +1,4 @@
-//! The window's own glass where the system has a material for it: Mica on Windows 11, used only where Windows accepts it.
+//! The window's own glass where the system has a material for it: Acrylic on Windows 11, which frosts what is behind the window as macOS does, used only where Windows accepts it.
 
 /// Applies the material and says whether it took; macOS frosts the window from its config instead.
 #[tauri::command]
@@ -9,13 +9,13 @@ pub(crate) fn window_glass(window: tauri::WebviewWindow) -> bool {
 #[cfg(windows)]
 fn applied(window: &tauri::WebviewWindow) -> bool {
     use windows::Win32::Graphics::Dwm::{
-        DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWM_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
         DwmSetWindowAttribute,
     };
     let Ok(hwnd) = window.hwnd() else {
         return false;
     };
-    let material = DWMSBT_MAINWINDOW;
+    let material = DWMSBT_TRANSIENTWINDOW;
     // SAFETY: the window handle is this live window's, and the value is a DWM_SYSTEMBACKDROP_TYPE of the size passed.
     let set = unsafe {
         DwmSetWindowAttribute(

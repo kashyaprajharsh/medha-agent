@@ -58,6 +58,11 @@
 :root[data-window-glass][data-look="glass"] body {
   background: transparent;
 }
+/* Windows' web view draws no frost over a transparent window, so what floats over the page is
+   solid there: menus, sheets and panes stay readable, keeping the glass rim and shadow. */
+:root[data-window-glass][data-look="glass"]:not([data-platform="mac"]) {
+  --glass: var(--overlay);
+}
 [data-look="glass"] :is(.side, .status, .head) {
   border-color: transparent;
 }

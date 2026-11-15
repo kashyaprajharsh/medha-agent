@@ -1299,7 +1299,14 @@ fn scratch_shown(world: &World) -> String {
 async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
     let world = World::new();
     let folder = world.folder("scratch-page");
-    let backend = world.backend();
+    // Windows runners can put scratch under RUNNER~1; that name must not trigger a RUN command.
+    let temporary = world.folder("RUNNER~1");
+    let temporary = temporary.to_str().unwrap();
+    let backend = world.backend_in(&[
+        ("TMPDIR", temporary),
+        ("TMP", temporary),
+        ("TEMP", temporary),
+    ]);
     let mut client = backend.connect().await;
     let chat = client.open(&folder).await;
     first_message(&mut client, &chat).await;
@@ -1308,13 +1315,18 @@ async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
     let in_scratch =
         json!({"path": std::path::Path::new(&scratch).join("index.html"), "content": page});
     let in_folder = json!({"path": "index.html", "content": page});
-    scripted(
+    let sent = scripted(
         &mut client,
         &world,
         &chat,
         &[format!("write {in_scratch}"), format!("write {in_folder}")],
     )
     .await;
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&scratch).join("index.html")).ok(),
+        Some(page.to_owned()),
+        "the scratch page was not written: {sent}"
+    );
     let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
     let listed = client.about(&folder, list).await.unwrap();
     let mut handed = Vec::new();
@@ -1331,9 +1343,7 @@ async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
     assert_eq!(
         (scratch_page.len(), folder_page.len()),
         (1, 1),
-        "{handed:?}\nscratch {scratch:?}\nwrites: {}\n{}",
-        result_of(&world, &chat, 0).await,
-        result_of(&world, &chat, 1).await
+        "{handed:?}\nscratch {scratch:?}\nwrites: {sent}"
     );
     let named = scratch_page[0]["scratch"].as_str().unwrap_or_default();
     assert!(

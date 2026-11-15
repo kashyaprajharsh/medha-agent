@@ -118,7 +118,7 @@ fn user_texts(body: &Value) -> String {
 const SERVER_SIZE_LIMIT: usize = 6_000_000;
 
 /// Echoes the last user message. One containing HOLD is answered only once
-/// released; one containing RUN is answered with a shell command first.
+/// released; one starting with RUN is answered with a shell command first.
 fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc::Receiver<()>>) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let Some((line, body)) = read_request(&mut stream) else {
@@ -255,7 +255,7 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
             json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}}]}),
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
         ]
-    } else if (asked.contains("RUN") || asked.starts_with("BACKGROUND")) && !ran {
+    } else if (asked.starts_with("RUN ") || asked.starts_with("BACKGROUND")) && !ran {
         shell_call(&body, &asked, "call_1")
     } else if let Some(call) = script_call(&body, &asked) {
         // SCRIPT then one `tool arguments-json` per line, each sent once the last has its result.

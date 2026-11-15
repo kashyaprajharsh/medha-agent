@@ -54,6 +54,17 @@
   --glass-page: 64%;
   --glass-card: 86%;
 }
+/* Acrylic tints far less than macOS's material, so a white window behind washes the theme out unless it is denser. */
+:root[data-window-glass][data-look="glass"]:not([data-platform="mac"]) {
+  --glass-frame: 82%;
+  --glass-page: 86%;
+  --glass-card: 90%;
+}
+:root[data-window-glass][data-theme="light"][data-look="glass"]:not([data-platform="mac"]) {
+  --glass-frame: 82%;
+  --glass-page: 88%;
+  --glass-card: 95%;
+}
 :root[data-window-glass][data-look="glass"],
 :root[data-window-glass][data-look="glass"] body {
   background: transparent;

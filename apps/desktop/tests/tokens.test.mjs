@@ -95,6 +95,33 @@ test("a style preview starts from the plain theme, so it never shows the active 
   assert.equal(firstSelector(await theme("parchment")), ':root[data-theme="light"], :where([data-theme="light"]) [data-look]');
 });
 
+test("Windows glass keeps at least 80% of the theme's colour, so a white window behind cannot wash out the text", async () => {
+  const css = (await readFile(new URL("styles/themes/looks.css", src), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const top = css.replace(/@media[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}/g, "");
+  const rules = [...top.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(([, selectors, body]) => ({ selectors: selectors.split(",").map((s) => s.trim()), body }));
+  const density = (theme, platform, name) => {
+    let best = { weight: -1, value: undefined };
+    for (const [order, rule] of rules.entries()) {
+      const value = rule.body.match(new RegExp(`--glass-${name}:\\s*(\\d+)%`))?.[1];
+      if (!value) continue;
+      for (const selector of rule.selectors) {
+        if (!selector.startsWith(':root[data-window-glass]') || !selector.includes('[data-look="glass"]')) continue;
+        if (selector.includes('[data-theme="light"]') && theme !== "light") continue;
+        if (selector.includes(':not([data-platform="mac"])') && platform === "mac") continue;
+        const weight = (selector.match(/\[|:not/g) || []).length * 1000 + order;
+        if (weight > best.weight) best = { weight, value: Number(value) };
+      }
+    }
+    return best.value;
+  };
+  for (const theme of ["dark", "light"])
+    for (const name of ["frame", "page", "card"]) {
+      assert.ok(density(theme, "windows", name) >= 80, `Windows ${theme} ${name} is ${density(theme, "windows", name)}%`);
+      assert.ok(density(theme, "mac", name) <= density(theme, "windows", name), `Mac ${theme} ${name} is denser than Windows`);
+    }
+  assert.equal(density("dark", "mac", "frame"), 40, "macOS keeps its own glass");
+});
+
 test("styles change how dense the theme's surfaces are, never their colour", async () => {
   const css = (await readFile(new URL("styles/themes/looks.css", src), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
   const surfaces = [...css.matchAll(/--(side|canvas|raised):\s*([^;]+);/g)];

@@ -12,8 +12,6 @@ use serde_json::{Value, json};
 use crate::{MEDIA, RELAYED_TRUST, ToolError, arg_str};
 
 const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
-/// After this Chrome stops loading and pictures the page as far as it got, inside the hard stop above.
-const LOAD_TIMEOUT_MS: u64 = 20_000;
 
 pub(crate) struct BrowserScreenshot {
     pub(crate) sbx: Arc<sandbox::WorkspaceSandbox>,
@@ -143,7 +141,6 @@ pub(crate) fn browser_args(
         "--mute-audio".into(),
         "--hide-scrollbars".into(),
         format!("--window-size={},{}", size.0, size.1),
-        format!("--timeout={LOAD_TIMEOUT_MS}"),
         format!("--screenshot={}", out.display()),
     ];
     // Windows CI has no hardware graphics session. Software rendering keeps
@@ -541,9 +538,7 @@ impl BrowserScreenshot {
             // Enough of Chrome's own log to name the cause; its last lines are often unrelated warnings.
             let tail = |text: &str| text.lines().rev().take(20).collect::<Vec<_>>().join(" | ");
             let outcome = if timed_out {
-                "the browser took no picture within 30s, even of the page as far as it had loaded; \
-                 its log follows, newest line first, and display warnings in it are normal"
-                    .into()
+                "the browser did not produce a screenshot within 30s".into()
             } else if let Some(code) = early_exit {
                 let status = code
                     .map(|code| code.to_string())

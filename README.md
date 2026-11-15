@@ -90,7 +90,7 @@ Versions up to 0.1.12 do not have the check yet: update them once by running the
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-version=v0.1.12
+version=v0.1.13
 curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$version/install.sh" \
   | MEDHA_VERSION="$version" sh                            # pin installer + binary
 

@@ -95,6 +95,20 @@ pub(crate) fn sweep_unlocked(root: &Path) {
     }
 }
 
+/// Where this user's scratch folders live, whether or not it exists yet.
+fn root_path(temp: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        // SAFETY: reads this process's own user id.
+        let uid = unsafe { libc::geteuid() };
+        temp.join(format!("medha-scratch-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        temp.join("medha-scratch")
+    }
+}
+
 /// One root per user: on Linux the temp directory is shared with every account.
 fn user_root(temp: &Path) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
@@ -102,7 +116,7 @@ fn user_root(temp: &Path) -> std::io::Result<PathBuf> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         // SAFETY: reads this process's own user id.
         let uid = unsafe { libc::geteuid() };
-        let root = temp.join(format!("medha-scratch-{uid}"));
+        let root = root_path(temp);
         match std::fs::DirBuilder::new().mode(0o700).create(&root) {
             Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error),
             _ => {}
@@ -119,7 +133,7 @@ fn user_root(temp: &Path) -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        let root = temp.join("medha-scratch");
+        let root = root_path(temp);
         std::fs::create_dir_all(&root)?;
         Ok(root)
     }
@@ -155,6 +169,20 @@ impl Scratch {
     /// The chat's own folder, the same whenever the chat is opened, so paths in its history stay valid.
     pub fn for_chat(chat: &str) -> std::io::Result<Self> {
         Self::for_chat_in(&std::env::temp_dir(), chat)
+    }
+
+    /// Where `chat`'s folder already is, as [`for_chat`](Self::for_chat) names it; nothing is made.
+    pub fn chat_folder(chat: &str) -> Option<PathBuf> {
+        if chat.is_empty() || !chat.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let path = root_path(&std::env::temp_dir()).join(format!("{CHAT}{chat}"));
+        if !std::fs::symlink_metadata(&path).ok()?.is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        let path = path.canonicalize().ok()?;
+        Some(path)
     }
 
     fn for_chat_in(temp: &Path, chat: &str) -> std::io::Result<Self> {

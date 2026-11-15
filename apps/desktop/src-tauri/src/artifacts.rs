@@ -69,6 +69,19 @@ fn current(root: &std::path::Path, folder: &std::path::Path, asset: &str) -> Opt
     Some(data)
 }
 
+/// Where a page's files may be read from: the chat's scratch folder for a page inside it, else the chat's folder.
+pub(crate) fn asset_root<'a>(
+    chat: &'a std::path::Path,
+    page: &std::path::Path,
+    scratch: Option<&'a str>,
+) -> &'a std::path::Path {
+    // Compared as shown, so a Windows path written with `\\?\` still matches its folder.
+    scratch
+        .map(std::path::Path::new)
+        .filter(|scratch| file_ops::shown(page).starts_with(file_ops::shown(scratch)))
+        .unwrap_or(chat)
+}
+
 /// What a page loads from its own folder as the folder is now, after the copies it kept.
 pub(crate) fn assets_now(
     root: &std::path::Path,
@@ -185,12 +198,9 @@ pub fn preview(
     let (assets, missing) = match preview["extension"].as_str() {
         Some("html" | "htm") => {
             let page = preview["text"].as_str().unwrap_or_default().to_owned();
-            assets_now(
-                &runtime.path,
-                std::path::Path::new(&manifest.path),
-                &page,
-                kept,
-            )
+            let path = std::path::Path::new(&manifest.path);
+            let root = asset_root(&runtime.path, path, manifest.scratch.as_deref());
+            assets_now(root, path, &page, kept)
         }
         _ => (kept, manifest.missing),
     };

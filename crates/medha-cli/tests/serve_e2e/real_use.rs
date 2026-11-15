@@ -1294,6 +1294,57 @@ fn scratch_shown(world: &World) -> String {
     rest.split_once(" (").unwrap().0.to_owned()
 }
 
+/// A page written in the chat's scratch folder is handed over with that folder, so its own files can be shown;
+/// a page in the chat's folder is handed over without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
+    let world = World::new();
+    let folder = world.folder("scratch-page");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    first_message(&mut client, &chat).await;
+    let scratch = scratch_shown(&world);
+    let page = "<link rel=stylesheet href=style.css><h1>kept</h1>";
+    let in_scratch =
+        json!({"path": std::path::Path::new(&scratch).join("index.html"), "content": page});
+    let in_folder = json!({"path": "index.html", "content": page});
+    scripted(
+        &mut client,
+        &world,
+        &chat,
+        &[format!("write {in_scratch}"), format!("write {in_folder}")],
+    )
+    .await;
+    let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
+    let listed = client.about(&folder, list).await.unwrap();
+    let mut handed = Vec::new();
+    for saved in listed["revisions"].as_array().unwrap() {
+        let file = json!({"method":"application.artifacts.file","params":{"session_id":chat,"revision_id":saved["revision_id"]}});
+        handed.push(client.about(&folder, file).await.unwrap());
+    }
+    let shown = |path: &str| std::path::Path::new(path).to_path_buf();
+    let (scratch_page, folder_page): (Vec<_>, Vec<_>) = handed
+        .iter()
+        .partition(|file| shown(file["path"].as_str().unwrap()).starts_with(&scratch));
+    assert_eq!(
+        (scratch_page.len(), folder_page.len()),
+        (1, 1),
+        "{handed:?}"
+    );
+    let named = scratch_page[0]["scratch"].as_str().unwrap_or_default();
+    assert!(
+        !named.is_empty() && shown(scratch_page[0]["path"].as_str().unwrap()).starts_with(named),
+        "the scratch page was not handed over with its folder: {:?}",
+        scratch_page[0]
+    );
+    assert!(
+        folder_page[0].get("scratch").is_none(),
+        "{:?}",
+        folder_page[0]
+    );
+}
+
 /// A reopened chat keeps its scratch folder, so the files its history names are still there and allowed.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

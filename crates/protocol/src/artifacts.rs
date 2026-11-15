@@ -25,6 +25,9 @@ pub struct ArtifactSnapshot {
     pub assets: Vec<ArtifactAsset>,
     #[serde(default)]
     pub missing: Vec<String>,
+    /// The chat's scratch folder, named only when the page was written inside it, so its own files can be read there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -33,6 +33,33 @@ fn a_page_shows_the_files_it_loads_even_when_they_were_written_after_it() {
     assert_eq!(missing, ["../secret.png", "gone.png"]);
 }
 
+/// A page reads its files from the chat's scratch folder only when it lies there; every other page reads from the chat's folder.
+#[test]
+fn only_a_page_inside_the_named_scratch_folder_reads_its_files_there() {
+    let chat = std::path::Path::new("/work/chat");
+    let scratch = "/tmp/medha-scratch-501/chat-01ABC";
+    let inside = std::path::Path::new("/tmp/medha-scratch-501/chat-01ABC/site/index.html");
+    let other = std::path::Path::new("/tmp/medha-scratch-501/chat-01XYZ/site/index.html");
+    assert_eq!(
+        asset_root(chat, inside, Some(scratch)),
+        std::path::Path::new(scratch)
+    );
+    assert_eq!(
+        asset_root(chat, other, Some(scratch)),
+        chat,
+        "another chat's scratch"
+    );
+    assert_eq!(asset_root(chat, inside, None), chat, "no folder named");
+    assert_eq!(
+        asset_root(
+            chat,
+            std::path::Path::new("/work/chat/index.html"),
+            Some(scratch)
+        ),
+        chat
+    );
+}
+
 /// Files a page's script loads with fetch or new URL are part of the page too.
 #[test]
 fn a_page_shows_the_files_its_script_loads() {

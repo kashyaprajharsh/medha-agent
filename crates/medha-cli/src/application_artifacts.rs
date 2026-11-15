@@ -488,6 +488,7 @@ pub(crate) fn page(records: Vec<ArtifactRevision>, cursor: usize) -> Result<Arti
                     size: bytes.len(),
                     assets: Vec::new(),
                     missing: Vec::new(),
+                    scratch: None,
                 });
                 record.screen = None;
             }
@@ -537,7 +538,10 @@ pub(crate) async fn file(
         if !event.payload["tool"].as_str().is_some_and(publishing_tool) {
             return Err("This event is not a built-in file publication.".into());
         }
-        return written(&event.payload["payload"]).ok_or("This revision has no saved file.".into());
+        let mut snapshot =
+            written(&event.payload["payload"]).ok_or("This revision has no saved file.")?;
+        snapshot.scratch = own_scratch(log, session, &snapshot.path).await;
+        return Ok(snapshot);
     }
     let (kind, bytes) = inline_bytes(&event, revision).ok_or("Invalid file revision.")?;
     use sha2::{Digest, Sha256};
@@ -554,7 +558,22 @@ pub(crate) async fn file(
         size: bytes.len(),
         assets: Vec::new(),
         missing: Vec::new(),
+        scratch: None,
     })
+}
+
+/// This chat's scratch folder, named as the session names it (after the chat's root), when `path` lies inside it.
+async fn own_scratch(
+    log: &impl kernel::EventLog,
+    session: ulid::Ulid,
+    path: &str,
+) -> Option<String> {
+    let root = kernel::events::root_chat(&log.events(session).await).unwrap_or(session);
+    let folder = sandbox::Scratch::chat_folder(&root.to_string())?;
+    let folder = file_ops::shown(&folder).to_path_buf();
+    file_ops::shown(std::path::Path::new(path))
+        .starts_with(&folder)
+        .then(|| folder.display().to_string())
 }
 
 /// Older observations predate the trusted outer tool tag. Resolve only their
@@ -624,6 +643,7 @@ fn written(payload: &Value) -> Option<ArtifactSnapshot> {
             }
             None => Vec::new(),
         },
+        scratch: None,
     })
 }
 

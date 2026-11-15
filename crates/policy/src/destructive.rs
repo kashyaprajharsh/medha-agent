@@ -39,8 +39,8 @@ pub(crate) struct Folders {
 }
 
 impl Folders {
-    /// The line only deletes things already in this chat's scratch folder, links followed, in every reading.
-    pub(crate) fn only_clears_scratch(&self, readings: &[&Reading], workdir: Option<&str>) -> bool {
+    /// The line, as its shell reads it, only deletes things already in this chat's scratch folder, links followed.
+    pub(crate) fn only_clears_scratch(&self, reading: &Reading, workdir: Option<&str>) -> bool {
         let Some(scratch) = self
             .scratch
             .as_deref()
@@ -55,14 +55,12 @@ impl Folders {
             (Some(root), None) => root.clone(),
             (None, None) => return false,
         };
-        readings.iter().all(|reading| {
-            reading.complete
-                && !reading.commands.is_empty()
-                && reading
-                    .commands
-                    .iter()
-                    .all(|command| clears(command, &scratch, &cwd))
-        })
+        reading.complete
+            && !reading.commands.is_empty()
+            && reading
+                .commands
+                .iter()
+                .all(|command| clears(command, &scratch, &cwd))
     }
 }
 

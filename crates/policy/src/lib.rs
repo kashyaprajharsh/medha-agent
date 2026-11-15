@@ -288,9 +288,10 @@ fn scan_command(
     // Deleting or throwing away anything is the person's alone to allow, in every mode, jailed or not.
     let readings: Vec<&shell_reader::Reading> =
         std::iter::once(&reading).chain(asked.as_ref()).collect();
+    // Whether a delete stays in scratch is read as the running shell reads it; bash would eat `C:\`'s backslashes.
     let workdir = intent.args.get("workdir").and_then(|v| v.as_str());
     if let Some(reason) = destructive::loss(&readings, command)
-        && !folders.only_clears_scratch(&readings, workdir)
+        && !folders.only_clears_scratch(asked.as_ref().unwrap_or(&reading), workdir)
     {
         return Decision::Person {
             reason: reason.into(),
@@ -556,66 +557,90 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
         }
         std::fs::write(scratch.join("run.log"), "x").unwrap();
-        let (r, s, o) = (
-            repo.canonicalize().unwrap(),
-            scratch.canonicalize().unwrap(),
-            other.canonicalize().unwrap(),
-        );
-        let (r, s, o) = (r.display(), s.display(), o.display());
-        let policy = DefaultPolicy::requiring_approval(["shell.exec"])
-            .with_jail(Jail::Active)
-            .with_workspace(&repo)
-            .with_scratch(&scratch);
-        let decide = |command: &str, workdir: Option<&std::path::Path>| {
-            let mut args = json!({ "command": command });
-            if let Some(dir) = workdir {
-                args["workdir"] = json!(dir);
-            }
-            policy.authorize(
-                AutonomyLevel::Autopilot,
-                &intent("shell.exec", args),
-                radius_of("shell.exec"),
-            )
-        };
-        let here = Some(scratch.as_path());
-        for (command, workdir) in [
-            (format!("rm -rf {s}/venv"), None),
-            (format!("rm -rf {s}/venv {s}/out"), None),
-            (format!("rm -f {s}/*.log"), None),
-            ("rm -rf venv".into(), here),
-            ("rm -rf venv out && rm run.log".into(), here),
-        ] {
-            let decided = decide(&command, workdir);
-            assert!(matches!(decided, Decision::Allow), "{command}: {decided:?}");
-        }
-        let asks = vec![
-            ("rm -rf src".to_string(), None),
-            ("rm -rf ../repo/src".into(), here),
-            (format!("rm -rf {o}/keep"), None),
-            (format!("rm -rf {s}/venv {r}/src"), None),
-            (format!("rm -rf {s}/venv && rm -rf {r}/src"), None),
-            (format!("rm -rf {s}/missing"), None),
-            (format!("rm -rf {s}/*/x"), None),
-            ("rm -rf \"$f\"".into(), here),
-            ("rm -rf ~/x".into(), here),
-            ("rm -rf .".into(), here),
-            ("rm -rf venv && mkdir venv".into(), here),
-            ("git clean -fdx".into(), here),
-        ];
         // A link out of scratch is followed to where it really points.
         #[cfg(unix)]
-        let linked = {
-            std::os::unix::fs::symlink(&repo, scratch.join("link")).unwrap();
-            ["", "/", "/src", "/*"].map(|tail| (format!("rm -rf {s}/link{tail}"), None))
-        };
-        #[cfg(not(unix))]
-        let linked: [(String, Option<&std::path::Path>); 0] = [];
-        for (command, workdir) in asks.into_iter().chain(linked) {
-            let decided = decide(&command, workdir);
-            assert!(
-                matches!(decided, Decision::Person { .. }),
-                "{command}: {decided:?}"
-            );
+        std::os::unix::fs::symlink(&repo, scratch.join("link")).unwrap();
+        let here = Some(scratch.as_path());
+        // Each shell gets paths as the model types them there: `C:/x` for bash on Windows, `C:\x` for PowerShell.
+        for (kind, sep) in [
+            (Shell::Posix, "/"),
+            (Shell::PowerShell, std::path::MAIN_SEPARATOR_STR),
+        ] {
+            let typed = |path: &std::path::Path| {
+                let shown = path.canonicalize().unwrap().display().to_string();
+                shown.trim_start_matches(r"\\?\").replace(['/', '\\'], sep)
+            };
+            let (r, s, o) = (typed(&repo), typed(&scratch), typed(&other));
+            let policy = DefaultPolicy::requiring_approval(["shell.exec"])
+                .with_jail(Jail::Active)
+                .with_shell(kind)
+                .with_workspace(&repo)
+                .with_scratch(&scratch);
+            let decide = |command: &str, workdir: Option<&std::path::Path>| {
+                let mut args = json!({ "command": command });
+                if let Some(dir) = workdir {
+                    args["workdir"] = json!(dir);
+                }
+                policy.authorize(
+                    AutonomyLevel::Autopilot,
+                    &intent("shell.exec", args),
+                    radius_of("shell.exec"),
+                )
+            };
+            let mut allowed = vec![
+                (format!("rm -rf {s}{sep}venv"), None),
+                (format!("rm -rf {s}{sep}venv {s}{sep}out"), None),
+                ("rm -rf venv".into(), here),
+            ];
+            // PowerShell's reading keeps a wildcard as plain text, so a wildcard delete there still asks.
+            let wildcard = (format!("rm -f {s}{sep}*.log"), None);
+            if kind == Shell::Posix {
+                allowed.push(wildcard.clone());
+                allowed.push(("rm -rf venv out && rm run.log".into(), here));
+            } else {
+                allowed.push((format!("Remove-Item -Recurse -Force {s}{sep}venv"), None));
+                // Bash reads `\` as an escape, as in `C:\x`; only the shell that runs the line decides.
+                if cfg!(unix) {
+                    std::fs::create_dir_all(scratch.join(r"back\slash")).unwrap();
+                    allowed.push((format!(r"Remove-Item -Recurse {s}/back\slash"), None));
+                }
+            }
+            for (command, workdir) in allowed {
+                let decided = decide(&command, workdir);
+                assert!(
+                    matches!(decided, Decision::Allow),
+                    "{kind:?} {command}: {decided:?}"
+                );
+            }
+            let mut asks = vec![
+                ("rm -rf src".to_string(), None),
+                (format!("rm -rf ..{sep}repo{sep}src"), here),
+                (format!("rm -rf {o}{sep}keep"), None),
+                (format!("rm -rf {s}{sep}venv {r}{sep}src"), None),
+                (format!("rm -rf {s}{sep}venv; rm -rf {r}{sep}src"), None),
+                (format!("rm -rf {s}{sep}missing"), None),
+                (format!("rm -rf {s}{sep}*{sep}x"), None),
+                ("rm -rf \"$f\"".into(), here),
+                ("rm -rf ~/x".into(), here),
+                ("rm -rf .".into(), here),
+                ("rm -rf venv; mkdir venv".into(), here),
+                ("git clean -fdx".into(), here),
+            ];
+            if kind == Shell::PowerShell {
+                asks.push(wildcard);
+            }
+            if cfg!(unix) {
+                for tail in ["", "/", "/src", "/*"] {
+                    asks.push((format!("rm -rf {s}/link{tail}"), None));
+                }
+            }
+            for (command, workdir) in asks {
+                let decided = decide(&command, workdir);
+                assert!(
+                    matches!(decided, Decision::Person { .. }),
+                    "{kind:?} {command}: {decided:?}"
+                );
+            }
         }
     }
 

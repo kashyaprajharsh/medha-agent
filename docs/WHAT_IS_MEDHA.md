@@ -631,7 +631,10 @@ verdict is returned untouched, so no level, `autopilot` included, can loosen the
 >   into every future session, so they earn a gate; project scope rides its `Read`
 >   radius
 > - Any web-tainted consequential action — trust-flow escalation is applied *after*
->   the dial, so it survives `autopilot`
+>   the dial, so it survives `autopilot`. Its card says so: "This chat read web content earlier."
+> - A command that deletes or throws away work (see [Commands that lose work](#commands-that-lose-work)):
+>   only the person can allow it, in every mode, jailed or not; it never goes to Autopilot's
+>   reviewer and is never remembered
 > - Anything unregistered — `Deny`, deny-first
 
 **Autopilot's reviewer.** In `autopilot`, what still asks goes to a reviewer first: the chat's own
@@ -655,6 +658,7 @@ outcomes**, not a yes/no.
 scan_command(command)
      │
      ├─ a real danger?   → DENY   (never runs, at any autonomy level)
+     ├─ deletes or throws away work, outside this chat's scratch folder? → PERSON (with a warning)
      ├─ recursive rm outside the workspace? → HUMAN
      ├─ no OS jail and the text cannot show what runs? → HUMAN
      └─ otherwise        → ALLOW
@@ -686,9 +690,30 @@ A recursive `rm` is classified by the riskiest target it names:
 
 | Target | Outcome |
 |---|---|
-| Temp or inside the workspace | **Allow** — this is ordinary work |
-| Any other out-of-workspace user path (e.g. `~/Documents/x`) | **Human** — mirrors how out-of-workspace *writes* are gated |
 | Filesystem root, home root, or a system directory | **Deny** |
+| Only things already inside this chat's scratch folder | **Allow**: the model's own temporary work |
+| Anywhere else, the workspace included | **Person**: see below |
+
+#### Commands that lose work
+
+A command that deletes or throws away work asks the person, in every mode, with a
+warning first on its card. It is never sent to Autopilot's reviewer, and "always
+allow" is not offered.
+
+| Kind | Examples | Card warning |
+|---|---|---|
+| Files | `rm`, `rmdir`, `unlink`, `shred`, `trash`, `find -delete`, `Remove-Item`, `del`, `rd`, `Clear-Content` | This deletes files or folders. |
+| Git | `git reset --hard`, `git clean`, `git checkout -- .`, `git restore`, a force push, deleting a branch | This throws away work in git. |
+| Databases | `DROP`/`TRUNCATE` in SQL, `dropdb`, `redis-cli flushall`, `prisma migrate reset`, `rails db:drop` | This deletes data in a database. |
+| Containers and cloud | `docker rm`, `docker system prune`, `docker compose down -v`, `kubectl delete`, `helm uninstall`, `terraform destroy`, `aws s3 rm`, `gcloud … delete` | This deletes containers, volumes or cloud resources. |
+| Disks and system | `mkfs`, `dd of=/dev/…`, `diskutil erase…`, `format`, `diskpart`, `reg delete`, `vssadmin delete`, `tmutil delete` | This erases a disk, backups or system settings. |
+
+The one exception is a plain delete whose every target is already inside this
+chat's scratch folder, links followed: that runs unasked. It is read as the
+running shell reads it (PowerShell on Windows), and anything it cannot be sure
+of, such as a variable, `..`, `~`, a glob before the last name or a redirect,
+asks. The system prompt also tells the model to delete only what it was asked
+to or made itself, and never to tidy the person's files on its own.
 
 `$HOME` and `${HOME}` are resolved and treated exactly like `~`. Any *other*
 unexpanded variable cannot be resolved statically: without a jail it falls to

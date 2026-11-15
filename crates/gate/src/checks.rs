@@ -1201,18 +1201,23 @@ mod tests {
     #[tokio::test]
     async fn command_check_reads_exit_code() {
         let ws = temp_workspace("gate-command");
-        let runner = test_runner(Duration::from_secs(5), 8 * 1024);
+        // Exercise exit codes and output, allowing for shell startup on busy CI runners.
+        // Timeout enforcement is covered separately by command_timeout_reaps_descendant_processes.
+        let runner = test_runner(Duration::from_secs(30), 8 * 1024);
         // `exit N` works in every selected interpreter.
         let (success, failure) = ("exit 0", "exit 1");
-        let (ok, _) = run_command(&runner, &ws, success, 0, None).await;
-        assert!(ok);
-        let (bad, _) = run_command(&runner, &ws, failure, 0, None).await;
-        assert!(!bad);
+        let (ok, why) = run_command(&runner, &ws, success, 0, None).await;
+        assert!(ok, "{success}: {why}");
+        let (bad, why) = run_command(&runner, &ws, failure, 0, None).await;
+        assert!(!bad && why.starts_with("exit 1,"), "{failure}: {why}");
         // stdout substring gate
-        let (has, _) = run_command(&runner, &ws, "echo hello", 0, Some("hello")).await;
-        assert!(has);
-        let (miss, _) = run_command(&runner, &ws, "echo hello", 0, Some("goodbye")).await;
-        assert!(!miss);
+        let (has, why) = run_command(&runner, &ws, "echo hello", 0, Some("hello")).await;
+        assert!(has, "expected hello in output: {why}");
+        let (miss, why) = run_command(&runner, &ws, "echo hello", 0, Some("goodbye")).await;
+        assert!(
+            !miss && why.starts_with("exit 0,") && why.contains("does not contain"),
+            "expected a successful command without goodbye in output: {why}"
+        );
         std::fs::remove_dir_all(ws).ok();
     }
 

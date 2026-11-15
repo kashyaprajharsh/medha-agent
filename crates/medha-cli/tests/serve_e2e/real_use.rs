@@ -1281,7 +1281,6 @@ async fn a_refusal_after_cd_names_no_folder_and_asks_for_workdir() {
 }
 
 /// The scratch folder the model was last shown, read from what it was sent.
-#[cfg(unix)]
 fn scratch_shown(world: &World) -> String {
     let sent: Vec<Value> = std::iter::from_fn(|| world.provider.seen.try_recv().ok()).collect();
     let system = sent.last().expect("the model was sent nothing")["messages"][0]["content"]
@@ -1323,7 +1322,9 @@ async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
         let file = json!({"method":"application.artifacts.file","params":{"session_id":chat,"revision_id":saved["revision_id"]}});
         handed.push(client.about(&folder, file).await.unwrap());
     }
-    let shown = |path: &str| std::path::Path::new(path).to_path_buf();
+    // Compared as shown, so a Windows path written with `\\?\` still matches its folder.
+    let shown = |path: &str| file_ops::shown(std::path::Path::new(path)).to_path_buf();
+    let scratch = shown(&scratch);
     let (scratch_page, folder_page): (Vec<_>, Vec<_>) = handed
         .iter()
         .partition(|file| shown(file["path"].as_str().unwrap()).starts_with(&scratch));

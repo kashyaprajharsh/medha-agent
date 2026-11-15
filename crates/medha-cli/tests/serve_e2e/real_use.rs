@@ -1331,7 +1331,9 @@ async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
     assert_eq!(
         (scratch_page.len(), folder_page.len()),
         (1, 1),
-        "{handed:?}"
+        "{handed:?}\nscratch {scratch:?}\nwrites: {}\n{}",
+        result_of(&world, &chat, 0).await,
+        result_of(&world, &chat, 1).await
     );
     let named = scratch_page[0]["scratch"].as_str().unwrap_or_default();
     assert!(

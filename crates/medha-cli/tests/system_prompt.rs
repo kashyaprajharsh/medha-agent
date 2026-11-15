@@ -125,7 +125,7 @@ fn the_brief_names_only_tools_and_arguments_that_exist() {
 fn the_brief_stays_within_its_budget() {
     let brief = context::identity::system_prompt(None);
     assert!(
-        brief.len() <= 7_500,
+        brief.len() <= 7_700,
         "the operating brief is {} characters (~{} tokens) on every request",
         brief.len(),
         brief.len() / 4

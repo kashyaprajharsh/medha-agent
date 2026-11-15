@@ -1,5 +1,8 @@
 use super::*;
 
+/// Why a command with real effects is asked after web content, where nothing keeps it off the network.
+const WEB_ASK: &str = "This chat read web content earlier. Nothing keeps this command off the network, so only you can allow it.";
+
 impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// Take `lane` unless this call holds it already; an error is for the model.
     pub(super) async fn enter_lane(&self, lane: &Lane) -> Result<(), String> {
@@ -526,6 +529,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // What may be lost is read first, before the command.
                     if let Some(reason) = &person_reason {
                         detail = format!("{reason}\n\n{detail}");
+                    } else if trust_escalated {
+                        detail = format!("{WEB_ASK}\n\n{detail}");
                     }
                     let action = approval_key(intent);
                     let confirm = self.gate.confirm(&action, Some(&detail), escalated);

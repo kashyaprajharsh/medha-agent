@@ -267,7 +267,16 @@ async fn network_and_folder_are_approved_together_before_the_only_execution() {
         assert_eq!(cards.len(), 1);
         assert!(cards[0].contains("Network access"));
         assert!(cards[0].contains("Read/write"));
-        assert!(cards[0].contains(&format!("Working directory: {}", f.outside.display())));
+        let folder = sandbox::exec::plain_path(&f.outside).display();
+        assert!(
+            cards[0].contains(&format!("Working directory: {folder}")),
+            "{}",
+            cards[0]
+        );
+        assert!(
+            !cards[0].contains(r"\\?\"),
+            "the card names the folder as a person writes it"
+        );
         assert!(!cards[0].contains("- Read "), "write already includes read");
     }
     assert!(!f.network.granted());

@@ -64,6 +64,9 @@
   color: var(--code);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  /* A long script scrolls in place, so Allow and Deny stay in view. */
+  max-height: calc(1.6em * 12);
+  overflow-y: auto;
 }
 .ask-command small {
   display: block;

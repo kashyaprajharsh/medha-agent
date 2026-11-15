@@ -963,6 +963,27 @@ test("action approvals keep their action label", async () => {
   assert.deepEqual([...document.querySelectorAll(".ask-actions button")].map(button => button.textContent), ["Allow", "Always allow", "Deny"]);
 });
 
+test("a command card asks one short question and shows its command once, in the box", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  const command = "New-Item -ItemType Directory -Force 'promo\\assets'\nGet-ChildItem";
+  const reason = "This chat read web content earlier. Nothing keeps this command off the network, so only you can allow it.";
+  const state = reduceLive(startingLive(), { method: "approval", params: {
+    gate_id: 3, action: `shell.exec: ${command}`, escalated: true, kind: "action",
+    detail: `${reason}\n\nWorking directory: C:\\work\n$ ${command}`, choices: ["once", "deny"],
+  }});
+  await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
+  assert.equal(document.querySelector(".ask-top b").textContent, "Run this command?");
+  const card = document.querySelector(".ask").textContent;
+  assert.equal(card.split(command).length - 1, 1, `the command shows once: ${card}`);
+  assert.ok(!card.includes("shell.exec"), "the tool's own name stays out of the card");
+  assert.equal(document.querySelector(".ask-command code").textContent, command);
+  assert.equal(document.querySelector(".ask-command small").textContent, "in C:\\work");
+  const why = document.querySelector(".ask-gets .risky");
+  assert.equal(why.querySelector("b").textContent, "This chat read web content earlier.");
+  assert.ok(!document.querySelector(".ask-detail"), "the reason is read as words, not as part of the command");
+});
+
 test("the window lets Tauri's own channel through on every platform, so bytes reach the app unchanged", async () => {
   const config = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   const connect = config.app.security.csp.split(";").map((part) => part.trim()).find((part) => part.startsWith("connect-src"));

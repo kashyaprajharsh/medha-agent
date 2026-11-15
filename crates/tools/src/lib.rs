@@ -7243,7 +7243,7 @@ impl Tool for ShellExec {
         let plan = ShellPlan::parse(args, &self.sbx).ok()?;
         Some(format!(
             "Working directory: {}\n$ {}",
-            plan.workdir.display(),
+            sandbox::exec::plain_path(&plan.workdir).display(),
             plan.command
         ))
     }

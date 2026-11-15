@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 #[path = "runtime_limits/outbound_tests.rs"]
 mod outbound_tests;
+#[path = "runtime_limits/web_ask_tests.rs"]
+mod web_ask_tests;
 
 enum Turn {
     Blocks(Vec<Block>),

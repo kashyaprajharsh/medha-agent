@@ -56,6 +56,16 @@ function Warning({ text }: { text: string }) {
   );
 }
 
+/** A plain command card's text, `[reason]\n\nWorking directory: …\n$ …[hook]`, read back as the access card's parts. */
+function commandParts(approval: Approval): AccessParts | undefined {
+  if (!approval.action.startsWith("shell.exec: ") || !approval.detail) return undefined;
+  const shape = /^(?:([\s\S]+?)\n\n)?Working directory: (.*)\n\$ ([\s\S]*?)(?:\n\nA pre-tool hook requires approval: ([\s\S]*))?$/;
+  const found = approval.detail.match(shape);
+  if (!found) return undefined;
+  const [, warning, workdir, command, hook] = found;
+  return { command, workdir, warning, hook, outsideSandbox: false, network: false, read: [], write: [], untrusted: false };
+}
+
 /** The command on its own, then each thing it may reach on its own line, the riskiest first. */
 function AccessBody({ parts }: { parts: AccessParts }) {
   return (
@@ -67,6 +77,7 @@ function AccessBody({ parts }: { parts: AccessParts }) {
           {parts.agent && <small>Asked by agent {parts.agent}</small>}
         </div>
       )}
+      {(parts.warning || parts.outsideSandbox || parts.network || parts.write.length > 0 || parts.read.length > 0 || parts.hook) && (
       <ul className="ask-gets">
         {parts.warning && <Warning text={parts.warning} />}
         {parts.outsideSandbox && (
@@ -115,6 +126,7 @@ function AccessBody({ parts }: { parts: AccessParts }) {
           </li>
         )}
       </ul>
+      )}
     </>
   );
 }
@@ -122,6 +134,8 @@ function AccessBody({ parts }: { parts: AccessParts }) {
 function asks(approval: Approval): string {
   // A command-access card's action is already the whole question.
   if (approval.access) return approval.action;
+  // The command is in the box below, so the title only asks.
+  if (approval.action.startsWith("shell.exec: ")) return "Run this command?";
   if (approval.kind !== "path") return `Medha wants to ${approval.action}`;
   const parts = approval.action.split(" · ");
   const request = parts.pop() ?? "";
@@ -240,6 +254,8 @@ export const LiveTail = memo(function LiveTail({
           </div>
           {approval.access ? (
             <AccessBody parts={approval.access} />
+          ) : commandParts(approval) ? (
+            <AccessBody parts={commandParts(approval)!} />
           ) : (
             approval.detail && <pre className="ask-detail">{approval.detail}</pre>
           )}

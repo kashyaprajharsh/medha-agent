@@ -1308,13 +1308,17 @@ async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
     let in_scratch =
         json!({"path": std::path::Path::new(&scratch).join("index.html"), "content": page});
     let in_folder = json!({"path": "index.html", "content": page});
-    scripted(
+    let sent = scripted(
         &mut client,
         &world,
         &chat,
         &[format!("write {in_scratch}"), format!("write {in_folder}")],
     )
     .await;
+    assert!(
+        std::path::Path::new(&scratch).join("index.html").is_file(),
+        "the page did not land in the scratch folder {scratch}: {sent}"
+    );
     let list = json!({"method":"application.artifacts","params":{"session_id":chat}});
     let listed = client.about(&folder, list).await.unwrap();
     let mut handed = Vec::new();
@@ -1331,9 +1335,7 @@ async fn a_page_in_scratch_names_its_scratch_folder_and_no_other_page_does() {
     assert_eq!(
         (scratch_page.len(), folder_page.len()),
         (1, 1),
-        "{handed:?}\nscratch {scratch:?}\nwrites: {}\n{}",
-        result_of(&world, &chat, 0).await,
-        result_of(&world, &chat, 1).await
+        "{handed:?}\nscratch {scratch:?}"
     );
     let named = scratch_page[0]["scratch"].as_str().unwrap_or_default();
     assert!(

@@ -122,6 +122,8 @@ pub struct AccessAsk {
     pub untrusted: bool,
     pub hook: Option<String>,
     pub agent: Option<String>,
+    /// What the command may lose, such as files, when only the person may allow it.
+    pub warning: Option<String>,
 }
 
 impl AccessAsk {

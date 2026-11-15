@@ -566,6 +566,9 @@ pub struct AccessPrompt {
     pub hook: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// What the command may lose, when only the person may allow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 impl AccessPrompt {

@@ -40,6 +40,8 @@ export type AccessParts = {
   untrusted: boolean;
   hook?: string;
   agent?: string;
+  /** What the command may lose, when only the person may allow it. */
+  warning?: string;
 };
 export type QuestionForm = {
   id: number;
@@ -216,6 +218,7 @@ function accessParts(value: unknown): AccessParts | undefined {
     untrusted: parts.untrusted === true,
     hook: str(parts.hook),
     agent: str(parts.agent),
+    warning: str(parts.warning),
   };
 }
 const now = () => Date.now() / 1000;

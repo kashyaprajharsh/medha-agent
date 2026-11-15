@@ -1009,6 +1009,7 @@ impl kernel::HumanGate for Gate {
             untrusted: ask.untrusted,
             hook: ask.hook.clone(),
             agent: ask.agent.clone(),
+            warning: ask.warning.clone(),
         };
         self.access(&parts.question(), Some(&ask.text), Some(parts), escalated)
             .await

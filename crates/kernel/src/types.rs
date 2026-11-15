@@ -1306,8 +1306,14 @@ impl Observation {
 #[derive(Debug, Clone)]
 pub enum Decision {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
     Human,
+    /// Only the person may allow it: never a reviewer, never a remembered answer.
+    Person {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]

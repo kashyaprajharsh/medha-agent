@@ -1,6 +1,7 @@
 //! Deny-first tool policy with deterministic shell-command scanning.
 
 mod admission;
+mod destructive;
 pub mod guard;
 
 use admission::DeleteTier;
@@ -18,6 +19,8 @@ pub struct DefaultPolicy {
     memory_write_approval: MemoryWriteApproval,
     jail: Jail,
     scratch: Option<String>,
+    /// The workspace and scratch folders as given, for resolving a delete's real target.
+    folders: destructive::Folders,
     /// The shell commands run in, which decides how a line is read for whether it asks.
     shell: shell_reader::Shell,
 }
@@ -48,14 +51,7 @@ enum MemoryWriteApproval {
 
 impl DefaultPolicy {
     pub fn new() -> Self {
-        Self {
-            approve: HashSet::new(),
-            workspace: None,
-            memory_write_approval: MemoryWriteApproval::UserScope,
-            jail: Jail::Off,
-            scratch: None,
-            shell: shell_reader::Shell::Posix,
-        }
+        Self::requiring_approval(std::iter::empty::<String>())
     }
 
     /// Require human approval for the given tools (e.g. `["fs.edit","shell.exec"]`).
@@ -70,6 +66,7 @@ impl DefaultPolicy {
             memory_write_approval: MemoryWriteApproval::UserScope,
             jail: Jail::Off,
             scratch: None,
+            folders: destructive::Folders::default(),
             shell: shell_reader::Shell::Posix,
         }
     }
@@ -88,12 +85,14 @@ impl DefaultPolicy {
     /// Treats absolute paths beneath `root` as in-workspace scan targets.
     pub fn with_workspace(mut self, root: impl AsRef<std::path::Path>) -> Self {
         self.workspace = scan_root(root.as_ref());
+        self.folders.workspace = Some(root.as_ref().to_path_buf());
         self
     }
 
     /// Medha's own throwaway folder counts as inside, like the workspace.
     pub fn with_scratch(mut self, root: impl AsRef<std::path::Path>) -> Self {
         self.scratch = scan_root(root.as_ref());
+        self.folders.scratch = Some(root.as_ref().to_path_buf());
         self
     }
 
@@ -189,6 +188,7 @@ impl Policy for DefaultPolicy {
                 intent,
                 self.workspace.as_deref(),
                 self.scratch.as_deref(),
+                &self.folders,
                 self.jail,
                 self.shell,
             ),
@@ -260,6 +260,7 @@ fn scan_command(
     intent: &ToolIntent,
     workspace: Option<&str>,
     scratch: Option<&str>,
+    folders: &destructive::Folders,
     jail: Jail,
     shell: shell_reader::Shell,
 ) -> Decision {
@@ -279,17 +280,29 @@ fn scan_command(
             ),
         };
     }
+    // Whether it asks is read as the shell will run it: an unread line still asks.
+    let asked = match shell {
+        shell_reader::Shell::Posix => None,
+        shell_reader::Shell::PowerShell => Some(shell_reader::read_as(command, shell)),
+    };
+    // Deleting or throwing away anything is the person's alone to allow, in every mode, jailed or not.
+    let readings: Vec<&shell_reader::Reading> =
+        std::iter::once(&reading).chain(asked.as_ref()).collect();
+    let workdir = intent.args.get("workdir").and_then(|v| v.as_str());
+    if let Some(reason) = destructive::loss(&readings, command)
+        && !folders.only_clears_scratch(&readings, workdir)
+    {
+        return Decision::Person {
+            reason: reason.into(),
+        };
+    }
     // Deleting your files outside the workspace asks, as an outside write does.
     match admission::delete_tier(&reading, workspace) {
         Some(DeleteTier::Outside) => return Decision::Human,
         Some(DeleteTier::Unseen) if !jailed => return Decision::Human,
         _ => {}
     }
-    // Whether it asks is read as the shell will run it: an unread line still asks.
-    let asked = match shell {
-        shell_reader::Shell::Posix => reading,
-        shell_reader::Shell::PowerShell => shell_reader::read_as(command, shell),
-    };
+    let asked = asked.unwrap_or(reading);
     if !jailed && admission::review(&asked, workspace, scratch).is_some() {
         return Decision::Human;
     }
@@ -471,6 +484,138 @@ mod tests {
                 );
             }
             assert!(!policy.escalates(AutonomyLevel::Careful, "read"));
+        }
+    }
+
+    /// A command that deletes recursively or by force, or throws away work in git, is the person's
+    /// alone to allow, in every mode and every shell, inside the jail or not; a plain delete is unchanged.
+    #[test]
+    fn destructive_deletes_are_for_the_person_in_every_mode() {
+        use AutonomyLevel::{Autopilot, Careful, Normal};
+        let person = |decision: Decision| matches!(decision, Decision::Person { .. });
+        for (jail, kind) in [
+            (Jail::Active, Shell::Posix),
+            (Jail::Missing, Shell::Posix),
+            (Jail::Missing, Shell::PowerShell),
+        ] {
+            let policy = DefaultPolicy::requiring_approval(["shell.exec"])
+                .with_jail(jail)
+                .with_shell(kind);
+            for mode in [Careful, Normal, Autopilot] {
+                for command in [
+                    "rm -rf gui-app/app",
+                    "rm -r src",
+                    "rm -f notes.txt",
+                    "rm --recursive build",
+                    "rm notes.txt",
+                    "env X=1 rm -rf build",
+                    "cd gui-app && rm -rf app",
+                    "git clean -fdx",
+                    "git reset --hard HEAD~1",
+                    "git checkout -- src",
+                    "git restore src",
+                    "find . -name '*.py' -delete",
+                    "Remove-Item gui-app -Recurse -Force",
+                    "del /s /q src",
+                    "rd /s /q src",
+                ] {
+                    let decided = policy.authorize(mode, &shell(command), radius_of("shell.exec"));
+                    assert!(
+                        person(decided.clone()),
+                        "{jail:?} {kind:?} {mode:?} {command}: {decided:?}"
+                    );
+                }
+                // Refused outright stays refused: stricter than asking.
+                let elevated =
+                    policy.authorize(mode, &shell("sudo rm -rf build"), radius_of("shell.exec"));
+                assert!(matches!(elevated, Decision::Deny { .. }), "{elevated:?}");
+            }
+        }
+        let jailed = DefaultPolicy::requiring_approval(["shell.exec"]).with_jail(Jail::Active);
+        for command in ["git status", "ls src", "cargo test", "mkdir out"] {
+            let decided = jailed.authorize(Normal, &shell(command), radius_of("shell.exec"));
+            assert!(!person(decided.clone()), "{command}: {decided:?}");
+        }
+    }
+
+    /// Deleting what lives in this chat's scratch folder runs unasked; a delete that may reach past it asks.
+    #[test]
+    fn deletes_inside_this_chats_scratch_do_not_ask() {
+        let base = tempfile::tempdir().unwrap();
+        let (repo, scratch, other) = (
+            base.path().join("repo"),
+            base.path().join("scratch"),
+            base.path().join("other"),
+        );
+        for dir in [
+            repo.join("src"),
+            scratch.join("venv"),
+            scratch.join("out"),
+            other.join("keep"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(scratch.join("run.log"), "x").unwrap();
+        let (r, s, o) = (
+            repo.canonicalize().unwrap(),
+            scratch.canonicalize().unwrap(),
+            other.canonicalize().unwrap(),
+        );
+        let (r, s, o) = (r.display(), s.display(), o.display());
+        let policy = DefaultPolicy::requiring_approval(["shell.exec"])
+            .with_jail(Jail::Active)
+            .with_workspace(&repo)
+            .with_scratch(&scratch);
+        let decide = |command: &str, workdir: Option<&std::path::Path>| {
+            let mut args = json!({ "command": command });
+            if let Some(dir) = workdir {
+                args["workdir"] = json!(dir);
+            }
+            policy.authorize(
+                AutonomyLevel::Autopilot,
+                &intent("shell.exec", args),
+                radius_of("shell.exec"),
+            )
+        };
+        let here = Some(scratch.as_path());
+        for (command, workdir) in [
+            (format!("rm -rf {s}/venv"), None),
+            (format!("rm -rf {s}/venv {s}/out"), None),
+            (format!("rm -f {s}/*.log"), None),
+            ("rm -rf venv".into(), here),
+            ("rm -rf venv out && rm run.log".into(), here),
+        ] {
+            let decided = decide(&command, workdir);
+            assert!(matches!(decided, Decision::Allow), "{command}: {decided:?}");
+        }
+        let asks = vec![
+            ("rm -rf src".to_string(), None),
+            ("rm -rf ../repo/src".into(), here),
+            (format!("rm -rf {o}/keep"), None),
+            (format!("rm -rf {s}/venv {r}/src"), None),
+            (format!("rm -rf {s}/venv && rm -rf {r}/src"), None),
+            (format!("rm -rf {s}/missing"), None),
+            (format!("rm -rf {s}/*/x"), None),
+            ("rm -rf \"$f\"".into(), here),
+            ("rm -rf ~/x".into(), here),
+            ("rm -rf .".into(), here),
+            ("rm -rf venv && mkdir venv".into(), here),
+            ("git clean -fdx".into(), here),
+        ];
+        // A link out of scratch is followed to where it really points.
+        #[cfg(unix)]
+        let linked = {
+            std::os::unix::fs::symlink(&repo, scratch.join("link")).unwrap();
+            ["", "/", "/src", "/*"].map(|tail| (format!("rm -rf {s}/link{tail}"), None))
+        };
+        #[cfg(not(unix))]
+        let linked: [(String, Option<&std::path::Path>); 0] = [];
+        for (command, workdir) in asks.into_iter().chain(linked) {
+            let decided = decide(&command, workdir);
+            assert!(
+                matches!(decided, Decision::Person { .. }),
+                "{command}: {decided:?}"
+            );
         }
     }
 
@@ -656,6 +801,13 @@ mod tests {
     fn auth_at(p: &DefaultPolicy, level: AutonomyLevel, i: &ToolIntent) -> Decision {
         p.authorize(level, i, radius_of(&i.tool))
     }
+    /// Someone is asked: anyone who can answer, or only the person.
+    fn asked(decision: &Decision) -> bool {
+        matches!(decision, Decision::Human | Decision::Person { .. })
+    }
+    fn for_the_person(decision: &Decision) -> bool {
+        matches!(decision, Decision::Person { .. })
+    }
 
     #[test]
     fn user_scope_memory_writes_gate_project_scope_rides_read_radius() {
@@ -787,20 +939,17 @@ mod tests {
             auth(&p, &shell("ls -la && cargo test")),
             Decision::Allow
         ));
-        assert!(matches!(
-            auth(&p, &shell("rm -rf target/debug")),
-            Decision::Allow
-        ));
-        // Cleaning up temp scratch dirs is allowed (inside the sandbox's writable
-        // zone) — an agent must be able to tidy its own venvs/workdirs.
+        // A delete, even of build output, is the person's to allow.
+        assert!(for_the_person(&auth(&p, &shell("rm -rf target/debug"))));
+        // Temp folders are not refused, but even deleting them is the person's to allow.
         for ok in [
             "rm -rf /tmp/pptx-env",
             "rm -rf /tmp/pptx-env /tmp/md-env",
             "rm -rf /var/folders/5q/abc/T/medha-gate-01",
         ] {
             assert!(
-                matches!(auth(&p, &shell(ok)), Decision::Allow),
-                "should allow temp cleanup: {ok}"
+                for_the_person(&auth(&p, &shell(ok))),
+                "the person allows: {ok}"
             );
         }
         // …but a temp prefix must not be a traversal escape to the real fs.
@@ -841,26 +990,23 @@ mod tests {
             "rm -rf /Users/reeturajharsh/scratch/tmp",
             "rm -rf ~/Downloads/build",
         ] {
-            assert!(
-                matches!(auth(&p, &shell(ask)), Decision::Human),
-                "must ask: {ask}"
-            );
+            assert!(asked(&auth(&p, &shell(ask))), "must ask: {ask}");
         }
         // `--` ends option parsing. A later `-r` is an operand, so this is a
         // non-recursive out-of-workspace deletion and must still be reviewed.
-        assert!(matches!(
-            auth(&p, &shell("rm -- -r /Users/reeturajharsh/scratch/file")),
-            Decision::Human
-        ));
-        // Tier 1 — temp + workspace-relative: allowed (no approval needed here).
+        assert!(asked(&auth(
+            &p,
+            &shell("rm -- -r /Users/reeturajharsh/scratch/file")
+        )));
+        // Temp and workspace-relative deletes are not refused, but the person allows them.
         for ok in [
             "rm -rf /tmp/pptx-env",
             "rm -rf ./build",
             "rm -rf target/debug",
         ] {
             assert!(
-                matches!(auth(&p, &shell(ok)), Decision::Allow),
-                "must allow: {ok}"
+                for_the_person(&auth(&p, &shell(ok))),
+                "the person allows: {ok}"
             );
         }
     }
@@ -880,10 +1026,7 @@ mod tests {
             "rm -rf $HOME/Documents/old",
             "rm -rf ${HOME}/Downloads/build",
         ] {
-            assert!(
-                matches!(auth(&p, &shell(ask)), Decision::Human),
-                "must ask: {ask}"
-            );
+            assert!(asked(&auth(&p, &shell(ask))), "must ask: {ask}");
         }
         // Any other variable can't be resolved statically → never silently
         // allowed; it fails closed to human approval (deny under a no-human policy).
@@ -892,10 +1035,7 @@ mod tests {
             "rm -rf $HOMEDIR",
             "rm -rf ${SOMEDIR}/nested",
         ] {
-            assert!(
-                matches!(auth(&p, &shell(ask)), Decision::Human),
-                "must ask: {ask}"
-            );
+            assert!(asked(&auth(&p, &shell(ask))), "must ask: {ask}");
         }
     }
 
@@ -968,10 +1108,7 @@ mod tests {
             auth(&p, &shell("ls -la && cargo test")),
             Decision::Allow
         ));
-        assert!(matches!(
-            auth(&p, &shell("rm -rf target/debug")),
-            Decision::Allow
-        ));
+        assert!(for_the_person(&auth(&p, &shell("rm -rf target/debug"))));
     }
 
     #[test]
@@ -1031,10 +1168,7 @@ mod tests {
             "echo 'unterminated",
         ] {
             assert!(
-                matches!(
-                    auth_at(&p, AutonomyLevel::Autopilot, &shell(reviewed)),
-                    Decision::Human
-                ),
+                asked(&auth_at(&p, AutonomyLevel::Autopilot, &shell(reviewed))),
                 "must fail closed to review even in Autopilot: {reviewed}"
             );
         }

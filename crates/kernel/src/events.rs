@@ -582,6 +582,7 @@ impl Event {
             Decision::Allow => ("allow", String::new()),
             Decision::Deny { reason } => ("deny", reason.clone()),
             Decision::Human => ("human", String::new()),
+            Decision::Person { reason } => ("person", reason.clone()),
         };
         Self::new(
             s,

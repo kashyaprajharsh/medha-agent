@@ -590,6 +590,72 @@ entrypoint = { program = "hook.sh", args = [] }
     }
 }
 
+/// A delete is never the reviewer's call: both cards reach the person, say what is lost, and offer no lasting allow.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_in_autopilot_asks_the_person_with_a_warning_and_never_the_reviewer() {
+    let world = World::new();
+    let (_backend, mut client, folder, chat) = autopilot(&world, "deletes").await;
+    std::fs::create_dir_all(folder.join("app")).unwrap();
+    let plain = json!({"command": "rm -rf app; echo REVIEW_ALLOW"});
+    let steps = [
+        format!("shell_exec {plain}"),
+        networked("rm -rf app; echo REVIEW_ALLOW"),
+    ];
+    client
+        .send(&chat, &format!("SCRIPT\n{}", steps.join("\n")))
+        .await;
+    let mut cards = Vec::new();
+    loop {
+        let (_, frame) = client
+            .until(|frame| frame["method"] == "approval" || kind(frame, "turn.done"))
+            .await;
+        if frame["method"] != "approval" {
+            break;
+        }
+        let answer = json!({"gate_id": frame["params"]["gate_id"], "approve": false});
+        client.ask("approval.respond", Some(&chat), answer).await;
+        cards.push(frame["params"].clone());
+    }
+    assert_eq!(
+        cards.len(),
+        2,
+        "a delete did not reach the person: {cards:?}"
+    );
+    assert!(folder.join("app").is_dir(), "the folder was deleted");
+    let warning = "This deletes files or folders.";
+    assert!(
+        cards[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(warning)),
+        "the command card did not warn: {}",
+        cards[0]
+    );
+    assert_eq!(cards[1]["kind"], "access", "{}", cards[1]);
+    assert!(
+        cards[1]["access"]["warning"]
+            .as_str()
+            .is_some_and(|said| said.starts_with(warning)),
+        "the access card did not warn: {}",
+        cards[1]
+    );
+    for card in &cards {
+        assert!(
+            !card["choices"].to_string().contains("always"),
+            "a delete offered a lasting allow: {card}"
+        );
+    }
+    let logged = answers(&world, &chat).await;
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    for answer in &logged {
+        assert_eq!(answer["by"], "person", "{logged:?}");
+        assert!(
+            answer["review"].is_null(),
+            "the reviewer was asked: {logged:?}"
+        );
+    }
+}
+
 /// A run with no screen in Autopilot does what the reviewer allows and refuses the rest at once, never waiting.
 #[cfg(unix)]
 #[test]

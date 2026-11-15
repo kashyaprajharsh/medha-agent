@@ -3287,6 +3287,7 @@ dependencies = [
  "regex",
  "serde_json",
  "shell-reader",
+ "tempfile",
 ]
 
 [[package]]

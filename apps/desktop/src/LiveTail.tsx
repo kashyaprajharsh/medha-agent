@@ -42,6 +42,20 @@ export function skillDraft(approval: Approval): string | undefined {
 
 const NO_STEPS: Step[] = [];
 
+/** What may be lost, first and in the risky style: "This deletes files or folders." over the rest. */
+function Warning({ text }: { text: string }) {
+  const at = text.indexOf(". ");
+  return (
+    <li className="risky">
+      <Icon name="alert" />
+      <span>
+        <b>{at < 0 ? text : text.slice(0, at + 1)}</b>
+        {at >= 0 && <small>{text.slice(at + 2)}</small>}
+      </span>
+    </li>
+  );
+}
+
 /** The command on its own, then each thing it may reach on its own line, the riskiest first. */
 function AccessBody({ parts }: { parts: AccessParts }) {
   return (
@@ -54,6 +68,7 @@ function AccessBody({ parts }: { parts: AccessParts }) {
         </div>
       )}
       <ul className="ask-gets">
+        {parts.warning && <Warning text={parts.warning} />}
         {parts.outsideSandbox && (
           <li className="risky">
             <Icon name="alert" />

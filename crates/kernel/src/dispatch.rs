@@ -347,7 +347,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
                 crate::hooks::HookDirective::RequestApproval(reason) => {
                     hook_approval_reason = Some(reason);
-                    decision = crate::types::Decision::Human;
+                    // A hook may ask too, but never turns a person-only ask into a plain one.
+                    if !matches!(decision, crate::types::Decision::Person { .. }) {
+                        decision = crate::types::Decision::Human;
+                    }
                 }
             }
         }
@@ -371,6 +374,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 ),
             );
         }
+        // A person-only ask is asked as a hook's is: not the reviewer's call, and never remembered.
+        let person_reason = match &decision {
+            crate::types::Decision::Person { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        if person_reason.is_some() {
+            decision = crate::types::Decision::Human;
+        }
+        let escalated = escalated || person_reason.is_some();
         if !matches!(decision, crate::types::Decision::Deny { .. }) {
             if let Some(blocked) = self.executor.mutation_preflight(intent).await {
                 return blocked;
@@ -383,8 +395,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // This card reviews both the command and its missing capabilities,
                 // so a policy Human decision does not create a second prompt.
                 let jailed = crate::types::Containment::OsFsJail;
-                let access_escalated =
-                    escalated || (access.network && follows_web(radius, web_tainted, jailed));
+                let untrusted =
+                    trust_escalated || (access.network && follows_web(radius, web_tainted, jailed));
+                let access_escalated = escalated || untrusted;
                 sink.phase(crate::progress::Phase::AwaitingApproval {
                     action: approval_key(intent),
                 });
@@ -417,25 +430,32 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             path.display()
                         ));
                     }
-                    if access_escalated {
+                    if untrusted {
                         detail.push_str("\nThis command handled untrusted content; approve this invocation only.");
                     }
                     if let Some(reason) = &hook_approval_reason {
                         detail.push_str("\nA pre-tool hook requires approval: ");
                         detail.push_str(reason);
                     }
+                    if let Some(reason) = &person_reason {
+                        detail.push('\n');
+                        detail.push_str(reason);
+                    }
                     let ask = crate::AccessAsk {
                         text: detail,
                         command: self.executor.command_line(intent),
                         access: access.clone(),
-                        untrusted: trust_escalated
-                            || (access.network && follows_web(radius, web_tainted, jailed)),
+                        untrusted,
                         hook: hook_approval_reason.clone(),
                         agent: None,
+                        warning: person_reason.clone(),
                     };
                     let grant = self.executor.grant_access(&access, &ask, access_escalated);
-                    // Leaving the sandbox, or a hook wanting a person, is never the reviewer's call.
-                    if access.outside_sandbox || hook_approval_reason.is_some() {
+                    // Leaving the sandbox, a hook wanting a person, or a destructive command is never the reviewer's call.
+                    if access.outside_sandbox
+                        || hook_approval_reason.is_some()
+                        || person_reason.is_some()
+                    {
                         crate::review::withheld(grant).await
                     } else {
                         grant.await
@@ -483,7 +503,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
-            crate::types::Decision::Human => {
+            crate::types::Decision::Human | crate::types::Decision::Person { .. } => {
                 // Published before the wait for the lane, not after: an agent
                 // queued behind another agent's card is still blocked on a
                 // person, and a watcher must be able to say so.
@@ -503,9 +523,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         detail.push_str("\n\nA pre-tool hook requires approval: ");
                         detail.push_str(reason);
                     }
+                    // What may be lost is read first, before the command.
+                    if let Some(reason) = &person_reason {
+                        detail = format!("{reason}\n\n{detail}");
+                    }
                     let action = approval_key(intent);
                     let confirm = self.gate.confirm(&action, Some(&detail), escalated);
-                    if hook_approval_reason.is_some() {
+                    if hook_approval_reason.is_some() || person_reason.is_some() {
                         crate::review::withheld(confirm).await
                     } else {
                         confirm.await

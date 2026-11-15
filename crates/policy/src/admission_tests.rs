@@ -18,20 +18,30 @@ fn decide(jail: Jail, mode: AutonomyLevel, command: &str) -> Decision {
 #[test]
 fn the_jail_runs_what_used_to_be_refused() {
     for command in [
-        "cd /repo && for f in *.png; do cp \"$f\" out/; rm -rf \"$f\"; done",
         "cd /repo && ffmpeg -y -i a.gif -filter_complex_script work/f.txt work/m.mp4 2>work/err.log; echo \"exit=$?\"; head -40 work/err.log",
         "printf x > work/mini.txt && ffmpeg -y -i work/mini.txt out.mp4 2>&1 | tail -6; echo \"exit=${PIPESTATUS[0]}\"",
-        "cd campaign && rm -rf node_modules package-lock.json",
         "# render output\nprintf x > output.txt",
         "ffprobe -v error out.mp4; awk '{print $1}' in.txt; jq . facts.json; mkdir -p work/render",
         "cat data.json | python3 -m json.tool",
-        "rm -rf work/../generated",
         "chown -R me ./build",
         "dd if=input.bin of=output.bin",
     ] {
         for mode in [AutonomyLevel::Normal, AutonomyLevel::Autopilot] {
             assert!(
                 matches!(decide(Jail::Active, mode, command), Decision::Allow),
+                "{command} in {mode:?}"
+            );
+        }
+    }
+    // A recursive delete runs only when the person allows it, inside the jail as well.
+    for command in [
+        "cd /repo && for f in *.png; do cp \"$f\" out/; rm -rf \"$f\"; done",
+        "cd campaign && rm -rf node_modules package-lock.json",
+        "rm -rf work/../generated",
+    ] {
+        for mode in [AutonomyLevel::Normal, AutonomyLevel::Autopilot] {
+            assert!(
+                matches!(decide(Jail::Active, mode, command), Decision::Person { .. }),
                 "{command} in {mode:?}"
             );
         }
@@ -95,32 +105,20 @@ fn quoted_text_and_file_names_are_not_dangers() {
     }
 }
 
-/// Outside the workspace a delete still asks; a target only the jail can place asks only without one.
+/// A recursive delete asks the person wherever it lands, inside the workspace or out, with a jail or without.
 #[test]
 fn deletes_outside_the_workspace_still_ask() {
     let autopilot = AutonomyLevel::Autopilot;
-    assert!(matches!(
-        decide(Jail::Active, autopilot, "rm -rf ~/Documents/old"),
-        Decision::Human
-    ));
-    assert!(matches!(
-        decide(Jail::Off, autopilot, "rm -rf ~/Documents/old"),
-        Decision::Human
-    ));
-    assert!(matches!(
-        decide(Jail::Active, autopilot, "rm -rf ../sibling"),
-        Decision::Allow
-    ));
-    assert!(matches!(
-        decide(Jail::Off, autopilot, "rm -rf ../sibling"),
-        Decision::Human
-    ));
-    assert!(matches!(
-        decide(Jail::Active, autopilot, "rm -rf \"$f\""),
-        Decision::Allow
-    ));
-    assert!(matches!(
-        decide(Jail::Off, autopilot, "rm -rf \"$f\""),
-        Decision::Human
-    ));
+    for command in [
+        "rm -rf ~/Documents/old",
+        "rm -rf ../sibling",
+        "rm -rf \"$f\"",
+    ] {
+        for jail in [Jail::Active, Jail::Off] {
+            assert!(
+                matches!(decide(jail, autopilot, command), Decision::Person { .. }),
+                "{command} with {jail:?}"
+            );
+        }
+    }
 }

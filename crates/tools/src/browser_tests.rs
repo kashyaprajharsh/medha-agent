@@ -521,6 +521,34 @@ async fn a_render_saved_as_a_file_lands_in_the_folder_and_nowhere_else() {
     );
 }
 
+/// A page that never finishes loading is still pictured as far as it got, never returned empty.
+#[tokio::test]
+async fn a_page_that_never_finishes_loading_is_still_pictured() {
+    let Some(browser) = installed_browser() else {
+        return;
+    };
+    let base = scratch("endless");
+    // Each missing picture asks for another, so the page always has one more file pending.
+    std::fs::write(
+        base.path().join("index.html"),
+        "<h1>still loading</h1><script>function more() { const img = new Image(); \
+         img.onerror = more; img.src = 'missing-' + Math.random() + '.png'; \
+         document.body.appendChild(img); } more();</script>",
+    )
+    .unwrap();
+    let page = BrowserScreenshot {
+        sbx: Arc::new(sandbox::WorkspaceSandbox::new_jailed(base.path()).unwrap()),
+        artifacts: Arc::new(MemArtifacts::default()),
+        browser,
+    };
+    let pictured = page
+        .render(&json!({"path": "index.html", "render": true}))
+        .await
+        .unwrap();
+    let media: Vec<kernel::MediaPart> = serde_json::from_value(pictured[MEDIA].clone()).unwrap();
+    assert_eq!(media.len(), 1, "{pictured}");
+}
+
 /// `read` with `render: true` returns the picture; an ungranted URL never starts a browser.
 #[tokio::test]
 async fn read_render_returns_the_page_as_an_image_and_refuses_ungranted_urls() {

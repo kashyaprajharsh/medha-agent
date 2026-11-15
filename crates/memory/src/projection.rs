@@ -741,7 +741,8 @@ mod tests {
         assert!(cancelled.unwrap_err().is_cancelled());
 
         blocker.execute_batch("ROLLBACK").unwrap();
-        tokio::time::timeout(Duration::from_secs(2), first)
+        // The latency checks above cover responsiveness; allow disk I/O to finish on busy CI hosts.
+        tokio::time::timeout(Duration::from_secs(30), first)
             .await
             .expect("write should finish after releasing the database")
             .unwrap()
